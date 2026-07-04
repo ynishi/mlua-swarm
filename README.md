@@ -30,6 +30,26 @@ MCP client config:
 { "command": "mse", "args": ["mcp"] }
 ```
 
+#### Docker (no Rust toolchain required)
+
+Also listed on the [MCP Registry](https://registry.modelcontextprotocol.io)
+as `io.github.ynishi/mlua-swarm`:
+
+```json
+{
+  "mcpServers": {
+    "mlua-swarm": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "ghcr.io/ynishi/mse:latest",
+        "mcp"
+      ]
+    }
+  }
+}
+```
+
 ## Documentation
 
 Documentation is served from the code itself:

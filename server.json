@@ -1,0 +1,26 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.ynishi/mlua-swarm",
+  "description": "MCP server for mlua-swarm: engine that compiles flow.ir Blueprints and dispatches agent steps.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/ynishi/mlua-swarm",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/ynishi/mse:0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "valueHint": "subcommand"
+        }
+      ]
+    }
+  ]
+}
