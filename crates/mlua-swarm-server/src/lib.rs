@@ -179,14 +179,30 @@ pub fn build_router_with_ws_factory(
     store: Option<Arc<dyn BlueprintStore>>,
     ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
 ) -> Router {
+    build_router_with_ws_factory_and_output(engine, registry, store, ws_operator_factory, None)
+}
+
+/// 5-argument variant of [`build_router_with_ws_factory`]. Passing
+/// `output_store = Some(arc)` swaps the default `InMemoryOutputStore` for a
+/// caller-supplied backend (a `SqliteOutputStore`, for instance). `None`
+/// preserves the historical behaviour (fresh in-memory store per call).
+pub fn build_router_with_ws_factory_and_output(
+    engine: Engine,
+    registry: SpawnerRegistry,
+    store: Option<Arc<dyn BlueprintStore>>,
+    ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+    output_store: Option<Arc<dyn mlua_swarm::store::output::OutputStore>>,
+) -> Router {
     let compiler = Compiler::new(registry);
     let launch = Arc::new(TaskLaunchService::new(engine.clone(), compiler));
     let task_app = Arc::new(match store {
         Some(s) => TaskApplication::new(launch, s),
         None => TaskApplication::new_inline_only(launch),
     });
-    let data_store: Arc<dyn mlua_swarm::store::output::OutputStore> =
-        Arc::new(mlua_swarm::store::output::InMemoryOutputStore::new());
+    let data_store: Arc<dyn mlua_swarm::store::output::OutputStore> = match output_store {
+        Some(s) => s,
+        None => Arc::new(mlua_swarm::store::output::InMemoryOutputStore::new()),
+    };
     let state = AppState {
         engine,
         sessions: Arc::new(Mutex::new(SessionStore::default())),

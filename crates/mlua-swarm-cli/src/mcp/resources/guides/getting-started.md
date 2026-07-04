@@ -50,9 +50,11 @@ Notable flags (see `mse serve --help` for the full set):
   patch-applier / verifier-router / committer) into the registry.
 - `--git-store-path <path>` — use a Git2-backed `BlueprintStore` instead of
   the default in-memory store (lost on restart).
-- `--issue-store-path <path>` — use a SQLite-backed `IssueStore` at that
-  path (via `rusqlite-isle`, thread-isolated `Connection`). Omit for the
-  default in-memory store (lost on restart).
+- `--issue-store-path <path>` / `--enhance-setting-store-path <path>` /
+  `--enhance-log-store-path <path>` / `--output-store-path <path>` —
+  use a SQLite backend (via `rusqlite-isle`, thread-isolated `Connection`)
+  for that store at the given path. Omit for the default in-memory
+  store (lost on restart). Each flag is independent.
 - `--blueprint-ref-base <path>` — base dir for expanding `$file` /
   `$agent_md` refs in seeded Blueprint bodies.
 

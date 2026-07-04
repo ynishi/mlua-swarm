@@ -18,10 +18,14 @@ use mlua_swarm::blueprint::{
     current_schema_version, AgentDef, AgentKind, Blueprint, BlueprintMetadata, BlueprintOrigin,
     CompilerHints, CompilerStrategy,
 };
+use mlua_swarm::store::enhance_log::{
+    EnhanceLogStore, InMemoryEnhanceLogStore, SqliteEnhanceLogStore,
+};
 use mlua_swarm::store::enhance_setting::{
-    EnhanceSettingId, EnhanceSettingStore, InMemoryEnhanceSettingStore,
+    EnhanceSettingId, EnhanceSettingStore, InMemoryEnhanceSettingStore, SqliteEnhanceSettingStore,
 };
 use mlua_swarm::store::issue::{InMemoryIssueStore, IssueStore, SqliteIssueStore};
+use mlua_swarm::store::output::{InMemoryOutputStore, OutputStore, SqliteOutputStore};
 use mlua_swarm::{
     Compiler, Engine, EngineCfg, EnhanceApplication, EnhanceApplicationConfig, Role,
     TaskLaunchService,
@@ -32,7 +36,7 @@ use mlua_swarm::{
 };
 use mlua_swarm_server::{
     build_blueprints_router_with_refs, build_enhance_log_router, build_enhance_settings_router,
-    build_issues_router, build_router_with_ws_factory, default_layer_registry,
+    build_issues_router, build_router_with_ws_factory_and_output, default_layer_registry,
     default_registry_with_enhance_flow,
     doctor::{build_doctor_router, DoctorInfo},
 };
@@ -70,6 +74,21 @@ pub struct Args {
     /// `InMemoryIssueStore`. Overrides the config file's `issue_store_path`.
     #[arg(long)]
     issue_store_path: Option<std::path::PathBuf>,
+    /// Path to the SQLite database file backing the `EnhanceSettingStore`.
+    /// Omit for the in-memory default. Overrides
+    /// `enhance_setting_store_path` in the config file.
+    #[arg(long)]
+    enhance_setting_store_path: Option<std::path::PathBuf>,
+    /// Path to the SQLite database file backing the `EnhanceLogStore`.
+    /// Omit for the in-memory default. Overrides `enhance_log_store_path`
+    /// in the config file.
+    #[arg(long)]
+    enhance_log_store_path: Option<std::path::PathBuf>,
+    /// Path to the SQLite database file backing the `OutputStore`. Omit for
+    /// the in-memory default. Overrides `output_store_path` in the config
+    /// file.
+    #[arg(long)]
+    output_store_path: Option<std::path::PathBuf>,
     /// Merges the 4 enhance-flow workers (patch-spawner / patch-applier /
     /// verifier-router / committer) + 3 host bridges into `default_registry`.
     /// Used when running the default enhance Blueprint through `/v1/tasks`. A pure
@@ -116,6 +135,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         blueprint_ref_base: args.blueprint_ref_base.clone(),
         git_store_path: args.git_store_path.clone(),
         issue_store_path: args.issue_store_path.clone(),
+        enhance_setting_store_path: args.enhance_setting_store_path.clone(),
+        enhance_log_store_path: args.enhance_log_store_path.clone(),
+        output_store_path: args.output_store_path.clone(),
         seed_blueprint_id: args.seed_blueprint_id.clone(),
         default_agent_kind: args.default_agent_kind.clone(),
         token_secret: args.token_secret.clone(),
@@ -218,37 +240,72 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         reg
     };
 
+    // Store backend selection.
+    //
+    // Each of the four stores (Issue / EnhanceSetting / EnhanceLog / Output)
+    // picks a SQLite-backed impl when its `*_store_path` is set in the
+    // resolved config; otherwise it falls back to the process-volatile
+    // in-memory default. The `AsyncIsleDriver` handles are collected into
+    // `isle_drivers` and drained on shutdown so their SQLite threads join
+    // cleanly instead of racing process exit.
+    let mut isle_drivers: Vec<rusqlite_isle::AsyncIsleDriver> = Vec::new();
+
+    let issue_store: Arc<dyn IssueStore> = match &cfg.issue_store_path {
+        Some(path) => {
+            eprintln!("mse serve: SqliteIssueStore at {}", path.display());
+            let (s, driver) = SqliteIssueStore::open(path)
+                .await
+                .unwrap_or_else(|e| panic!("mse serve: SqliteIssueStore open failed: {e}"));
+            isle_drivers.push(driver);
+            Arc::new(s)
+        }
+        None => Arc::new(InMemoryIssueStore::new()),
+    };
+    let setting_store: Arc<dyn EnhanceSettingStore> = match &cfg.enhance_setting_store_path {
+        Some(path) => {
+            eprintln!("mse serve: SqliteEnhanceSettingStore at {}", path.display());
+            let (s, driver) = SqliteEnhanceSettingStore::open(path).await.unwrap_or_else(
+                |e| panic!("mse serve: SqliteEnhanceSettingStore open failed: {e}"),
+            );
+            isle_drivers.push(driver);
+            Arc::new(s)
+        }
+        None => Arc::new(InMemoryEnhanceSettingStore::new()),
+    };
+    let log_store: Arc<dyn EnhanceLogStore> = match &cfg.enhance_log_store_path {
+        Some(path) => {
+            eprintln!("mse serve: SqliteEnhanceLogStore at {}", path.display());
+            let (s, driver) = SqliteEnhanceLogStore::open(path)
+                .await
+                .unwrap_or_else(|e| panic!("mse serve: SqliteEnhanceLogStore open failed: {e}"));
+            isle_drivers.push(driver);
+            Arc::new(s)
+        }
+        None => Arc::new(InMemoryEnhanceLogStore::new()),
+    };
+    let output_store: Option<Arc<dyn OutputStore>> = match &cfg.output_store_path {
+        Some(path) => {
+            eprintln!("mse serve: SqliteOutputStore at {}", path.display());
+            let (s, driver) = SqliteOutputStore::open(path)
+                .await
+                .unwrap_or_else(|e| panic!("mse serve: SqliteOutputStore open failed: {e}"));
+            isle_drivers.push(driver);
+            Some(Arc::new(s))
+        }
+        // Explicit `InMemoryOutputStore` construction here (rather than
+        // leaving `output_store = None` and letting the router build one)
+        // keeps the branch symmetric with the other three stores.
+        None => Some(Arc::new(InMemoryOutputStore::new())),
+    };
+
     // Router assembly (fixed combined mode): merges task, ws_operator_factory, and every enhance route.
-    let mut app = build_router_with_ws_factory(
+    let mut app = build_router_with_ws_factory_and_output(
         engine.clone(),
         make_registry(),
         Some(store.clone()),
         Some(op_factory.clone()),
+        output_store,
     );
-
-    // Enhance axis integration (/v1/issues + /v1/blueprints + /v1/enhance-settings + consumer loop, always on).
-    let setting_store: Arc<dyn EnhanceSettingStore> = Arc::new(InMemoryEnhanceSettingStore::new());
-    // IssueStore backend selection: SQLite when `cfg.issue_store_path` is set,
-    // otherwise fall back to the process-volatile in-memory store. The
-    // `AsyncIsleDriver` returned by `SqliteIssueStore::open` is kept alive for
-    // the process lifetime; it will be dropped on shutdown (which cancels
-    // queued jobs — see `rusqlite-isle` docs for graceful `shutdown().await`).
-    let (issue_store, _issue_isle_driver): (Arc<dyn IssueStore>, Option<_>) =
-        match &cfg.issue_store_path {
-            Some(path) => {
-                eprintln!(
-                    "mse serve: SqliteIssueStore at {}",
-                    path.display()
-                );
-                let (store, driver) = SqliteIssueStore::open(path)
-                    .await
-                    .unwrap_or_else(|e| panic!("mse serve: SqliteIssueStore open failed: {e}"));
-                (Arc::new(store), Some(driver))
-            }
-            None => (Arc::new(InMemoryIssueStore::new()), None),
-        };
-    let log_store: Arc<dyn mlua_swarm::store::enhance_log::EnhanceLogStore> =
-        Arc::new(mlua_swarm::store::enhance_log::InMemoryEnhanceLogStore::new());
 
     let compiler = Compiler::new(make_registry());
     let launch_enhance = Arc::new(TaskLaunchService::new(engine.clone(), compiler));
@@ -316,6 +373,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         _ = wait_sigterm() => { eprintln!("mse serve: SIGTERM, shutting down"); }
     }
     enhance_loop.abort();
+    // Drain SQLite isle drivers (drops queued jobs, joins the SQLite thread).
+    // Errors are logged but do not fail shutdown — the process is exiting.
+    for driver in isle_drivers {
+        if let Err(e) = driver.shutdown().await {
+            eprintln!("mse serve: isle driver shutdown error: {e}");
+        }
+    }
     Ok(())
 }
 

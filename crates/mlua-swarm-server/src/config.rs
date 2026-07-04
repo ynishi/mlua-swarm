@@ -40,6 +40,15 @@ pub struct FileConfig {
     /// Path to the SQLite database file backing the `IssueStore`. `None` = fall
     /// back to `InMemoryIssueStore` (process-volatile).
     pub issue_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `EnhanceSettingStore`.
+    /// `None` = fall back to `InMemoryEnhanceSettingStore` (process-volatile).
+    pub enhance_setting_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `EnhanceLogStore`.
+    /// `None` = fall back to `InMemoryEnhanceLogStore` (process-volatile).
+    pub enhance_log_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `OutputStore`.
+    /// `None` = fall back to `InMemoryOutputStore` (process-volatile).
+    pub output_store_path: Option<PathBuf>,
     /// Seed blueprint id used in combined-mode default routing.
     pub seed_blueprint_id: Option<String>,
     /// snake_case `AgentKind` literal (`operator` / `agent_block` / `rust_fn` /
@@ -64,6 +73,12 @@ pub struct CliOverrides {
     pub git_store_path: Option<PathBuf>,
     /// `--issue-store-path` value (mirrors [`FileConfig::issue_store_path`]).
     pub issue_store_path: Option<PathBuf>,
+    /// `--enhance-setting-store-path` value.
+    pub enhance_setting_store_path: Option<PathBuf>,
+    /// `--enhance-log-store-path` value.
+    pub enhance_log_store_path: Option<PathBuf>,
+    /// `--output-store-path` value.
+    pub output_store_path: Option<PathBuf>,
     /// `--seed-blueprint-id` value.
     pub seed_blueprint_id: Option<String>,
     /// `--default-agent-kind` value (snake_case `AgentKind` literal, unvalidated).
@@ -86,6 +101,15 @@ pub struct ResolvedConfig {
     /// Path to the SQLite database file backing the `IssueStore`. `None` = fall
     /// back to `InMemoryIssueStore` (process-volatile).
     pub issue_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `EnhanceSettingStore`.
+    /// `None` = `InMemoryEnhanceSettingStore`.
+    pub enhance_setting_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `EnhanceLogStore`.
+    /// `None` = `InMemoryEnhanceLogStore`.
+    pub enhance_log_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `OutputStore`.
+    /// `None` = `InMemoryOutputStore`.
+    pub output_store_path: Option<PathBuf>,
     /// Seed blueprint id used in combined-mode default routing.
     pub seed_blueprint_id: String,
     /// snake_case `AgentKind` literal, unvalidated. `None` = caller applies
@@ -103,6 +127,9 @@ impl Default for ResolvedConfig {
             blueprint_ref_base: None,
             git_store_path: None,
             issue_store_path: None,
+            enhance_setting_store_path: None,
+            enhance_log_store_path: None,
+            output_store_path: None,
             seed_blueprint_id: "main".into(),
             default_agent_kind: None,
             token_secret: None,
@@ -150,6 +177,13 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
         blueprint_ref_base: cli.blueprint_ref_base.or(file.blueprint_ref_base),
         git_store_path: cli.git_store_path.or(file.git_store_path),
         issue_store_path: cli.issue_store_path.or(file.issue_store_path),
+        enhance_setting_store_path: cli
+            .enhance_setting_store_path
+            .or(file.enhance_setting_store_path),
+        enhance_log_store_path: cli
+            .enhance_log_store_path
+            .or(file.enhance_log_store_path),
+        output_store_path: cli.output_store_path.or(file.output_store_path),
         seed_blueprint_id: cli
             .seed_blueprint_id
             .or(file.seed_blueprint_id)

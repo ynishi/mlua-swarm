@@ -12,9 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (thread-isolated `Connection`, single-writer FIFO discipline):
   `SqliteIssueStore`, `SqliteEnhanceSettingStore`, `SqliteEnhanceLogStore`,
   `SqliteOutputStore`. In-memory backends remain the default.
-- `mse serve --issue-store-path <path>` (and `issue_store_path` in the TOML
-  config file) — when set, `IssueStore` is backed by SQLite at that path;
-  omit to fall back to the process-volatile `InMemoryIssueStore`.
+- `mse serve` gained four `--<store>-store-path` flags (and matching
+  `<store>_store_path` TOML fields) selecting the SQLite backend per store:
+  `--issue-store-path`, `--enhance-setting-store-path`,
+  `--enhance-log-store-path`, `--output-store-path`. Omit any of them to
+  fall back to the in-memory default.
+- `mlua_swarm_server::build_router_with_ws_factory_and_output` — new
+  5-argument variant that lets callers inject a custom `Arc<dyn OutputStore>`
+  (the 4-argument form now delegates with `None` for compatibility).
+- Graceful SQLite shutdown: `mse serve` collects each backend's
+  `AsyncIsleDriver` and drains them via `driver.shutdown().await` after the
+  Ctrl-C / SIGTERM handler, so SQLite threads join cleanly.
 - `EnhanceSettingStoreError::Other` and `EnhanceLogStoreError::Other`
   variants to carry backend-specific failures (SQLite / IO / serde).
 
