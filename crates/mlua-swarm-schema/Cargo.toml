@@ -9,6 +9,8 @@ repository.workspace = true
 homepage.workspace = true
 readme = "../../README.md"
 description = "Blueprint schema types for mlua-swarm — Swarm IF SoT (Blueprint / AgentDef / AgentKind / Hints / Strategy / Metadata)."
+keywords = ["swarm", "lua", "blueprint", "schema", "flow-ir"]
+categories = ["data-structures"]
 
 [dependencies]
 serde.workspace = true

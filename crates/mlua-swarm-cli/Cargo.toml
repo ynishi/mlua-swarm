@@ -9,6 +9,8 @@ repository.workspace = true
 homepage.workspace = true
 readme = "../../README.md"
 description = "Command line interface for mlua-swarm (mse binary with serve / mcp subcommands)."
+keywords = ["swarm", "lua", "mcp", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "mse"

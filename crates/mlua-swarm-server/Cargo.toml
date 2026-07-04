@@ -8,7 +8,9 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "../../README.md"
-description = "HTTP interface for mlua-swarm."
+description = "HTTP + WebSocket server for mlua-swarm (task API, Blueprint store, Operator WS sessions)."
+keywords = ["swarm", "lua", "mcp", "http", "websocket"]
+categories = ["asynchronous", "web-programming::websocket"]
 
 [dependencies]
 mlua-swarm.workspace = true
