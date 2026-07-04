@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-07-05
+
+### Fixed
+- `server.json` version was still `0.1.0` in the v0.1.2 tag, causing
+  the `publish-mcp-registry` job to fail its
+  `SERVER_VERSION != tag` guard. Bumped alongside the Cargo
+  workspace. The OCI `identifier` (`ghcr.io/ynishi/mse:<version>`)
+  is bumped in lockstep — Docker image tag is still the actual
+  version literal per the cargo-dist runbook.
+
+### Note
+- The `publish-homebrew-formula` job also failed for the v0.1.2 tag,
+  because the `ynishi/homebrew-tap` repository was created empty and
+  has no `main` branch for the formula commit to target. This is
+  bootstrap state, not code state, and is fixed out-of-band by
+  seeding the tap repo before this tag is pushed.
+
 ## [0.1.2] — 2026-07-05
 
 ### Fixed
@@ -56,7 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mlua-swarm-server`: HTTP + WebSocket server (task API, Blueprint store, Operator WS sessions).
 - `mlua-swarm-cli`: `mse` binary with `serve` and `mcp` subcommands (MCP adapter for AI agents).
 
-[Unreleased]: https://github.com/ynishi/mlua-swarm/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/ynishi/mlua-swarm/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/ynishi/mlua-swarm/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ynishi/mlua-swarm/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ynishi/mlua-swarm/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ynishi/mlua-swarm/releases/tag/v0.1.0
