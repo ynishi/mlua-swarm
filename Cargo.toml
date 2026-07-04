@@ -19,6 +19,11 @@ readme = "README.md"
 [profile.release]
 overflow-checks = true
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 [workspace.dependencies]
 mlua-flow-ir = "0.0.5"
 mlua-isle = { version = "0.5.0", features = ["pool", "tokio"] }

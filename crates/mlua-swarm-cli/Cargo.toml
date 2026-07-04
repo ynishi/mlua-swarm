@@ -16,6 +16,10 @@ categories = ["command-line-utilities", "development-tools"]
 name = "mse"
 path = "src/main.rs"
 
+[package.metadata.dist]
+# Homebrew formula name (cargo-dist defaults to package name; pin to the bin name)
+formula = "mse"
+
 [dependencies]
 mlua-swarm.workspace = true
 mlua-swarm-server.workspace = true
