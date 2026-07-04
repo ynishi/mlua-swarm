@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- SQLite-backed persistence for all four in-crate stores via `rusqlite-isle`
+  (thread-isolated `Connection`, single-writer FIFO discipline):
+  `SqliteIssueStore`, `SqliteEnhanceSettingStore`, `SqliteEnhanceLogStore`,
+  `SqliteOutputStore`. In-memory backends remain the default.
+- `mse serve --issue-store-path <path>` (and `issue_store_path` in the TOML
+  config file) — when set, `IssueStore` is backed by SQLite at that path;
+  omit to fall back to the process-volatile `InMemoryIssueStore`.
+- `EnhanceSettingStoreError::Other` and `EnhanceLogStoreError::Other`
+  variants to carry backend-specific failures (SQLite / IO / serde).
+
 ## [0.1.0] — 2026-07-04
 
 ### Added

@@ -19,6 +19,9 @@
 //! the `append` with `bp_store.write_new`. Timestamps are stamped
 //! caller-side, where the epoch is already known.
 
+pub mod sqlite;
+pub use sqlite::SqliteEnhanceLogStore;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -77,6 +80,10 @@ pub enum EnhanceLogStoreError {
     /// append-only, so the existing entry is left untouched.
     #[error("conflict: issue_id {0:?} already appended (append-only)")]
     Conflict(IssueId),
+    /// Backend-specific failure not covered by the other variants
+    /// (i.e. SQLite / IO / serde errors from a persistent backend).
+    #[error("other: {0}")]
+    Other(String),
 }
 
 /// Append-only persistence interface for [`EnhanceLogEntry`] records.

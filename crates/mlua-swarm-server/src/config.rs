@@ -37,6 +37,9 @@ pub struct FileConfig {
     pub blueprint_ref_base: Option<PathBuf>,
     /// Root path for the git-backed `BlueprintStore` (when using the git2 backend).
     pub git_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `IssueStore`. `None` = fall
+    /// back to `InMemoryIssueStore` (process-volatile).
+    pub issue_store_path: Option<PathBuf>,
     /// Seed blueprint id used in combined-mode default routing.
     pub seed_blueprint_id: Option<String>,
     /// snake_case `AgentKind` literal (`operator` / `agent_block` / `rust_fn` /
@@ -59,6 +62,8 @@ pub struct CliOverrides {
     pub blueprint_ref_base: Option<PathBuf>,
     /// `--git-store-path` value.
     pub git_store_path: Option<PathBuf>,
+    /// `--issue-store-path` value (mirrors [`FileConfig::issue_store_path`]).
+    pub issue_store_path: Option<PathBuf>,
     /// `--seed-blueprint-id` value.
     pub seed_blueprint_id: Option<String>,
     /// `--default-agent-kind` value (snake_case `AgentKind` literal, unvalidated).
@@ -78,6 +83,9 @@ pub struct ResolvedConfig {
     pub blueprint_ref_base: Option<PathBuf>,
     /// Root path for the git-backed `BlueprintStore` (when using the git2 backend).
     pub git_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `IssueStore`. `None` = fall
+    /// back to `InMemoryIssueStore` (process-volatile).
+    pub issue_store_path: Option<PathBuf>,
     /// Seed blueprint id used in combined-mode default routing.
     pub seed_blueprint_id: String,
     /// snake_case `AgentKind` literal, unvalidated. `None` = caller applies
@@ -94,6 +102,7 @@ impl Default for ResolvedConfig {
             enable_enhance_flow: false,
             blueprint_ref_base: None,
             git_store_path: None,
+            issue_store_path: None,
             seed_blueprint_id: "main".into(),
             default_agent_kind: None,
             token_secret: None,
@@ -140,6 +149,7 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .unwrap_or(default.enable_enhance_flow),
         blueprint_ref_base: cli.blueprint_ref_base.or(file.blueprint_ref_base),
         git_store_path: cli.git_store_path.or(file.git_store_path),
+        issue_store_path: cli.issue_store_path.or(file.issue_store_path),
         seed_blueprint_id: cli
             .seed_blueprint_id
             .or(file.seed_blueprint_id)

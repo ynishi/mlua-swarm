@@ -27,6 +27,8 @@ lto = "thin"
 [workspace.dependencies]
 mlua-flow-ir = "0.0.5"
 mlua-isle = { version = "0.5.0", features = ["pool", "tokio"] }
+rusqlite-isle = { version = "0.2", features = ["tokio"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 semver = { version = "1", features = ["serde"] }
 schemars = "1"
 hmac = "0.12"
@@ -84,6 +86,8 @@ categories = ["asynchronous", "development-tools"]
 mlua-swarm-schema.workspace = true
 mlua-flow-ir.workspace = true
 mlua-isle.workspace = true
+rusqlite-isle.workspace = true
+rusqlite.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true

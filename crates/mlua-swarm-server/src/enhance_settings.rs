@@ -146,6 +146,9 @@ async fn get_setting(
                 StatusCode::NOT_FOUND,
                 format!("enhance setting not found: {id}"),
             ),
+            EnhanceSettingStoreError::Other(msg) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, msg)
+            }
         })?;
     Ok(Json(setting))
 }
@@ -188,6 +191,9 @@ async fn delete_setting(
                 StatusCode::NOT_FOUND,
                 format!("enhance setting not found: {id}"),
             ),
+            EnhanceSettingStoreError::Other(msg) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, msg)
+            }
         })?;
     Ok(StatusCode::NO_CONTENT)
 }

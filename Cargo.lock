@@ -1675,6 +1675,8 @@ dependencies = [
  "mlua-flow-ir",
  "mlua-isle 0.5.0",
  "mlua-swarm-schema",
+ "rusqlite",
+ "rusqlite-isle",
  "semver",
  "serde",
  "serde_json",
@@ -2280,6 +2282,17 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
+]
+
+[[package]]
+name = "rusqlite-isle"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be775d7d7d2e9c834e259e70e9852a0336c848eba311a1022cb5bed28e4d1503"
+dependencies = [
+ "rusqlite",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

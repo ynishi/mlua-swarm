@@ -66,6 +66,9 @@
 //! (canonical), and `worker/output.rs` was narrowed to re-exports plus the
 //! engine-specific `OutputSink` / `EngineSink`.
 
+pub mod sqlite;
+pub use sqlite::SqliteOutputStore;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

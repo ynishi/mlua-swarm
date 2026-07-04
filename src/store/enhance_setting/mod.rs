@@ -6,8 +6,11 @@
 //! version management runs on a separate path that commits the embedded
 //! `EnhanceSetting.blueprint` to `BlueprintStore` (carry).
 //!
-//! Only an in-memory implementation ships today; a Git2 backend is a
-//! carry for a future turn.
+//! `SqliteEnhanceSettingStore` (see [`sqlite`]) adds file-backed persistence
+//! on top of `rusqlite-isle`. A Git2 backend is still a future carry.
+
+pub mod sqlite;
+pub use sqlite::SqliteEnhanceSettingStore;
 
 use crate::enhance::setting::EnhanceSetting;
 use async_trait::async_trait;
@@ -49,6 +52,10 @@ pub enum EnhanceSettingStoreError {
     /// No setting exists for the given id.
     #[error("not found: {0}")]
     NotFound(EnhanceSettingId),
+    /// Backend-specific failure not covered by the other variants
+    /// (i.e. SQLite / IO / serde errors from a persistent backend).
+    #[error("other: {0}")]
+    Other(String),
 }
 
 /// CRUD persistence interface for [`EnhanceSetting`].

@@ -7,8 +7,10 @@
 //!
 //! Current scope:
 //!
-//! - `InMemoryIssueStore` — process-volatile; noted as a carry.
-//! - Persistent backends (SQLite / Git / mini-app / …) are future carries.
+//! - `InMemoryIssueStore` — process-volatile default.
+//! - `SqliteIssueStore` — file-backed persistence via `rusqlite-isle`
+//!   (thread-isolated `Connection`, single-writer FIFO discipline).
+//! - Other persistent backends (Git / mini-app / …) are future carries.
 
 use crate::blueprint::store::BlueprintId;
 use async_trait::async_trait;
@@ -18,7 +20,9 @@ use std::sync::Mutex;
 use thiserror::Error;
 
 pub mod inmemory;
+pub mod sqlite;
 pub use inmemory::InMemoryIssueStore;
+pub use sqlite::SqliteIssueStore;
 
 // ──────────────────────────────────────────────────────────────────────────
 // IssueId / IssuePayload / IssueStatus

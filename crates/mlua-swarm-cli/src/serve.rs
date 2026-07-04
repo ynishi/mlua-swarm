@@ -21,7 +21,7 @@ use mlua_swarm::blueprint::{
 use mlua_swarm::store::enhance_setting::{
     EnhanceSettingId, EnhanceSettingStore, InMemoryEnhanceSettingStore,
 };
-use mlua_swarm::store::issue::{InMemoryIssueStore, IssueStore};
+use mlua_swarm::store::issue::{InMemoryIssueStore, IssueStore, SqliteIssueStore};
 use mlua_swarm::{
     Compiler, Engine, EngineCfg, EnhanceApplication, EnhanceApplicationConfig, Role,
     TaskLaunchService,
@@ -65,6 +65,11 @@ pub struct Args {
     /// Note: currently fixed to `Layout::Single`; `blueprint_id` = `"main"` recommended.
     #[arg(long)]
     git_store_path: Option<std::path::PathBuf>,
+    /// Path to the SQLite database file backing the `IssueStore`. When omitted
+    /// (and absent from the config file), falls back to the process-volatile
+    /// `InMemoryIssueStore`. Overrides the config file's `issue_store_path`.
+    #[arg(long)]
+    issue_store_path: Option<std::path::PathBuf>,
     /// Merges the 4 enhance-flow workers (patch-spawner / patch-applier /
     /// verifier-router / committer) + 3 host bridges into `default_registry`.
     /// Used when running the default enhance Blueprint through `/v1/tasks`. A pure
@@ -110,6 +115,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         },
         blueprint_ref_base: args.blueprint_ref_base.clone(),
         git_store_path: args.git_store_path.clone(),
+        issue_store_path: args.issue_store_path.clone(),
         seed_blueprint_id: args.seed_blueprint_id.clone(),
         default_agent_kind: args.default_agent_kind.clone(),
         token_secret: args.token_secret.clone(),
@@ -222,7 +228,25 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     // Enhance axis integration (/v1/issues + /v1/blueprints + /v1/enhance-settings + consumer loop, always on).
     let setting_store: Arc<dyn EnhanceSettingStore> = Arc::new(InMemoryEnhanceSettingStore::new());
-    let issue_store: Arc<dyn IssueStore> = Arc::new(InMemoryIssueStore::new());
+    // IssueStore backend selection: SQLite when `cfg.issue_store_path` is set,
+    // otherwise fall back to the process-volatile in-memory store. The
+    // `AsyncIsleDriver` returned by `SqliteIssueStore::open` is kept alive for
+    // the process lifetime; it will be dropped on shutdown (which cancels
+    // queued jobs — see `rusqlite-isle` docs for graceful `shutdown().await`).
+    let (issue_store, _issue_isle_driver): (Arc<dyn IssueStore>, Option<_>) =
+        match &cfg.issue_store_path {
+            Some(path) => {
+                eprintln!(
+                    "mse serve: SqliteIssueStore at {}",
+                    path.display()
+                );
+                let (store, driver) = SqliteIssueStore::open(path)
+                    .await
+                    .unwrap_or_else(|e| panic!("mse serve: SqliteIssueStore open failed: {e}"));
+                (Arc::new(store), Some(driver))
+            }
+            None => (Arc::new(InMemoryIssueStore::new()), None),
+        };
     let log_store: Arc<dyn mlua_swarm::store::enhance_log::EnhanceLogStore> =
         Arc::new(mlua_swarm::store::enhance_log::InMemoryEnhanceLogStore::new());
 
