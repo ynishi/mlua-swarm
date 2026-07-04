@@ -71,7 +71,7 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
-description = "Swarm engine host for mlua — long-running stateful runtime with Role/Verb gate, CapToken, 3-stage pipeline, and Middleware overlay."
+description = "Swarm engine host built on mlua — long-running stateful runtime with Role/Verb gate, CapToken, 3-stage pipeline, and Middleware overlay."
 keywords = ["swarm", "lua", "mcp", "flow-ir", "agent"]
 categories = ["asynchronous", "development-tools"]
 
