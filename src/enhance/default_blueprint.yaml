@@ -1,0 +1,72 @@
+# Enhance default Blueprint (= system default, used for dogfooding).
+#
+# - flow: Seq [patch-spawner -> patch-applier -> Fanout(verifier-router) -> committer]
+# - All 4 agents run on the InProc backend; spec.fn_id selects the worker fn
+# - Verifier axis count is determined by the length of the `$.verifiers` array in
+#   the init ctx (the Blueprint itself is axis-count agnostic)
+#
+# This YAML file is the source of truth and should be edited directly rather
+# than via a Rust struct literal. The patch-applier / verifier-router /
+# committer worker fns are implemented as embedded Lua scripts (see
+# src/enhance/scripts/), registered through LuaScriptSource.
+schema_version: "0.1.0"
+id: enhance-default
+flow:
+  kind: seq
+  children:
+    - kind: step
+      ref: patch-spawner
+      in: { op: path, at: "$" }
+      out: { op: path, at: "$.patch" }
+    - kind: step
+      ref: patch-applier
+      in: { op: path, at: "$" }
+      out: { op: path, at: "$.applied" }
+    - kind: fanout
+      items: { op: path, at: "$.verifiers" }
+      bind: { op: path, at: "$.axis" }
+      body:
+        kind: step
+        ref: verifier-router
+        in: { op: path, at: "$" }
+        out: { op: path, at: "$.verdict" }
+      join: all
+      out: { op: path, at: "$.verdicts" }
+    - kind: step
+      ref: committer
+      in: { op: path, at: "$" }
+      out: { op: path, at: "$.commit" }
+agents:
+  - name: patch-spawner
+    kind: agent_block
+    spec:
+      script_path: assets/operator_scripts/blueprint_patch_spawner.lua
+      project_root: "."
+    profile:
+      system_prompt: "You are a Blueprint Patch generator."
+      model: claude-haiku-4-5-20251001
+    meta:
+      description: "enhance-flow default: patch-spawner (= LLM-driven NL Issue → JSON Patch)"
+      tags: [enhance]
+  - name: patch-applier
+    kind: lua
+    spec: { fn_id: patch-applier }
+    meta:
+      description: "enhance-flow default: patch-applier"
+      tags: [enhance]
+  - name: verifier-router
+    kind: lua
+    spec: { fn_id: verifier-router }
+    meta:
+      description: "enhance-flow default: verifier-router"
+      tags: [enhance]
+  - name: committer
+    kind: lua
+    spec: { fn_id: committer }
+    meta:
+      description: "enhance-flow default: committer"
+      tags: [enhance]
+metadata:
+  description: "Enhance default flow: spawn → apply → verify (Fanout N axes) → commit"
+  tags: [enhance, default]
+  version_label: "0.2.0"

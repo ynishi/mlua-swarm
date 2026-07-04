@@ -1,0 +1,90 @@
+{
+  "id": "sample-pure-ctx",
+  "flow": {
+    "kind": "seq",
+    "children": [
+      {
+        "kind": "assign",
+        "at": {
+          "op": "path",
+          "at": "$.x"
+        },
+        "value": {
+          "op": "lit",
+          "value": 10
+        }
+      },
+      {
+        "kind": "assign",
+        "at": {
+          "op": "path",
+          "at": "$.y"
+        },
+        "value": {
+          "op": "lit",
+          "value": 20
+        }
+      },
+      {
+        "kind": "branch",
+        "cond": {
+          "op": "and",
+          "operands": [
+            {
+              "op": "gt",
+              "lhs": {
+                "op": "path",
+                "at": "$.x"
+              },
+              "rhs": {
+                "op": "lit",
+                "value": 5
+              }
+            },
+            {
+              "op": "lt",
+              "lhs": {
+                "op": "path",
+                "at": "$.y"
+              },
+              "rhs": {
+                "op": "lit",
+                "value": 30
+              }
+            }
+          ]
+        },
+        "then": {
+          "kind": "assign",
+          "at": {
+            "op": "path",
+            "at": "$.verdict"
+          },
+          "value": {
+            "op": "lit",
+            "value": "PASS"
+          }
+        },
+        "else": {
+          "kind": "assign",
+          "at": {
+            "op": "path",
+            "at": "$.verdict"
+          },
+          "value": {
+            "op": "lit",
+            "value": "FAIL"
+          }
+        }
+      }
+    ]
+  },
+  "agents": [],
+  "strategy": {
+    "strict_refs": true,
+    "strict_kind": true
+  },
+  "metadata": {
+    "description": "Zero-spawn pure ctx evaluation using Assign + And + Gt + Lt + Lit primitives. No worker dispatch required."
+  }
+}

@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  mse serve LaunchAgent template.
+
+  DO NOT install this file directly. Use the installer script:
+      scripts/launchd/install.sh
+  It expands the placeholders below to concrete absolute paths and drops
+  the result at ~/Library/LaunchAgents/com.mse.server.plist.
+
+  Placeholders:
+    {{HOME}}          -> $HOME (e.g. /Users/alice)
+    {{CARGO_BIN}}     -> cargo install target dir (default: $HOME/.cargo/bin)
+    {{PROJECT_ROOT}}  -> this repository's absolute path (WorkingDirectory)
+
+  Manual expand + install (if you don't want the script):
+    sed -e "s|{{HOME}}|$HOME|g" \
+        -e "s|{{CARGO_BIN}}|$HOME/.cargo/bin|g" \
+        -e "s|{{PROJECT_ROOT}}|$(pwd)|g" \
+        scripts/launchd/com.mse.server.plist.template \
+      > ~/Library/LaunchAgents/com.mse.server.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mse.server.plist
+
+  uninstall:
+    launchctl bootout gui/$(id -u)/com.mse.server
+    rm ~/Library/LaunchAgents/com.mse.server.plist
+
+  config:
+    Mutable settings (bind / enable_enhance_flow / git_store_path / ...) live
+    in ~/.mse/config.toml, not in ProgramArguments. Change = edit the file +
+    `launchctl kickstart -k gui/$(id -u)/com.mse.server` (this plist stays
+    fixed). See the mlua-swarm-server config module doc for details.
+
+  Notes:
+    - binary path / config path / WorkingDirectory must be absolute
+      (launchd does not resolve relative paths or tildes).
+    - EnvironmentVariables.PATH may need tweaking for your environment.
+-->
+<dict>
+    <key>Label</key>
+    <string>com.mse.server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{CARGO_BIN}}/mse</string>
+        <string>serve</string>
+        <string>--config</string>
+        <string>{{HOME}}/.mse/config.toml</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_ROOT}}</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/mse-server.stdout</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mse-server.stderr</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

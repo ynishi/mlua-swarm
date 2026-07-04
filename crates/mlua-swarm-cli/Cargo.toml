@@ -1,0 +1,39 @@
+[package]
+name = "mlua-swarm-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+description = "Command line interface for mlua-swarm (mse binary with serve / mcp subcommands)."
+
+[[bin]]
+name = "mse"
+path = "src/main.rs"
+
+[dependencies]
+mlua-swarm.workspace = true
+mlua-swarm-server.workspace = true
+mlua-swarm-schema.workspace = true
+mlua-flow-ir.workspace = true
+
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
+rmcp.workspace = true
+nix.workspace = true
+tokio-tungstenite.workspace = true
+axum.workspace = true
+hex.workspace = true

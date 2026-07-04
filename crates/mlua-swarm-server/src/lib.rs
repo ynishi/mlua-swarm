@@ -1,0 +1,731 @@
+//! the server lib: axum Router + handler set. Split out as a library so it can
+//! be used from both `main.rs` (CLI) and integration tests.
+//!
+//! # Endpoints
+//!
+//! - `GET /v1/healthz`
+//! - `POST /v1/sessions` / `DELETE /v1/sessions` (= operator attach / detach, Bearer sid)
+//! - `POST /v1/tasks` (= unified Flow-form entry, Operator inject supported;
+//!   `operator_sid` explicitly pins the task to a registered Operator session, S2)
+//! - `POST /v1/operators` / `GET /v1/operators/:sid` / `DELETE /v1/operators/:sid` /
+//!   `GET /v1/operators/:sid/ws` (WS upgrade) — REST-like Operator login flow,
+//!   Bearer-mandatory; the sole WS Operator session route. See `operator_ws::login`
+//!   module doc.
+//!
+//! The Enhance issue axis (`/issues`) lives in the `issues` module; callers merge
+//! `build_issues_router` to integrate it into the same server.
+//!
+//! # The 3 faces of the Operator role (= registered directly on the engine SoT)
+//!
+//! The engine stateless-executor refactor removed the three
+//! `AppState` registries (former `HookRegistry` / `BridgeRegistry` / `OperatorRegistry`);
+//! all registration now goes directly to the engine SoT via
+//! `engine.register_spawn_hook` / `register_senior_bridge` / `register_operator`.
+//! `WSOperatorSession` (in the `operator_ws` module) registers all three traits
+//! simultaneously under a single sid — one WS connection covers all 3 faces of
+//! the Operator role, the canonical pattern.
+//!
+//! # `build_*` family
+//!
+//! - [`build_router`] — minimal entry (= `default_registry()`)
+//! - [`build_router_with`] — caller provides a `SpawnerRegistry` and optional `BlueprintStore`
+//!
+//! The engine should be started with [`default_layer_registry`] (= `Engine::new_with_layers`);
+//! otherwise `Blueprint.spawner_hints` is ignored.
+
+#![warn(missing_docs)]
+
+/// HTTP surface for inspecting/registering Blueprint state (`/v1/blueprints/*`).
+pub mod blueprints;
+/// Server config file support (`~/.mse/config.toml`, CLI > file > default merge).
+pub mod config;
+/// `/v1/data/*` endpoints (v9 Big Response handling, Store-owner direct path).
+pub mod data;
+/// `GET /v1/doctor` — read-only startup config / Store snapshot.
+pub mod doctor;
+/// HTTP surface for the `/v1/enhance/log` axis.
+pub mod enhance_log;
+/// `EnhanceSetting` HTTP CRUD (`/v1/enhance-settings*`).
+pub mod enhance_settings;
+/// HTTP surface for the Enhance issue axis (`/v1/issues*`).
+pub mod issues;
+/// WebSocket Operator Callback IF (`/v1/operators*`).
+pub mod operator_ws;
+/// `/v1/worker/*` endpoints (SubAgent self-fetch path).
+pub mod worker;
+pub use blueprints::{build_blueprints_router, build_blueprints_router_with_refs};
+pub use enhance_log::build_enhance_log_router;
+pub use enhance_settings::build_enhance_settings_router;
+pub use issues::{build_issues_router, GetIssueResponse, PostIssueRequest, PostIssueResponse};
+pub use operator_ws::{
+    operators_create, operators_delete, operators_info, operators_ws_connect, ClientMsg,
+    OperatorSessionEntry, ServerMsg, WSOperatorSession,
+};
+pub use worker::{worker_prompt, worker_result, PromptQuery, WorkerResultReq};
+
+use axum::{
+    extract::State,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use mlua_swarm::application::{BlueprintRef, TaskApplication};
+use mlua_swarm::blueprint::store::BlueprintStore;
+use mlua_swarm::service::TaskLaunchService;
+use mlua_swarm::{
+    CapToken, Compiler, Engine, LayerRegistry, LuaInProcessSpawnerFactory, MainAIMiddleware,
+    OperatorDelegateMiddleware, OperatorSpawnerFactory, Role, RustFnInProcessSpawnerFactory,
+    SeniorEscalationMiddleware, SpawnerRegistry, SubprocessProcessSpawnerFactory,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+
+/// In-memory `sid → CapToken` map backing `/v1/sessions` attach/detach.
+#[derive(Default)]
+pub struct SessionStore {
+    /// Live session tokens keyed by `sid` (the token's `nonce`).
+    pub map: HashMap<String, CapToken>,
+}
+
+/// Shared axum handler state for the whole router. Cloned per-request (all
+/// fields are `Arc`/cheap-clone), constructed once in [`build_router_with_ws_factory`].
+#[derive(Clone)]
+pub struct AppState {
+    /// The engine SoT (attach/detach, dispatch, registries).
+    pub engine: Engine,
+    /// Live `/v1/sessions` attach records (Operator/Worker/etc session tokens).
+    pub sessions: Arc<Mutex<SessionStore>>,
+    /// Application used at the task entry to resolve `BlueprintRef`. Without a Store, runs in Inline-only mode.
+    pub task_app: Arc<TaskApplication>,
+    /// When `Some`, on WS connect a new `WSOperatorSession` is automatically registered
+    /// with this factory under the sid name (= a `kind=operator` + `operator_ref=<sid>` AgentDef
+    /// binds to the `WSOperatorSession` backend).
+    /// When `None`, no auto-registration happens; the session is only registered on
+    /// `engine.OperatorRegistry` (= only the `OperatorDelegateMiddleware` path is effective;
+    /// the `OperatorSpawnerFactory` path is dead).
+    pub ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+    /// Owner of the Store on the Data path (Big Response handling). Added in v9.
+    /// Independent layer — the Engine core and the Domain path (`/v1/worker/result`)
+    /// are not involved.
+    /// Default = `InMemoryOutputStore` (constructed inside `build_router_with_ws_factory`);
+    /// callers can swap in an sqlite/fs backend later (future carry).
+    pub data_store: Arc<dyn mlua_swarm::store::output::OutputStore>,
+    /// Login-flow session store (`POST /v1/operators` mint records). `sid` →
+    /// `OperatorSessionEntry`. This is the sole session store for the WS
+    /// Operator role. See `operator_ws::login` module doc.
+    pub operator_sessions:
+        Arc<Mutex<HashMap<String, Arc<crate::operator_ws::login::OperatorSessionEntry>>>>,
+    /// S1 login-flow roles-exclusivity map. Role name → owning `sid`. Checked
+    /// (and updated) atomically under a single lock in
+    /// `operator_ws::login::operators_create` — a role already present here
+    /// causes `POST /v1/operators` to return `409 CONFLICT`. Entries are
+    /// released on `DELETE /v1/operators/:sid`.
+    pub roles_to_sid: Arc<Mutex<HashMap<String, String>>>,
+}
+
+/// Minimal entry point: builds a router with [`default_registry`] and no
+/// `BlueprintStore` (Inline-only mode) or `ws_operator_factory`.
+pub fn build_router(engine: Engine) -> Router {
+    build_router_with(engine, default_registry(), None)
+}
+
+/// Default `LayerRegistry` for the server. Hint keys:
+/// - `"main_ai"` → `MainAIMiddleware` (= fires SpawnHook before/after)
+/// - `"senior_escalation"` → `SeniorEscalationMiddleware` (= on `ok=false`, escalates via `SeniorBridge.ask`)
+/// - `"operator_delegate"` → `OperatorDelegateMiddleware` (= when an operator backend is registered, delegates the entire spawn)
+///
+/// Including any of these keys in `Blueprint.spawner_hints.layers` causes them to
+/// be wrapped into a `SpawnerStack` at `service::linker::link` time (= per-launch;
+/// the old `engine.bind` global-state path is retired).
+/// Callers (the engine builder side) receive it via
+/// `Engine::new_with_layers(cfg, mse_server::default_layer_registry())`.
+pub fn default_layer_registry() -> LayerRegistry {
+    LayerRegistry::new()
+        .with_hint("main_ai", |_engine| Arc::new(MainAIMiddleware::new()))
+        .with_hint("senior_escalation", |_engine| {
+            Arc::new(SeniorEscalationMiddleware::new())
+        })
+        .with_hint("operator_delegate", |_engine| {
+            Arc::new(OperatorDelegateMiddleware::new())
+        })
+}
+
+/// Build form where the caller supplies a registry and an optional `BlueprintStore`.
+/// The Operator callback path (= external HTTP / WS callers acting as an Operator)
+/// must be pre-registered via `engine.register_*` (= the engine is the SoT).
+/// See the `operator_ws` module doc and `OperatorInfo` (engine-side `ctx.rs`) for details.
+pub fn build_router_with(
+    engine: Engine,
+    registry: SpawnerRegistry,
+    store: Option<Arc<dyn BlueprintStore>>,
+) -> Router {
+    build_router_with_ws_factory(engine, registry, store, None)
+}
+
+/// 4-argument variant of `build_router_with`. Passing `ws_operator_factory = Some(arc)`
+/// causes each WS connect to auto-register a new `WSOperatorSession` under its sid
+/// name with the factory (= a `kind=operator` AgentDef with `operator_ref: <sid>`
+/// can then bind to the WS client backend). Callers are expected to also install
+/// the same `Arc` into the `SpawnerRegistry` via
+/// `reg.register::<OperatorSpawnerFactory>(arc.clone())`.
+pub fn build_router_with_ws_factory(
+    engine: Engine,
+    registry: SpawnerRegistry,
+    store: Option<Arc<dyn BlueprintStore>>,
+    ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+) -> Router {
+    let compiler = Compiler::new(registry);
+    let launch = Arc::new(TaskLaunchService::new(engine.clone(), compiler));
+    let task_app = Arc::new(match store {
+        Some(s) => TaskApplication::new(launch, s),
+        None => TaskApplication::new_inline_only(launch),
+    });
+    let data_store: Arc<dyn mlua_swarm::store::output::OutputStore> =
+        Arc::new(mlua_swarm::store::output::InMemoryOutputStore::new());
+    let state = AppState {
+        engine,
+        sessions: Arc::new(Mutex::new(SessionStore::default())),
+        task_app,
+        ws_operator_factory,
+        data_store,
+        operator_sessions: Arc::new(Mutex::new(HashMap::new())),
+        roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
+    };
+    Router::new()
+        .route("/v1/healthz", get(healthz))
+        // session = collection (POST = attach, DELETE = detach, sid via Authorization)
+        .route(
+            "/v1/sessions",
+            post(sessions_attach).delete(sessions_detach),
+        )
+        // task = flat, single level; authz resolved via Authorization: Bearer <sid>
+        .route("/v1/tasks", post(tasks_start))
+        // REST-like Operator login flow (Bearer-mandatory, roles exclusivity).
+        // Sole WS Operator session route; see `operator_ws::login` module doc.
+        .route("/v1/operators", post(operators_create))
+        .route("/v1/operators/:sid/ws", get(operators_ws_connect))
+        .route(
+            "/v1/operators/:sid",
+            get(operators_info).delete(operators_delete),
+        )
+        // SubAgent self-fetch path (the SubAgent self-fetch design). The SubAgent puts the
+        // CapToken handed over via WS Spawn into Bearer and hits the prompt / result
+        // endpoints directly over HTTP. See the `worker` module doc for details.
+        .route("/v1/worker/prompt", get(worker::worker_prompt))
+        .route("/v1/worker/result", post(worker::worker_result))
+        // Simplified endpoint (= worker POSTs with just token + raw body; task_id is auto-looked-up)
+        .route("/v1/worker/submit", post(worker::worker_submit))
+        // Data path (v9 Big Response handling, independent from Domain / verdict flow)
+        .route("/v1/data/emit", post(data::data_emit))
+        .route(
+            "/v1/data/:key",
+            get(data::data_get).post(data::data_emit_named),
+        )
+        .with_state(state)
+}
+
+/// Default registry = Subprocess + RustFn (baseline `identity` worker pre-baked) + empty Operator factory.
+///
+/// `RustFnInProcessSpawnerFactory` gets one baseline entry (`fn_id = "identity"`)
+/// baked in via [`mlua_swarm::worker::baseline::extend_with_baseline`]. This
+/// is the shared bootstrap / smoke worker SoT across each binary (the server / MCP adapter /
+/// one-shot runner) — it structurally replaces the old per-binary inline echo injection.
+///
+/// Usage: default Task path at server startup. If production needs additional
+/// backends, callers bring in a different registry via
+/// `build_router_with(engine, custom_registry)`. The enhance flow
+/// (= patch-spawner / patch-applier / verifier-router / committer axes) uses
+/// [`default_registry_with_enhance_flow`].
+///
+/// The Operator factory is an empty shell with zero registrations (= sids are
+/// dynamically registered per WS connect; see the `operator_ws` module).
+pub fn default_registry() -> SpawnerRegistry {
+    let rustfn_factory =
+        mlua_swarm::worker::baseline::extend_with_baseline(RustFnInProcessSpawnerFactory::new());
+
+    let mut reg = SpawnerRegistry::new();
+    reg.register::<SubprocessProcessSpawnerFactory>(Arc::new(SubprocessProcessSpawnerFactory));
+    reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(rustfn_factory));
+    reg.register::<OperatorSpawnerFactory>(Arc::new(OperatorSpawnerFactory::new()));
+    reg
+}
+
+/// Opt-in registry that merges [`default_registry`] with the enhance flow
+/// (Lua factory + AgentBlock factory).
+///
+/// Selected via the `the server` CLI flag `--enable-enhance-flow`. The enhance
+/// flow is a separate-axis wrapper: the Lua factory (= 3 Lua workers + 3 primitive
+/// bridges) and the AgentBlock factory (= patch-spawner path, expects
+/// `assets/operator_scripts/blueprint_patch_spawner.lua` + `ANTHROPIC_API_KEY`)
+/// are baked in as pipeline defaults. The baseline RustFn (`identity`) is pre-baked
+/// the same way as in `default_registry`.
+pub fn default_registry_with_enhance_flow() -> SpawnerRegistry {
+    let lua_factory =
+        mlua_swarm::enhance::blueprint::extend_factory(LuaInProcessSpawnerFactory::new());
+    // The Factory is stateless (= 1 process → 1 factory shared by all AgentDefs).
+    // Per-agent specialization (script_path / project_root, etc.) goes through AgentDef.spec.
+    // The enhance-flow patch-spawner is declared literally in agents[].spec of `default_blueprint.yaml`.
+    let agent_block_factory =
+        mlua_swarm::worker::agent_block::AgentBlockInProcessSpawnerFactory::new();
+    let rustfn_factory =
+        mlua_swarm::worker::baseline::extend_with_baseline(RustFnInProcessSpawnerFactory::new());
+
+    let mut reg = SpawnerRegistry::new();
+    reg.register::<SubprocessProcessSpawnerFactory>(Arc::new(SubprocessProcessSpawnerFactory));
+    reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(rustfn_factory));
+    reg.register::<LuaInProcessSpawnerFactory>(Arc::new(lua_factory));
+    reg.register::<mlua_swarm::worker::agent_block::AgentBlockInProcessSpawnerFactory>(Arc::new(
+        agent_block_factory,
+    ));
+    reg.register::<OperatorSpawnerFactory>(Arc::new(OperatorSpawnerFactory::new()));
+    reg
+}
+
+// ─── handlers ────────────────────────────────────────────────────────────
+
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+#[derive(Deserialize)]
+struct AttachReq {
+    agent_id: String,
+    role: String,
+    ttl_secs: u64,
+}
+
+#[derive(Serialize)]
+struct AttachResp {
+    session_id: String,
+    role: String,
+}
+
+async fn sessions_attach(
+    State(state): State<AppState>,
+    Json(req): Json<AttachReq>,
+) -> Result<Json<AttachResp>, ApiError> {
+    let role = parse_role(&req.role)?;
+    let token = state
+        .engine
+        .attach(req.agent_id, role, Duration::from_secs(req.ttl_secs))
+        .await
+        .map_err(ApiError::engine)?;
+    let sid = token.nonce.clone();
+    state.sessions.lock().await.map.insert(sid.clone(), token);
+    Ok(Json(AttachResp {
+        session_id: sid,
+        role: req.role,
+    }))
+}
+
+async fn sessions_detach(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let sid = extract_bearer(&headers)?;
+    let token = take_session_token(&state, &sid).await?;
+    state
+        .engine
+        .detach(&token)
+        .await
+        .map_err(ApiError::engine)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Unified /v1/tasks schema (= flow-eval path, Operator inject supported) ───────
+
+/// `/v1/tasks` POST schema. Uses the flow-eval path and supports Operator inject
+/// (kind / spawn_hook / senior_bridge). Expressing a one-shot task as a 1-Step
+/// Blueprint is the only correct model.
+#[derive(Deserialize)]
+struct FlowTasksReq {
+    blueprint: BlueprintRef,
+    init_ctx: Value,
+    /// TTL in seconds. When unspecified (`None`), falls back in this order:
+    /// (1) `metadata.default_run_ttl_secs` from the resolved BP,
+    /// (2) if absent, the server global `default_run_ttl()` (1800s).
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+    #[serde(default)]
+    operator: Option<OperatorReq>,
+    /// Explicit Operator session sid (or role alias) this task's entire Spawn
+    /// stream should be routed to (runtime Operator match stage 1).
+    ///
+    /// When `Some`, it is validated at request time against
+    /// `state.engine.list_operator_ids()` (the live `engine.operators`
+    /// registry key set): an unknown/never-registered id returns `400`
+    /// immediately — this is a deliberate hard-fail, in contrast to
+    /// `OperatorDelegateWrapped::spawn`, which silently falls through to
+    /// `inner.spawn` on a registry miss. A sid that *was* registered but has
+    /// since disconnected (WS `tx` cleared, session entry retained for
+    /// reconnect) passes this check and surfaces as an explicit dispatch-time
+    /// error instead (`WSOperatorSession::send_and_await` returns `Err` when
+    /// `tx` is `None`), which also propagates as a request failure rather
+    /// than a silent fallback.
+    ///
+    /// On success this value **overrides** `operator.operator_backend_id`
+    /// (last-write-wins, `operator_sid` takes priority) before the flow is
+    /// dispatched — see `run_flow_form`. Dispatch still only delegates if the
+    /// Blueprint opts into `spawner_hints.layers = ["operator_delegate"]`
+    /// (unchanged precondition, same as the existing `operator_backend_id`
+    /// field).
+    ///
+    /// When unset, behavior is unchanged: whatever
+    /// `operator.operator_backend_id` / BP-level `operator_ref` alias
+    /// resolution already does still applies.
+    #[serde(default)]
+    operator_sid: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct OperatorReq {
+    /// `main_ai` / `automate` / `composite`. This is the "Runtime Global"
+    /// tier of the 4-tier `OperatorKind` cascade (see `mlua_swarm
+    /// ::ctx::collapse_operator_kind`); when unspecified, falls through to
+    /// the BP-level tiers (`OperatorDef.kind` / `Blueprint
+    /// .default_operator_kind`) instead of eagerly defaulting to `automate`.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Operator id at attach time (= sessions tracking key in the EventLog); unspecified defaults to `"http-run"`.
+    #[serde(default)]
+    id: Option<String>,
+    /// Name of a hook pre-registered via `engine.register_spawn_hook`; `None` if unspecified.
+    #[serde(default)]
+    spawn_hook_id: Option<String>,
+    /// Name of a bridge pre-registered via `engine.register_senior_bridge`; `None` if unspecified.
+    #[serde(default)]
+    senior_bridge_id: Option<String>,
+    /// Name of an Operator backend pre-registered via `engine.register_operator`
+    /// (= the path that delegates the entire spawn to an external Operator);
+    /// `None` if unspecified. When `kind == MainAi/Composite` and this id is `Some`,
+    /// `OperatorDelegateMiddleware` bypasses `inner.spawn` and calls `operator.execute` instead.
+    /// This is a different axis from `operator.id` (= session tracking label);
+    /// `operator_backend_id` is the registry lookup key.
+    #[serde(default)]
+    operator_backend_id: Option<String>,
+    /// "Runtime Agent-level" tier (highest priority) of the `OperatorKind`
+    /// cascade — per-agent override, keyed by `AgentDef.name`, value is
+    /// `main_ai` / `automate` / `composite` (same parsing as `kind`).
+    /// `None` / absent means no per-agent override.
+    #[serde(default)]
+    per_agent_kinds: Option<HashMap<String, String>>,
+}
+
+/// Parse a wire-level kind string (`"main_ai"` / `"automate"` / `"composite"`)
+/// into `OperatorKind`. Shared by `OperatorReq.kind` and
+/// `OperatorReq.per_agent_kinds` values.
+fn parse_operator_kind_str(s: &str) -> Result<mlua_swarm::OperatorKind, ApiError> {
+    use mlua_swarm::OperatorKind;
+    match s {
+        "main_ai" => Ok(OperatorKind::MainAi),
+        "composite" => Ok(OperatorKind::Composite),
+        "automate" => Ok(OperatorKind::Automate),
+        other => Err(ApiError::bad_request(format!(
+            "operator kind: unknown value '{other}' (expected main_ai|automate|composite)"
+        ))),
+    }
+}
+
+#[derive(Serialize)]
+struct FlowTasksResp {
+    final_ctx: Value,
+    bound_version: Option<String>,
+    /// Resolved TTL (seconds) actually applied to the run. Exposes the
+    /// 3-layer cascade (request body → BP metadata → server default) so
+    /// clients can verify which value took effect without re-deriving it.
+    effective_ttl_secs: u64,
+    ttl_source: TtlSource,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TtlSource {
+    RequestBody,
+    BpMetadata,
+    ServerDefault,
+}
+
+/// Unified `/v1/tasks` POST entry (= Flow form only).
+/// Runs `Blueprint.flow` to completion via flow eval in a single round-trip.
+/// One-shot tasks are also expressed as a 1-Step Blueprint. Operator
+/// (kind / spawn_hook / senior_bridge) can be injected per request body.
+/// `operator_sid` (S2, runtime Operator match stage 1) additionally
+/// lets the caller pin the task to a specific already-registered Operator
+/// session sid, bypassing BP-level alias lookup — see `FlowTasksReq` doc.
+async fn tasks_start(
+    State(state): State<AppState>,
+    Json(req): Json<FlowTasksReq>,
+) -> Result<Json<FlowTasksResp>, ApiError> {
+    let resp = run_flow_form(&state, req).await?;
+    Ok(Json(resp))
+}
+
+/// Flow-form path (= via `TaskApplication.handle`).
+/// Core handler behind the `/v1/tasks` entry (`tasks_start`).
+///
+/// Engine stateless-executor refactor: the per-request
+/// sub_engine + 3-registry propagate loop is retired; the startup-built
+/// `state.task_app` (= a `TaskLaunchService` wrap around `state.engine`) is
+/// used directly. The Operator callback IF (`spawn_hook_id` /
+/// `senior_bridge_id` / `operator_backend_id`) is registered on
+/// `state.engine.register_*` at WS connect time — the engine is the SoT.
+/// See the `operator_ws` module doc for details.
+async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksResp, ApiError> {
+    use mlua_swarm::application::{BlueprintRef as AppBlueprintRef, TaskApplicationInput};
+    use mlua_swarm::Application;
+    use mlua_swarm::OperatorKind;
+
+    let mut op_req = req.operator.unwrap_or_default();
+
+    // S2: explicit `operator_sid` override (runtime Operator match stage 1).
+    // Resolved *before* building `operator_kind` / dispatching so an
+    // unknown sid fails fast with a 400, never silently falling back to the
+    // BP-level alias lookup. See `FlowTasksReq::operator_sid` doc for the
+    // disconnected-vs-unknown distinction.
+    if let Some(sid) = &req.operator_sid {
+        let known_ids = state.engine.list_operator_ids().await;
+        if !known_ids.iter().any(|id| id == sid) {
+            return Err(ApiError::bad_request(format!(
+                "operator_sid: no such registered operator session '{sid}'"
+            )));
+        }
+        op_req.operator_backend_id = Some(sid.clone());
+    }
+
+    // "Runtime Global" tier: `Some(_)` — including `Some(Automate)` — is
+    // always an explicit request that outranks the BP-level tiers; an
+    // absent/unset `kind` in the request body stays `None`, leaving the
+    // BP-level tiers (`OperatorDef.kind` / `Blueprint.default_operator_kind`)
+    // to decide instead of eagerly defaulting to `Automate`.
+    let operator_kind = op_req
+        .kind
+        .as_deref()
+        .map(parse_operator_kind_str)
+        .transpose()?;
+    let operator_id = op_req.id.unwrap_or_else(|| "http-run".to_string());
+    // "Runtime Agent-level" tier: per-agent overrides. Absent/empty = no
+    // override for any agent, letting the BP-level tiers decide per agent.
+    let mut operator_kind_overrides: HashMap<String, OperatorKind> = HashMap::new();
+    for (agent, kind_str) in op_req.per_agent_kinds.take().unwrap_or_default() {
+        operator_kind_overrides.insert(agent, parse_operator_kind_str(&kind_str)?);
+    }
+
+    let blueprint: AppBlueprintRef = match req.blueprint {
+        AppBlueprintRef::Inline { value } => AppBlueprintRef::Inline { value },
+        AppBlueprintRef::Id { id, version } => AppBlueprintRef::Id { id, version },
+    };
+
+    // TTL resolution cascade: (1) request body value, (2) BP metadata `default_run_ttl_secs`,
+    // (3) server global default (`default_run_ttl()`, 1800s).
+    let (ttl_secs, ttl_source) = match req.ttl_secs {
+        Some(v) => (v, TtlSource::RequestBody),
+        None => {
+            let (resolved_bp, _ver) = state
+                .task_app
+                .resolve(&blueprint)
+                .await
+                .map_err(|e| ApiError::bad_request(format!("bp resolve: {e}")))?;
+            match resolved_bp.metadata.default_run_ttl_secs {
+                Some(v) => (v, TtlSource::BpMetadata),
+                None => (default_run_ttl(), TtlSource::ServerDefault),
+            }
+        }
+    };
+
+    let out = state
+        .task_app
+        .handle(TaskApplicationInput {
+            blueprint,
+            operator_id: operator_id.clone(),
+            role: Role::Operator,
+            ttl: Duration::from_secs(ttl_secs),
+            init_ctx: req.init_ctx,
+            operator_kind,
+            bridge_id: op_req.senior_bridge_id,
+            hook_id: op_req.spawn_hook_id,
+            operator_backend_id: op_req.operator_backend_id,
+            operator_kind_overrides,
+        })
+        .await
+        .map_err(|e| ApiError::bad_request(format!("run: {e}")))?;
+
+    Ok(FlowTasksResp {
+        final_ctx: out.final_ctx,
+        bound_version: out.bound_version.map(|v| format!("{:?}", v)),
+        effective_ttl_secs: ttl_secs,
+        ttl_source,
+    })
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────
+
+async fn take_session_token(state: &AppState, sid: &str) -> Result<CapToken, ApiError> {
+    state
+        .sessions
+        .lock()
+        .await
+        .map
+        .remove(sid)
+        .ok_or_else(|| ApiError::not_found(format!("session: {sid}")))
+}
+
+/// Extracts sid from `Authorization: Bearer <sid>`. Strict — does not accept any other scheme prefix.
+fn extract_bearer(headers: &HeaderMap) -> Result<String, ApiError> {
+    let v = headers
+        .get(AUTHORIZATION)
+        .ok_or_else(|| ApiError::bad_request("missing Authorization header".into()))?
+        .to_str()
+        .map_err(|_| ApiError::bad_request("invalid Authorization header encoding".into()))?;
+    let sid = v
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| ApiError::bad_request("Authorization must be 'Bearer <sid>'".into()))?
+        .trim();
+    if sid.is_empty() {
+        return Err(ApiError::bad_request("Bearer sid is empty".into()));
+    }
+    Ok(sid.to_string())
+}
+
+fn parse_role(s: &str) -> Result<Role, ApiError> {
+    match s.to_ascii_lowercase().as_str() {
+        "operator" => Ok(Role::Operator),
+        "worker" => Ok(Role::Worker),
+        "observer" => Ok(Role::Observer),
+        "senior" => Ok(Role::Senior),
+        other => Err(ApiError::bad_request(format!("unknown role: {other}"))),
+    }
+}
+
+// ─── error type ──────────────────────────────────────────────────────────
+
+/// Uniform error response type for the handlers in this module. Converts to
+/// a JSON `{"error": message}` body with the given status via [`IntoResponse`].
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    /// Wraps an engine-side error as `500 Internal Server Error`.
+    pub fn engine(e: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("engine: {e}"),
+        }
+    }
+    /// Builds a `404 Not Found` with the given message.
+    pub fn not_found(m: String) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: m,
+        }
+    }
+    /// Builds a `400 Bad Request` with the given message.
+    pub fn bad_request(m: String) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: m,
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(json!({"error": self.message}))).into_response()
+    }
+}
+
+fn default_run_ttl() -> u64 {
+    // 1800s (= 30 min). Prevents op_token expiry across a flow.ir multi-step chain
+    // (= 5+ SubAgent dispatches at 30–60s each). Origin: the observed fvloop smoke
+    // where a post-gate mock-commit dispatch blew past 300s and expired — sibling of worker_token TTL.
+    1800
+}
+
+/// TTL cascade resolve helper (Blueprint metadata → server default fallback).
+/// Second-stage fallback, called when the POST `/v1/tasks` body does not set `ttl_secs`.
+/// (1) If BP metadata `default_run_ttl_secs` is `Some`, use it.
+/// (2) If `None`, fall back to the server global `default_run_ttl()` (1800s).
+///
+/// # Full cascade (combined in `run_flow_form`)
+///
+/// - request body `ttl_secs=Some(v)` → v (this helper is not called)
+/// - request body `None` + metadata `Some(v)` → v
+/// - request body `None` + metadata `None` → `default_run_ttl()` = 1800s
+#[cfg(test)]
+fn resolve_ttl_from_metadata(metadata_ttl: Option<u64>) -> u64 {
+    metadata_ttl.unwrap_or_else(default_run_ttl)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TTL cascade case 1: when the request body sets it, that value is used as-is
+    /// (upper branch that does not go through the helper; semantic verify of the
+    /// `Some(v) => v` direct-return path in `run_flow_form`).
+    #[test]
+    fn ttl_cascade_request_body_wins_over_metadata() {
+        let req_ttl: Option<u64> = Some(100);
+        let metadata_ttl: Option<u64> = Some(3600);
+        let effective = match req_ttl {
+            Some(v) => v,
+            None => resolve_ttl_from_metadata(metadata_ttl),
+        };
+        assert_eq!(
+            effective, 100,
+            "request body ttl_secs=100 must win over metadata=3600 (cascade priority (1) > (2))"
+        );
+    }
+
+    /// TTL cascade case 2: request body omitted + BP metadata `Some(N)` → `N` is effective.
+    #[test]
+    fn ttl_cascade_metadata_used_when_body_missing() {
+        let req_ttl: Option<u64> = None;
+        let metadata_ttl: Option<u64> = Some(3600);
+        let effective = match req_ttl {
+            Some(v) => v,
+            None => resolve_ttl_from_metadata(metadata_ttl),
+        };
+        assert_eq!(
+            effective, 3600,
+            "body None + metadata=3600 must resolve to 3600 (cascade (2))"
+        );
+    }
+
+    /// TTL cascade case 3: request body omitted + BP metadata `None` → server default (1800s).
+    #[test]
+    fn ttl_cascade_server_default_when_both_missing() {
+        let req_ttl: Option<u64> = None;
+        let metadata_ttl: Option<u64> = None;
+        let effective = match req_ttl {
+            Some(v) => v,
+            None => resolve_ttl_from_metadata(metadata_ttl),
+        };
+        assert_eq!(
+            effective,
+            default_run_ttl(),
+            "body None + metadata None must fall back to default_run_ttl() = 1800s"
+        );
+        assert_eq!(effective, 1800, "default_run_ttl() literal = 1800s");
+    }
+
+    /// Helper unit: metadata `None` → 1800 (server default expansion).
+    #[test]
+    fn resolve_ttl_from_metadata_none_returns_server_default() {
+        assert_eq!(resolve_ttl_from_metadata(None), 1800);
+    }
+
+    /// Helper unit: metadata `Some(N)` → `N` (server default ignored).
+    #[test]
+    fn resolve_ttl_from_metadata_some_returns_value() {
+        assert_eq!(resolve_ttl_from_metadata(Some(7200)), 7200);
+        assert_eq!(resolve_ttl_from_metadata(Some(60)), 60);
+    }
+}

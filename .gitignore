@@ -1,0 +1,16 @@
+workspace
+.worktrees
+.claude
+.mcp.json
+target
+.ryo
+
+.mcp.json
+.claude
+*.db*
+*.sqlite*
+.env*
+!.env.example
+!.env.sample
+!.env.template
+!.env.dist

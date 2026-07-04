@@ -1,0 +1,18 @@
+[package]
+name = "mlua-swarm-schema"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+description = "Blueprint schema types for mlua-swarm — Swarm IF SoT (Blueprint / AgentDef / AgentKind / Hints / Strategy / Metadata)."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+schemars.workspace = true
+mlua-flow-ir.workspace = true

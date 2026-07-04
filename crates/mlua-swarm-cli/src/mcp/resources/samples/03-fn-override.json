@@ -1,0 +1,173 @@
+{
+  "id": "sample-fn-override",
+  "flow": {
+    "kind": "seq",
+    "children": [
+      {
+        "kind": "step",
+        "ref": "mock-gate",
+        "in": {
+          "op": "lit",
+          "value": "check"
+        },
+        "out": {
+          "op": "path",
+          "at": "$.verdict"
+        }
+      },
+      {
+        "kind": "branch",
+        "cond": {
+          "op": "eq",
+          "lhs": {
+            "op": "path",
+            "at": "$.verdict"
+          },
+          "rhs": {
+            "op": "lit",
+            "value": "BLOCKED"
+          }
+        },
+        "then": {
+          "kind": "seq",
+          "children": [
+            {
+              "kind": "step",
+              "ref": "mock-approver",
+              "in": {
+                "op": "path",
+                "at": "$.verdict"
+              },
+              "out": {
+                "op": "path",
+                "at": "$.approval"
+              }
+            },
+            {
+              "kind": "assign",
+              "at": {
+                "op": "path",
+                "at": "$.verdict_final"
+              },
+              "value": {
+                "op": "path",
+                "at": "$.approval"
+              }
+            }
+          ]
+        },
+        "else": {
+          "kind": "assign",
+          "at": {
+            "op": "path",
+            "at": "$.verdict_final"
+          },
+          "value": {
+            "op": "path",
+            "at": "$.verdict"
+          }
+        }
+      },
+      {
+        "kind": "branch",
+        "cond": {
+          "op": "or",
+          "operands": [
+            {
+              "op": "eq",
+              "lhs": {
+                "op": "path",
+                "at": "$.verdict_final"
+              },
+              "rhs": {
+                "op": "lit",
+                "value": "PASS"
+              }
+            },
+            {
+              "op": "eq",
+              "lhs": {
+                "op": "path",
+                "at": "$.verdict_final"
+              },
+              "rhs": {
+                "op": "lit",
+                "value": "ALLOW"
+              }
+            }
+          ]
+        },
+        "then": {
+          "kind": "step",
+          "ref": "mock-commit",
+          "in": {
+            "op": "lit",
+            "value": "go"
+          },
+          "out": {
+            "op": "path",
+            "at": "$.commit"
+          }
+        },
+        "else": {
+          "kind": "assign",
+          "at": {
+            "op": "path",
+            "at": "$.escalated"
+          },
+          "value": {
+            "op": "lit",
+            "value": "ESCALATED"
+          }
+        }
+      }
+    ]
+  },
+  "agents": [
+    {
+      "name": "mock-gate",
+      "kind": "operator",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "profile": {
+        "system_prompt": "Always reply `BLOCKED` (= FN signal)",
+        "tools": []
+      }
+    },
+    {
+      "name": "mock-approver",
+      "kind": "operator",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "profile": {
+        "system_prompt": "Always reply `ALLOW` (= override)",
+        "tools": []
+      }
+    },
+    {
+      "name": "mock-commit",
+      "kind": "operator",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "profile": {
+        "system_prompt": "Always reply `COMMITTED`",
+        "tools": []
+      }
+    }
+  ],
+  "operators": [
+    {
+      "name": "main-ai"
+    }
+  ],
+  "strategy": {
+    "strict_refs": true,
+    "strict_kind": true
+  },
+  "metadata": {
+    "description": "Fn-override pattern: a BLOCKED verdict is overridden to ALLOW by an approver step, and Or([PASS, ALLOW]) lets the commit branch proceed. All operator agents point at the \"main-ai\" logical role; join with mse_operator_join(roles=[\"main-ai\"]) before dispatch."
+  }
+}

@@ -1,0 +1,198 @@
+{
+  "id": "sample-verdict-loop",
+  "flow": {
+    "kind": "seq",
+    "children": [
+      {
+        "kind": "step",
+        "ref": "mock-scout",
+        "in": {
+          "op": "lit",
+          "value": "issue"
+        },
+        "out": {
+          "op": "path",
+          "at": "$.scout"
+        }
+      },
+      {
+        "kind": "step",
+        "ref": "mock-planner",
+        "in": {
+          "op": "path",
+          "at": "$.scout"
+        },
+        "out": {
+          "op": "path",
+          "at": "$.plan"
+        }
+      },
+      {
+        "kind": "loop",
+        "counter": {
+          "op": "path",
+          "at": "$.n"
+        },
+        "cond": {
+          "op": "eq",
+          "lhs": {
+            "op": "path",
+            "at": "$.verdict"
+          },
+          "rhs": {
+            "op": "lit",
+            "value": "BLOCKED"
+          }
+        },
+        "max": 3,
+        "body": {
+          "kind": "seq",
+          "children": [
+            {
+              "kind": "step",
+              "ref": "mock-resolver",
+              "in": {
+                "op": "path",
+                "at": "$.plan"
+              },
+              "out": {
+                "op": "path",
+                "at": "$.fix"
+              }
+            },
+            {
+              "kind": "step",
+              "ref": "mock-gate",
+              "in": {
+                "op": "path",
+                "at": "$.fix"
+              },
+              "out": {
+                "op": "path",
+                "at": "$.verdict"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "kind": "branch",
+        "cond": {
+          "op": "eq",
+          "lhs": {
+            "op": "path",
+            "at": "$.verdict"
+          },
+          "rhs": {
+            "op": "lit",
+            "value": "PASS"
+          }
+        },
+        "then": {
+          "kind": "step",
+          "ref": "mock-commit",
+          "in": {
+            "op": "path",
+            "at": "$.fix"
+          },
+          "out": {
+            "op": "path",
+            "at": "$.commit"
+          }
+        },
+        "else": {
+          "kind": "step",
+          "ref": "mock-escalate",
+          "in": {
+            "op": "path",
+            "at": "$.fix"
+          },
+          "out": {
+            "op": "path",
+            "at": "$.escalated"
+          }
+        }
+      }
+    ]
+  },
+  "agents": [
+    {
+      "name": "mock-scout",
+      "kind": "operator",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "profile": {
+        "system_prompt": "Always reply `SCOUT_OK`",
+        "tools": []
+      }
+    },
+    {
+      "name": "mock-planner",
+      "kind": "operator",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "profile": {
+        "system_prompt": "Always reply `PLAN_OK`",
+        "tools": []
+      }
+    },
+    {
+      "name": "mock-resolver",
+      "kind": "operator",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "profile": {
+        "system_prompt": "Always reply `FIX_OK`",
+        "tools": []
+      }
+    },
+    {
+      "name": "mock-gate",
+      "kind": "operator",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "profile": {
+        "system_prompt": "Always reply `PASS` (change to `BLOCKED` if you want to exercise the retry path)",
+        "tools": []
+      }
+    },
+    {
+      "name": "mock-commit",
+      "kind": "operator",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "profile": {
+        "system_prompt": "Always reply `COMMITTED`",
+        "tools": []
+      }
+    },
+    {
+      "name": "mock-escalate",
+      "kind": "operator",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "profile": {
+        "system_prompt": "Always reply `ESCALATED`",
+        "tools": []
+      }
+    }
+  ],
+  "operators": [
+    {
+      "name": "main-ai"
+    }
+  ],
+  "strategy": {
+    "strict_refs": true,
+    "strict_kind": true
+  },
+  "metadata": {
+    "description": "Verdict retry loop with a self-managed counter. Seed with init_ctx={\"verdict\":\"BLOCKED\"}. All operator agents point at the \"main-ai\" logical role; join with mse_operator_join(roles=[\"main-ai\"]) before dispatch."
+  }
+}

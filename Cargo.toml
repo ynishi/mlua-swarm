@@ -1,0 +1,102 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mlua-swarm-schema",
+    "crates/mlua-swarm-server",
+    "crates/mlua-swarm-cli",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.77"
+license = "MIT OR Apache-2.0"
+authors = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
+repository = "https://github.com/ynishi/mlua-swarm-engine"
+homepage = "https://github.com/ynishi/mlua-swarm-engine"
+readme = "README.md"
+
+[profile.release]
+overflow-checks = true
+
+[workspace.dependencies]
+mlua-flow-ir = "0.0.5"
+mlua-isle = { version = "0.5.0", features = ["pool", "tokio"] }
+semver = { version = "1", features = ["serde"] }
+schemars = "1"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+getrandom = "0.3"
+blake3 = "1"
+git2 = { version = "0.19", default-features = false }
+async-trait = "0.1"
+serde_yaml = "0.9"
+minijinja = "2"
+mlua = { version = "0.11", features = ["lua54", "vendored", "serde"] }
+tempfile = "3"
+agent-block-core = "0.28.1"
+agent-block-types = "0.28.1"
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
+toml = "0.8"
+tokio-tungstenite = "0.24"
+clap = { version = "4", features = ["derive"] }
+rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
+nix = { version = "0.29", features = ["user"] }
+
+mlua-swarm = { path = "." }
+mlua-swarm-schema = { path = "crates/mlua-swarm-schema" }
+mlua-swarm-server = { path = "crates/mlua-swarm-server" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[package]
+name = "mlua-swarm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Swarm engine host for mlua — long-running stateful runtime with Role/Verb gate, CapToken, 3-stage pipeline, and Middleware overlay."
+
+[dependencies]
+mlua-swarm-schema.workspace = true
+mlua-flow-ir.workspace = true
+mlua-isle.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+thiserror.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+base64.workspace = true
+hex.workspace = true
+getrandom.workspace = true
+blake3.workspace = true
+git2.workspace = true
+async-trait.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+minijinja.workspace = true
+mlua.workspace = true
+agent-block-core.workspace = true
+agent-block-types.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
