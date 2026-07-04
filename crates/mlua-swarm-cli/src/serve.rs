@@ -388,6 +388,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 /// (see the server-lifecycle design). If the
 /// signal handler itself fails to install, this future never resolves so
 /// `tokio::select!` falls back to the other two arms (ctrl_c / serve).
+///
+/// On non-Unix targets (Windows) `SIGTERM` does not exist; this future
+/// simply never resolves so the same `tokio::select!` falls through to the
+/// `ctrl_c` arm.
+#[cfg(unix)]
 async fn wait_sigterm() {
     use tokio::signal::unix::{signal, SignalKind};
     match signal(SignalKind::terminate()) {
@@ -399,6 +404,11 @@ async fn wait_sigterm() {
             std::future::pending::<()>().await;
         }
     }
+}
+
+#[cfg(not(unix))]
+async fn wait_sigterm() {
+    std::future::pending::<()>().await;
 }
 
 fn seed_blueprint(id: &str) -> Blueprint {

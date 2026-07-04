@@ -44,7 +44,19 @@ pub async fn healthz_ok(bind: &str) -> bool {
 }
 
 fn current_uid() -> u32 {
-    nix::unistd::Uid::current().as_raw()
+    // launchctl targets are `gui/<uid>/<label>`, so the numeric uid is only
+    // meaningful on Unix. On Windows this whole module's tools (`launchctl
+    // kickstart` / `bootout`) will fail at runtime for lack of the binary
+    // regardless of what we return, so a placeholder keeps the code
+    // portable at build time without pretending to offer functionality.
+    #[cfg(unix)]
+    {
+        nix::unistd::Uid::current().as_raw()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 fn domain_target() -> String {

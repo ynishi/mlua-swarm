@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-07-05
+
+### Fixed
+- Windows build: `mse serve`'s SIGTERM handler and `mse mcp`'s
+  `launchctl` uid lookup were unconditionally referencing
+  `tokio::signal::unix` / `nix::unistd::Uid`, which do not exist on
+  Windows. Both are now `#[cfg(unix)]`-gated (the SIGTERM waiter
+  becomes a never-resolving future on non-Unix so the `ctrl_c` arm of
+  the shutdown `select!` still fires; the `launchctl` module's uid is a
+  placeholder on non-Unix since `launchctl` itself is absent there).
+  `nix` moved to a `[target.'cfg(unix)'.dependencies]` block. Detected
+  by cargo-dist's `x86_64-pc-windows-msvc` target on the v0.1.1 tag.
+
+### Added
+- `.github/workflows/ci.yml` — `cargo check` on
+  Ubuntu / macOS / Windows and `cargo test` on Ubuntu / macOS for every
+  push/PR. Catches unix-only-API regressions before they reach a
+  cargo-dist release tag.
+
 ## [0.1.1] — 2026-07-05
 
 ### Added
@@ -37,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mlua-swarm-server`: HTTP + WebSocket server (task API, Blueprint store, Operator WS sessions).
 - `mlua-swarm-cli`: `mse` binary with `serve` and `mcp` subcommands (MCP adapter for AI agents).
 
-[Unreleased]: https://github.com/ynishi/mlua-swarm/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/ynishi/mlua-swarm/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/ynishi/mlua-swarm/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ynishi/mlua-swarm/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ynishi/mlua-swarm/releases/tag/v0.1.0
