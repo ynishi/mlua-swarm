@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-07-05
+
 ### Added
 - SQLite-backed persistence for all four in-crate stores via `rusqlite-isle`
   (thread-isolated `Connection`, single-writer FIFO discipline):
@@ -35,5 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mlua-swarm-server`: HTTP + WebSocket server (task API, Blueprint store, Operator WS sessions).
 - `mlua-swarm-cli`: `mse` binary with `serve` and `mcp` subcommands (MCP adapter for AI agents).
 
-[Unreleased]: https://github.com/ynishi/mlua-swarm/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ynishi/mlua-swarm/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/ynishi/mlua-swarm/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ynishi/mlua-swarm/releases/tag/v0.1.0
