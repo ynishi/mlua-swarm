@@ -10,6 +10,7 @@
 //! against the session's pending `HashMap` keyed by `req_id`.
 //! See `session::WSOperatorSession::resolve_pending` for details.
 
+use mlua_swarm::WorkerBinding;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -129,6 +130,12 @@ pub enum ServerMsg {
         /// **this field** instead of `capability_token` as the recommended path.
         #[serde(skip_serializing_if = "Option::is_none")]
         worker_handle: Option<String>,
+        /// Worker binding resolved from the Blueprint at compile time. `None`
+        /// never reaches the wire on the WS thin path (compile-time gate,
+        /// see `Operator::requires_worker_binding`), but the field stays
+        /// optional for forward compatibility.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        worker: Option<WorkerBinding>,
         /// Literal natural-language instruction for the MainAI (see the
         /// variant doc above for why this is embedded in the payload).
         directive: String,

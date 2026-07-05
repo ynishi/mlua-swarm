@@ -30,7 +30,7 @@
 use crate::blueprint::{AgentDef, AgentKind, Blueprint, BlueprintMetadata};
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
-use crate::operator::{Operator, OperatorSpawner};
+use crate::operator::{Operator, OperatorSpawner, WorkerBinding};
 use crate::types::{CapToken, TaskId};
 use crate::worker::adapter::{InProcSpawner, SpawnError, SpawnerAdapter, WorkerFn};
 use crate::worker::process_spawner::{ProcessSpawner, StreamMode};
@@ -848,7 +848,10 @@ impl crate::worker::Worker for RustFnWorker {
 
 /// Factory for `AgentKind::Operator`. Looks up the `Arc<dyn Operator>`
 /// pre-registered under `spec.operator_ref` and wraps it in an
-/// `OperatorSpawner`.
+/// `OperatorSpawner`. Also resolves `AgentDef.profile.worker_binding` into
+/// a `WorkerBinding` at compile time and fails loud (`CompileError::InvalidSpec`)
+/// when the resolved operator's `Operator::requires_worker_binding` is `true`
+/// and no binding was declared.
 ///
 /// Spec shape:
 /// ```jsonc
@@ -983,6 +986,144 @@ impl SpawnerFactory for OperatorSpawnerFactory {
             ))
         })?;
         drop(operators);
-        Ok(Arc::new(OperatorSpawner::new(op, system_prompt)))
+
+        // Resolve the Blueprint-baked worker binding from
+        // `AgentDef.profile.worker_binding` — the SoT for the
+        // declaration↔executor binding (see `WorkerBinding` doc). Fail
+        // loud at compile time when the operator backend requires one
+        // and the Blueprint didn't declare it; this is a compile-time
+        // gate, not a runtime guess.
+        let worker_binding = agent_def
+            .profile
+            .as_ref()
+            .and_then(|p| p.worker_binding.as_ref())
+            .map(|subagent_type| WorkerBinding {
+                subagent_type: subagent_type.clone(),
+                tools: agent_def
+                    .profile
+                    .as_ref()
+                    .map(|p| p.tools.clone())
+                    .unwrap_or_default(),
+            });
+        if op.requires_worker_binding() && worker_binding.is_none() {
+            return Err(invalid(
+                "profile.worker_binding is required for this operator backend; \
+                 declare it in the agent .md frontmatter"
+                    .into(),
+            ));
+        }
+        Ok(Arc::new(OperatorSpawner::new(
+            op,
+            system_prompt,
+            worker_binding,
+        )))
+    }
+}
+
+#[cfg(test)]
+mod operator_spawner_factory_worker_binding_tests {
+    use super::*;
+    use crate::blueprint::AgentProfile;
+    use crate::core::ctx::Ctx;
+    use crate::types::CapToken;
+    use crate::worker::adapter::{WorkerError, WorkerResult};
+
+    /// Minimal `Operator` stub whose `requires_worker_binding` is
+    /// configurable — enough to exercise the compile-time fail-loud gate
+    /// without standing up a real backend (e.g. `WSOperatorSession`,
+    /// which lives in a downstream crate).
+    struct StubOperator {
+        requires_binding: bool,
+    }
+
+    #[async_trait]
+    impl Operator for StubOperator {
+        async fn execute(
+            &self,
+            _ctx: &Ctx,
+            _system: Option<String>,
+            _prompt: String,
+            _worker: Option<WorkerBinding>,
+            _worker_token: CapToken,
+        ) -> Result<WorkerResult, WorkerError> {
+            Ok(WorkerResult {
+                value: Value::Null,
+                ok: true,
+            })
+        }
+
+        fn requires_worker_binding(&self) -> bool {
+            self.requires_binding
+        }
+    }
+
+    fn agent_def_with(profile: Option<AgentProfile>) -> AgentDef {
+        AgentDef {
+            name: "test-agent".to_string(),
+            kind: AgentKind::Operator,
+            spec: serde_json::json!({ "operator_ref": "op1" }),
+            profile,
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn build_fails_loud_when_binding_required_but_absent() {
+        let factory = OperatorSpawnerFactory::new();
+        factory.register_operator(
+            "op1",
+            Arc::new(StubOperator {
+                requires_binding: true,
+            }) as Arc<dyn Operator>,
+        );
+        let def = agent_def_with(Some(AgentProfile::default()));
+        match factory.build(&def, None) {
+            Err(CompileError::InvalidSpec { name, msg }) => {
+                assert_eq!(name, "test-agent");
+                assert!(
+                    msg.contains("worker_binding is required"),
+                    "unexpected message: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidSpec, got: {other:?}"),
+            Ok(_) => panic!("expected compile-time failure, got Ok"),
+        }
+    }
+
+    #[test]
+    fn build_succeeds_when_binding_required_and_present() {
+        let factory = OperatorSpawnerFactory::new();
+        factory.register_operator(
+            "op1",
+            Arc::new(StubOperator {
+                requires_binding: true,
+            }) as Arc<dyn Operator>,
+        );
+        let profile = AgentProfile {
+            worker_binding: Some("mse-worker-coder".to_string()),
+            tools: vec!["Read".to_string(), "Edit".to_string()],
+            ..Default::default()
+        };
+        let def = agent_def_with(Some(profile));
+        assert!(
+            factory.build(&def, None).is_ok(),
+            "expected Ok when worker_binding is declared"
+        );
+    }
+
+    #[test]
+    fn build_succeeds_when_binding_not_required_and_absent() {
+        let factory = OperatorSpawnerFactory::new();
+        factory.register_operator(
+            "op1",
+            Arc::new(StubOperator {
+                requires_binding: false,
+            }) as Arc<dyn Operator>,
+        );
+        let def = agent_def_with(Some(AgentProfile::default()));
+        assert!(
+            factory.build(&def, None).is_ok(),
+            "backends that don't require a binding must not be gated by its absence"
+        );
     }
 }

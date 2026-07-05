@@ -105,7 +105,7 @@ pub use middleware::{
     AuditMiddleware, LayerFactory, LayerRegistry, LongHoldMiddleware, MainAIMiddleware,
     OperatorDelegateMiddleware, SeniorEscalationMiddleware, SpawnerLayer, SpawnerStack,
 };
-pub use operator::{Operator, OperatorSpawner};
+pub use operator::{Operator, OperatorSpawner, WorkerBinding};
 pub use service::{TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService};
 pub use store::output::{
     InMemoryOutputStore, OutputRecord, OutputRef, OutputStore, OutputStoreError,

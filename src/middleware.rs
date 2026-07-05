@@ -581,13 +581,15 @@ impl SpawnerAdapter for OperatorDelegateWrapped {
             > = tokio::select! {
                 // OperatorDelegateMiddleware = session-global Operator delegation.
                 // Baking per-AgentDef profile.system_prompt is OperatorSpawner's job;
-                // this path has no profile, so we execute with system=None.
+                // this path has no profile (ctx.agent is ignored on this axis), so
+                // we execute with system=None and worker=None — there is no
+                // AgentDef.profile.worker_binding to resolve here.
                 // We hand the capability token (Role::Worker, 600s TTL) to the
                 // operator as `worker_token` — thin-spawn operators (e.g. a
                 // WebSocket-backed operator session) forward it to the SubAgent
                 // via encode(), while Operator impls that call the LLM directly
                 // may ignore it.
-                r = operator.execute(&ctx_clone, None, prompt, token_for_op) => r,
+                r = operator.execute(&ctx_clone, None, prompt, None, token_for_op) => r,
                 _ = cancel_inner.cancelled() => Err(crate::worker::adapter::WorkerError::Cancelled),
             };
             if let Ok(wr) = &result {

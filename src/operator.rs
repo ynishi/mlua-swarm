@@ -36,13 +36,27 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+/// Worker binding baked from `AgentDef.profile` at compile time — which
+/// Claude Code SubAgent definition the MainAI must dispatch, plus the
+/// tool surface the Blueprint declared for this agent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkerBinding {
+    /// SubAgent definition name (Agent tool `subagent_type`).
+    pub subagent_type: String,
+    /// Tool list declared in `AgentDef.profile.tools` (informational
+    /// for the MainAI / observability; the SubAgent's own frontmatter
+    /// is what actually grants tools).
+    pub tools: Vec<String>,
+}
+
 /// The `Operator` trait: takes a spawn request and returns a
 /// `WorkerResult`. The backend for `OperatorSpawner`. Implementations
 /// are free to differ per kind; the spawner just calls `execute` and
 /// stays out of the internals.
 ///
 /// Arguments — a two-slot payload plus `worker_token` (the thin path
-/// was added later):
+/// was added later) plus `worker` (the Blueprint-baked binding, added
+/// later still):
 ///
 /// - `system`: the agent persona — the rendered value of
 ///   `AgentDef.profile.system_prompt` after template expansion. `None`
@@ -51,6 +65,11 @@ use tokio_util::sync::CancellationToken;
 /// - `prompt`: task-specific intent — `TaskSpec.initial_directive`,
 ///   pulled server-side via `engine.fetch_prompt`. Expected to map
 ///   straight onto the LLM API's user message.
+/// - `worker`: the compile-time-baked [`WorkerBinding`] (subagent type +
+///   declared tools) resolved from `AgentDef.profile.worker_binding`.
+///   `None` for agents whose profile has no `worker_binding` set.
+///   Backends that require one (see [`Operator::requires_worker_binding`])
+///   must fail loud rather than silently degrade when this is `None`.
 /// - `worker_token`: a capability token (`Role::Worker`, 600s TTL,
 ///   `scopes = ["*"]`). Thin-path operators (a `a WebSocket-backed operator session`,
 ///   for instance) `encode()` this token and hand it to the MainAI
@@ -73,8 +92,20 @@ pub trait Operator: Send + Sync {
         ctx: &Ctx,
         system: Option<String>,
         prompt: String,
+        worker: Option<WorkerBinding>,
         worker_token: CapToken,
     ) -> Result<WorkerResult, WorkerError>;
+
+    /// Whether this operator backend requires a non-`None` `worker`
+    /// binding to execute at all. `false` by default (direct-LLM
+    /// operators consume `system` / `prompt` directly and have no
+    /// SubAgent to dispatch). WS thin-path operators override this to
+    /// `true` — the compiler uses it to fail loud at `compile()` time
+    /// when `AgentDef.profile.worker_binding` is absent, rather than
+    /// silently degrading at dispatch time.
+    fn requires_worker_binding(&self) -> bool {
+        false
+    }
 }
 
 /// A `SpawnerAdapter` implementation that hands the dispatch off to an
@@ -88,9 +119,10 @@ pub trait Operator: Send + Sync {
 ///
 /// Use this type on the path that **bakes a separate Operator backend
 /// into every `AgentDef`**. For an `AgentKind::Operator` `AgentDef`, the
-/// `OperatorSpawnerFactory` produces one with `OperatorSpawner::new(op)`
-/// and places it in `routes[agent_name]`. Agents flowing in through the
-/// `agent.md` loader default to `kind = Operator`, so they land here.
+/// `OperatorSpawnerFactory` produces one with
+/// `OperatorSpawner::new(op, system_prompt, worker_binding)` and places it
+/// in `routes[agent_name]`. Agents flowing in through the `agent.md`
+/// loader default to `kind = Operator`, so they land here.
 ///
 /// The paired **Blueprint-global (session) axis** is
 /// `crate::middleware::OperatorDelegateMiddleware` — a single operator
@@ -105,15 +137,25 @@ pub struct OperatorSpawner {
     /// agent's persona. If `Some`, it takes priority at spawn time; if
     /// `None`, we fall back to `fetch_prompt` (`initial_directive`).
     system_prompt: Option<String>,
+    /// The compile-time-baked worker binding — resolved from
+    /// `AgentDef.profile.worker_binding` by `OperatorSpawnerFactory`.
+    /// Passed straight through to `Operator::execute` on every spawn.
+    worker_binding: Option<WorkerBinding>,
 }
 
 impl OperatorSpawner {
     /// Binds an operator backend plus an optional compile-time
-    /// `system_prompt` template (rendered per-spawn via `render_system`).
-    pub fn new(operator: Arc<dyn Operator>, system_prompt: Option<String>) -> Self {
+    /// `system_prompt` template (rendered per-spawn via `render_system`)
+    /// and an optional compile-time-baked `worker_binding`.
+    pub fn new(
+        operator: Arc<dyn Operator>,
+        system_prompt: Option<String>,
+        worker_binding: Option<WorkerBinding>,
+    ) -> Self {
         Self {
             operator,
             system_prompt,
+            worker_binding,
         }
     }
 }
@@ -168,6 +210,7 @@ impl SpawnerAdapter for OperatorSpawner {
         let token_for_op = token.clone();
         let task_id_clone = task_id.clone();
         let ctx_clone = ctx.clone();
+        let worker_binding = self.worker_binding.clone();
         let (tx, rx) = oneshot::channel();
         let cancel = CancellationToken::new();
         let cancel_inner = cancel.clone();
@@ -175,7 +218,7 @@ impl SpawnerAdapter for OperatorSpawner {
 
         tokio::spawn(async move {
             let result: Result<WorkerResult, WorkerError> = tokio::select! {
-                r = op.execute(&ctx_clone, system, prompt, token_for_op) => r,
+                r = op.execute(&ctx_clone, system, prompt, worker_binding, token_for_op) => r,
                 _ = cancel_inner.cancelled() => Err(WorkerError::Cancelled),
             };
             // Emit `WorkerResult` → `OutputEvent::Final` in

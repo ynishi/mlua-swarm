@@ -10,6 +10,7 @@
 //! model: sonnet
 //! effort: high
 //! tools: Read, Edit, Write, Grep, Glob
+//! worker_binding: mse-worker-coder
 //! permissionMode: bypassPermissions
 //! memory: user
 //! abtest: true
@@ -30,9 +31,13 @@
 //!   JSON are not supported.
 //! - `tools` accepts both a CSV string (`"Read, Edit"`) and a YAML
 //!   array (`["Read", "Edit"]`).
+//! - `worker_binding` is the Claude Code SubAgent definition name this
+//!   agent binds to at spawn time — first-class (not dumped into
+//!   `extras`) because the compiler and the WS thin path read it
+//!   directly (see `AgentProfile::worker_binding`).
 //! - Any field beyond the known set (`name` / `description` / `model`
-//!   / `effort` / `tools`) is dumped into an `extras` `Value` — a
-//!   future-proof carry for C-C-specific fields.
+//!   / `effort` / `tools` / `worker_binding`) is dumped into an
+//!   `extras` `Value` — a future-proof carry for C-C-specific fields.
 //! - The body is kept verbatim, from just after the closing `---` to
 //!   the end of the file.
 
@@ -168,10 +173,21 @@ pub fn parse(text: &str, source_label: &str, kind: AgentKind) -> Result<AgentDef
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let tools = obj.get("tools").map(normalize_tools).unwrap_or_default();
+    let worker_binding = obj
+        .get("worker_binding")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // Dump everything outside the known set into `extras` — a
     // future-proof carry for C-C-specific fields.
-    let known = ["name", "description", "model", "effort", "tools"];
+    let known = [
+        "name",
+        "description",
+        "model",
+        "effort",
+        "tools",
+        "worker_binding",
+    ];
     let mut extras = Map::new();
     for (k, v) in &obj {
         if !known.contains(&k.as_str()) {
@@ -193,6 +209,7 @@ pub fn parse(text: &str, source_label: &str, kind: AgentKind) -> Result<AgentDef
             Value::Object(extras)
         },
         version_hash,
+        worker_binding,
     };
 
     Ok(AgentDef {
@@ -288,6 +305,27 @@ mod tests {
         );
         assert_eq!(extras.get("memory").and_then(|v| v.as_str()), Some("user"));
         assert_eq!(extras.get("abtest").and_then(|v| v.as_bool()), Some(true));
+        // no worker_binding in SAMPLE → None, and not dumped into extras.
+        assert_eq!(p.worker_binding, None);
+        assert!(extras.get("worker_binding").is_none());
+    }
+
+    #[test]
+    fn worker_binding_extracted_as_first_class_field() {
+        let t = "---\nname: x\nworker_binding: mse-worker-coder\n---\nbody\n";
+        let def = parse(t, "x", AgentKind::Operator).unwrap();
+        let p = def.profile.expect("profile present");
+        assert_eq!(p.worker_binding.as_deref(), Some("mse-worker-coder"));
+        // must not leak into extras alongside the first-class field.
+        assert!(matches!(p.extras, Value::Null));
+    }
+
+    #[test]
+    fn worker_binding_absent_is_none_not_extras() {
+        let t = "---\nname: x\nmodel: sonnet\n---\nbody\n";
+        let def = parse(t, "x", AgentKind::Operator).unwrap();
+        let p = def.profile.expect("profile present");
+        assert_eq!(p.worker_binding, None);
     }
 
     #[test]

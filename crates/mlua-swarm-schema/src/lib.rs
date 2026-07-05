@@ -329,6 +329,15 @@ pub struct AgentProfile {
     /// Planned to be used as the cache-index key in `AgentStore`.
     #[serde(default)]
     pub version_hash: Option<String>,
+    /// Claude Code SubAgent definition name this agent binds to at spawn
+    /// time (e.g. "mse-worker-coder"). Why: the Blueprint is the single
+    /// source of truth for the declaration↔executor binding — an external
+    /// registry would duplicate what `tools` already declares and drift.
+    /// `None` is valid for agents whose operator backend never dispatches
+    /// a SubAgent (direct-LLM operators); WS thin-path operators require
+    /// it at compile time (see `Operator::requires_worker_binding`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_binding: Option<String>,
 }
 
 /// SoT of the **Worker IMPL axis**. A closed enum managed inside Swarm and extended by
@@ -585,5 +594,30 @@ mod tests {
         assert!(dump.contains("main_ai"), "OperatorKind variants in schema");
         // nested defs are referenced (AgentDef reachable from agents[])
         assert!(dump.contains("AgentDef"), "AgentDef definition in schema");
+    }
+
+    #[test]
+    fn agent_profile_worker_binding_roundtrips_when_some() {
+        let profile = AgentProfile {
+            worker_binding: Some("mse-worker-coder".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&profile).expect("serializes");
+        assert_eq!(json["worker_binding"], "mse-worker-coder");
+        let back: AgentProfile = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.worker_binding.as_deref(), Some("mse-worker-coder"));
+    }
+
+    #[test]
+    fn agent_profile_worker_binding_omitted_when_none() {
+        let profile = AgentProfile::default();
+        let json = serde_json::to_value(&profile).expect("serializes");
+        // `skip_serializing_if = "Option::is_none"` — the key must not appear at all.
+        assert!(
+            json.as_object().unwrap().get("worker_binding").is_none(),
+            "worker_binding key must be absent when None: {json}"
+        );
+        let back: AgentProfile = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.worker_binding, None);
     }
 }
