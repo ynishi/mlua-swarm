@@ -391,6 +391,15 @@ jobs:
         run: |
           TAG="${{ needs.plan.outputs.tag }}"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      # server.json's committed version literal is NOT bumped per release
+      # (release-plz only manages Cargo.toml); patch it from the tag here so
+      # the manifest always matches the release being published.
+      - name: Sync server.json version from tag
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          jq --arg v "$VER" \
+            '.version = $v | .packages[0].identifier = "ghcr.io/ynishi/mse:\($v)"' \
+            server.json > server.json.tmp && mv server.json.tmp server.json
       - name: Verify server.json version matches
         run: |
           SERVER_VERSION=$(jq -r '.version' server.json)

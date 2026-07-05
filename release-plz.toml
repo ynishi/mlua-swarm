@@ -1,0 +1,29 @@
+[workspace]
+changelog_update = true
+dependencies_update = false
+git_release_enable = false   # GitHub Release is created by cargo-dist
+git_tag_enable = false       # default off; only the representative crate tags
+semver_check = true
+release_always = false       # publish only when the release PR is merged
+pr_labels = ["release"]
+
+# Keep all 4 crates in lockstep versioning
+[[package]]
+name = "mlua-swarm-schema"
+version_group = "mse"
+
+[[package]]
+name = "mlua-swarm"
+version_group = "mse"
+
+[[package]]
+name = "mlua-swarm-server"
+version_group = "mse"
+
+# Representative crate: creates the single unified tag v{version},
+# which is what the cargo-dist + MCP Registry workflow (release.yml) keys on.
+[[package]]
+name = "mlua-swarm-cli"
+version_group = "mse"
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
