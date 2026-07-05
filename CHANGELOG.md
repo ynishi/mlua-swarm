@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/ynishi/mlua-swarm/compare/v0.1.4...v0.2.0) - 2026-07-05
+
+### Added
+
+- *(operator)* bake worker binding from Blueprint into spawn path
+
+### Other
+
+- resolve remaining clippy warnings
+- apply cargo fmt to sqlite store modules
+
 ## [0.1.4](https://github.com/ynishi/mlua-swarm/compare/v0.1.3...v0.1.4) - 2026-07-05
 
 ### Added
