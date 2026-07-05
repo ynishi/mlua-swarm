@@ -29,7 +29,7 @@
         "kind": "branch",
         "cond": {
           "op": "and",
-          "operands": [
+          "args": [
             {
               "op": "gt",
               "lhs": {

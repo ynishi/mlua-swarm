@@ -25,7 +25,7 @@ inherits = "release"
 lto = "thin"
 
 [workspace.dependencies]
-mlua-flow-ir = "0.0.5"
+mlua-flow-ir = "0.1.1"
 mlua-isle = { version = "0.5.0", features = ["pool", "tokio"] }
 rusqlite-isle = { version = "0.2", features = ["tokio"] }
 rusqlite = { version = "0.31", features = ["bundled"] }

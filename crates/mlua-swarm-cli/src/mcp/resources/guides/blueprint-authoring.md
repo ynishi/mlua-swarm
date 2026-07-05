@@ -54,14 +54,19 @@ Every expr is tagged with an `op` discriminator:
 | `lit`    | `value`                    | A literal JSON value.                                                   |
 | `eq`     | `lhs`, `rhs`               | Structural equality.                                                     |
 | `ne`     | `lhs`, `rhs`               | Structural inequality.                                                   |
-| `lt` / `le` / `gt` / `ge` | `lhs`, `rhs`  | Numeric comparison (both sides coerced to `f64`).                        |
-| `not`    | `operand`                  | Boolean negation (truthy-based).                                        |
-| `and`    | `operands` (array)         | Short-circuit conjunction; empty array → `true`.                        |
-| `or`     | `operands` (array)         | Short-circuit disjunction; empty array → `false`.                       |
-| `exists` | `at`                       | `true`/`false` for whether a path resolves (does not raise on missing).  |
-| `add` / `sub` / `mul` / `div` | `lhs`, `rhs`  | Numeric arithmetic (`f64`); `div` by zero raises.                       |
-| `len`    | `of`                       | Element count (array), char count (string), or key count (object).      |
+| `lt` / `lte` / `gt` / `gte` | `lhs`, `rhs` | Comparison: both numbers (`f64`) or both strings (lexicographic, Lua `<` parity). Mixed types raise. |
+| `not`    | `arg`                      | Boolean negation (truthy-based).                                        |
+| `and`    | `args` (array)             | Short-circuit conjunction; empty array → `true`.                        |
+| `or`     | `args` (array)             | Short-circuit disjunction; empty array → `false`.                       |
+| `exists` | `arg` (expr)               | `true` iff `arg` resolves to a non-`null` value (missing path → `false`, present-but-`null` → `false`). |
+| `add` / `sub` / `mul` / `div` / `mod` | `lhs`, `rhs` | Numeric arithmetic (`f64`); `div` / `mod` by zero raises. `mod` follows Lua `%` (result takes the sign of `rhs`). |
+| `len`    | `arg`                      | Element count (array), char count (string), or key count (object).      |
 | `in`     | `needle`, `haystack`       | `true` if `needle` equals any element of the `haystack` array.          |
+| `call_extern` | `ref`, `args` (array) | Invoke a host-registered pure function (`Externs` registry) with the evaluated `args`. Unregistered `ref` raises. Value-shape only — no side effects, no flow control. |
+
+`call_extern` requires the host to register an externs registry
+(`TaskLaunchService::with_externs`); without one every `call_extern`
+raises an extern error.
 
 Truthy semantics match Lua/JS: `null`/`false` are falsy, everything else
 (including `0` and `""`) is truthy.

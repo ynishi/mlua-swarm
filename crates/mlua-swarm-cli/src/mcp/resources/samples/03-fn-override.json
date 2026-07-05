@@ -72,7 +72,7 @@
         "kind": "branch",
         "cond": {
           "op": "or",
-          "operands": [
+          "args": [
             {
               "op": "eq",
               "lhs": {

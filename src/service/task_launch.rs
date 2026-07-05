@@ -5,9 +5,10 @@
 //! 1. Compile the Blueprint and link it into a `SpawnerAdapter` (via
 //!    `service::linker::link`, wrapped by `EngineDispatcher::with_spawner`).
 //! 2. Acquire an Operator session (via `engine.attach`).
-//! 3. Run flow.ir's `eval_async` through an `EngineDispatcher` and
-//!    return the final `ctx`.
-//! 4. If any step fails (dispatcher error), `eval_async` errors and
+//! 3. Run flow.ir's `eval_async_externs` through an `EngineDispatcher`
+//!    (threading the service-held `call_extern` registry) and return
+//!    the final `ctx`.
+//! 4. If any step fails (dispatcher error), the eval errors and
 //!    the failure propagates as-is.
 //!
 //! Callers on the Application layer never touch the engine directly —
@@ -27,8 +28,10 @@ use crate::middleware::project_name_alias::ProjectNameAliasMiddleware;
 use crate::middleware::SpawnerStack;
 use crate::service::linker;
 use crate::types::{CapToken, Role};
+use mlua_flow_ir::{Externs, NoExterns};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -177,12 +180,29 @@ pub struct TaskLaunchOutput {
 pub struct TaskLaunchService {
     engine: Engine,
     compiler: Compiler,
+    /// `call_extern` registry threaded into flow eval. Defaults to
+    /// [`NoExterns`] (= every `call_extern` in a Blueprint raises
+    /// `ExternError`); hosts opt in via [`Self::with_externs`] with an
+    /// `ExternMap` of pure value-shape functions.
+    externs: Arc<dyn Externs + Send + Sync>,
 }
 
 impl TaskLaunchService {
     /// Build a service bound to one `Engine` and one `Compiler`.
     pub fn new(engine: Engine, compiler: Compiler) -> Self {
-        Self { engine, compiler }
+        Self {
+            engine,
+            compiler,
+            externs: Arc::new(NoExterns),
+        }
+    }
+
+    /// Replace the `call_extern` registry (builder style). Entries MUST be
+    /// pure functions — no side effects, no flow control; effectful work
+    /// belongs to `Step` / agents, not externs (flow-ir canonical contract).
+    pub fn with_externs(mut self, externs: Arc<dyn Externs + Send + Sync>) -> Self {
+        self.externs = externs;
+        self
     }
 
     /// The bound `Engine`.
@@ -265,10 +285,14 @@ impl TaskLaunchService {
             .await?;
         let dispatcher =
             EngineDispatcher::with_spawner(self.engine.clone(), token.clone(), spawner);
-        let final_ctx =
-            mlua_flow_ir::eval_async(&input.blueprint.flow, input.init_ctx, &dispatcher)
-                .await
-                .map_err(|e| TaskLaunchError::FlowEval(e.to_string()))?;
+        let final_ctx = mlua_flow_ir::eval_async_externs(
+            &input.blueprint.flow,
+            input.init_ctx,
+            &dispatcher,
+            &*self.externs,
+        )
+        .await
+        .map_err(|e| TaskLaunchError::FlowEval(e.to_string()))?;
         Ok(TaskLaunchOutput { token, final_ctx })
     }
 }
@@ -505,6 +529,66 @@ mod tests {
                     msg.contains("boom") || msg.contains("intentional"),
                     "expected error to mention worker failure, got: {msg}"
                 );
+            }
+            other => panic!("expected FlowEval error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_resolves_call_extern_via_registered_externs() {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "echoed": inv.prompt }),
+                ok: true,
+            })
+        });
+        let mut externs = mlua_flow_ir::ExternMap::new();
+        externs.register("fmt.greet", |args: &[Value]| {
+            let name = args[0].as_str().unwrap_or("?");
+            Ok(json!(format!("hello, {name}")))
+        });
+        let svc = build_service(factory).with_externs(Arc::new(externs));
+        let flow = step(
+            "echo",
+            Expr::CallExtern {
+                ref_: "fmt.greet".into(),
+                args: vec![path("$.who")],
+            },
+            path("$.out"),
+        );
+        let blueprint = bp(flow, vec![agent("echo", "echo")]);
+        let out = svc
+            .launch(launch_input(blueprint, json!({ "who": "swarm" })))
+            .await
+            .expect("launch ok");
+        assert_eq!(out.final_ctx["out"]["echoed"], json!("hello, swarm"));
+    }
+
+    #[tokio::test]
+    async fn launch_call_extern_without_registry_fails_as_flow_eval() {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!(inv.prompt),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory); // default NoExterns
+        let flow = step(
+            "echo",
+            Expr::CallExtern {
+                ref_: "fmt.greet".into(),
+                args: vec![],
+            },
+            path("$.out"),
+        );
+        let blueprint = bp(flow, vec![agent("echo", "echo")]);
+        let err = svc
+            .launch(launch_input(blueprint, json!({})))
+            .await
+            .expect_err("expected fail");
+        match err {
+            TaskLaunchError::FlowEval(msg) => {
+                assert!(msg.contains("extern"), "expected extern error, got: {msg}");
             }
             other => panic!("expected FlowEval error, got {other:?}"),
         }
