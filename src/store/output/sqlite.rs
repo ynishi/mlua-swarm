@@ -105,11 +105,10 @@ impl OutputStore for SqliteOutputStore {
         self.isle
             .call(move |conn| {
                 let tx = conn.transaction()?;
-                let seq: i64 = tx.query_row(
-                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM outputs",
-                    [],
-                    |row| row.get(0),
-                )?;
+                let seq: i64 =
+                    tx.query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM outputs", [], |row| {
+                        row.get(0)
+                    })?;
                 tx.execute(
                     "INSERT INTO outputs (id, task_id, attempt, producer_agent, event_json, \
                      parent_refs_json, seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -314,7 +313,13 @@ mod tests {
             .await
             .unwrap();
         let _ = s
-            .append("t", 1, "other-producer", mk_final("unrelated", true), vec![])
+            .append(
+                "t",
+                1,
+                "other-producer",
+                mk_final("unrelated", true),
+                vec![],
+            )
             .await
             .unwrap();
         let latest_id = s

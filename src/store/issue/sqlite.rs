@@ -163,7 +163,9 @@ impl IssueStore for SqliteIssueStore {
                 IsleError::Sqlite(rusqlite::Error::SqliteFailure(_, Some(msg)))
                     if msg.starts_with("__mlua_swarm_duplicate:") =>
                 {
-                    let id = msg.trim_start_matches("__mlua_swarm_duplicate:").to_string();
+                    let id = msg
+                        .trim_start_matches("__mlua_swarm_duplicate:")
+                        .to_string();
                     IssueStoreError::Duplicate(IssueId::new(id))
                 }
                 _ => map_isle_err(e),

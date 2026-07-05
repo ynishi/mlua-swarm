@@ -232,9 +232,13 @@ impl EnhanceLogStore for SqliteEnhanceLogStore {
             .await
             .map_err(map_isle_err)?;
         rows.into_iter()
-            .map(|(iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts)| {
-                row_to_entry(iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts)
-            })
+            .map(
+                |(iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts)| {
+                    row_to_entry(
+                        iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts,
+                    )
+                },
+            )
             .collect()
     }
 
@@ -270,9 +274,13 @@ impl EnhanceLogStore for SqliteEnhanceLogStore {
             .await
             .map_err(map_isle_err)?;
         rows.into_iter()
-            .map(|(iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts)| {
-                row_to_entry(iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts)
-            })
+            .map(
+                |(iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts)| {
+                    row_to_entry(
+                        iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts,
+                    )
+                },
+            )
             .collect()
     }
 }

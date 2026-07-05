@@ -103,7 +103,10 @@ impl EnhanceSettingStore for SqliteEnhanceSettingStore {
         let n = self
             .isle
             .call(move |conn| {
-                conn.execute("DELETE FROM enhance_settings WHERE id = ?1", params![id_str])
+                conn.execute(
+                    "DELETE FROM enhance_settings WHERE id = ?1",
+                    params![id_str],
+                )
             })
             .await
             .map_err(map_isle_err)?;
@@ -221,9 +224,12 @@ mod tests {
 
         {
             let (s, driver) = SqliteEnhanceSettingStore::open(&path).await.unwrap();
-            s.put(&EnhanceSettingId::new("keep"), dummy_setting("keep", "bp-x"))
-                .await
-                .unwrap();
+            s.put(
+                &EnhanceSettingId::new("keep"),
+                dummy_setting("keep", "bp-x"),
+            )
+            .await
+            .unwrap();
             drop(s);
             driver.shutdown().await.unwrap();
         }
