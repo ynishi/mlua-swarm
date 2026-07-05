@@ -23,6 +23,17 @@ pub fn default_config_path() -> PathBuf {
     }
 }
 
+/// Default `BlueprintStore` root, `~/.mse/store`. Same `$HOME` fallback
+/// rule as [`default_config_path`]. The store is always git-backed;
+/// config/CLI only override *where* the repos live, never whether they
+/// persist.
+pub fn default_store_path() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join(".mse").join("store"),
+        Err(_) => PathBuf::from(".mse/store"),
+    }
+}
+
 /// TOML config schema. All fields are optional — a missing field falls back
 /// to the CLI-supplied value or the built-in default at [`resolve`] time.
 /// Unknown fields are a hard error (`deny_unknown_fields`; typo guard).
@@ -96,8 +107,10 @@ pub struct ResolvedConfig {
     pub enable_enhance_flow: bool,
     /// Base dir for `$file` / `$agent_md` ref expansion in seeded Blueprints.
     pub blueprint_ref_base: Option<PathBuf>,
-    /// Root path for the git-backed `BlueprintStore` (when using the git2 backend).
-    pub git_store_path: Option<PathBuf>,
+    /// Root path for the git-backed `BlueprintStore`. Always set — defaults
+    /// to [`default_store_path`] (`~/.mse/store`) when neither CLI nor config
+    /// file provides one.
+    pub git_store_path: PathBuf,
     /// Path to the SQLite database file backing the `IssueStore`. `None` = fall
     /// back to `InMemoryIssueStore` (process-volatile).
     pub issue_store_path: Option<PathBuf>,
@@ -125,7 +138,7 @@ impl Default for ResolvedConfig {
             bind: default_bind(),
             enable_enhance_flow: false,
             blueprint_ref_base: None,
-            git_store_path: None,
+            git_store_path: default_store_path(),
             issue_store_path: None,
             enhance_setting_store_path: None,
             enhance_log_store_path: None,
@@ -175,14 +188,15 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .or(file.enable_enhance_flow)
             .unwrap_or(default.enable_enhance_flow),
         blueprint_ref_base: cli.blueprint_ref_base.or(file.blueprint_ref_base),
-        git_store_path: cli.git_store_path.or(file.git_store_path),
+        git_store_path: cli
+            .git_store_path
+            .or(file.git_store_path)
+            .unwrap_or_else(default_store_path),
         issue_store_path: cli.issue_store_path.or(file.issue_store_path),
         enhance_setting_store_path: cli
             .enhance_setting_store_path
             .or(file.enhance_setting_store_path),
-        enhance_log_store_path: cli
-            .enhance_log_store_path
-            .or(file.enhance_log_store_path),
+        enhance_log_store_path: cli.enhance_log_store_path.or(file.enhance_log_store_path),
         output_store_path: cli.output_store_path.or(file.output_store_path),
         seed_blueprint_id: cli
             .seed_blueprint_id
@@ -233,7 +247,17 @@ mod tests {
         assert_eq!(resolved.bind, default_bind());
         assert_eq!(resolved.seed_blueprint_id, "main");
         assert!(!resolved.enable_enhance_flow);
-        assert_eq!(resolved.git_store_path, None);
+        assert_eq!(resolved.git_store_path, default_store_path());
+    }
+
+    #[test]
+    fn resolve_git_store_path_file_overrides_default_location() {
+        let file = FileConfig {
+            git_store_path: Some(PathBuf::from("/tmp/custom-store")),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file).expect("resolve");
+        assert_eq!(resolved.git_store_path, PathBuf::from("/tmp/custom-store"));
     }
 
     #[test]

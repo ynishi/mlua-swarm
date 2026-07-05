@@ -12,7 +12,6 @@
 use clap::Parser;
 use mlua_swarm::blueprint::store::{
     blueprint_version, BlueprintId, BlueprintStore, CommitMetadata, Git2BlueprintStore,
-    InMemoryBlueprintStore,
 };
 use mlua_swarm::blueprint::{
     current_schema_version, AgentDef, AgentKind, Blueprint, BlueprintMetadata, BlueprintOrigin,
@@ -62,11 +61,11 @@ pub struct Args {
     /// Seed Blueprint id for enhance mode. Overrides the config file's `seed_blueprint_id`.
     #[arg(long)]
     seed_blueprint_id: Option<String>,
-    /// Use Git2 as the `BlueprintStore` backend at this path (when omitted, uses
-    /// `InMemory` — lost on process restart). If the path does not exist, `init`;
-    /// if an existing repo, `open` (= if the seed already exists, skip). Overrides
-    /// the config file's `git_store_path`.
-    /// Note: currently fixed to `Layout::Single`; `blueprint_id` = `"main"` recommended.
+    /// Root path for the git-backed `BlueprintStore` (when omitted, uses the
+    /// config file's `git_store_path`, then `~/.mse/store`). If the path does
+    /// not exist, `init`; if an existing repo, `open` (= if the seed already
+    /// exists, skip). The store is always git-backed and persistent; this flag
+    /// only overrides where the repos live.
     #[arg(long)]
     git_store_path: Option<std::path::PathBuf>,
     /// Path to the SQLite database file backing the `IssueStore`. When omitted
@@ -173,24 +172,18 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     // Combined mode is fixed (running task + enhance + Operator side by side is mlua-swarm's essential property).
 
-    // Store construction (always needed under combined mode). With
-    // --git-store-path set, per-id repos are split under
-    // <root>/blueprints/<id>/.git/, and EnhanceConfig lives under
-    // <root>/enhance-configs/<id>/.git/.
-    let store: Arc<dyn BlueprintStore> = match &cfg.git_store_path {
-        Some(root) => {
-            let bp_root = root.join("blueprints");
-            let s = Git2BlueprintStore::open_or_init(&bp_root).expect("git store open_or_init");
-            eprintln!(
-                "mse serve: blueprint store = Git2 root={} (per-id repos)",
-                bp_root.display()
-            );
-            Arc::new(s)
-        }
-        None => {
-            eprintln!("mse serve: blueprint store = InMemory (volatile)");
-            Arc::new(InMemoryBlueprintStore::new())
-        }
+    // Store construction (always needed under combined mode). Always
+    // git-backed: per-id repos are split under <root>/blueprints/<id>/.git/,
+    // and EnhanceConfig lives under <root>/enhance-configs/<id>/.git/.
+    // <root> defaults to ~/.mse/store (config/CLI only override location).
+    let store: Arc<dyn BlueprintStore> = {
+        let bp_root = cfg.git_store_path.join("blueprints");
+        let s = Git2BlueprintStore::open_or_init(&bp_root).expect("git store open_or_init");
+        eprintln!(
+            "mse serve: blueprint store = Git2 root={} (per-id repos)",
+            bp_root.display()
+        );
+        Arc::new(s)
     };
 
     // Seed (always runs — required under fixed combined mode).
@@ -264,9 +257,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let setting_store: Arc<dyn EnhanceSettingStore> = match &cfg.enhance_setting_store_path {
         Some(path) => {
             eprintln!("mse serve: SqliteEnhanceSettingStore at {}", path.display());
-            let (s, driver) = SqliteEnhanceSettingStore::open(path).await.unwrap_or_else(
-                |e| panic!("mse serve: SqliteEnhanceSettingStore open failed: {e}"),
-            );
+            let (s, driver) = SqliteEnhanceSettingStore::open(path)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("mse serve: SqliteEnhanceSettingStore open failed: {e}")
+                });
             isle_drivers.push(driver);
             Arc::new(s)
         }
@@ -328,15 +323,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     let doctor_info = DoctorInfo {
         bind: cfg.bind.to_string(),
-        blueprint_backend: if cfg.git_store_path.is_some() {
-            "git2".into()
-        } else {
-            "in_memory".into()
-        },
-        blueprint_store_root: cfg
-            .git_store_path
-            .as_ref()
-            .map(|p| p.join("blueprints").display().to_string()),
+        blueprint_backend: "git2".into(),
+        blueprint_store_root: Some(cfg.git_store_path.join("blueprints").display().to_string()),
         blueprint_ref_base: cfg
             .blueprint_ref_base
             .as_ref()
