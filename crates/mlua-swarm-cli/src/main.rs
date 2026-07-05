@@ -24,7 +24,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Run the HTTP + WS server.
-    Serve(serve::Args),
+    Serve(Box<serve::Args>),
     /// Run the MCP adapter (stdio transport).
     Mcp,
 }
@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve(args) => serve::run(args).await,
+        Cmd::Serve(args) => serve::run(*args).await,
         Cmd::Mcp => mcp::run().await,
     }
 }

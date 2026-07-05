@@ -62,18 +62,35 @@ fn map_isle_err(e: IsleError) -> EnhanceLogStoreError {
     EnhanceLogStoreError::Other(format!("sqlite: {e}"))
 }
 
-fn row_to_entry(
-    issue_id: String,
-    blueprint_id: String,
-    prev_hash: String,
-    new_hash: String,
-    intent: String,
-    rationale: String,
-    verdicts_json: String,
-    status: String,
-    reasons_json: String,
-    ts_ms: i64,
-) -> Result<EnhanceLogEntry, EnhanceLogStoreError> {
+/// One `enhance_log` SELECT row in column order: issue_id, blueprint_id,
+/// prev_hash, new_hash, intent, rationale, verdicts_json, status,
+/// reasons_json, ts_ms.
+type LogRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+);
+
+fn row_to_entry(row: LogRow) -> Result<EnhanceLogEntry, EnhanceLogStoreError> {
+    let (
+        issue_id,
+        blueprint_id,
+        prev_hash,
+        new_hash,
+        intent,
+        rationale,
+        verdicts_json,
+        status,
+        reasons_json,
+        ts_ms,
+    ) = row;
     let verdicts: Vec<VerdictSummary> = serde_json::from_str(&verdicts_json)
         .map_err(|e| EnhanceLogStoreError::Other(format!("decode verdicts: {e}")))?;
     let reasons: Vec<String> = serde_json::from_str(&reasons_json)
@@ -189,9 +206,7 @@ impl EnhanceLogStore for SqliteEnhanceLogStore {
             .await
             .map_err(map_isle_err)?;
         match row {
-            Some((iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts)) => row_to_entry(
-                iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts,
-            ),
+            Some(row) => row_to_entry(row),
             None => Err(EnhanceLogStoreError::NotFound(id_for_notfound)),
         }
     }
@@ -231,15 +246,7 @@ impl EnhanceLogStore for SqliteEnhanceLogStore {
             })
             .await
             .map_err(map_isle_err)?;
-        rows.into_iter()
-            .map(
-                |(iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts)| {
-                    row_to_entry(
-                        iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts,
-                    )
-                },
-            )
-            .collect()
+        rows.into_iter().map(row_to_entry).collect()
     }
 
     async fn list_all(&self) -> Result<Vec<EnhanceLogEntry>, EnhanceLogStoreError> {
@@ -273,15 +280,7 @@ impl EnhanceLogStore for SqliteEnhanceLogStore {
             })
             .await
             .map_err(map_isle_err)?;
-        rows.into_iter()
-            .map(
-                |(iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts)| {
-                    row_to_entry(
-                        iid, bp, prev, new, intent, rat, verdicts, status, reasons, ts,
-                    )
-                },
-            )
-            .collect()
+        rows.into_iter().map(row_to_entry).collect()
     }
 }
 
