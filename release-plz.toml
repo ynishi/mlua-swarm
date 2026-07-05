@@ -1,19 +1,22 @@
 [workspace]
-changelog_update = true
+changelog_update = false     # default off; only the root crate updates the root CHANGELOG
 dependencies_update = false
 git_release_enable = false   # GitHub Release is created by cargo-dist
 git_tag_enable = false       # default off; only the representative crate tags
+git_tag_name = "v{{ version }}"  # unified tag name, also used for CHANGELOG compare links
 semver_check = true
 release_always = false       # publish only when the release PR is merged
 pr_labels = ["release"]
 
-# Keep all 4 crates in lockstep versioning
-[[package]]
-name = "mlua-swarm-schema"
-version_group = "mse"
-
+# Keep all 4 crates in lockstep versioning.
+# Only the root crate maintains the (root) CHANGELOG.md.
 [[package]]
 name = "mlua-swarm"
+version_group = "mse"
+changelog_update = true
+
+[[package]]
+name = "mlua-swarm-schema"
 version_group = "mse"
 
 [[package]]
@@ -26,4 +29,3 @@ version_group = "mse"
 name = "mlua-swarm-cli"
 version_group = "mse"
 git_tag_enable = true
-git_tag_name = "v{{ version }}"
