@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/ynishi/mlua-swarm/compare/v0.1.3...v0.1.4) - 2026-07-05
+
+### Added
+
+- *(release)* adopt release-plz for automated version bump + crates.io publish
+
+### Fixed
+
+- *(release)* stop member-crate CHANGELOG stubs + fix compare-link tag names
+
 ## [0.1.3] — 2026-07-05
 
 ### Fixed
