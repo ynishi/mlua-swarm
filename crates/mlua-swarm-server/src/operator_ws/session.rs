@@ -219,7 +219,7 @@ impl Operator for WSOperatorSession {
         let directive = default_spawn_directive(
             &ctx.agent,
             &ctx.task_id.0,
-            &worker.subagent_type,
+            &worker.variant,
             project_name_alias,
             data_sink_endpoint,
         );

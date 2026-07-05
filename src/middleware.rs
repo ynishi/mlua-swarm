@@ -55,6 +55,7 @@ pub mod lua_layer;
 pub mod project_name_alias;
 pub mod resolver;
 pub mod sink;
+pub mod worker_binding;
 
 use crate::core::ctx::{Ctx, OperatorKind};
 use crate::core::engine::Engine;
@@ -564,6 +565,27 @@ impl SpawnerAdapter for OperatorDelegateWrapped {
             .await
             .map_err(|e| SpawnError::Internal(format!("fetch_prompt: {e}")))?;
 
+        // Resolve the Blueprint-baked worker binding injected into
+        // `ctx.meta.runtime` by `WorkerBindingMiddleware` (launch-time layer,
+        // built from `AgentDef.profile.worker_binding`). Absent key = agent
+        // declared no binding → hand `None` and let binding-requiring
+        // backends fail loud (`requires_worker_binding`). A present-but-
+        // malformed value is a wiring bug, not a degrade case — fail here.
+        let worker: Option<crate::operator::WorkerBinding> = match ctx
+            .meta
+            .runtime
+            .get(crate::middleware::worker_binding::WORKER_BINDING_KEY)
+        {
+            Some(v) => Some(serde_json::from_value(v.clone()).map_err(|e| {
+                SpawnError::Internal(format!(
+                    "ctx.meta.runtime['{}'] for agent '{}' is malformed: {e}",
+                    crate::middleware::worker_binding::WORKER_BINDING_KEY,
+                    ctx.agent
+                ))
+            })?),
+            None => None,
+        };
+
         let engine_clone = engine.clone();
         let token_clone = token.clone();
         let token_for_op = token.clone();
@@ -580,16 +602,19 @@ impl SpawnerAdapter for OperatorDelegateWrapped {
                 crate::worker::adapter::WorkerError,
             > = tokio::select! {
                 // OperatorDelegateMiddleware = session-global Operator delegation.
-                // Baking per-AgentDef profile.system_prompt is OperatorSpawner's job;
-                // this path has no profile (ctx.agent is ignored on this axis), so
-                // we execute with system=None and worker=None — there is no
-                // AgentDef.profile.worker_binding to resolve here.
+                // Baking per-AgentDef profile.system_prompt is OperatorSpawner's
+                // job; this path has no per-agent spawner, so system stays None.
+                // The worker binding, however, IS resolved on this axis now:
+                // `WorkerBindingMiddleware` (launch-time layer) injects the
+                // Blueprint-baked binding into ctx.meta.runtime and we forward
+                // it here — the delegate axis is a first-class variant-dispatch
+                // path, not a binding-less fallback (issue 45db42a7).
                 // We hand the capability token (Role::Worker, 600s TTL) to the
                 // operator as `worker_token` — thin-spawn operators (e.g. a
                 // WebSocket-backed operator session) forward it to the SubAgent
                 // via encode(), while Operator impls that call the LLM directly
                 // may ignore it.
-                r = operator.execute(&ctx_clone, None, prompt, None, token_for_op) => r,
+                r = operator.execute(&ctx_clone, None, prompt, worker, token_for_op) => r,
                 _ = cancel_inner.cancelled() => Err(crate::worker::adapter::WorkerError::Cancelled),
             };
             if let Ok(wr) = &result {
@@ -705,5 +730,194 @@ impl SpawnerAdapter for LongHoldWrapped {
                 signal
             }
         }))
+    }
+}
+
+// Boundary regression spec for the delegate-axis worker-binding handoff
+// (issue 45db42a7): OperatorDelegateMiddleware must forward the binding
+// injected into ctx.meta.runtime by WorkerBindingMiddleware — both the
+// hit path (Some(worker) reaches Operator::execute) and the absent path
+// (None reaches it), plus fail-loud on a malformed value.
+#[cfg(test)]
+mod operator_delegate_worker_binding_tests {
+    use super::*;
+    use crate::core::config::EngineCfg;
+    use crate::core::state::TaskSpec;
+    use crate::operator::WorkerBinding;
+    use crate::types::Role;
+    use crate::worker::adapter::{WorkerError, WorkerResult};
+    use std::sync::Mutex;
+
+    /// Operator stub recording the `worker` argument it was executed with.
+    struct RecordingOperator {
+        seen: Arc<Mutex<Option<Option<WorkerBinding>>>>,
+    }
+
+    #[async_trait]
+    impl crate::operator::Operator for RecordingOperator {
+        async fn execute(
+            &self,
+            _ctx: &Ctx,
+            _system: Option<String>,
+            _prompt: String,
+            worker: Option<WorkerBinding>,
+            _worker_token: CapToken,
+        ) -> Result<WorkerResult, WorkerError> {
+            *self.seen.lock().unwrap() = Some(worker);
+            Ok(WorkerResult {
+                value: Value::Null,
+                ok: true,
+            })
+        }
+    }
+
+    /// Inner spawner that must never be reached when an operator is attached.
+    struct MustNotSpawn;
+
+    #[async_trait]
+    impl SpawnerAdapter for MustNotSpawn {
+        async fn spawn(
+            &self,
+            _engine: &Engine,
+            _ctx: &Ctx,
+            _task_id: TaskId,
+            _attempt: u32,
+            _token: CapToken,
+        ) -> Result<Box<dyn Worker>, SpawnError> {
+            panic!("delegate axis must bypass inner.spawn when an operator is attached");
+        }
+    }
+
+    async fn seeded_engine() -> (Engine, CapToken, TaskId) {
+        let engine = Engine::new(EngineCfg::default());
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let task_id = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: "planner".to_string(),
+                    initial_directive: "do the thing".to_string(),
+                },
+            )
+            .await
+            .expect("start_task");
+        // Mint + register a worker token the same way
+        // `dispatch_attempt_with` does — the spawner path runs with a
+        // `Role::Worker` token (FetchPrompt is worker-verb-gated).
+        let worker_token = engine.signer().session(
+            format!("worker-of-{task_id}"),
+            Role::Worker,
+            vec!["*".into()],
+            Duration::from_secs(600),
+        );
+        let nonce = worker_token.nonce.clone();
+        let record = crate::core::state::CapTokenRecord::from_worker_token(
+            worker_token.clone(),
+            task_id.clone(),
+        );
+        engine
+            .with_state("test.mint_worker", move |s| {
+                s.tokens.insert(nonce, record);
+            })
+            .await
+            .expect("mint worker token");
+        (engine, worker_token, task_id)
+    }
+
+    fn delegate_stack() -> Arc<dyn SpawnerAdapter> {
+        OperatorDelegateMiddleware::new().wrap(Arc::new(MustNotSpawn))
+    }
+
+    async fn recorded_worker(
+        seen: &Arc<Mutex<Option<Option<WorkerBinding>>>>,
+    ) -> Option<WorkerBinding> {
+        for _ in 0..100 {
+            if let Some(w) = seen.lock().unwrap().clone() {
+                return w;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("operator.execute was never called within 1s");
+    }
+
+    #[tokio::test]
+    async fn forwards_ctx_injected_binding_to_operator_execute() {
+        let (engine, token, task_id) = seeded_engine().await;
+        let seen = Arc::new(Mutex::new(None));
+        let op = Arc::new(RecordingOperator { seen: seen.clone() });
+
+        let mut ctx = Ctx::new(task_id.clone(), 1, "planner");
+        ctx.operator.operator = Some(op);
+        ctx.meta.runtime.insert(
+            crate::middleware::worker_binding::WORKER_BINDING_KEY.to_string(),
+            serde_json::to_value(WorkerBinding {
+                variant: "mse-worker-coder".to_string(),
+                tools: vec!["Edit".to_string()],
+            })
+            .unwrap(),
+        );
+
+        let _worker = delegate_stack()
+            .spawn(&engine, &ctx, task_id, 1, token)
+            .await
+            .expect("delegate spawn ok");
+
+        let got = recorded_worker(&seen).await.expect("binding forwarded");
+        assert_eq!(got.variant, "mse-worker-coder");
+        assert_eq!(got.tools, vec!["Edit".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn absent_binding_stays_none_no_silent_default() {
+        let (engine, token, task_id) = seeded_engine().await;
+        let seen = Arc::new(Mutex::new(None));
+        let op = Arc::new(RecordingOperator { seen: seen.clone() });
+
+        let mut ctx = Ctx::new(task_id.clone(), 1, "planner");
+        ctx.operator.operator = Some(op);
+
+        let _worker = delegate_stack()
+            .spawn(&engine, &ctx, task_id, 1, token)
+            .await
+            .expect("delegate spawn ok");
+
+        assert!(
+            recorded_worker(&seen).await.is_none(),
+            "no binding declared must reach the operator as None (fail-loud stays downstream)"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_binding_fails_loud_before_execute() {
+        let (engine, token, task_id) = seeded_engine().await;
+        let seen = Arc::new(Mutex::new(None));
+        let op = Arc::new(RecordingOperator { seen: seen.clone() });
+
+        let mut ctx = Ctx::new(task_id.clone(), 1, "planner");
+        ctx.operator.operator = Some(op);
+        ctx.meta.runtime.insert(
+            crate::middleware::worker_binding::WORKER_BINDING_KEY.to_string(),
+            serde_json::json!({ "not_a_binding": true }),
+        );
+
+        let err = match delegate_stack()
+            .spawn(&engine, &ctx, task_id, 1, token)
+            .await
+        {
+            Ok(_) => panic!("malformed binding must fail the spawn"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("worker_binding") && msg.contains("malformed"),
+            "error must name the malformed key: {msg}"
+        );
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "operator.execute must not run on malformed binding"
+        );
     }
 }

@@ -997,8 +997,8 @@ impl SpawnerFactory for OperatorSpawnerFactory {
             .profile
             .as_ref()
             .and_then(|p| p.worker_binding.as_ref())
-            .map(|subagent_type| WorkerBinding {
-                subagent_type: subagent_type.clone(),
+            .map(|variant| WorkerBinding {
+                variant: variant.clone(),
                 tools: agent_def
                     .profile
                     .as_ref()

@@ -37,12 +37,18 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 /// Worker binding baked from `AgentDef.profile` at compile time — which
-/// Claude Code SubAgent definition the MainAI must dispatch, plus the
-/// tool surface the Blueprint declared for this agent.
+/// worker variant the operator backend must run, plus the tool surface
+/// the Blueprint declared for this agent.
+///
+/// `variant` is mse domain vocabulary; backend-specific terms (e.g. the
+/// Claude Code Agent tool's `subagent_type` parameter) belong to the
+/// rendering boundary (`operator_ws::session` directive render), not here.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerBinding {
-    /// SubAgent definition name (Agent tool `subagent_type`).
-    pub subagent_type: String,
+    /// Worker variant name (for the Claude Code backend this maps onto
+    /// the Agent tool `subagent_type` at directive-render time).
+    #[serde(alias = "subagent_type")]
+    pub variant: String,
     /// Tool list declared in `AgentDef.profile.tools` (informational
     /// for the MainAI / observability; the SubAgent's own frontmatter
     /// is what actually grants tools).

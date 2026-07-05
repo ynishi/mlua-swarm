@@ -25,7 +25,9 @@ use crate::core::ctx::OperatorKind;
 use crate::core::engine::Engine;
 use crate::core::errors::EngineError;
 use crate::middleware::project_name_alias::ProjectNameAliasMiddleware;
+use crate::middleware::worker_binding::WorkerBindingMiddleware;
 use crate::middleware::SpawnerStack;
+use crate::operator::WorkerBinding;
 use crate::service::linker;
 use crate::types::{CapToken, Role};
 use mlua_flow_ir::{Externs, NoExterns};
@@ -54,6 +56,31 @@ use thiserror::Error;
 /// `blueprint::compiler::Compiler::compile` (issue: `OperatorDef`
 /// first-class treatment), which only checks the reference resolves for
 /// `AgentKind::Operator` agents and is unaffected by this function.
+/// Build the `agent name → WorkerBinding` map from
+/// `Blueprint.agents[].profile.worker_binding` — the launch-time sibling of
+/// the compile-time resolution in `OperatorSpawnerFactory::build`. Consumed
+/// by `WorkerBindingMiddleware` so the delegate axis
+/// (`OperatorDelegateMiddleware`) can resolve the binding via `ctx.agent`
+/// like every other agent-keyed table (`CompiledAgentTable.routes` idiom).
+/// Agents without a declared binding are simply absent (no silent default).
+fn derive_worker_bindings(blueprint: &Blueprint) -> HashMap<String, WorkerBinding> {
+    blueprint
+        .agents
+        .iter()
+        .filter_map(|ad| {
+            let profile = ad.profile.as_ref()?;
+            let variant = profile.worker_binding.as_ref()?;
+            Some((
+                ad.name.clone(),
+                WorkerBinding {
+                    variant: variant.clone(),
+                    tools: profile.tools.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
 fn derive_bp_agent_kinds(blueprint: &Blueprint) -> HashMap<String, OperatorKind> {
     let mut out = HashMap::new();
     if blueprint.operators.is_empty() {
@@ -256,6 +283,17 @@ impl TaskLaunchService {
                 .build()
         } else {
             spawner
+        };
+        // Layer the Blueprint-baked worker bindings (same ctx.meta.runtime
+        // inject shape as the alias layer above) so the delegate axis can
+        // resolve per-agent variants — see `derive_worker_bindings`.
+        let worker_bindings = derive_worker_bindings(&input.blueprint);
+        let spawner = if worker_bindings.is_empty() {
+            spawner
+        } else {
+            SpawnerStack::new(spawner)
+                .layer(WorkerBindingMiddleware::new(worker_bindings))
+                .build()
         };
 
         // "BP Agent-level" (`OperatorDef.kind` via `operator_ref`) + "BP
