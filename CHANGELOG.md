@@ -9,9 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.0](https://github.com/ynishi/mlua-swarm/compare/v0.3.0...v0.4.0) - 2026-07-06
 
+### Added
+
+- *(mcp)* unify `swarm_run` blueprint under `BlueprintSelector` (inline | id | file)
+- *(mcp)* add `spawn_halt` verb to `mse_ack` for controlled halt
+- *(server)* render actual server bind into Spawn directive `base_url`
+
 ### Fixed
 
 - *(compiler)* make worker_binding message actionable on both paths + guide
+
+### Other
+
+- *(docs)* lock blueprint-authoring guide field names against flow-ir schema
+
+### Changelog notes
+
+The three `Added` entries and the `Other` entry above were added
+retroactively (shipping in the v0.4.1 release train). release-plz
+auto-generated the v0.4.0 entry with only the `Fixed` line because
+those four commits only touched files under `crates/*/`, and the
+per-package `changelog_update` flag was only enabled on the root
+crate. The same follow-up also wires `changelog_include` on the root
+package so future releases produce a unified CHANGELOG covering all
+four crates in the lockstep `version_group = "mse"`.
 
 ## [0.3.0](https://github.com/ynishi/mlua-swarm/compare/v0.2.1...v0.3.0) - 2026-07-05
 

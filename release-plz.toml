@@ -14,6 +14,15 @@ pr_labels = ["release"]
 name = "mlua-swarm"
 version_group = "mse"
 changelog_update = true
+# release-plz assigns each commit to the crate whose path it touches;
+# a commit that only touches `crates/*/…` never lands in the root
+# crate's CHANGELOG. Since the whole workspace ships lockstep under
+# `version_group = "mse"`, tell release-plz to fold every sibling
+# crate's commits into the single unified root CHANGELOG. Without
+# this, feat/fix commits scoped to a sibling crate disappear from
+# every CHANGELOG (see v0.4.0 — only the one commit that touched
+# `src/` made it in; the other four were dropped).
+changelog_include = ["mlua-swarm-schema", "mlua-swarm-server", "mlua-swarm-cli"]
 
 [[package]]
 name = "mlua-swarm-schema"
