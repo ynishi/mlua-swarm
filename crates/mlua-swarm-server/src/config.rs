@@ -60,6 +60,13 @@ pub struct FileConfig {
     /// Path to the SQLite database file backing the `OutputStore`.
     /// `None` = fall back to `InMemoryOutputStore` (process-volatile).
     pub output_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `TaskStore` (issue #13
+    /// ID-hierarchy `POST /v1/tasks` work-item records). `None` = fall back
+    /// to `InMemoryTaskStore` (process-volatile).
+    pub task_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `RunStore` (one kick of
+    /// a Task). `None` = fall back to `InMemoryRunStore` (process-volatile).
+    pub run_store_path: Option<PathBuf>,
     /// Seed blueprint id used in combined-mode default routing.
     pub seed_blueprint_id: Option<String>,
     /// snake_case `AgentKind` literal (`operator` / `agent_block` / `rust_fn` /
@@ -90,6 +97,10 @@ pub struct CliOverrides {
     pub enhance_log_store_path: Option<PathBuf>,
     /// `--output-store-path` value.
     pub output_store_path: Option<PathBuf>,
+    /// `--task-store-path` value (mirrors [`FileConfig::task_store_path`]).
+    pub task_store_path: Option<PathBuf>,
+    /// `--run-store-path` value (mirrors [`FileConfig::run_store_path`]).
+    pub run_store_path: Option<PathBuf>,
     /// `--seed-blueprint-id` value.
     pub seed_blueprint_id: Option<String>,
     /// `--default-agent-kind` value (snake_case `AgentKind` literal, unvalidated).
@@ -123,6 +134,12 @@ pub struct ResolvedConfig {
     /// Path to the SQLite database file backing the `OutputStore`.
     /// `None` = `InMemoryOutputStore`.
     pub output_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `TaskStore`.
+    /// `None` = `InMemoryTaskStore`.
+    pub task_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `RunStore`.
+    /// `None` = `InMemoryRunStore`.
+    pub run_store_path: Option<PathBuf>,
     /// Seed blueprint id used in combined-mode default routing.
     pub seed_blueprint_id: String,
     /// snake_case `AgentKind` literal, unvalidated. `None` = caller applies
@@ -143,6 +160,8 @@ impl Default for ResolvedConfig {
             enhance_setting_store_path: None,
             enhance_log_store_path: None,
             output_store_path: None,
+            task_store_path: None,
+            run_store_path: None,
             seed_blueprint_id: "main".into(),
             default_agent_kind: None,
             token_secret: None,
@@ -198,6 +217,8 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .or(file.enhance_setting_store_path),
         enhance_log_store_path: cli.enhance_log_store_path.or(file.enhance_log_store_path),
         output_store_path: cli.output_store_path.or(file.output_store_path),
+        task_store_path: cli.task_store_path.or(file.task_store_path),
+        run_store_path: cli.run_store_path.or(file.run_store_path),
         seed_blueprint_id: cli
             .seed_blueprint_id
             .or(file.seed_blueprint_id)
@@ -302,5 +323,36 @@ mod tests {
         assert_eq!(cfg.bind.as_deref(), Some("127.0.0.1:7000"));
         assert_eq!(cfg.enable_enhance_flow, Some(true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_task_and_run_store_path_cli_wins_over_file() {
+        let cli = CliOverrides {
+            task_store_path: Some(PathBuf::from("/tmp/cli-tasks.db")),
+            ..Default::default()
+        };
+        let file = FileConfig {
+            task_store_path: Some(PathBuf::from("/tmp/file-tasks.db")),
+            run_store_path: Some(PathBuf::from("/tmp/file-runs.db")),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).expect("resolve");
+        assert_eq!(
+            resolved.task_store_path,
+            Some(PathBuf::from("/tmp/cli-tasks.db")),
+            "cli task_store_path must win over file"
+        );
+        assert_eq!(
+            resolved.run_store_path,
+            Some(PathBuf::from("/tmp/file-runs.db")),
+            "run_store_path falls back to file when cli is absent"
+        );
+    }
+
+    #[test]
+    fn resolve_task_and_run_store_path_default_none() {
+        let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
+        assert_eq!(resolved.task_store_path, None);
+        assert_eq!(resolved.run_store_path, None);
     }
 }

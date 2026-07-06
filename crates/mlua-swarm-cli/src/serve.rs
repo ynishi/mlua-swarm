@@ -25,6 +25,8 @@ use mlua_swarm::store::enhance_setting::{
 };
 use mlua_swarm::store::issue::{InMemoryIssueStore, IssueStore, SqliteIssueStore};
 use mlua_swarm::store::output::{InMemoryOutputStore, OutputStore, SqliteOutputStore};
+use mlua_swarm::store::run::{InMemoryRunStore, RunStore, SqliteRunStore};
+use mlua_swarm::store::task::{InMemoryTaskStore, SqliteTaskStore, TaskStore};
 use mlua_swarm::{
     Compiler, Engine, EngineCfg, EnhanceApplication, EnhanceApplicationConfig, Role,
     TaskLaunchService,
@@ -88,6 +90,16 @@ pub struct Args {
     /// file.
     #[arg(long)]
     output_store_path: Option<std::path::PathBuf>,
+    /// Path to the SQLite database file backing the `TaskStore` (issue #13
+    /// ID-hierarchy `POST /v1/tasks` work-item records). Omit for the
+    /// in-memory default. Overrides `task_store_path` in the config file.
+    #[arg(long)]
+    task_store_path: Option<std::path::PathBuf>,
+    /// Path to the SQLite database file backing the `RunStore` (one kick of
+    /// a Task). Omit for the in-memory default. Overrides `run_store_path`
+    /// in the config file.
+    #[arg(long)]
+    run_store_path: Option<std::path::PathBuf>,
     /// Merges the 4 enhance-flow workers (patch-spawner / patch-applier /
     /// verifier-router / committer) + 3 host bridges into `default_registry`.
     /// Used when running the default enhance Blueprint through `/v1/tasks`. A pure
@@ -137,6 +149,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         enhance_setting_store_path: args.enhance_setting_store_path.clone(),
         enhance_log_store_path: args.enhance_log_store_path.clone(),
         output_store_path: args.output_store_path.clone(),
+        task_store_path: args.task_store_path.clone(),
+        run_store_path: args.run_store_path.clone(),
         seed_blueprint_id: args.seed_blueprint_id.clone(),
         default_agent_kind: args.default_agent_kind.clone(),
         token_secret: args.token_secret.clone(),
@@ -292,6 +306,28 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         // keeps the branch symmetric with the other three stores.
         None => Some(Arc::new(InMemoryOutputStore::new())),
     };
+    let task_store: Arc<dyn TaskStore> = match &cfg.task_store_path {
+        Some(path) => {
+            eprintln!("mse serve: SqliteTaskStore at {}", path.display());
+            let (s, driver) = SqliteTaskStore::open(path)
+                .await
+                .unwrap_or_else(|e| panic!("mse serve: SqliteTaskStore open failed: {e}"));
+            isle_drivers.push(driver);
+            Arc::new(s)
+        }
+        None => Arc::new(InMemoryTaskStore::new()),
+    };
+    let run_store: Arc<dyn RunStore> = match &cfg.run_store_path {
+        Some(path) => {
+            eprintln!("mse serve: SqliteRunStore at {}", path.display());
+            let (s, driver) = SqliteRunStore::open(path)
+                .await
+                .unwrap_or_else(|e| panic!("mse serve: SqliteRunStore open failed: {e}"));
+            isle_drivers.push(driver);
+            Arc::new(s)
+        }
+        None => Arc::new(InMemoryRunStore::new()),
+    };
 
     // Issue #8: source the public base URL from the same bind the
     // listener will use, so `WSOperatorSession` can render it into
@@ -306,6 +342,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(op_factory.clone()),
         output_store,
         Some(base_url),
+        Some(task_store),
+        Some(run_store),
     );
 
     let compiler = Compiler::new(make_registry());

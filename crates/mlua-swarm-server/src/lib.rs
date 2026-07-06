@@ -6,7 +6,14 @@
 //! - `GET /v1/healthz`
 //! - `POST /v1/sessions` / `DELETE /v1/sessions` (= operator attach / detach, Bearer sid)
 //! - `POST /v1/tasks` (= unified Flow-form entry, Operator inject supported;
-//!   `operator_sid` explicitly pins the task to a registered Operator session, S2)
+//!   `operator_sid` explicitly pins the task to a registered Operator session, S2).
+//!   Also creates a `TaskRecord` + `RunRecord` (issue #13 ID-hierarchy persistence)
+//!   and echoes their ids in the response; see the `tasks` module doc.
+//! - `GET /v1/tasks` — list every persisted `TaskRecord` (newest first).
+//! - `GET /v1/tasks/:id` — a `TaskRecord` plus every `RunRecord` kicked from it.
+//! - `POST /v1/tasks/:id/runs` — re-kick an existing Task (new `RunId`, same
+//!   `blueprint_ref` / `input_ctx`).
+//! - `GET /v1/runs/:id` — a single `RunRecord` (its `step_entries` trace included).
 //! - `POST /v1/operators` / `GET /v1/operators/:sid` / `DELETE /v1/operators/:sid` /
 //!   `GET /v1/operators/:sid/ws` (WS upgrade) — REST-like Operator login flow,
 //!   Bearer-mandatory; the sole WS Operator session route. See `operator_ws::login`
@@ -51,6 +58,12 @@ pub mod enhance_settings;
 pub mod issues;
 /// WebSocket Operator Callback IF (`/v1/operators*`).
 pub mod operator_ws;
+/// HTTP surface for the Task/Run persistence axis (issue #13 ID hierarchy;
+/// `GET /v1/tasks`, `GET /v1/tasks/:id`, `POST /v1/tasks/:id/runs`,
+/// `GET /v1/runs/:id`). `POST /v1/tasks` itself stays in this module (it is
+/// the entry point `tasks_start` shares with the flow-eval path) — see the
+/// `tasks` module doc for the split rationale.
+pub mod tasks;
 /// `/v1/worker/*` endpoints (SubAgent self-fetch path).
 pub mod worker;
 pub use blueprints::{build_blueprints_router, build_blueprints_router_with_refs};
@@ -61,6 +74,7 @@ pub use operator_ws::{
     operators_create, operators_delete, operators_info, operators_ws_connect, ClientMsg,
     OperatorSessionEntry, ServerMsg, WSOperatorSession,
 };
+pub use tasks::{RunKickResponse, TaskDetailResponse};
 pub use worker::{worker_prompt, worker_result, PromptQuery, WorkerResultReq};
 
 use axum::{
@@ -73,10 +87,12 @@ use axum::{
 use mlua_swarm::application::{BlueprintRef, TaskApplication};
 use mlua_swarm::blueprint::store::BlueprintStore;
 use mlua_swarm::service::TaskLaunchService;
+use mlua_swarm::store::run::{RunRecord, RunStatus, RunStore};
+use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
 use mlua_swarm::{
     CapToken, Compiler, Engine, LayerRegistry, LuaInProcessSpawnerFactory, MainAIMiddleware,
-    OperatorDelegateMiddleware, OperatorSpawnerFactory, Role, RustFnInProcessSpawnerFactory,
-    SeniorEscalationMiddleware, SpawnerRegistry, SubprocessProcessSpawnerFactory,
+    OperatorDelegateMiddleware, OperatorSpawnerFactory, Role, RunId, RustFnInProcessSpawnerFactory,
+    SeniorEscalationMiddleware, SpawnerRegistry, SubprocessProcessSpawnerFactory, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -126,6 +142,15 @@ pub struct AppState {
     /// causes `POST /v1/operators` to return `409 CONFLICT`. Entries are
     /// released on `DELETE /v1/operators/:sid`.
     pub roles_to_sid: Arc<Mutex<HashMap<String, String>>>,
+    /// Persistence for `Task` records (issue #13 ID-hierarchy work-item
+    /// identity; see `mlua_swarm::store::task` module doc). Default =
+    /// `InMemoryTaskStore` (constructed inside `build_router_full`); callers
+    /// can swap in a `SqliteTaskStore` via the `task_store` argument.
+    pub task_store: Arc<dyn TaskStore>,
+    /// Persistence for `Run` records (one kick of a Task; see
+    /// `mlua_swarm::store::run` module doc). Default = `InMemoryRunStore`;
+    /// callers can swap in a `SqliteRunStore` via the `run_store` argument.
+    pub run_store: Arc<dyn RunStore>,
     /// Public HTTP base URL the server is reachable at (e.g.
     /// `"http://127.0.0.1:7777"`), sourced from the binary at boot time.
     /// When `Some`, `WSOperatorSession` renders it literally into the
@@ -208,15 +233,27 @@ pub fn build_router_with_ws_factory_and_output(
         ws_operator_factory,
         output_store,
         None,
+        None,
+        None,
     )
 }
 
-/// 6-argument variant of [`build_router_with_ws_factory_and_output`].
+/// 8-argument variant of [`build_router_with_ws_factory_and_output`].
 /// Passing `base_url = Some(...)` (e.g. `"http://127.0.0.1:7777"`) makes
 /// `WSOperatorSession` render the actual server bind into the Spawn
 /// directive's `base_url` line, so the receiving operator can copy the
 /// frame straight into a SubAgent prompt (issue #8). `None` preserves
 /// the historical fallback (`<check with mse_doctor>` placeholder).
+/// `task_store` / `run_store` swap the default `InMemoryTaskStore` /
+/// `InMemoryRunStore` (issue #13 ID-hierarchy persistence) for a
+/// caller-supplied backend (`SqliteTaskStore` / `SqliteRunStore`, for
+/// instance); `None` preserves the process-volatile default.
+// This is the terminal builder in the `build_router*` delegation chain
+// (each variant adds one more caller-overridable store/factory); the
+// argument count grows with the number of pluggable backends, not with
+// unrelated responsibilities, so a plain allow is preferable to bundling
+// them into a config struct only this one function would consume.
+#[allow(clippy::too_many_arguments)]
 pub fn build_router_full(
     engine: Engine,
     registry: SpawnerRegistry,
@@ -224,6 +261,8 @@ pub fn build_router_full(
     ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
     output_store: Option<Arc<dyn mlua_swarm::store::output::OutputStore>>,
     base_url: Option<Arc<str>>,
+    task_store: Option<Arc<dyn TaskStore>>,
+    run_store: Option<Arc<dyn RunStore>>,
 ) -> Router {
     let compiler = Compiler::new(registry);
     let launch = Arc::new(TaskLaunchService::new(engine.clone(), compiler));
@@ -235,6 +274,14 @@ pub fn build_router_full(
         Some(s) => s,
         None => Arc::new(mlua_swarm::store::output::InMemoryOutputStore::new()),
     };
+    let task_store: Arc<dyn TaskStore> = match task_store {
+        Some(s) => s,
+        None => Arc::new(mlua_swarm::store::task::InMemoryTaskStore::new()),
+    };
+    let run_store: Arc<dyn RunStore> = match run_store {
+        Some(s) => s,
+        None => Arc::new(mlua_swarm::store::run::InMemoryRunStore::new()),
+    };
     let state = AppState {
         engine,
         sessions: Arc::new(Mutex::new(SessionStore::default())),
@@ -243,6 +290,8 @@ pub fn build_router_full(
         data_store,
         operator_sessions: Arc::new(Mutex::new(HashMap::new())),
         roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
+        task_store,
+        run_store,
         base_url,
     };
     Router::new()
@@ -253,7 +302,10 @@ pub fn build_router_full(
             post(sessions_attach).delete(sessions_detach),
         )
         // task = flat, single level; authz resolved via Authorization: Bearer <sid>
-        .route("/v1/tasks", post(tasks_start))
+        .route("/v1/tasks", post(tasks_start).get(tasks::tasks_list))
+        .route("/v1/tasks/:id", get(tasks::task_get))
+        .route("/v1/tasks/:id/runs", post(tasks::task_rekick))
+        .route("/v1/runs/:id", get(tasks::run_get))
         // REST-like Operator login flow (Bearer-mandatory, roles exclusivity).
         // Sole WS Operator session route; see `operator_ws::login` module doc.
         .route("/v1/operators", post(operators_create))
@@ -429,6 +481,11 @@ struct FlowTasksReq {
     /// resolution already does still applies.
     #[serde(default)]
     operator_sid: Option<String>,
+    /// Human-facing description of the work item (e.g. "resolve issue #10"),
+    /// stashed verbatim into the minted `TaskRecord.goal`. Omitted / `None`
+    /// stores an empty string — the flow-eval path itself never reads it.
+    #[serde(default)]
+    goal: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -489,6 +546,13 @@ struct FlowTasksResp {
     /// clients can verify which value took effect without re-deriving it.
     effective_ttl_secs: u64,
     ttl_source: TtlSource,
+    /// The `TaskRecord` minted for this request (issue #13 ID-hierarchy
+    /// persistence). `GET /v1/tasks/:id` re-fetches it; `POST
+    /// /v1/tasks/:id/runs` re-kicks it under a fresh `RunId`.
+    task_id: TaskId,
+    /// The `RunRecord` minted for this specific kick. `GET /v1/runs/:id`
+    /// re-fetches it (`step_entries` included).
+    run_id: RunId,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -528,6 +592,13 @@ async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksR
     use mlua_swarm::application::{BlueprintRef as AppBlueprintRef, TaskApplicationInput};
     use mlua_swarm::Application;
     use mlua_swarm::OperatorKind;
+
+    // Snapshot everything the TaskRecord needs before `req.blueprint` /
+    // `req.init_ctx` are moved into the dispatch path below.
+    let blueprint_ref_json = serde_json::to_value(&req.blueprint)
+        .map_err(|e| ApiError::bad_request(format!("blueprint snapshot: {e}")))?;
+    let input_ctx_snapshot = req.init_ctx.clone();
+    let goal = req.goal.clone().unwrap_or_default();
 
     let mut op_req = req.operator.unwrap_or_default();
 
@@ -586,7 +657,42 @@ async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksR
         }
     };
 
-    let out = state
+    // issue #13 ID-hierarchy persistence: mint the work-item identity (Task)
+    // and this kick's identity (Run) *before* dispatching, so a Task/Run
+    // pair always exists even if the flow itself fails mid-way (the
+    // Failed-status paths below still have a row to update).
+    let task_id = TaskId::new();
+    let run_id = RunId::new();
+    let now = tasks::now_secs();
+    state
+        .task_store
+        .create(TaskRecord {
+            id: task_id.clone(),
+            goal,
+            blueprint_ref: blueprint_ref_json,
+            input_ctx: input_ctx_snapshot,
+            status: TaskRecordStatus::Running,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .map_err(ApiError::engine)?;
+    state
+        .run_store
+        .create(RunRecord {
+            id: run_id.clone(),
+            task_id: task_id.clone(),
+            status: RunStatus::Running,
+            step_entries: Vec::new(),
+            operator_sid: req.operator_sid.clone(),
+            result_ref: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .map_err(ApiError::engine)?;
+
+    let outcome = state
         .task_app
         .handle(TaskApplicationInput {
             blueprint,
@@ -600,6 +706,9 @@ async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksR
             operator_backend_id: op_req.operator_backend_id,
             operator_kind_overrides,
         })
+        .await;
+
+    let out = tasks::finalize_run(state, &task_id, &run_id, outcome)
         .await
         .map_err(|e| ApiError::bad_request(format!("run: {e}")))?;
 
@@ -608,6 +717,8 @@ async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksR
         bound_version: out.bound_version.map(|v| format!("{:?}", v)),
         effective_ttl_secs: ttl_secs,
         ttl_source,
+        task_id,
+        run_id,
     })
 }
 
