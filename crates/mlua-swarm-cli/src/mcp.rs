@@ -20,7 +20,11 @@ use anyhow::Result;
 use mlua_swarm::application::{BlueprintRef, TaskApplication, TaskApplicationInput};
 use mlua_swarm::blueprint::store::{BlueprintId, BlueprintStore, InMemoryBlueprintStore};
 use mlua_swarm::blueprint::Blueprint;
-use mlua_swarm::{Application, Compiler, Engine, EngineCfg, OperatorKind, Role, TaskLaunchService};
+use mlua_swarm::store::run::{
+    InMemoryRunStore, RunContext, RunRecord, RunStatus as StoreRunStatus, RunStore,
+};
+use mlua_swarm::types::{RunId, TaskId};
+use mlua_swarm::{Compiler, Engine, EngineCfg, OperatorKind, Role, TaskLaunchService};
 use operator_client::{ClientError, OperatorClientState};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -36,7 +40,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 /// In-process run handle.
 #[allow(dead_code)]
@@ -61,6 +64,9 @@ struct Inner {
     runs: HashMap<String, RunHandle>,
     task_app: Arc<TaskApplication>,
     store: Arc<dyn BlueprintStore>,
+    /// In-process run trace (issue #13): in-memory only — the stdio MCP
+    /// adapter has no persistence; `swarm_status` reads step_entries here.
+    run_store: Arc<dyn RunStore>,
 }
 
 #[derive(Clone)]
@@ -84,15 +90,25 @@ impl MseServer {
         let compiler = Compiler::new(registry);
         let launch = Arc::new(TaskLaunchService::new(engine, compiler));
         let task_app = Arc::new(TaskApplication::new(launch, store.clone()));
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
         Self {
             state: Arc::new(RwLock::new(Inner {
                 runs: HashMap::new(),
                 task_app,
                 store,
+                run_store,
             })),
             op_client: Arc::new(OperatorClientState::new()),
         }
     }
+}
+
+/// Unix epoch seconds (same convention as the store records' timestamps).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Maps `operator_client::ClientError` to an `McpError` for tool responses.
@@ -441,7 +457,11 @@ impl MseServer {
         &self,
         Parameters(req): Parameters<SwarmRunReq>,
     ) -> Result<CallToolResult, McpError> {
-        let run_id = Uuid::new_v4().to_string();
+        // R-<hex> RunId (issue #13): the in-process path traces into the
+        // local run store under this id; the HTTP proxy path re-keys to the
+        // server-minted run_id once the response arrives.
+        let run_id_typed = RunId::new();
+        let run_id = run_id_typed.0.clone();
         let ttl = Duration::from_secs(req.timeout_secs.unwrap_or(300));
 
         // Normalize BlueprintInput → BlueprintSelector.
@@ -467,7 +487,7 @@ impl MseServer {
                 .await;
         }
 
-        let task_app = {
+        let (task_app, run_store) = {
             let mut inner = self.state.write().await;
             inner.runs.insert(
                 run_id.clone(),
@@ -476,7 +496,7 @@ impl MseServer {
                     status: RunStatus::Running,
                 },
             );
-            inner.task_app.clone()
+            (inner.task_app.clone(), inner.run_store.clone())
         };
 
         // Resolve Inline / File → Blueprint JSON.
@@ -552,7 +572,33 @@ impl MseServer {
             operator_kind_overrides,
         };
 
-        let exec = task_app.handle(input);
+        // Trace this kick in the local run store (in-memory; issue #13).
+        // The stdio adapter has no TaskStore, so the work-item id is minted
+        // ad hoc — it groups re-runs only within this process's lifetime.
+        let task_id_typed = TaskId::new();
+        let now = now_secs();
+        let run_ctx = match run_store
+            .create(RunRecord {
+                id: run_id_typed.clone(),
+                task_id: task_id_typed.clone(),
+                status: StoreRunStatus::Running,
+                step_entries: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+        {
+            Ok(()) => Some(RunContext {
+                run_id: run_id_typed.clone(),
+                run_store: run_store.clone(),
+            }),
+            // A trace-store failure must not block the run itself.
+            Err(_) => None,
+        };
+
+        let exec = task_app.handle_with_run(input, run_ctx);
         let result = tokio::time::timeout(ttl, exec).await;
 
         // Post-action store snapshot. Inline mode does not write to the
@@ -582,6 +628,7 @@ impl MseServer {
                 RunStatus::Done,
                 serde_json::json!({
                     "run_id": run_id,
+                    "task_id": task_id_typed.0,
                     "status": "done",
                     "final_ctx": out.final_ctx,
                     "bound_version": out.bound_version.map(|v| format!("{:?}", v)),
@@ -594,6 +641,7 @@ impl MseServer {
                 RunStatus::Failed,
                 serde_json::json!({
                     "run_id": run_id,
+                    "task_id": task_id_typed.0,
                     "status": "failed",
                     "error": e.to_string(),
                     "head": head_id,
@@ -605,6 +653,7 @@ impl MseServer {
                 RunStatus::Failed,
                 serde_json::json!({
                     "run_id": run_id,
+                    "task_id": task_id_typed.0,
                     "status": "failed",
                     "error": format!("timeout after {}s", ttl.as_secs()),
                     "head": head_id,
@@ -613,6 +662,19 @@ impl MseServer {
                 }),
             ),
         };
+
+        // Finalize the local run trace (best effort; the wire response is
+        // authoritative for the caller).
+        let store_status = match status {
+            RunStatus::Done => StoreRunStatus::Done,
+            _ => StoreRunStatus::Failed,
+        };
+        let _ = run_store.update_status(&run_id_typed, store_status).await;
+        if matches!(status, RunStatus::Done) {
+            if let Some(fc) = body.get("final_ctx") {
+                let _ = run_store.set_result(&run_id_typed, fc.clone()).await;
+            }
+        }
 
         {
             let mut inner = self.state.write().await;
@@ -718,13 +780,22 @@ impl MseServer {
         };
         let http_status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        // On success the server response is the id authority (issue #13):
+        // adopt its run_id / task_id instead of the locally minted
+        // placeholder, so the caller-visible run_id matches what
+        // GET /v1/runs/:id on the server will resolve.
+        let mut effective_run_id = run_id.clone();
         let (final_status, body) = if http_status.is_success() {
             let parsed: JsonValue =
                 serde_json::from_str(&text).unwrap_or_else(|_| JsonValue::String(text.clone()));
+            if let Some(sid) = parsed.get("run_id").and_then(|v| v.as_str()) {
+                effective_run_id = sid.to_string();
+            }
             (
                 RunStatus::Done,
                 serde_json::json!({
-                    "run_id": run_id,
+                    "run_id": effective_run_id.clone(),
+                    "task_id": parsed.get("task_id").cloned().unwrap_or(JsonValue::Null),
                     "status": "done",
                     "final_ctx": parsed.get("final_ctx").cloned().unwrap_or(JsonValue::Null),
                     "bound_version": parsed.get("bound_version").cloned().unwrap_or(JsonValue::Null),
@@ -747,24 +818,53 @@ impl MseServer {
         };
         {
             let mut inner = self.state.write().await;
-            if let Some(h) = inner.runs.get_mut(&run_id) {
+            if effective_run_id != run_id {
+                // Re-key the handle to the server-minted run_id.
+                inner.runs.remove(&run_id);
+                inner.runs.insert(
+                    effective_run_id.clone(),
+                    RunHandle {
+                        run_id: effective_run_id.clone(),
+                        status: final_status,
+                    },
+                );
+            } else if let Some(h) = inner.runs.get_mut(&run_id) {
                 h.status = final_status;
             }
         }
         json_result(&body)
     }
 
-    #[tool(description = "Peek at a known run by run_id. Returns status snapshot.")]
+    #[tool(
+        description = "Peek at a known run by run_id. Returns status snapshot; for in-process runs the per-step trace (step_entries) is included."
+    )]
     async fn swarm_status(
         &self,
         Parameters(req): Parameters<SwarmStatusReq>,
     ) -> Result<CallToolResult, McpError> {
-        let inner = self.state.read().await;
-        match inner.runs.get(&req.run_id) {
-            Some(h) => json_result(&serde_json::json!({
-                "run_id": h.run_id,
-                "status": h.status,
-            })),
+        let (handle, run_store) = {
+            let inner = self.state.read().await;
+            (
+                inner.runs.get(&req.run_id).cloned(),
+                inner.run_store.clone(),
+            )
+        };
+        match handle {
+            Some(h) => {
+                let mut body = serde_json::json!({
+                    "run_id": h.run_id,
+                    "status": h.status,
+                });
+                // In-process runs carry a local step trace (issue #13);
+                // HTTP-proxied runs live on the server — drill down there
+                // via GET /v1/runs/:id instead.
+                if let Ok(rec) = run_store.get(&RunId(req.run_id.clone())).await {
+                    body["task_id"] = serde_json::json!(rec.task_id.0);
+                    body["step_entries"] =
+                        serde_json::to_value(&rec.step_entries).unwrap_or(JsonValue::Null);
+                }
+                json_result(&body)
+            }
             None => Err(McpError::invalid_params(
                 format!("run_id not found: {}", req.run_id),
                 None,
@@ -1165,6 +1265,43 @@ mod tests {
         assert!(parsed.get("history_len").is_some(), "payload: {text}");
         assert!(parsed.get("log_tail").is_some(), "payload: {text}");
         assert_eq!(parsed["history_len"], 0, "Inline mode -> 0");
+    }
+
+    /// Issue #13: an in-process run mints R-/T- prefixed ids and traces its
+    /// steps into the local run store, visible via `swarm_status`.
+    #[tokio::test]
+    async fn swarm_run_traces_steps_and_status_exposes_them() {
+        let server = MseServer::new();
+        let bp_json = serde_json::to_value(identity_blueprint()).expect("serialize blueprint");
+        let req = SwarmRunReq {
+            blueprint: BlueprintInput::BareInline(bp_json),
+            init_ctx: Some(serde_json::json!({"in": "hello"})),
+            timeout_secs: Some(10),
+            operator_id: None,
+            operator_kind: None,
+            operator_kind_overrides: None,
+        };
+        let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&extract_text_payload(&result)).expect("parse json");
+        let run_id = parsed["run_id"].as_str().expect("run_id");
+        let task_id = parsed["task_id"].as_str().expect("task_id");
+        assert!(run_id.starts_with("R-"), "run_id: {run_id}");
+        assert!(task_id.starts_with("T-"), "task_id: {task_id}");
+
+        let status = server
+            .swarm_status(Parameters(SwarmStatusReq {
+                run_id: run_id.to_string(),
+            }))
+            .await
+            .expect("swarm_status");
+        let sparsed: serde_json::Value =
+            serde_json::from_str(&extract_text_payload(&status)).expect("parse status json");
+        assert_eq!(sparsed["task_id"], task_id);
+        let entries = sparsed["step_entries"].as_array().expect("step_entries");
+        assert!(!entries.is_empty(), "expected at least one step entry");
+        let step_id = entries[0]["step_id"].as_str().expect("step_id");
+        assert!(step_id.starts_with("ST-"), "step_id: {step_id}");
     }
 
     // ─── BlueprintSelector: shape / File hygiene / bare-object compat ───────
