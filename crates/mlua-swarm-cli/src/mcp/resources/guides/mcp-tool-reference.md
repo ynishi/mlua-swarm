@@ -21,7 +21,8 @@ worker ctx (`ctx.meta.runtime.run_id`), pending-wait payload, and spawn
 directive, so wire frames and outputs correlate back to one Run. Server
 drill-down: `GET /v1/tasks` → `GET /v1/tasks/:id` (runs included) →
 `GET /v1/runs/:id` (step trace); `POST /v1/tasks/:id/runs` re-kicks an
-existing Task.
+existing Task. Full inventory (sid / worker_handle / req_id /
+capability_token included): `mse://guides/id-lifecycle`.
 
 ## Blueprint run / schema
 

@@ -25,6 +25,7 @@
 //! | `mse://guides/getting-started`              | Entry points, quickstart, MCP client wiring.       |
 //! | `mse://guides/blueprint-authoring`           | Flow node kinds, expr ops, agents, versioning.     |
 //! | `mse://guides/mcp-tool-reference`            | All `mse mcp` tools grouped by family.             |
+//! | `mse://guides/id-lifecycle`                  | Canonical ID inventory + lifecycle (issue #11).     |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
@@ -57,6 +58,7 @@ pub struct ResourceEntry {
 const GETTING_STARTED_BODY: &str = include_str!("./resources/guides/getting-started.md");
 const BLUEPRINT_AUTHORING_BODY: &str = include_str!("./resources/guides/blueprint-authoring.md");
 const MCP_TOOL_REFERENCE_BODY: &str = include_str!("./resources/guides/mcp-tool-reference.md");
+const ID_LIFECYCLE_BODY: &str = include_str!("./resources/guides/id-lifecycle.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -85,6 +87,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "All mse mcp tools grouped by family, with side-effect notes.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(MCP_TOOL_REFERENCE_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/id-lifecycle",
+        title: "mse — ID lifecycle",
+        description: "Canonical inventory of every run-pipeline identifier (Blueprint/Task/Run/Step/Attempt, sid, worker_handle, req_id, capability_token) with mint sites and lifecycle scopes.",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(ID_LIFECYCLE_BODY),
     },
     ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",
