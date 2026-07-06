@@ -118,6 +118,9 @@ impl SeniorBridge for WSOperatorSession {
             PendingReply::SpawnAck { .. } => {
                 Err("ws operator: unexpected spawn_ack reply to ask".into())
             }
+            PendingReply::SpawnHalt { .. } => {
+                Err("ws operator: unexpected spawn_halt reply to ask".into())
+            }
         }
     }
 }
@@ -143,6 +146,9 @@ impl SpawnHook for WSOperatorSession {
             }
             PendingReply::SpawnAck { .. } => {
                 Err("ws operator: unexpected spawn_ack reply to hook_before".into())
+            }
+            PendingReply::SpawnHalt { .. } => {
+                Err("ws operator: unexpected spawn_halt reply to hook_before".into())
             }
         }
     }
@@ -243,6 +249,23 @@ impl Operator for WSOperatorSession {
             Ok(PendingReply::SpawnAck {
                 error: Some(msg), ..
             }) => Err(WorkerError::Failed(msg)),
+            // `spawn_halt` (issue #7): controlled halt. Return
+            // `Ok(WorkerResult { ok: true, value: halt_marker })` so the
+            // step lands as a normal termination rather than a
+            // `WorkerError::Failed` — log stays `info`, downstream retry
+            // logic doesn't fire. The halt marker carries the caller's
+            // partial value and reason string in a fixed shape.
+            Ok(PendingReply::SpawnHalt { value, reason }) => {
+                let marker = serde_json::json!({
+                    "halted": true,
+                    "reason": reason,
+                    "value": value,
+                });
+                Ok(WorkerResult {
+                    value: marker,
+                    ok: true,
+                })
+            }
             Ok(_) => Err(WorkerError::Failed(
                 "ws operator: unexpected non-spawn reply".into(),
             )),
@@ -496,5 +519,129 @@ mod tests {
             d.contains("FAIL LOUD"),
             "directive must instruct the MainAI to fail loud instead of falling back: {d}"
         );
+    }
+
+    // ─── Issue #7: spawn_halt handling in Operator::execute ──────────────
+
+    fn test_ctx(task_id: &str) -> mlua_swarm::Ctx {
+        mlua_swarm::Ctx::new(mlua_swarm::TaskId(task_id.into()), 1, "a")
+    }
+
+    fn test_worker_binding() -> mlua_swarm::WorkerBinding {
+        mlua_swarm::WorkerBinding {
+            variant: "test-variant".into(),
+            tools: vec![],
+        }
+    }
+
+    fn test_cap_token() -> mlua_swarm::CapToken {
+        mlua_swarm::CapToken {
+            agent_id: "a".into(),
+            role: mlua_swarm::Role::Worker,
+            scopes: vec!["*".into()],
+            issued_at: 0,
+            expire_at: u64::MAX / 2,
+            max_uses: None,
+            nonce: "test-nonce".into(),
+            sig_hex: "".into(),
+        }
+    }
+
+    /// A `PendingReply::SpawnHalt` reply must translate into a
+    /// `Ok(WorkerResult { ok: true, value: <halt marker> })` — a normal
+    /// termination, not a `WorkerError::Failed` (fail-loud). This is
+    /// the whole point of the new verb: distinguishing a controlled
+    /// halt from a real worker error at the log / retry-signal level.
+    #[tokio::test]
+    async fn spawn_halt_reply_lands_as_ok_worker_result_with_marker() {
+        use mlua_swarm::Operator;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new("sid-halt".into(), tx));
+
+        // Kick execute() in a background task so we can grab the
+        // req_id the server assigns and inject a matching SpawnHalt.
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &test_ctx("task-halt"),
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        let sent = rx.recv().await.expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn { req_id, .. } => req_id,
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnHalt {
+                    value: serde_json::json!({"partial": "abc"}),
+                    reason: Some("shape verified".into()),
+                },
+            )
+            .await;
+
+        let result = handle.await.expect("join").expect("execute Ok");
+        assert!(
+            result.ok,
+            "spawn_halt must land as ok=true (normal termination), got: {result:?}"
+        );
+        assert_eq!(result.value["halted"], true);
+        assert_eq!(result.value["reason"], "shape verified");
+        assert_eq!(result.value["value"], serde_json::json!({"partial": "abc"}));
+    }
+
+    /// `spawn_ack { ok: false, error: Some(_) }` must retain its
+    /// current fail-loud behaviour (backward compat guard).
+    #[tokio::test]
+    async fn spawn_ack_with_error_still_lands_as_worker_error() {
+        use mlua_swarm::{Operator, WorkerError};
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new("sid-err".into(), tx));
+
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &test_ctx("task-err"),
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        let sent = rx.recv().await.expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn { req_id, .. } => req_id,
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnAck {
+                    value: serde_json::json!({}),
+                    ok: false,
+                    error: Some("real crash".into()),
+                },
+            )
+            .await;
+
+        let err = handle.await.expect("join").expect_err("must be error");
+        assert!(matches!(err, WorkerError::Failed(msg) if msg.contains("real crash")));
     }
 }

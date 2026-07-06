@@ -126,6 +126,17 @@ enum ClientMsgMirror {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Controlled halt for the current spawn (issue #7). See
+    /// server-side `ClientMsg::SpawnHalt` for semantics: server marks
+    /// the step as a normal termination (log `info`, not
+    /// `WorkerError`), merging `value` + `reason` into the ctx halt
+    /// marker.
+    SpawnHalt {
+        req_id: String,
+        value: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// One popped server frame — the shape `mse_pending_wait` hands back to the caller.
@@ -182,6 +193,14 @@ fn build_client_msg(
             value: value.unwrap_or_else(|| serde_json::json!({})),
             ok,
             error,
+        }),
+        "spawn_halt" => Ok(ClientMsgMirror::SpawnHalt {
+            req_id,
+            value: value.unwrap_or_else(|| serde_json::json!({})),
+            // `error` field is reused as the halt `reason` string on
+            // the outgoing wire message — it's the same channel from
+            // the caller's perspective (human-readable log line).
+            reason: error,
         }),
         other => Err(ClientError::InvalidAckKind(other.to_string())),
     }
@@ -254,7 +273,7 @@ impl std::fmt::Display for ClientError {
             ClientError::InvalidAckKind(k) => {
                 write!(
                     f,
-                    "invalid ack kind '{k}' (expected answer|hook_ack|spawn_ack)"
+                    "invalid ack kind '{k}' (expected answer|hook_ack|spawn_ack|spawn_halt)"
                 )
             }
         }
@@ -599,6 +618,47 @@ mod tests {
     fn build_client_msg_rejects_unknown_kind() {
         let err = build_client_msg("bogus", "r5".into(), None, true, None).unwrap_err();
         assert!(matches!(err, ClientError::InvalidAckKind(k) if k == "bogus"));
+    }
+
+    /// Issue #7: `spawn_halt` serializes as its own wire type and carries
+    /// the caller-supplied partial value + reason (from the `error`
+    /// field, reused).
+    #[test]
+    fn build_client_msg_spawn_halt_carries_value_and_reason() {
+        let msg = build_client_msg(
+            "spawn_halt",
+            "r6".into(),
+            Some(serde_json::json!({"partial": 1})),
+            true,
+            Some("dogfood shape verified".into()),
+        )
+        .expect("valid kind");
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "spawn_halt");
+        assert_eq!(v["req_id"], "r6");
+        assert_eq!(v["value"], serde_json::json!({"partial": 1}));
+        assert_eq!(v["reason"], "dogfood shape verified");
+        // `ok` is not part of the spawn_halt wire shape (halt is always
+        // a normal termination — no ok/failure axis).
+        assert!(v.get("ok").is_none());
+    }
+
+    #[test]
+    fn build_client_msg_spawn_halt_defaults_value_to_empty_object() {
+        let msg = build_client_msg("spawn_halt", "r7".into(), None, true, None).expect("valid kind");
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "spawn_halt");
+        assert_eq!(v["value"], serde_json::json!({}));
+        assert!(v.get("reason").is_none());
+    }
+
+    #[test]
+    fn error_message_lists_all_four_ack_kinds() {
+        let err = ClientError::InvalidAckKind("x".into());
+        let msg = format!("{err}");
+        for kind in ["answer", "hook_ack", "spawn_ack", "spawn_halt"] {
+            assert!(msg.contains(kind), "kind `{kind}` missing from: {msg}");
+        }
     }
 
     // ─── PendingQueue ────────────────────────────────────────────────────

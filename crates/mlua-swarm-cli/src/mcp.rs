@@ -197,16 +197,24 @@ struct OperatorAckReq {
     req_id: String,
     /// One of `"answer"` (SeniorBridge.ask reply — pass `value`),
     /// `"hook_ack"` (SpawnHook.before OK/NG — pass `ok` + optional `error` as
-    /// the rejection reason), or `"spawn_ack"` (Operator.execute result —
-    /// pass `value` + `ok` + optional `error`).
+    /// the rejection reason), `"spawn_ack"` (Operator.execute result —
+    /// pass `value` + `ok` + optional `error`), or `"spawn_halt"` (issue #7:
+    /// controlled halt for the current spawn — pass `value` (optional
+    /// partial ctx) + `error` (reused as the human-readable halt
+    /// reason). The step lands as `WorkerResult { ok: true, value:
+    /// {"halted": true, "reason": <reason>, "value": <partial>} }` —
+    /// distinct from `spawn_ack ok=false`, which is the fail-loud path
+    /// for real worker errors).
     kind: String,
     #[serde(default)]
     value: Option<JsonValue>,
     /// `true` = pass (default). For `hook_ack`, `false` rejects the spawn.
+    /// Ignored for `spawn_halt` (halt is always a normal termination).
     #[serde(default = "default_true_bool")]
     ok: bool,
     /// `hook_ack`: rejection reason when `ok=false`. `spawn_ack`: error
-    /// message when `ok=false`. Ignored for `answer`.
+    /// message when `ok=false`. `spawn_halt`: human-readable halt reason
+    /// (for logs). Ignored for `answer`.
     #[serde(default)]
     error: Option<String>,
 }
@@ -398,7 +406,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Ack a pending frame popped via mse_pending_wait. kind=\"answer\" (SeniorBridge.ask reply, pass `value`), kind=\"hook_ack\" (SpawnHook.before OK/NG, pass `ok` + optional `error` as the rejection reason), kind=\"spawn_ack\" (Operator.execute result, pass `value` + `ok` + optional `error`). Sends the corresponding ClientMsg over the sid's WS connection. Returns {sent: true}."
+        description = "Ack a pending frame popped via mse_pending_wait. kind=\"answer\" (SeniorBridge.ask reply, pass `value`), kind=\"hook_ack\" (SpawnHook.before OK/NG, pass `ok` + optional `error` as the rejection reason), kind=\"spawn_ack\" (Operator.execute result, pass `value` + `ok` + optional `error`), kind=\"spawn_halt\" (issue #7: controlled halt for the current spawn — pass optional `value` (partial ctx) + optional `error` (halt reason); the step lands as WorkerResult{ok:true, value:{halted:true, reason, value}} — a normal termination, not a worker error). Sends the corresponding ClientMsg over the sid's WS connection. Returns {sent: true}."
     )]
     async fn mse_ack(
         &self,

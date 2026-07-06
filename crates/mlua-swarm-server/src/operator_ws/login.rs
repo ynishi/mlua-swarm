@@ -300,6 +300,18 @@ async fn handle_operator_socket(
                                 )
                                 .await;
                         }
+                        ClientMsg::SpawnHalt {
+                            req_id,
+                            value,
+                            reason,
+                        } => {
+                            session_for_read
+                                .resolve_pending(
+                                    &req_id,
+                                    PendingReply::SpawnHalt { value, reason },
+                                )
+                                .await;
+                        }
                     }
                 }
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}

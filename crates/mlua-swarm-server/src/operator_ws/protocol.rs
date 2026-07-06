@@ -2,7 +2,24 @@
 //!
 //! `ServerMsg` = 4 messages the server pushes to the client (Ask / HookBefore /
 //! HookAfter / Spawn).
-//! `ClientMsg` = 3 messages the client replies with (Answer / HookAck / SpawnAck).
+//! `ClientMsg` = 4 messages the client replies with (Answer / HookAck / SpawnAck / SpawnHalt).
+//!
+//! ## Layer 2 audit (issue #7): halt vs error separation across verbs
+//!
+//! `spawn_halt` was added to disambiguate a controlled halt from a real
+//! worker error on the `spawn_ack` axis. The other client verbs were
+//! audited for the same shape:
+//!
+//! - **`answer`** (SeniorBridge.ask reply): carries `value` only — no
+//!   ok / failure axis exists. A "halt during a question" would already
+//!   be expressible by replying with a value that the middleware treats
+//!   as an abort signal (e.g. `null` or a domain-specific sentinel).
+//!   No sibling `answer_halt` is added.
+//! - **`hook_ack`** (SpawnHook.before OK/NG): `ok = false` here is a
+//!   genuine gate rejection — that is the entire purpose of the hook,
+//!   not a mix-signal. There is no confusion to fix; no `hook_halt` is
+//!   added.
+//! - **`spawn_ack`**: the subject of layer 1. `spawn_halt` handles it.
 //! For the parent module's message-flow figure, see the doc of `mod.rs`.
 //!
 //! `PendingReply` is the intermediate representation delivered over the internal
@@ -191,6 +208,39 @@ pub enum ClientMsg {
         #[serde(default)]
         error: Option<String>,
     },
+    /// Controlled halt for the current spawn (issue #7). Distinct from
+    /// `SpawnAck { ok: false, error: Some(_) }`, which is the fail-loud
+    /// path for real worker errors. `spawn_halt` signals the operator's
+    /// intent to end the current spawn as a normal termination:
+    ///
+    /// - The step return value is `WorkerResult { value: <halt marker>,
+    ///   ok: true }` — no `WorkerError` is raised, so log level stays
+    ///   `info` and downstream retry logic doesn't fire.
+    /// - The optional `value` payload is merged into the halt marker
+    ///   under `value`, so partial results reach `final_ctx` verbatim.
+    /// - `reason` is a human-readable log line.
+    ///
+    /// The halt marker written to ctx has the shape:
+    /// ```json
+    /// { "halted": true, "reason": "<reason or null>", "value": <payload or {}> }
+    /// ```
+    /// Blueprint flows that need to short-circuit downstream steps on
+    /// halt can `branch` on `$.<step_out>.halted`.
+    ///
+    /// **Scope note**: this halts one spawn, not the whole swarm. For
+    /// swarm-wide cancellation see `swarm_cancel`.
+    SpawnHalt {
+        /// Correlation key copied from the originating `ServerMsg::Spawn`.
+        req_id: String,
+        /// Optional partial ctx value to carry into `WorkerResult.value`.
+        /// Merged under the `value` key of the halt marker; defaults to `{}`.
+        #[serde(default)]
+        value: Value,
+        /// Optional human-readable halt reason (for logs). Included in
+        /// the halt marker under `reason`.
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 /// Intermediate representation for the session's `req_id` ↔ oneshot reply
@@ -206,5 +256,11 @@ pub(super) enum PendingReply {
         value: Value,
         ok: bool,
         error: Option<String>,
+    },
+    /// `spawn_halt` — controlled halt for the current spawn (issue #7).
+    /// See the `ClientMsg::SpawnHalt` doc for semantics.
+    SpawnHalt {
+        value: Value,
+        reason: Option<String>,
     },
 }
