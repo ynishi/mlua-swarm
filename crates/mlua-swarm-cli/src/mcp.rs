@@ -345,8 +345,7 @@ fn read_blueprint_from_file(path: &str) -> Result<JsonValue, String> {
             ));
         }
     }
-    let bytes = std::fs::read(&p)
-        .map_err(|e| format!("file: read {path:?} failed: {e}"))?;
+    let bytes = std::fs::read(&p).map_err(|e| format!("file: read {path:?} failed: {e}"))?;
     serde_json::from_slice::<JsonValue>(&bytes)
         .map_err(|e| format!("file: parse {path:?} as JSON failed: {e}"))
 }
@@ -683,7 +682,10 @@ impl MseServer {
             payload.insert("operator".into(), JsonValue::Object(operator_obj));
         }
 
-        let client = match reqwest::Client::builder().timeout(ttl + Duration::from_secs(5)).build() {
+        let client = match reqwest::Client::builder()
+            .timeout(ttl + Duration::from_secs(5))
+            .build()
+        {
             Ok(c) => c,
             Err(e) => {
                 let mut inner = self.state.write().await;
@@ -1267,7 +1269,11 @@ mod tests {
 
         // Resolve BlueprintInput (referenced from properties.blueprint).
         let input = defs.get("BlueprintInput").expect("BlueprintInput def");
-        let anyof = input.get("anyOf").expect("BlueprintInput anyOf").as_array().unwrap();
+        let anyof = input
+            .get("anyOf")
+            .expect("BlueprintInput anyOf")
+            .as_array()
+            .unwrap();
 
         // Every anyOf branch must resolve to an object-typed schema:
         //   - Selector branch: $ref → BlueprintSelector (oneOf of objects)

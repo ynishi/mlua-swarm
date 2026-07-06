@@ -310,10 +310,7 @@ async fn handle_operator_socket(
                             reason,
                         } => {
                             session_for_read
-                                .resolve_pending(
-                                    &req_id,
-                                    PendingReply::SpawnHalt { value, reason },
-                                )
+                                .resolve_pending(&req_id, PendingReply::SpawnHalt { value, reason })
                                 .await;
                         }
                     }

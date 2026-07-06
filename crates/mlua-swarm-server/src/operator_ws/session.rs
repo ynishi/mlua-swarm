@@ -439,7 +439,8 @@ mod tests {
 
     #[test]
     fn directive_omits_project_name_alias_when_none() {
-        let d = default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
+        let d =
+            default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
         assert!(!d.contains("project_name_alias:"));
         assert!(!d.contains("LDS Session Alias"));
         assert!(!d.contains("session_create"));
@@ -491,7 +492,8 @@ mod tests {
 
     #[test]
     fn directive_omits_data_endpoint_when_none() {
-        let d = default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
+        let d =
+            default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
         assert!(!d.contains("[Data path endpoint"));
         assert!(!d.contains("DATA_EMIT"));
         assert!(!d.contains("DATA_GET"));
@@ -536,7 +538,8 @@ mod tests {
 
     #[test]
     fn directive_carries_declared_subagent_type_and_has_no_fallback() {
-        let d = default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
+        let d =
+            default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
         assert!(
             d.contains("subagent_type=\"mse-worker-coder\""),
             "directive must carry the Blueprint-declared subagent_type literally: {d}"

@@ -219,25 +219,79 @@ mod tests {
 
         let cases: &[(&str, serde_json::Value)] = &[
             ("path", serde_json::json!({"op":"path","at":"$.x"})),
-            ("lit",  serde_json::json!({"op":"lit","value":42})),
-            ("eq",   serde_json::json!({"op":"eq","lhs":{"op":"lit","value":1},"rhs":{"op":"lit","value":1}})),
-            ("ne",   serde_json::json!({"op":"ne","lhs":{"op":"lit","value":1},"rhs":{"op":"lit","value":2}})),
-            ("lt",   serde_json::json!({"op":"lt","lhs":{"op":"lit","value":1},"rhs":{"op":"lit","value":2}})),
-            ("lte",  serde_json::json!({"op":"lte","lhs":{"op":"lit","value":1},"rhs":{"op":"lit","value":2}})),
-            ("gt",   serde_json::json!({"op":"gt","lhs":{"op":"lit","value":2},"rhs":{"op":"lit","value":1}})),
-            ("gte",  serde_json::json!({"op":"gte","lhs":{"op":"lit","value":2},"rhs":{"op":"lit","value":1}})),
-            ("not",  serde_json::json!({"op":"not","arg":{"op":"lit","value":true}})),
-            ("and",  serde_json::json!({"op":"and","args":[{"op":"lit","value":true}]})),
-            ("or",   serde_json::json!({"op":"or","args":[{"op":"lit","value":true}]})),
-            ("exists", serde_json::json!({"op":"exists","arg":{"op":"path","at":"$.x"}})),
-            ("add",  serde_json::json!({"op":"add","lhs":{"op":"lit","value":1},"rhs":{"op":"lit","value":2}})),
-            ("sub",  serde_json::json!({"op":"sub","lhs":{"op":"lit","value":3},"rhs":{"op":"lit","value":1}})),
-            ("mul",  serde_json::json!({"op":"mul","lhs":{"op":"lit","value":2},"rhs":{"op":"lit","value":3}})),
-            ("div",  serde_json::json!({"op":"div","lhs":{"op":"lit","value":6},"rhs":{"op":"lit","value":2}})),
-            ("mod",  serde_json::json!({"op":"mod","lhs":{"op":"lit","value":5},"rhs":{"op":"lit","value":2}})),
-            ("len",  serde_json::json!({"op":"len","arg":{"op":"lit","value":"hi"}})),
-            ("in",   serde_json::json!({"op":"in","needle":{"op":"lit","value":1},"haystack":{"op":"lit","value":[1,2,3]}})),
-            ("call_extern", serde_json::json!({"op":"call_extern","ref":"math.sqrt","args":[{"op":"lit","value":9}]})),
+            ("lit", serde_json::json!({"op":"lit","value":42})),
+            (
+                "eq",
+                serde_json::json!({"op":"eq","lhs":{"op":"lit","value":1},"rhs":{"op":"lit","value":1}}),
+            ),
+            (
+                "ne",
+                serde_json::json!({"op":"ne","lhs":{"op":"lit","value":1},"rhs":{"op":"lit","value":2}}),
+            ),
+            (
+                "lt",
+                serde_json::json!({"op":"lt","lhs":{"op":"lit","value":1},"rhs":{"op":"lit","value":2}}),
+            ),
+            (
+                "lte",
+                serde_json::json!({"op":"lte","lhs":{"op":"lit","value":1},"rhs":{"op":"lit","value":2}}),
+            ),
+            (
+                "gt",
+                serde_json::json!({"op":"gt","lhs":{"op":"lit","value":2},"rhs":{"op":"lit","value":1}}),
+            ),
+            (
+                "gte",
+                serde_json::json!({"op":"gte","lhs":{"op":"lit","value":2},"rhs":{"op":"lit","value":1}}),
+            ),
+            (
+                "not",
+                serde_json::json!({"op":"not","arg":{"op":"lit","value":true}}),
+            ),
+            (
+                "and",
+                serde_json::json!({"op":"and","args":[{"op":"lit","value":true}]}),
+            ),
+            (
+                "or",
+                serde_json::json!({"op":"or","args":[{"op":"lit","value":true}]}),
+            ),
+            (
+                "exists",
+                serde_json::json!({"op":"exists","arg":{"op":"path","at":"$.x"}}),
+            ),
+            (
+                "add",
+                serde_json::json!({"op":"add","lhs":{"op":"lit","value":1},"rhs":{"op":"lit","value":2}}),
+            ),
+            (
+                "sub",
+                serde_json::json!({"op":"sub","lhs":{"op":"lit","value":3},"rhs":{"op":"lit","value":1}}),
+            ),
+            (
+                "mul",
+                serde_json::json!({"op":"mul","lhs":{"op":"lit","value":2},"rhs":{"op":"lit","value":3}}),
+            ),
+            (
+                "div",
+                serde_json::json!({"op":"div","lhs":{"op":"lit","value":6},"rhs":{"op":"lit","value":2}}),
+            ),
+            (
+                "mod",
+                serde_json::json!({"op":"mod","lhs":{"op":"lit","value":5},"rhs":{"op":"lit","value":2}}),
+            ),
+            (
+                "len",
+                serde_json::json!({"op":"len","arg":{"op":"lit","value":"hi"}}),
+            ),
+            (
+                "in",
+                serde_json::json!({"op":"in","needle":{"op":"lit","value":1},"haystack":{"op":"lit","value":[1,2,3]}}),
+            ),
+            (
+                "call_extern",
+                serde_json::json!({"op":"call_extern","ref":"math.sqrt","args":[{"op":"lit","value":9}]}),
+            ),
         ];
         for (op, v) in cases {
             serde_json::from_value::<Expr>(v.clone()).unwrap_or_else(|e| {
@@ -253,10 +307,10 @@ mod tests {
     fn guide_flow_node_kinds_match_schema_field_names() {
         use mlua_flow_ir::Node;
 
-        let step  = serde_json::json!({
+        let step = serde_json::json!({
             "kind":"step","ref":"a","in":{"op":"path","at":"$.in"},"out":{"op":"path","at":"$.out"}
         });
-        let seq   = serde_json::json!({"kind":"seq","children":[]});
+        let seq = serde_json::json!({"kind":"seq","children":[]});
         let branch = serde_json::json!({
             "kind":"branch",
             "cond":{"op":"lit","value":true},
@@ -289,8 +343,12 @@ mod tests {
         });
 
         for (kind, v) in [
-            ("step", step), ("seq", seq), ("branch", branch),
-            ("loop", loop_n), ("fanout", fanout), ("try", try_n),
+            ("step", step),
+            ("seq", seq),
+            ("branch", branch),
+            ("loop", loop_n),
+            ("fanout", fanout),
+            ("try", try_n),
             ("assign", assign),
         ] {
             serde_json::from_value::<Node>(v).unwrap_or_else(|e| {

@@ -645,7 +645,8 @@ mod tests {
 
     #[test]
     fn build_client_msg_spawn_halt_defaults_value_to_empty_object() {
-        let msg = build_client_msg("spawn_halt", "r7".into(), None, true, None).expect("valid kind");
+        let msg =
+            build_client_msg("spawn_halt", "r7".into(), None, true, None).expect("valid kind");
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "spawn_halt");
         assert_eq!(v["value"], serde_json::json!({}));
