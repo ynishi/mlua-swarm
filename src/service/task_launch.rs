@@ -29,6 +29,7 @@ use crate::middleware::worker_binding::WorkerBindingMiddleware;
 use crate::middleware::SpawnerStack;
 use crate::operator::WorkerBinding;
 use crate::service::linker;
+use crate::store::run::RunContext;
 use crate::types::{CapToken, Role};
 use mlua_flow_ir::{Externs, NoExterns};
 use serde_json::Value;
@@ -158,6 +159,13 @@ pub struct TaskLaunchInput {
     /// starts from. Every `Step.in` `$.<path>` reference reads from
     /// here.
     pub init_ctx: Value,
+    /// Issue #13 run_id propagation: when `Some`, every step this launch
+    /// dispatches is traced into `RunRecord.step_entries` and exposes its
+    /// `run_id` via `Ctx.meta.runtime["run_id"]` (see
+    /// `EngineDispatcher::with_run`). `None` (the default via
+    /// [`Self::automate`]) preserves the pre-existing behavior — no run
+    /// tracing.
+    pub run_ctx: Option<RunContext>,
 }
 
 impl TaskLaunchInput {
@@ -167,7 +175,8 @@ impl TaskLaunchInput {
     /// (`OperatorKind::Automate`) decide — this preserves today's
     /// behaviour for every existing caller without silently forcing
     /// `Automate` as an explicit override that would outrank a BP-declared
-    /// `MainAi`/`Composite` kind.
+    /// `MainAi`/`Composite` kind. `run_ctx` defaults to `None` (no run
+    /// tracing); construct the struct literal directly to set it.
     pub fn automate(
         blueprint: Blueprint,
         operator_id: impl Into<String>,
@@ -186,6 +195,7 @@ impl TaskLaunchInput {
             operator_backend_id: None,
             operator_kind_overrides: HashMap::new(),
             init_ctx,
+            run_ctx: None,
         }
     }
 }
@@ -323,6 +333,10 @@ impl TaskLaunchService {
             .await?;
         let dispatcher =
             EngineDispatcher::with_spawner(self.engine.clone(), token.clone(), spawner);
+        let dispatcher = match input.run_ctx {
+            Some(run_ctx) => dispatcher.with_run(run_ctx),
+            None => dispatcher,
+        };
         let final_ctx = mlua_flow_ir::eval_async_externs(
             &input.blueprint.flow,
             input.init_ctx,
@@ -630,5 +644,103 @@ mod tests {
             }
             other => panic!("expected FlowEval error, got {other:?}"),
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // issue #13 run_id propagation (`TaskLaunchInput.run_ctx`)
+    // ──────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn launch_with_run_ctx_appends_one_step_entry_per_dispatched_step() {
+        use crate::store::run::{InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore};
+        use crate::types::{RunId, TaskId};
+
+        let factory = RustFnInProcessSpawnerFactory::new()
+            .register_fn("upper", |inv| async move {
+                Ok(WorkerResult {
+                    value: json!(inv.prompt.to_uppercase()),
+                    ok: true,
+                })
+            })
+            .register_fn("suffix", |inv| async move {
+                let s = serde_json::from_str::<String>(&inv.prompt).unwrap_or(inv.prompt);
+                Ok(WorkerResult {
+                    value: json!(format!("{s}!")),
+                    ok: true,
+                })
+            });
+        let svc = build_service(factory);
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("upper", path("$.in"), path("$.s1")),
+                step("suffix", path("$.s1"), path("$.s2")),
+            ],
+        };
+        let blueprint = bp(
+            flow,
+            vec![agent("upper", "upper"), agent("suffix", "suffix")],
+        );
+
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = RunId::new();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed RunRecord");
+
+        let mut input = launch_input(blueprint, json!({ "in": "hi" }));
+        input.run_ctx = Some(RunContext {
+            run_id: run_id.clone(),
+            run_store: run_store.clone(),
+        });
+
+        let out = svc.launch(input).await.expect("launch ok");
+        assert_eq!(out.final_ctx["s2"], "HI!");
+
+        let run = run_store.get(&run_id).await.expect("run present");
+        assert_eq!(
+            run.step_entries.len(),
+            2,
+            "expected one step_entry per dispatched step, got {:?}",
+            run.step_entries
+        );
+        assert_eq!(run.step_entries[0].step_ref, Some("upper".to_string()));
+        assert_eq!(run.step_entries[0].status, Some("passed".to_string()));
+        assert_eq!(run.step_entries[1].step_ref, Some("suffix".to_string()));
+        assert_eq!(run.step_entries[1].status, Some("passed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn launch_without_run_ctx_appends_no_step_entries() {
+        // `run_ctx: None` (the `automate()` default) must not touch any
+        // `RunStore` — this is the pre-existing no-tracing behavior, kept
+        // as a regression guard alongside the `Some` case above.
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!(inv.prompt),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        let input = launch_input(blueprint, json!({ "input": "hi" }));
+        assert!(
+            input.run_ctx.is_none(),
+            "automate() defaults run_ctx to None"
+        );
+        let out = svc.launch(input).await.expect("launch ok");
+        assert_eq!(out.final_ctx["out"], "hi");
     }
 }

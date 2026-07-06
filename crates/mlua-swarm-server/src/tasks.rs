@@ -5,7 +5,7 @@
 //! - `GET  /v1/tasks/:id`      — a `TaskRecord` plus every `RunRecord` kicked from it.
 //! - `POST /v1/tasks/:id/runs` — re-kick an existing Task: mints a fresh `RunId`,
 //!   replays the stored `blueprint_ref` / `input_ctx` through
-//!   `TaskApplication::handle`, and returns the new `{task_id, run_id}` pair.
+//!   `TaskApplication::handle_with_run`, and returns the new `{task_id, run_id}` pair.
 //! - `GET  /v1/runs/:id`       — a single `RunRecord` (`step_entries` trace included).
 //!
 //! `POST /v1/tasks` itself (the flow-eval entry point, `tasks_start` /
@@ -26,9 +26,9 @@ use axum::{
     Json,
 };
 use mlua_swarm::application::{TaskApplicationError, TaskApplicationInput, TaskApplicationOutput};
-use mlua_swarm::store::run::{RunRecord, RunStatus, RunStoreError};
+use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStoreError};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStoreError};
-use mlua_swarm::{Application, Role, RunId, TaskId};
+use mlua_swarm::{Role, RunId, TaskId};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -46,8 +46,9 @@ pub(crate) fn now_secs() -> u64 {
 
 /// Shared finalize step for a dispatched kick: updates the Run's
 /// `result_ref` + status and the owning Task's coarse status based on the
-/// `TaskApplication::handle` outcome, then returns that same outcome
-/// unchanged so callers keep shaping their own wire response / error.
+/// `TaskApplication::handle_with_run` outcome, then returns that same
+/// outcome unchanged so callers keep shaping their own wire response /
+/// error.
 ///
 /// Secondary persistence failures (the store call itself erroring) are
 /// logged via `tracing::warn!` and otherwise swallowed — they must not mask
@@ -160,10 +161,12 @@ pub struct RunKickResponse {
 
 /// `POST /v1/tasks/:id/runs`. Re-kicks an existing Task: reads its stored
 /// `blueprint_ref` / `input_ctx`, mints a fresh `RunId`, dispatches through
-/// `TaskApplication::handle` via `TaskApplicationInput::automate` (the
-/// unadorned Operator-default path — no per-request Operator override
+/// `TaskApplication::handle_with_run` via `TaskApplicationInput::automate`
+/// (the unadorned Operator-default path — no per-request Operator override
 /// support here, unlike `POST /v1/tasks`; the stored Task carries no such
-/// preferences), and persists the outcome via [`finalize_run`].
+/// preferences) plus a freshly-built `RunContext` (issue #13 run_id
+/// propagation, so this kick's steps get their own `step_entries` trace),
+/// and persists the outcome via [`finalize_run`].
 pub async fn task_rekick(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -211,7 +214,11 @@ pub async fn task_rekick(
         Duration::from_secs(crate::default_run_ttl()),
         task.input_ctx.clone(),
     );
-    let outcome = state.task_app.handle(input).await;
+    let run_ctx = RunContext {
+        run_id: run_id.clone(),
+        run_store: state.run_store.clone(),
+    };
+    let outcome = state.task_app.handle_with_run(input, Some(run_ctx)).await;
     finalize_run(&state, &task_id, &run_id, outcome)
         .await
         .map_err(|e| ApiError::bad_request(format!("run: {e}")))?;
@@ -391,6 +398,21 @@ mod tests {
         assert_eq!(run.id, run_id);
         assert_eq!(run.task_id, task_id);
         assert_eq!(run.result_ref, Some(posted.final_ctx));
+
+        // issue #13 run_id propagation: `POST /v1/tasks` (`run_flow_form`)
+        // wires a `RunContext` into `TaskApplication::handle_with_run`, so
+        // the single dispatched step must be traced into `step_entries`.
+        assert_eq!(
+            run.step_entries.len(),
+            1,
+            "expected one step_entry for the 1-step identity Blueprint, got {:?}",
+            run.step_entries
+        );
+        assert_eq!(
+            run.step_entries[0].step_ref,
+            Some(mlua_swarm::worker::baseline::AG_IDENTITY.to_string())
+        );
+        assert_eq!(run.step_entries[0].status, Some("passed".to_string()));
     }
 
     #[tokio::test]
@@ -423,6 +445,50 @@ mod tests {
         let ids: Vec<&RunId> = detail.runs.iter().map(|r| &r.id).collect();
         assert!(ids.contains(&&first_run_id));
         assert!(ids.contains(&&second_run_id));
+
+        // issue #13 run_id propagation: each kick's own `EngineDispatcher`
+        // (built fresh per `TaskApplication::handle_with_run` call) must
+        // trace its own dispatched step into its own `RunRecord` —
+        // independent `step_entries`, not shared/accumulated across kicks.
+        let first_run = detail
+            .runs
+            .iter()
+            .find(|r| r.id == first_run_id)
+            .expect("first run present in detail.runs");
+        let second_run = detail
+            .runs
+            .iter()
+            .find(|r| r.id == second_run_id)
+            .expect("second run present in detail.runs");
+        assert_eq!(
+            first_run.step_entries.len(),
+            1,
+            "first run step_entries: {:?}",
+            first_run.step_entries
+        );
+        assert_eq!(
+            second_run.step_entries.len(),
+            1,
+            "second run step_entries: {:?}",
+            second_run.step_entries
+        );
+        assert_eq!(
+            first_run.step_entries[0].step_ref,
+            Some(mlua_swarm::worker::baseline::AG_IDENTITY.to_string())
+        );
+        assert_eq!(
+            second_run.step_entries[0].step_ref,
+            Some(mlua_swarm::worker::baseline::AG_IDENTITY.to_string())
+        );
+        assert_eq!(first_run.step_entries[0].status, Some("passed".to_string()));
+        assert_eq!(
+            second_run.step_entries[0].status,
+            Some("passed".to_string())
+        );
+        assert_ne!(
+            first_run.step_entries[0].step_id, second_run.step_entries[0].step_id,
+            "each kick dispatches its own StepId — runs must not share step_entries"
+        );
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use crate::core::state::{
     ResumePending, TaskSpec, TaskState, TaskStatus,
 };
 use crate::types::{
-    default_role_verb_table, now_unix, CapToken, Role, RoleVerbGate, SessionId, StepId,
+    default_role_verb_table, now_unix, CapToken, Role, RoleVerbGate, RunId, SessionId, StepId,
     TokenSigner, Verb,
 };
 use crate::worker::adapter::SpawnerAdapter;
@@ -914,11 +914,20 @@ impl Engine {
     /// is passed per-request rather than looked up from engine-global
     /// state, parallel requests against a single `Engine` instance
     /// (different Blueprints, different spawners) do not race.
+    ///
+    /// `run_id`, when `Some` (issue #13 run_id propagation —
+    /// `EngineDispatcher` threads it in from its `RunContext`), is
+    /// inserted into `Ctx.meta.runtime["run_id"]` (a plain JSON string)
+    /// alongside `worker_handle`, so `Operator::execute` implementations
+    /// (e.g. `WSOperatorSession`) can read it back and surface it to the
+    /// worker (Spawn directive / prompt). `None` (every pre-existing
+    /// caller / test) omits the key entirely — unchanged behavior.
     pub async fn dispatch_attempt_with(
         &self,
         token: &CapToken,
         task_id: &StepId,
         spawner: &Arc<dyn SpawnerAdapter>,
+        run_id: Option<&RunId>,
     ) -> Result<DispatchOutcome, EngineError> {
         self.verify_token(token, Verb::DispatchAttempt).await?;
         let task_id = task_id.clone();
@@ -1001,6 +1010,11 @@ impl Engine {
         ctx.meta
             .runtime
             .insert("worker_handle".to_string(), Value::String(worker_handle));
+        if let Some(rid) = run_id {
+            ctx.meta
+                .runtime
+                .insert("run_id".to_string(), Value::String(rid.0.clone()));
+        }
 
         let worker = spawner
             .spawn(self, &ctx, task_id.clone(), attempt, worker_token)
@@ -1762,6 +1776,87 @@ mod resolve_operator_info_runtime_global_tests {
             info.kind,
             OperatorKind::MainAi,
             "None runtime_global must let bp_global MainAi win"
+        );
+    }
+}
+
+/// issue #13 run_id propagation: `dispatch_attempt_with`'s `run_id` param
+/// must land in `Ctx.meta.runtime["run_id"]` (the same slot pattern as the
+/// pre-existing `worker_handle`), or be omitted entirely when `None`. Same
+/// `CtxProbe` shape as `middleware::worker_binding`'s test module — an
+/// inner `SpawnerAdapter` that snapshots the `Ctx` it was called with and
+/// fails the spawn (only the ctx snapshot matters here).
+#[cfg(test)]
+mod dispatch_attempt_with_run_id_tests {
+    use super::*;
+    use crate::worker::adapter::{SpawnError, SpawnerAdapter};
+    use crate::worker::Worker;
+    use std::sync::Mutex as StdMutex;
+
+    struct CtxProbe {
+        seen: Arc<StdMutex<Option<Ctx>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnerAdapter for CtxProbe {
+        async fn spawn(
+            &self,
+            _engine: &Engine,
+            ctx: &Ctx,
+            _task_id: StepId,
+            _attempt: u32,
+            _token: CapToken,
+        ) -> Result<Box<dyn Worker>, SpawnError> {
+            *self.seen.lock().unwrap() = Some(ctx.clone());
+            Err(SpawnError::Internal("probe stop".into()))
+        }
+    }
+
+    async fn dispatch_with_probe(run_id: Option<&RunId>) -> Ctx {
+        let engine = Engine::new(EngineCfg::default());
+        let token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let tid = engine
+            .start_task(
+                &token,
+                TaskSpec {
+                    agent: "probe".into(),
+                    initial_directive: "hi".into(),
+                },
+            )
+            .await
+            .expect("start_task");
+        let seen: Arc<StdMutex<Option<Ctx>>> = Arc::new(StdMutex::new(None));
+        let spawner: Arc<dyn SpawnerAdapter> = Arc::new(CtxProbe { seen: seen.clone() });
+        // The probe always errors the spawn (`SpawnError::Internal`); we
+        // only care about the `Ctx` snapshot it captured, so the dispatch
+        // outcome itself (`Err`) is discarded.
+        let _ = engine
+            .dispatch_attempt_with(&token, &tid, &spawner, run_id)
+            .await;
+        let captured = seen.lock().unwrap().clone();
+        captured.expect("inner ctx captured")
+    }
+
+    #[tokio::test]
+    async fn run_id_lands_in_ctx_meta_runtime_when_some() {
+        let run_id = RunId::new();
+        let observed = dispatch_with_probe(Some(&run_id)).await;
+        assert_eq!(
+            observed.meta.runtime.get("run_id").and_then(|v| v.as_str()),
+            Some(run_id.0.as_str()),
+            "ctx.meta.runtime[\"run_id\"] must carry the run_id passed to dispatch_attempt_with"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_id_key_absent_when_none() {
+        let observed = dispatch_with_probe(None).await;
+        assert!(
+            !observed.meta.runtime.contains_key("run_id"),
+            "no run_id key must be injected when dispatch_attempt_with is called with None"
         );
     }
 }

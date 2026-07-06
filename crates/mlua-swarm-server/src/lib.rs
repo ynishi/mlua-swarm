@@ -87,7 +87,7 @@ use axum::{
 use mlua_swarm::application::{BlueprintRef, TaskApplication};
 use mlua_swarm::blueprint::store::BlueprintStore;
 use mlua_swarm::service::TaskLaunchService;
-use mlua_swarm::store::run::{RunRecord, RunStatus, RunStore};
+use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStore};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
 use mlua_swarm::{
     CapToken, Compiler, Engine, LayerRegistry, LuaInProcessSpawnerFactory, MainAIMiddleware,
@@ -578,7 +578,7 @@ async fn tasks_start(
     Ok(Json(resp))
 }
 
-/// Flow-form path (= via `TaskApplication.handle`).
+/// Flow-form path (= via `TaskApplication::handle_with_run`).
 /// Core handler behind the `/v1/tasks` entry (`tasks_start`).
 ///
 /// Engine stateless-executor refactor: the per-request
@@ -590,7 +590,6 @@ async fn tasks_start(
 /// See the `operator_ws` module doc for details.
 async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksResp, ApiError> {
     use mlua_swarm::application::{BlueprintRef as AppBlueprintRef, TaskApplicationInput};
-    use mlua_swarm::Application;
     use mlua_swarm::OperatorKind;
 
     // Snapshot everything the TaskRecord needs before `req.blueprint` /
@@ -692,20 +691,27 @@ async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksR
         .await
         .map_err(ApiError::engine)?;
 
+    let run_ctx = RunContext {
+        run_id: run_id.clone(),
+        run_store: state.run_store.clone(),
+    };
     let outcome = state
         .task_app
-        .handle(TaskApplicationInput {
-            blueprint,
-            operator_id: operator_id.clone(),
-            role: Role::Operator,
-            ttl: Duration::from_secs(ttl_secs),
-            init_ctx: req.init_ctx,
-            operator_kind,
-            bridge_id: op_req.senior_bridge_id,
-            hook_id: op_req.spawn_hook_id,
-            operator_backend_id: op_req.operator_backend_id,
-            operator_kind_overrides,
-        })
+        .handle_with_run(
+            TaskApplicationInput {
+                blueprint,
+                operator_id: operator_id.clone(),
+                role: Role::Operator,
+                ttl: Duration::from_secs(ttl_secs),
+                init_ctx: req.init_ctx,
+                operator_kind,
+                bridge_id: op_req.senior_bridge_id,
+                hook_id: op_req.spawn_hook_id,
+                operator_backend_id: op_req.operator_backend_id,
+                operator_kind_overrides,
+            },
+            Some(run_ctx),
+        )
         .await;
 
     let out = tasks::finalize_run(state, &task_id, &run_id, outcome)

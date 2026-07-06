@@ -11,6 +11,7 @@ use crate::blueprint::store::{BlueprintId, BlueprintStore, BlueprintStoreError, 
 use crate::blueprint::Blueprint;
 use crate::core::ctx::OperatorKind;
 use crate::service::{TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService};
+use crate::store::run::RunContext;
 use crate::types::{CapToken, Role};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -243,21 +244,23 @@ impl TaskApplication {
             }
         }
     }
-}
-
-#[async_trait]
-impl Application for TaskApplication {
-    type Input = TaskApplicationInput;
-    type Output = TaskApplicationOutput;
-    type Error = TaskApplicationError;
-
-    fn name(&self) -> &str {
-        "task"
-    }
 
     /// Resolve the `BlueprintRef` (Inline / Id) and run the flow to
-    /// completion through `TaskLaunchService::launch`.
-    async fn handle(&self, input: Self::Input) -> Result<Self::Output, Self::Error> {
+    /// completion through `TaskLaunchService::launch`, threading `run_ctx`
+    /// (issue #13 run_id propagation) into the launch input.
+    ///
+    /// [`Application::handle`] delegates here with `run_ctx: None` — a
+    /// separate method rather than a new field on [`TaskApplicationInput`]
+    /// so the pre-existing exhaustive `TaskApplicationInput { .. }` struct
+    /// literal in `mlua-swarm-cli`'s MCP adapter (which has no `run_ctx`)
+    /// keeps compiling unchanged. Server entry points that mint a `RunId`
+    /// up front (`POST /v1/tasks`, `POST /v1/tasks/:id/runs`) call this
+    /// directly with `Some(run_ctx)`.
+    pub async fn handle_with_run(
+        &self,
+        input: TaskApplicationInput,
+        run_ctx: Option<RunContext>,
+    ) -> Result<TaskApplicationOutput, TaskApplicationError> {
         let (blueprint, bound_version) = self.resolve(&input.blueprint).await?;
         let TaskLaunchOutput { token, final_ctx } = self
             .launch
@@ -272,6 +275,7 @@ impl Application for TaskApplication {
                 operator_backend_id: input.operator_backend_id,
                 operator_kind_overrides: input.operator_kind_overrides,
                 init_ctx: input.init_ctx,
+                run_ctx,
             })
             .await?;
         Ok(TaskApplicationOutput {
@@ -279,6 +283,26 @@ impl Application for TaskApplication {
             final_ctx,
             bound_version,
         })
+    }
+}
+
+#[async_trait]
+impl Application for TaskApplication {
+    type Input = TaskApplicationInput;
+    type Output = TaskApplicationOutput;
+    type Error = TaskApplicationError;
+
+    fn name(&self) -> &str {
+        "task"
+    }
+
+    /// Resolve the `BlueprintRef` (Inline / Id) and run the flow to
+    /// completion through `TaskLaunchService::launch`. Delegates to
+    /// [`TaskApplication::handle_with_run`] with `run_ctx: None` (no run
+    /// tracing) — callers that need `RunRecord.step_entries` tracing call
+    /// `handle_with_run` directly instead.
+    async fn handle(&self, input: Self::Input) -> Result<Self::Output, Self::Error> {
+        self.handle_with_run(input, None).await
     }
 }
 

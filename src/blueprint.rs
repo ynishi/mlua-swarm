@@ -26,7 +26,8 @@
 
 use crate::core::engine::Engine;
 use crate::core::state::{DispatchOutcome, TaskSpec};
-use crate::types::CapToken;
+use crate::store::run::{RunContext, StepEntry};
+use crate::types::{now_unix, CapToken};
 use crate::worker::adapter::SpawnerAdapter;
 use async_trait::async_trait;
 pub mod compiler;
@@ -55,19 +56,30 @@ pub use mlua_swarm_schema::{
 /// token and one `spawner`, and spins up a fresh task per `Step.ref`, using
 /// it as the agent name.
 ///
-/// Constructed exclusively via `with_spawner`: each dispatch goes through
-/// `engine.dispatch_attempt_with(token, tid, spawner)`, carrying the
+/// Constructed via `with_spawner`; each dispatch goes through
+/// `engine.dispatch_attempt_with(token, tid, spawner, run_id)`, carrying the
 /// spawner per request. Nothing is stashed on engine-global state, so
 /// multiple dispatchers can drive different Blueprints against the same
 /// `Engine` in parallel without racing.
+///
+/// Optionally carries a [`RunContext`] (via [`Self::with_run`], issue #13
+/// run_id propagation): when present, every dispatched step's `run_id` is
+/// exposed to the worker through `Ctx.meta.runtime["run_id"]`, and a
+/// [`StepEntry`] is appended to `RunRecord.step_entries` once the step's
+/// outcome is known (dispatch is synchronous end-to-end here, so there is
+/// no need for a separate event/notification mechanism — the entry is
+/// written with its final status in one call).
 pub struct EngineDispatcher {
     engine: Engine,
     op_token: CapToken,
     spawner: Arc<dyn SpawnerAdapter>,
+    run_ctx: Option<RunContext>,
 }
 
 impl EngineDispatcher {
-    /// The sole constructor: the spawner is carried per-dispatcher.
+    /// Build a dispatcher with no run-level tracing (`run_ctx = None`) —
+    /// the pre-existing behavior. Use [`Self::with_run`] to opt into
+    /// `RunRecord.step_entries` tracing / `ctx.meta.runtime["run_id"]`.
     pub fn with_spawner(
         engine: Engine,
         op_token: CapToken,
@@ -77,7 +89,16 @@ impl EngineDispatcher {
             engine,
             op_token,
             spawner,
+            run_ctx: None,
         }
+    }
+
+    /// Attach a [`RunContext`] (builder style) so every dispatched step is
+    /// traced into `RunRecord.step_entries` and exposes its `run_id` via
+    /// `Ctx.meta.runtime`.
+    pub fn with_run(mut self, run_ctx: RunContext) -> Self {
+        self.run_ctx = Some(run_ctx);
+        self
     }
 }
 
@@ -107,10 +128,44 @@ impl AsyncDispatcher for EngineDispatcher {
                 msg: format!("start_task: {e}"),
             })?;
 
+        let run_id_for_ctx = self.run_ctx.as_ref().map(|rc| rc.run_id.clone());
         let outcome = self
             .engine
-            .dispatch_attempt_with(&self.op_token, &tid, &self.spawner)
+            .dispatch_attempt_with(&self.op_token, &tid, &self.spawner, run_id_for_ctx.as_ref())
             .await;
+
+        // issue #13 run_id propagation: append one step_entry per dispatched
+        // step (`RunStore.append_step_entry` is append-only — there is no
+        // in-place update — so the entry is written once here, after the
+        // outcome is known, carrying its final status). Secondary
+        // persistence failures are logged and swallowed, matching
+        // `mse-server`'s `finalize_run` convention: they must not mask the
+        // primary dispatch outcome the flow eval already has in hand.
+        if let Some(rc) = &self.run_ctx {
+            let status = match &outcome {
+                Ok(DispatchOutcome::Pass(_)) => "passed",
+                Ok(DispatchOutcome::Blocked(_)) => "blocked",
+                Ok(DispatchOutcome::Suspended(_)) => "suspended",
+                Ok(DispatchOutcome::Cancelled) => "cancelled",
+                Ok(DispatchOutcome::Timeout) => "timeout",
+                Err(_) => "failed",
+            };
+            let entry = StepEntry {
+                step_id: tid.clone(),
+                step_ref: Some(ref_.to_string()),
+                status: Some(status.to_string()),
+                at: now_unix(),
+            };
+            if let Err(e) = rc.run_store.append_step_entry(&rc.run_id, entry).await {
+                tracing::warn!(
+                    run_id = %rc.run_id,
+                    step_id = %tid,
+                    error = %e,
+                    "EngineDispatcher::dispatch: append_step_entry failed"
+                );
+            }
+        }
+
         match outcome {
             Ok(DispatchOutcome::Pass(v)) => Ok(v),
             Ok(DispatchOutcome::Blocked(v)) => Err(EvalError::DispatcherError {

@@ -239,6 +239,11 @@ impl Operator for WSOperatorSession {
             .runtime
             .get("data_sink_endpoint")
             .and_then(|v| v.as_str());
+        // issue #13 run_id propagation: `EngineDispatcher::with_run` (when
+        // the launch carries a `RunContext`) inserts this into
+        // `Ctx.meta.runtime["run_id"]`; `None` on launches with no run
+        // tracing (see `Engine::dispatch_attempt_with`'s `run_id` param).
+        let run_id = ctx.meta.runtime.get("run_id").and_then(|v| v.as_str());
         let directive = default_spawn_directive(
             &ctx.agent,
             &ctx.task_id.0,
@@ -246,6 +251,7 @@ impl Operator for WSOperatorSession {
             project_name_alias,
             data_sink_endpoint,
             self.base_url.as_deref(),
+            run_id,
         );
         let msg = ServerMsg::Spawn {
             req_id: req_id.clone(),
@@ -335,6 +341,13 @@ impl Operator for WSOperatorSession {
 /// straight through without a `mse_doctor` lookup (issue #8). When
 /// `None`, a fallback placeholder points the reader at `mse_doctor` —
 /// no fake port number appears in the directive.
+///
+/// `run_id` (issue #13 ID-hierarchy persistence) is `Some` whenever this
+/// dispatch's `Ctx.meta.runtime["run_id"]` is populated (see
+/// `Engine::dispatch_attempt_with`), and is rendered into the observation
+/// route hint below (`GET /v1/runs/{run_id}`) so a MainAI reading the
+/// directive can drill into that specific kick's `RunRecord.step_entries`
+/// trace. `None` falls back to a generic `<run_id>` placeholder.
 pub(super) fn default_spawn_directive(
     agent: &str,
     task_id: &str,
@@ -342,6 +355,7 @@ pub(super) fn default_spawn_directive(
     project_name_alias: Option<&str>,
     data_sink_endpoint: Option<&str>,
     base_url: Option<&str>,
+    run_id: Option<&str>,
 ) -> String {
     // Expanded only when Blueprint.metadata.project_name_alias is Some.
     // Presents a discipline reminder to the MainAI plus the literal line the
@@ -398,6 +412,14 @@ pub(super) fn default_spawn_directive(
         Some(u) => u.to_string(),
         None => "<your server's actual bind — check with mse_doctor>".to_string(),
     };
+    // issue #13: the real drill-down route is `GET /v1/runs/{run_id}` (a
+    // single `RunRecord`, `step_entries` trace included) — `GET
+    // /v1/tasks/{id}` does exist but returns the coarser `TaskRecord` +
+    // every `RunRecord` kicked from it, not this specific kick.
+    let run_route_line = match run_id {
+        Some(rid) => format!("GET <base_url>/v1/runs/{rid}"),
+        None => "GET <base_url>/v1/runs/<run_id>".to_string(),
+    };
     format!(
         "[agent_primitive dispatch=@{agent}]\n\
          worker endpoint:\n  \
@@ -426,7 +448,7 @@ pub(super) fn default_spawn_directive(
          body lives in output_tail via the POST). \
          Do NOT fetch /v1/worker/prompt yourself. Do NOT wrap, summarize, or field-select \
          the SubAgent reply. Observation / debug is a separate channel (= agent-inspect MCP / \
-         GET /v1/tasks/{{id}}), do NOT mix it into the forward path. \
+         {run_route_line}), do NOT mix it into the forward path. \
          If the SubAgent type is not registered, FAIL LOUD: reply SpawnAck ok=false with an \
          error explaining the missing `.claude/agents/{subagent_type}.md` — do NOT fall back \
          to another subagent_type."
@@ -439,8 +461,15 @@ mod tests {
 
     #[test]
     fn directive_omits_project_name_alias_when_none() {
-        let d =
-            default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(!d.contains("project_name_alias:"));
         assert!(!d.contains("LDS Session Alias"));
         assert!(!d.contains("session_create"));
@@ -453,6 +482,7 @@ mod tests {
             "task-x",
             "mse-worker-coder",
             Some("mse-task-7785"),
+            None,
             None,
             None,
         );
@@ -492,8 +522,15 @@ mod tests {
 
     #[test]
     fn directive_omits_data_endpoint_when_none() {
-        let d =
-            default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(!d.contains("[Data path endpoint"));
         assert!(!d.contains("DATA_EMIT"));
         assert!(!d.contains("DATA_GET"));
@@ -508,6 +545,7 @@ mod tests {
             "mse-worker-coder",
             None,
             Some(base),
+            None,
             None,
         );
         assert!(
@@ -538,8 +576,15 @@ mod tests {
 
     #[test]
     fn directive_carries_declared_subagent_type_and_has_no_fallback() {
-        let d =
-            default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(
             d.contains("subagent_type=\"mse-worker-coder\""),
             "directive must carry the Blueprint-declared subagent_type literally: {d}"
@@ -577,6 +622,7 @@ mod tests {
             None,
             None,
             Some("http://127.0.0.1:8888"),
+            None,
         );
         assert!(
             d.contains("base_url: http://127.0.0.1:8888"),
@@ -593,8 +639,15 @@ mod tests {
     /// `mse_doctor` — never a fake port number.
     #[test]
     fn directive_falls_back_to_mse_doctor_pointer_when_none() {
-        let d =
-            default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(
             d.contains("check with mse_doctor"),
             "fallback must point at mse_doctor: {d}"
@@ -618,12 +671,73 @@ mod tests {
                 Some("mse-task-alias"),
                 Some("http://127.0.0.1:7785"),
                 base,
+                None,
             );
             assert!(
                 !d.contains("7786"),
                 "stale example port 7786 leaked: base={base:?}, d={d}"
             );
         }
+    }
+
+    // ─── Issue #13: run_id observation route (doc-drift fix) ─────────────
+
+    /// Regression guard: the stale `GET /v1/tasks/{id}` observation hint
+    /// (a route that never returns a single `RunRecord`) must be gone —
+    /// the directive must point at the real drill-down route instead.
+    #[test]
+    fn directive_never_contains_stale_tasks_id_route() {
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            Some("R-abc123"),
+        );
+        assert!(
+            !d.contains("/v1/tasks/{id}") && !d.contains("/v1/tasks/{{id}}"),
+            "stale /v1/tasks/{{id}} observation hint leaked: {d}"
+        );
+    }
+
+    /// When `run_id` is `Some`, it is rendered literally into the
+    /// observation route hint (`GET /v1/runs/<run_id>`).
+    #[test]
+    fn directive_renders_actual_run_id_when_some() {
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            Some("R-abc123"),
+        );
+        assert!(
+            d.contains("GET <base_url>/v1/runs/R-abc123"),
+            "directive missing real run_id in observation route: {d}"
+        );
+    }
+
+    /// `run_id: None` (no run tracing for this launch) falls back to a
+    /// generic placeholder route rather than a stale/incorrect one.
+    #[test]
+    fn directive_falls_back_to_run_id_placeholder_when_none() {
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            d.contains("GET <base_url>/v1/runs/<run_id>"),
+            "directive missing placeholder observation route: {d}"
+        );
     }
 
     // ─── Issue #7: spawn_halt handling in Operator::execute ──────────────

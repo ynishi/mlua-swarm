@@ -21,7 +21,7 @@ use crate::types::{RunId, StepId, TaskId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 pub mod inmemory;
@@ -101,6 +101,41 @@ pub enum RunStoreError {
     /// Backend-specific failure not covered by the other variants.
     #[error("other: {0}")]
     Other(String),
+}
+
+/// Pairs a [`RunId`] with the [`RunStore`] used to persist its trace.
+///
+/// Threaded from the server entry points (`POST /v1/tasks`, `POST
+/// /v1/tasks/:id/runs`) down through `TaskApplication::handle_with_run` /
+/// `TaskLaunchService::launch` / `EngineDispatcher` (issue #13 run_id
+/// propagation) so every step the dispatcher runs can be appended to
+/// `RunRecord.step_entries` and the run's id exposed to workers via
+/// `Ctx.meta.runtime["run_id"]`. Kept as a distinct type — rather than a
+/// new field on `TaskApplicationInput` — so the pre-existing exhaustive
+/// struct literal in `mlua-swarm-cli`'s MCP adapter (`TaskApplicationInput
+/// { .. }`, no `run_ctx`) keeps compiling unchanged: callers that don't
+/// care about run tracing keep calling `TaskApplication::handle` /
+/// `TaskLaunchService::launch`, which pass `None` through internally.
+#[derive(Clone)]
+pub struct RunContext {
+    /// The Run this dispatch's steps should be traced into.
+    pub run_id: RunId,
+    /// Where to append [`StepEntry`] rows as steps are dispatched.
+    pub run_store: Arc<dyn RunStore>,
+}
+
+impl std::fmt::Debug for RunContext {
+    // `dyn RunStore` carries no `Debug` bound (backend implementations
+    // shouldn't be forced to derive it just to satisfy this struct's
+    // `Debug`); render `run_store` as its `name()` instead, same idiom as
+    // `WorkerInvocation`'s manual `Debug` for its `Arc<dyn OutputSink>`
+    // field.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunContext")
+            .field("run_id", &self.run_id)
+            .field("run_store", &self.run_store.name())
+            .finish()
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
