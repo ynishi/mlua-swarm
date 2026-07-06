@@ -73,6 +73,32 @@ Truthy semantics match Lua/JS: `null`/`false` are falsy, everything else
 
 ## Agents (`AgentDef`) and kind resolution
 
+### Two authoring paths
+
+An `AgentDef` can be written in two places, and either is fine:
+
+- **Direct JSON literal (this guide's default form)** — the
+  `AgentDef` object appears inline inside the Blueprint JSON. All
+  fields (`name`, `kind`, `spec`, `profile.system_prompt`,
+  `profile.worker_binding`, `profile.tools`, `meta`, …) are set
+  literally in the JSON tree. This is the default authoring shape
+  for the samples under `mse://blueprints/samples/*` and for
+  programmatic authoring (algocline strategies, skills, dogfood
+  harnesses).
+- **`$agent_md` file ref** — the entry is a single-key object
+  `{ "$agent_md": "agents/foo.md" }` and the loader parses the
+  target file's frontmatter (+ Markdown body) into a
+  fully-populated `AgentDef`. See the `$agent_md file-ref
+  expansion` section below.
+
+Compile-time error messages that name a field (e.g.
+`profile.worker_binding`) are actionable on either path — for JSON
+authors, add the field to the JSON literal; for `$agent_md` authors,
+add it to the `.md` frontmatter. The messages themselves spell both
+paths out.
+
+### `AgentDef` shape (JSON-direct form)
+
 Each entry in `agents` maps a name (referenced from `flow.Step.ref`) to a
 backend:
 

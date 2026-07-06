@@ -1006,9 +1006,18 @@ impl SpawnerFactory for OperatorSpawnerFactory {
                     .unwrap_or_default(),
             });
         if op.requires_worker_binding() && worker_binding.is_none() {
+            // Issue #9: the two Blueprint authoring paths (direct JSON
+            // and `$agent_md` file ref) both land here. Old message
+            // pointed only at the `.md` frontmatter, which was
+            // confusing for authors on the JSON-direct path.
             return Err(invalid(
-                "profile.worker_binding is required for this operator backend; \
-                 declare it in the agent .md frontmatter"
+                "profile.worker_binding is required for this operator backend. \
+                 Fix by either: \
+                 (a) if authoring the Blueprint JSON directly, add \
+                 `agents[N].profile.worker_binding: \"<subagent-type>\"` \
+                 to the JSON literal; or \
+                 (b) if using an $agent_md file ref, add \
+                 `worker_binding: <subagent-type>` to the agent .md frontmatter."
                     .into(),
             ));
         }
@@ -1083,6 +1092,17 @@ mod operator_spawner_factory_worker_binding_tests {
                 assert!(
                     msg.contains("worker_binding is required"),
                     "unexpected message: {msg}"
+                );
+                // Issue #9: the message must be actionable for both
+                // authoring paths — the JSON-direct hint and the
+                // $agent_md hint both surface.
+                assert!(
+                    msg.contains("agents[N].profile.worker_binding"),
+                    "message missing JSON-direct hint (issue #9): {msg}"
+                );
+                assert!(
+                    msg.contains("agent .md frontmatter"),
+                    "message missing $agent_md hint: {msg}"
                 );
             }
             Err(other) => panic!("expected InvalidSpec, got: {other:?}"),
