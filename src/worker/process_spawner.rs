@@ -231,6 +231,8 @@ impl SpawnerAdapter for ProcessSpawner {
         let cancel = CancellationToken::new();
         let cancel_inner = cancel.clone();
         let worker_id = WorkerId::new();
+        // issue #11: surface the minted WorkerId in the trace log.
+        tracing::debug!(worker_id = %worker_id.0, step_id = %task_id, "worker spawned (subprocess)");
         let (tx, rx) = oneshot::channel();
         // design intent: hand `engine` / `token` to the spawn task so it can emit
         // OutputEvent via submit_output (side-by-side with the WorkerResult

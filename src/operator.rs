@@ -76,7 +76,7 @@ pub struct WorkerBinding {
 ///   `None` for agents whose profile has no `worker_binding` set.
 ///   Backends that require one (see [`Operator::requires_worker_binding`])
 ///   must fail loud rather than silently degrade when this is `None`.
-/// - `worker_token`: a capability token (`Role::Worker`, 600s TTL,
+/// - `worker_token`: a capability token (`Role::Worker`, 1800s TTL,
 ///   `scopes = ["*"]`). Thin-path operators (a `a WebSocket-backed operator session`,
 ///   for instance) `encode()` this token and hand it to the MainAI
 ///   WebSocket client, so the SubAgent can hit `/v1/worker/prompt` +
@@ -221,6 +221,8 @@ impl SpawnerAdapter for OperatorSpawner {
         let cancel = CancellationToken::new();
         let cancel_inner = cancel.clone();
         let worker_id = WorkerId::new();
+        // issue #11: surface the minted WorkerId in the trace log.
+        tracing::debug!(worker_id = %worker_id.0, step_id = %task_id, "worker spawned (operator spawner)");
 
         tokio::spawn(async move {
             let result: Result<WorkerResult, WorkerError> = tokio::select! {

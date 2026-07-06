@@ -264,6 +264,8 @@ impl<W: Worker + From<crate::worker::WorkerJoinHandler> + Send + Sync + 'static>
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_inner = cancel.clone();
         let worker_id = crate::types::WorkerId::new();
+        // issue #11: surface the minted WorkerId in the trace log.
+        tracing::debug!(worker_id = %worker_id.0, step_id = %task_id, "worker spawned (rustfn)");
         // design intent: hand `engine` / `token` to the spawn task so it can emit
         // OutputEvent::Final via submit_output (side-by-side with the
         // WorkerResult oneshot path).

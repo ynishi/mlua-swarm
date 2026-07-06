@@ -595,6 +595,9 @@ impl SpawnerAdapter for OperatorDelegateWrapped {
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_inner = cancel.clone();
         let worker_id = crate::types::WorkerId::new();
+        // issue #11: WorkerId was minted but never observable anywhere;
+        // surface it in the trace log, tied to the step it serves.
+        tracing::debug!(worker_id = %worker_id.0, step_id = %task_id, "worker spawned (delegate axis)");
 
         tokio::spawn(async move {
             let result: Result<
@@ -609,7 +612,8 @@ impl SpawnerAdapter for OperatorDelegateWrapped {
                 // Blueprint-baked binding into ctx.meta.runtime and we forward
                 // it here — the delegate axis is a first-class variant-dispatch
                 // path, not a binding-less fallback (issue 45db42a7).
-                // We hand the capability token (Role::Worker, 600s TTL) to the
+                // We hand the capability token (Role::Worker, 1800s TTL —
+                // minted by `Engine::dispatch_attempt_with`) to the
                 // operator as `worker_token` — thin-spawn operators (e.g. a
                 // WebSocket-backed operator session) forward it to the SubAgent
                 // via encode(), while Operator impls that call the LLM directly
