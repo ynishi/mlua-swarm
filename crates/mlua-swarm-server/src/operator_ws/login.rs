@@ -10,7 +10,7 @@
 //! POST /v1/operators { roles?: ["main-ai"] }
 //!   → 409 if any role already owns a live entry (roles alias exclusivity,
 //!     v1.md §Auth session flow)
-//!   → { sid: "op-<uuid>", token: "<10-hex>", roles: [...] }
+//!   → { sid: "S-<hex>", token: "<10-hex>", roles: [...] }
 //!
 //! WS /v1/operators/:sid/ws
 //!   Authorization: Bearer <token>   (mandatory — no empty-string default)
@@ -60,7 +60,7 @@ use crate::AppState;
 /// on reconnect the same `WSOperatorSession` is reused (`replace_tx`) rather
 /// than re-registered.
 pub struct OperatorSessionEntry {
-    /// Server-minted session id (`op-<uuid>`).
+    /// Server-minted session id (`S-<hex>`, the shared `SessionId` shape).
     pub sid: String,
     /// Bearer auth token (10-hex-char) required on the WS upgrade and admin routes.
     pub token: String,
@@ -83,7 +83,7 @@ pub struct OperatorsCreateReq {
 /// Response for `POST /v1/operators`.
 #[derive(Debug, Serialize)]
 pub struct OperatorsCreateResp {
-    /// Newly minted session id (`op-<uuid>`).
+    /// Newly minted session id (`S-<hex>`, the shared `SessionId` shape).
     pub sid: String,
     /// Bearer auth token required on the WS upgrade and admin routes.
     pub token: String,
@@ -91,7 +91,8 @@ pub struct OperatorsCreateResp {
     pub roles: Vec<String>,
 }
 
-/// `POST /v1/operators`. Mints `sid` (`op-<uuid>`) + a 10-hex-char token
+/// `POST /v1/operators`. Mints `sid` (`S-<hex>` — the shared `SessionId`
+/// shape; issue #11) + a 10-hex-char token
 /// (`mlua_swarm::types::secure_hex(5)` — OS-RNG hex, unguessable across
 /// calls and restarts, which is the point: this token is the sole bearer
 /// secret on the short-handle path). When `roles` is non-empty, checks
@@ -104,7 +105,13 @@ pub async fn operators_create(
     Json(req): Json<OperatorsCreateReq>,
 ) -> Response {
     let roles = req.roles;
-    let sid = format!("op-{}", uuid::Uuid::new_v4());
+    // The sid is the operator-session identity, so it mints in the same
+    // `SessionId` shape (`S-<hex>`) as the engine-side session id — one
+    // session-id form across the system (issue #11 observation 2; the old
+    // `op-<uuid>` shape collided with the operator-backend registry prefix).
+    // It is an identifier, not a secret: `token` (secure_hex) is the sole
+    // bearer credential on this path.
+    let sid = mlua_swarm::types::SessionId::new().0;
     let token = mlua_swarm::types::secure_hex(5);
 
     {

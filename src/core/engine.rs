@@ -628,7 +628,7 @@ impl Engine {
     /// # Pipeline
     ///
     /// Each `Arc<dyn ...>` is auto-registered on the engine's registry
-    /// under a synthetic ID (`br-<hex>` / `hk-<hex>` / `op-<hex>`), and
+    /// under a synthetic ID (`br-<hex>` / `hk-<hex>` / `ob-<hex>`), and
     /// the session stores that synthetic ID. Subsequent `dispatch_attempt`
     /// calls rebuild the `Arc`s from those IDs via
     /// `resolve_operator_info`, and the three middlewares fire as usual.
@@ -687,7 +687,12 @@ impl Engine {
             None
         };
         let operator_backend_id = if let Some(operator) = operator_info.operator.clone() {
-            let id = format!("op-{}", crate::types::uid_hex(8));
+            // `ob-` = operator-backend registry id. Renamed from `op-` in the
+            // issue #11 prefix reconciliation: `op-` used to collide with the
+            // WS operator sid shape (now unified into `S-<hex>` anyway), and a
+            // shared prefix across two unrelated registries made log filtering
+            // by prefix silently ambiguous.
+            let id = format!("ob-{}", crate::types::uid_hex(8));
             self.inner
                 .operators
                 .write()
@@ -982,7 +987,7 @@ impl Engine {
         // expected to hit `verify_token + fetch_prompt + fetch_data + post_result`
         // multiple times in order, so `one_time` would exhaust the token on the
         // very first verb. Capability is guarded by (a) the role × verb gate and
-        // (b) the short TTL (600s).
+        // (b) the short TTL (1800s).
         let worker_token = self.inner.signer.session(
             format!("worker-of-{task_id}"),
             Role::Worker,

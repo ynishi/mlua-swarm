@@ -96,6 +96,12 @@ impl std::fmt::Display for RunId {
 
 /// Opaque session identifier, e.g. `S-<hex>`. See [`StepId`] for the newtype
 /// rationale.
+///
+/// This is the one session-id shape across the system (issue #11): the
+/// engine mints it for attached operator sessions, and the server's
+/// `POST /v1/operators` login path mints the WS operator `sid` in the same
+/// shape (the old `op-<uuid>` sid form is retired). A `SessionId` is an
+/// identifier, not a credential — bearer secrets use `secure_hex` tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub String);
 
