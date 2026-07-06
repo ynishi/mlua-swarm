@@ -221,8 +221,11 @@ struct OperatorLeaveReq {
 
 #[derive(Deserialize, JsonSchema)]
 struct SwarmRunReq {
-    /// Blueprint payload (JSON object). Schema = mlua-swarm-blueprint-schema.
-    blueprint: JsonValue,
+    /// How to resolve the Blueprint. Accepts either a
+    /// `BlueprintSelector` (`{kind: "inline"|"id"|"file", ...}`) or, for
+    /// backward compat, a bare Blueprint object (implicitly wrapped as
+    /// `{kind: "inline", blueprint: <it>}`).
+    blueprint: BlueprintInput,
     /// Optional init context passed to the swarm. Default `{}`.
     #[serde(default)]
     init_ctx: Option<JsonValue>,
@@ -244,6 +247,60 @@ struct SwarmRunReq {
     operator_kind_overrides: Option<HashMap<String, String>>,
 }
 
+/// How to resolve a Blueprint for `swarm_run`. Symmetric with the
+/// `POST /v1/tasks` request shape.
+#[derive(Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BlueprintSelector {
+    /// Full Blueprint value embedded in the tool call.
+    Inline {
+        /// Blueprint payload. Schema = mlua-swarm-blueprint-schema.
+        blueprint: JsonValue,
+    },
+    /// Reference a Blueprint registered on the mse serve store by id.
+    /// Proxies to `POST /v1/tasks`.
+    Id {
+        /// Registered BlueprintId (server-side store).
+        id: String,
+        /// mse serve bind address (default `127.0.0.1:7777`).
+        #[serde(default)]
+        bind: Option<String>,
+    },
+    /// Read Blueprint JSON from a file rooted at the mse-mcp process CWD.
+    /// Absolute paths and `..` (parent-dir) components are rejected.
+    File {
+        /// Relative path to a Blueprint JSON file (CWD-rooted).
+        path: String,
+    },
+}
+
+/// Accepts either the new `BlueprintSelector` shape or, for backward
+/// compat, a bare Blueprint object treated as
+/// `{kind: "inline", blueprint: <it>}`.
+///
+/// Note: `serde(untagged)` tries `Selector` first; if the object lacks a
+/// recognized `kind` field, it falls through to `BareInline`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(untagged)]
+enum BlueprintInput {
+    Selector(BlueprintSelector),
+    /// A bare Blueprint JSON object (backward-compat). The schema is
+    /// pinned to `{"type": "object"}` so MCP clients keep the payload
+    /// as an object instead of string-encoding it (issue #5, layer 1).
+    #[schemars(schema_with = "bare_blueprint_schema")]
+    BareInline(JsonValue),
+}
+
+fn bare_blueprint_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    // Explicitly declare the JSON type as "object" so MCP clients keep
+    // the payload as a real object; without this, `JsonValue` renders
+    // to schemars' any-schema (`true`) which triggers the layer-1 bug.
+    schemars::json_schema!({
+        "type": "object",
+        "description": "Backward-compat: bare Blueprint object; treated as {kind: \"inline\", blueprint: <it>}."
+    })
+}
+
 /// Parse a wire-level kind string into `OperatorKind`. Shared by
 /// `SwarmRunReq.operator_kind` and `.operator_kind_overrides` values.
 fn parse_operator_kind_str(s: &str) -> Result<OperatorKind, McpError> {
@@ -256,6 +313,34 @@ fn parse_operator_kind_str(s: &str) -> Result<OperatorKind, McpError> {
             None,
         )),
     }
+}
+
+/// Read a Blueprint JSON file from the mse-mcp process CWD.
+///
+/// Path hygiene: absolute paths and any `..` (parent-dir) component are
+/// rejected. This is a tool-call argument (user-initiated), so the guard
+/// is a straightforward path-traversal block rather than the tighter
+/// `$file` ref sandbox described in the Blueprint authoring guide.
+fn read_blueprint_from_file(path: &str) -> Result<JsonValue, String> {
+    use std::path::{Component, PathBuf};
+
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        return Err(format!(
+            "file: absolute path rejected (got {path:?}); use a CWD-relative path"
+        ));
+    }
+    for c in p.components() {
+        if matches!(c, Component::ParentDir) {
+            return Err(format!(
+                "file: `..` parent-dir component rejected (got {path:?})"
+            ));
+        }
+    }
+    let bytes = std::fs::read(&p)
+        .map_err(|e| format!("file: read {path:?} failed: {e}"))?;
+    serde_json::from_slice::<JsonValue>(&bytes)
+        .map_err(|e| format!("file: parse {path:?} as JSON failed: {e}"))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -343,7 +428,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Run a Blueprint to completion via TaskApplication.handle. Blocking. Returns run_id + final_ctx + bound_version."
+        description = "Run a Blueprint to completion via TaskApplication.handle. Blocking. Returns run_id + final_ctx + bound_version. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline)."
     )]
     async fn swarm_run(
         &self,
@@ -351,6 +436,30 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let run_id = Uuid::new_v4().to_string();
         let ttl = Duration::from_secs(req.timeout_secs.unwrap_or(300));
+
+        // Normalize BlueprintInput → BlueprintSelector.
+        let selector = match req.blueprint {
+            BlueprintInput::Selector(s) => s,
+            BlueprintInput::BareInline(v) => BlueprintSelector::Inline { blueprint: v },
+        };
+
+        // Id kind: proxy POST /v1/tasks. Uses the server-side store; the
+        // in-process store dedicated to Inline is not consulted.
+        if let BlueprintSelector::Id { id, bind } = &selector {
+            return self
+                .swarm_run_via_http(
+                    run_id,
+                    id.clone(),
+                    bind.clone(),
+                    req.init_ctx,
+                    ttl,
+                    req.operator_id,
+                    req.operator_kind,
+                    req.operator_kind_overrides,
+                )
+                .await;
+        }
+
         let task_app = {
             let mut inner = self.state.write().await;
             inner.runs.insert(
@@ -363,7 +472,29 @@ impl MseServer {
             inner.task_app.clone()
         };
 
-        let blueprint: Blueprint = match serde_json::from_value(req.blueprint) {
+        // Resolve Inline / File → Blueprint JSON.
+        let bp_json: JsonValue = match selector {
+            BlueprintSelector::Inline { blueprint } => blueprint,
+            BlueprintSelector::File { path } => match read_blueprint_from_file(&path) {
+                Ok(v) => v,
+                Err(msg) => {
+                    let body = serde_json::json!({
+                        "run_id": run_id,
+                        "status": "failed",
+                        "error": msg,
+                    });
+                    let mut inner = self.state.write().await;
+                    if let Some(h) = inner.runs.get_mut(&run_id) {
+                        h.status = RunStatus::Failed;
+                    }
+                    drop(inner);
+                    return json_result(&body);
+                }
+            },
+            BlueprintSelector::Id { .. } => unreachable!("Id handled above"),
+        };
+
+        let blueprint: Blueprint = match serde_json::from_value(bp_json) {
             Ok(b) => b,
             Err(e) => {
                 let body = serde_json::json!({
@@ -480,6 +611,134 @@ impl MseServer {
             let mut inner = self.state.write().await;
             if let Some(h) = inner.runs.get_mut(&run_id) {
                 h.status = status;
+            }
+        }
+        json_result(&body)
+    }
+
+    /// Proxy `swarm_run(kind=id)` to `POST /v1/tasks` on the mse serve
+    /// process. The registered Blueprint lives in the server-side store,
+    /// so this cannot be resolved locally.
+    #[allow(clippy::too_many_arguments)]
+    async fn swarm_run_via_http(
+        &self,
+        run_id: String,
+        id: String,
+        bind: Option<String>,
+        init_ctx: Option<JsonValue>,
+        ttl: Duration,
+        operator_id: Option<String>,
+        operator_kind: Option<String>,
+        operator_kind_overrides: Option<HashMap<String, String>>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut inner = self.state.write().await;
+            inner.runs.insert(
+                run_id.clone(),
+                RunHandle {
+                    run_id: run_id.clone(),
+                    status: RunStatus::Running,
+                },
+            );
+        }
+
+        let bind = bind.unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+        let url = format!("http://{bind}/v1/tasks");
+
+        let mut operator_obj = serde_json::Map::new();
+        if let Some(k) = operator_kind {
+            operator_obj.insert("kind".into(), JsonValue::String(k));
+        }
+        if let Some(id) = operator_id {
+            operator_obj.insert("id".into(), JsonValue::String(id));
+        }
+        if let Some(map) = operator_kind_overrides {
+            if !map.is_empty() {
+                operator_obj.insert(
+                    "per_agent_kinds".into(),
+                    serde_json::to_value(map).unwrap_or(JsonValue::Null),
+                );
+            }
+        }
+
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "blueprint".into(),
+            serde_json::json!({ "kind": "id", "id": id }),
+        );
+        payload.insert(
+            "init_ctx".into(),
+            init_ctx.unwrap_or_else(|| serde_json::json!({})),
+        );
+        payload.insert("ttl_secs".into(), JsonValue::from(ttl.as_secs()));
+        if !operator_obj.is_empty() {
+            payload.insert("operator".into(), JsonValue::Object(operator_obj));
+        }
+
+        let client = match reqwest::Client::builder().timeout(ttl + Duration::from_secs(5)).build() {
+            Ok(c) => c,
+            Err(e) => {
+                let mut inner = self.state.write().await;
+                if let Some(h) = inner.runs.get_mut(&run_id) {
+                    h.status = RunStatus::Failed;
+                }
+                drop(inner);
+                return json_result(&serde_json::json!({
+                    "run_id": run_id,
+                    "status": "failed",
+                    "error": format!("client build: {e}"),
+                }));
+            }
+        };
+
+        let resp = match client.post(&url).json(&payload).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let mut inner = self.state.write().await;
+                if let Some(h) = inner.runs.get_mut(&run_id) {
+                    h.status = RunStatus::Failed;
+                }
+                drop(inner);
+                return json_result(&serde_json::json!({
+                    "run_id": run_id,
+                    "status": "failed",
+                    "error": format!("POST {url} failed: {e} (is mse serve running at {bind}?)"),
+                }));
+            }
+        };
+        let http_status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let (final_status, body) = if http_status.is_success() {
+            let parsed: JsonValue =
+                serde_json::from_str(&text).unwrap_or_else(|_| JsonValue::String(text.clone()));
+            (
+                RunStatus::Done,
+                serde_json::json!({
+                    "run_id": run_id,
+                    "status": "done",
+                    "final_ctx": parsed.get("final_ctx").cloned().unwrap_or(JsonValue::Null),
+                    "bound_version": parsed.get("bound_version").cloned().unwrap_or(JsonValue::Null),
+                    "effective_ttl_secs": parsed.get("effective_ttl_secs").cloned().unwrap_or(JsonValue::Null),
+                    "ttl_source": parsed.get("ttl_source").cloned().unwrap_or(JsonValue::Null),
+                    "head": id,
+                    "resolved_via": "http",
+                }),
+            )
+        } else {
+            (
+                RunStatus::Failed,
+                serde_json::json!({
+                    "run_id": run_id,
+                    "status": "failed",
+                    "error": format!("POST {url} returned {}: {}", http_status.as_u16(), text),
+                    "resolved_via": "http",
+                }),
+            )
+        };
+        {
+            let mut inner = self.state.write().await;
+            if let Some(h) = inner.runs.get_mut(&run_id) {
+                h.status = final_status;
             }
         }
         json_result(&body)
@@ -845,7 +1104,7 @@ mod tests {
         // empty / minimal blueprint will likely fail decode inside handle,
         // but the response shape should still be a valid CallToolResult.
         let req = SwarmRunReq {
-            blueprint: serde_json::json!({}),
+            blueprint: BlueprintInput::BareInline(serde_json::json!({})),
             init_ctx: None,
             timeout_secs: Some(5),
             operator_id: None,
@@ -875,7 +1134,7 @@ mod tests {
         let server = MseServer::new();
         let bp_json = serde_json::to_value(identity_blueprint()).expect("serialize blueprint");
         let req = SwarmRunReq {
-            blueprint: bp_json,
+            blueprint: BlueprintInput::BareInline(bp_json),
             init_ctx: Some(serde_json::json!({"in": "hello"})),
             timeout_secs: Some(10),
             operator_id: None,
@@ -896,6 +1155,137 @@ mod tests {
         assert!(parsed.get("history_len").is_some(), "payload: {text}");
         assert!(parsed.get("log_tail").is_some(), "payload: {text}");
         assert_eq!(parsed["history_len"], 0, "Inline mode -> 0");
+    }
+
+    // ─── BlueprintSelector: shape / File hygiene / bare-object compat ───────
+
+    /// Selector `{kind: "inline", blueprint: {...}}` end-to-end.
+    #[tokio::test]
+    async fn swarm_run_accepts_inline_selector_form() {
+        let server = MseServer::new();
+        let bp_json = serde_json::to_value(identity_blueprint()).expect("serialize");
+        let sel_json = serde_json::json!({
+            "kind": "inline",
+            "blueprint": bp_json,
+        });
+        let input: BlueprintInput = serde_json::from_value(sel_json).expect("selector parse");
+        let req = SwarmRunReq {
+            blueprint: input,
+            init_ctx: Some(serde_json::json!({"in": "hello"})),
+            timeout_secs: Some(10),
+            operator_id: None,
+            operator_kind: None,
+            operator_kind_overrides: None,
+        };
+        let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
+        let text = extract_text_payload(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(parsed["status"], "done", "payload: {text}");
+    }
+
+    /// Backward compat: a bare Blueprint object (no `kind` wrapper) is
+    /// treated as inline.
+    #[tokio::test]
+    async fn swarm_run_bare_blueprint_still_works() {
+        let server = MseServer::new();
+        let bp_json = serde_json::to_value(identity_blueprint()).expect("serialize");
+        let input: BlueprintInput = serde_json::from_value(bp_json).expect("bare parse");
+        let req = SwarmRunReq {
+            blueprint: input,
+            init_ctx: Some(serde_json::json!({"in": "hi"})),
+            timeout_secs: Some(10),
+            operator_id: None,
+            operator_kind: None,
+            operator_kind_overrides: None,
+        };
+        let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
+        let text = extract_text_payload(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(parsed["status"], "done", "payload: {text}");
+    }
+
+    /// Selector `{kind: "file", path: "..."}` reads the Blueprint from a
+    /// CWD-relative file and runs it.
+    #[tokio::test]
+    async fn swarm_run_file_selector_reads_and_runs() {
+        let server = MseServer::new();
+        let bp_json = serde_json::to_value(identity_blueprint()).expect("serialize");
+        // write to a unique CWD-relative filename to avoid path-traversal
+        // rejection; clean up after.
+        let name = format!("__mse_test_bp_{}.json", uuid::Uuid::new_v4());
+        std::fs::write(&name, serde_json::to_vec(&bp_json).unwrap()).expect("write bp");
+        let sel_json = serde_json::json!({ "kind": "file", "path": &name });
+        let input: BlueprintInput = serde_json::from_value(sel_json).expect("selector parse");
+        let req = SwarmRunReq {
+            blueprint: input,
+            init_ctx: Some(serde_json::json!({"in": "hi"})),
+            timeout_secs: Some(10),
+            operator_id: None,
+            operator_kind: None,
+            operator_kind_overrides: None,
+        };
+        let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
+        let _ = std::fs::remove_file(&name);
+        let text = extract_text_payload(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(parsed["status"], "done", "payload: {text}");
+    }
+
+    /// File hygiene: `..` parent-dir components are rejected.
+    #[test]
+    fn file_path_with_parent_dir_component_rejected() {
+        let e = read_blueprint_from_file("../etc/passwd").unwrap_err();
+        assert!(e.contains("parent-dir") || e.contains(".."), "err: {e}");
+    }
+
+    /// File hygiene: absolute paths are rejected.
+    #[test]
+    fn file_absolute_path_rejected() {
+        let e = read_blueprint_from_file("/etc/passwd").unwrap_err();
+        assert!(e.contains("absolute"), "err: {e}");
+    }
+
+    /// Annotation regression guard: every `swarm_run.blueprint` variant must
+    /// expose `type: object` in the JSON Schema (either directly or via a
+    /// `oneOf` branch). Layer 1 of the issue was that a bare `JsonValue`
+    /// omitted `type` entirely and the MCP client fell back to
+    /// string-encoding the payload.
+    #[test]
+    fn swarm_run_blueprint_schema_declares_object_type() {
+        use schemars::schema_for;
+        let schema = schema_for!(SwarmRunReq);
+        let schema_json = serde_json::to_value(&schema).expect("schema to json");
+        let defs = schema_json.get("$defs").expect("$defs");
+
+        // Resolve BlueprintInput (referenced from properties.blueprint).
+        let input = defs.get("BlueprintInput").expect("BlueprintInput def");
+        let anyof = input.get("anyOf").expect("BlueprintInput anyOf").as_array().unwrap();
+
+        // Every anyOf branch must resolve to an object-typed schema:
+        //   - Selector branch: $ref → BlueprintSelector (oneOf of objects)
+        //   - BareInline branch: direct `type: "object"`
+        for (i, branch) in anyof.iter().enumerate() {
+            if let Some(t) = branch.get("type").and_then(|v| v.as_str()) {
+                assert_eq!(t, "object", "branch {i}: {branch}");
+            } else if let Some(r) = branch.get("$ref").and_then(|v| v.as_str()) {
+                let name = r.rsplit('/').next().unwrap();
+                let referenced = defs.get(name).expect("resolves def");
+                let oneof = referenced
+                    .get("oneOf")
+                    .expect("selector def oneOf")
+                    .as_array()
+                    .unwrap();
+                for v in oneof {
+                    assert_eq!(
+                        v.get("type").and_then(|x| x.as_str()),
+                        Some("object"),
+                        "selector variant {v}"
+                    );
+                }
+            } else {
+                panic!("branch {i} has neither type nor $ref: {branch}");
+            }
+        }
     }
 
     // ─── S3 operator client tools: error paths (no network required) ───────
@@ -969,7 +1359,7 @@ mod tests {
         // seed a run first
         let _ = server
             .swarm_run(Parameters(SwarmRunReq {
-                blueprint: serde_json::json!({}),
+                blueprint: BlueprintInput::BareInline(serde_json::json!({})),
                 init_ctx: None,
                 timeout_secs: Some(5),
                 operator_id: None,
