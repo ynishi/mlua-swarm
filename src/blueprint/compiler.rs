@@ -31,7 +31,7 @@ use crate::blueprint::{AgentDef, AgentKind, Blueprint, BlueprintMetadata};
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
 use crate::operator::{Operator, OperatorSpawner, WorkerBinding};
-use crate::types::{CapToken, TaskId};
+use crate::types::{CapToken, StepId};
 use crate::worker::adapter::{InProcSpawner, SpawnError, SpawnerAdapter, WorkerFn};
 use crate::worker::process_spawner::{ProcessSpawner, StreamMode};
 use crate::worker::Worker;
@@ -356,7 +356,7 @@ impl SpawnerAdapter for CompiledAgentTable {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {

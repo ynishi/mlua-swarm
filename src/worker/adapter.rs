@@ -16,7 +16,7 @@
 
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
-use crate::types::{CapToken, TaskId};
+use crate::types::{CapToken, StepId};
 use crate::worker::Worker;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -86,7 +86,7 @@ pub trait SpawnerAdapter: Send + Sync {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError>;
@@ -119,7 +119,7 @@ pub struct WorkerInvocation {
     /// Capability token authorizing this attempt.
     pub token: CapToken,
     /// The task this invocation belongs to.
-    pub task_id: TaskId,
+    pub task_id: StepId,
     /// Attempt number within the task (used to key output events).
     pub attempt: u32,
     /// Registered agent name the `WorkerFn` was looked up under.
@@ -244,7 +244,7 @@ impl<W: Worker + From<crate::worker::WorkerJoinHandler> + Send + Sync + 'static>
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {

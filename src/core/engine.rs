@@ -16,7 +16,7 @@ use crate::core::state::{
     ResumePending, TaskSpec, TaskState, TaskStatus,
 };
 use crate::types::{
-    default_role_verb_table, now_unix, CapToken, Role, RoleVerbGate, SessionId, TaskId,
+    default_role_verb_table, now_unix, CapToken, Role, RoleVerbGate, SessionId, StepId,
     TokenSigner, Verb,
 };
 use crate::worker::adapter::SpawnerAdapter;
@@ -257,7 +257,7 @@ impl Engine {
         &self,
         token: &CapToken,
         verb: Verb,
-        task_id: &TaskId,
+        task_id: &StepId,
     ) -> Result<(), EngineError> {
         self.verify_token(token, verb).await?;
         if token.role != Role::Worker {
@@ -288,7 +288,7 @@ impl Engine {
     /// simple `/v1/worker/submit` endpoint, where the worker POSTs with a
     /// token but no `task_id`. Returns `Err` if the token role is not
     /// Worker, or if no bound task is set.
-    pub async fn task_id_from_token(&self, token: &CapToken) -> Result<TaskId, EngineError> {
+    pub async fn task_id_from_token(&self, token: &CapToken) -> Result<StepId, EngineError> {
         if token.role != Role::Worker {
             return Err(EngineError::RoleViolation {
                 role: token.role,
@@ -310,7 +310,7 @@ impl Engine {
     /// `task_id`. Used on `/v1/worker/submit` when the Bearer is a short
     /// handle string rather than a full `CapToken` JSON. A missing entry
     /// returns `TokenNotFound`, i.e. "the handle is not in the store".
-    pub async fn task_id_from_handle(&self, handle: &str) -> Result<TaskId, EngineError> {
+    pub async fn task_id_from_handle(&self, handle: &str) -> Result<StepId, EngineError> {
         let h = handle.to_string();
         self.with_state("task_id_from_handle", move |s| {
             let nonce = s
@@ -335,7 +335,7 @@ impl Engine {
     /// trusted.
     pub async fn submit_worker_result_trusted(
         &self,
-        task_id: &TaskId,
+        task_id: &StepId,
         attempt: u32,
         value: Value,
         ok: bool,
@@ -802,9 +802,9 @@ impl Engine {
         &self,
         token: &CapToken,
         spec: TaskSpec,
-    ) -> Result<TaskId, EngineError> {
+    ) -> Result<StepId, EngineError> {
         self.verify_token(token, Verb::StartTask).await?;
-        let task_id = TaskId::new();
+        let task_id = StepId::new();
         let directive = spec.initial_directive.clone();
         let task_id_clone = task_id.clone();
         let nonce = token.nonce.clone();
@@ -862,7 +862,7 @@ impl Engine {
     pub async fn read_task_state(
         &self,
         token: &CapToken,
-        task_id: &TaskId,
+        task_id: &StepId,
     ) -> Result<TaskState, EngineError> {
         self.verify_token_for_task(token, Verb::ReadTaskState, task_id)
             .await?;
@@ -878,7 +878,7 @@ impl Engine {
 
     /// Mark `task_id` as `Cancelled` and wake any caller blocked in
     /// `poll_task` for it.
-    pub async fn cancel_task(&self, token: &CapToken, task_id: &TaskId) -> Result<(), EngineError> {
+    pub async fn cancel_task(&self, token: &CapToken, task_id: &StepId) -> Result<(), EngineError> {
         self.verify_token_for_task(token, Verb::CancelTask, task_id)
             .await?;
         let tid = task_id.clone();
@@ -917,7 +917,7 @@ impl Engine {
     pub async fn dispatch_attempt_with(
         &self,
         token: &CapToken,
-        task_id: &TaskId,
+        task_id: &StepId,
         spawner: &Arc<dyn SpawnerAdapter>,
     ) -> Result<DispatchOutcome, EngineError> {
         self.verify_token(token, Verb::DispatchAttempt).await?;
@@ -1120,7 +1120,7 @@ impl Engine {
     pub async fn fetch_prompt(
         &self,
         token: &CapToken,
-        task_id: &TaskId,
+        task_id: &StepId,
     ) -> Result<String, EngineError> {
         self.verify_token_for_task(token, Verb::FetchPrompt, task_id)
             .await?;
@@ -1154,7 +1154,7 @@ impl Engine {
     pub async fn fetch_worker_payload(
         &self,
         token: &CapToken,
-        task_id: &TaskId,
+        task_id: &StepId,
     ) -> Result<crate::types::WorkerPayload, EngineError> {
         self.verify_token_for_task(token, Verb::FetchPrompt, task_id)
             .await?;
@@ -1200,7 +1200,7 @@ impl Engine {
     /// trusted.
     pub async fn fetch_worker_payload_trusted(
         &self,
-        task_id: &TaskId,
+        task_id: &StepId,
     ) -> Result<crate::types::WorkerPayload, EngineError> {
         let task_id_clone = task_id.clone();
         self.with_state("fetch_worker_payload_trusted", move |s| {
@@ -1239,7 +1239,7 @@ impl Engine {
     /// Read the current attempt number for a task (server-side lookup, no
     /// token verification). Used on `HTTP /v1/worker/result` when the
     /// worker omits `attempt` and the server has to fill it in.
-    pub async fn task_attempt(&self, task_id: &TaskId) -> Result<u32, EngineError> {
+    pub async fn task_attempt(&self, task_id: &StepId) -> Result<u32, EngineError> {
         let task_id = task_id.clone();
         self.with_state("task_attempt", move |s| {
             s.tasks
@@ -1256,7 +1256,7 @@ impl Engine {
     /// this alongside the prompt on the `/v1/worker/prompt` path.
     pub async fn bake_worker_system_prompt(
         &self,
-        task_id: &TaskId,
+        task_id: &StepId,
         attempt: u32,
         system: Option<String>,
     ) -> Result<(), EngineError> {
@@ -1300,7 +1300,7 @@ impl Engine {
     pub async fn submit_output(
         &self,
         token: &crate::types::CapToken,
-        task_id: &TaskId,
+        task_id: &StepId,
         attempt: u32,
         event: crate::worker::output::OutputEvent,
     ) -> Result<(), EngineError> {
@@ -1328,7 +1328,7 @@ impl Engine {
     /// reading the trace.
     pub async fn output_tail(
         &self,
-        task_id: &TaskId,
+        task_id: &StepId,
         attempt: u32,
     ) -> Vec<crate::worker::output::OutputEvent> {
         let key = (task_id.clone(), attempt);
@@ -1345,7 +1345,7 @@ impl Engine {
     pub async fn post_result(
         &self,
         token: &CapToken,
-        task_id: &TaskId,
+        task_id: &StepId,
         result: Value,
     ) -> Result<(), EngineError> {
         self.verify_token_for_task(token, Verb::PostResult, task_id)
@@ -1396,7 +1396,7 @@ impl Engine {
     pub async fn query_senior(
         &self,
         token: &CapToken,
-        task_id: &TaskId,
+        task_id: &StepId,
         question: Value,
     ) -> Result<ResumeKey, EngineError> {
         self.verify_token(token, Verb::QuerySenior).await?;
@@ -1570,7 +1570,7 @@ impl Engine {
     pub async fn poll_task(
         &self,
         token: &CapToken,
-        task_id: &TaskId,
+        task_id: &StepId,
         hold: Duration,
     ) -> Result<TaskState, EngineError> {
         self.verify_token_for_task(token, Verb::PollTask, task_id)
@@ -1676,7 +1676,7 @@ impl Engine {
 
     /// Helper: wake a task whose status has changed. Called from the
     /// method body outside the lock.
-    async fn wake_task(&self, task_id: &TaskId) -> Result<(), EngineError> {
+    async fn wake_task(&self, task_id: &StepId) -> Result<(), EngineError> {
         let task_id = task_id.clone();
         let notify_opt = self
             .with_state("wake_task.get_notify", move |s| {

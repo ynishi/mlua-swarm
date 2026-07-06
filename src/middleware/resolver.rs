@@ -14,7 +14,7 @@
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
 use crate::middleware::SpawnerLayer;
-use crate::types::{CapToken, TaskId};
+use crate::types::{CapToken, StepId};
 use crate::worker::adapter::{SpawnError, SpawnerAdapter};
 use crate::worker::Worker;
 use async_trait::async_trait;
@@ -94,7 +94,7 @@ impl SpawnerAdapter for ResolverWrapped {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {

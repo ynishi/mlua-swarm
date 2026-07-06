@@ -40,7 +40,7 @@ use axum::{
     Json,
 };
 use mlua_swarm::store::output::{OutputEvent, OutputRecord, OutputRef};
-use mlua_swarm::{types::Verb, CapToken, TaskId};
+use mlua_swarm::{types::Verb, CapToken, StepId};
 use serde::{Deserialize, Serialize};
 
 use crate::{ApiError, AppState};
@@ -128,7 +128,7 @@ async fn emit_inner(
     req: DataEmitReq,
 ) -> Result<Json<DataEmitResp>, ApiError> {
     let token = extract_captoken(headers, query_token)?;
-    let tid = TaskId(req.task_id.clone());
+    let tid = StepId(req.task_id.clone());
     state
         .engine
         .verify_token_for_task(&token, Verb::EmitOutput, &tid)

@@ -8,8 +8,44 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ─── ID newtypes ───────────────────────────────────────────────────────────
 
-/// Opaque task identifier, e.g. `T-<hex>`. Newtype over `String` so task,
-/// session, and worker ids can't be swapped by accident at call sites.
+/// Opaque per-step identifier, e.g. `ST-<hex>`. Newtype over `String` so
+/// step, session, and worker ids can't be swapped by accident at call sites.
+///
+/// One `StepId` is minted per dispatched Blueprint step (the engine's
+/// dispatcher "spins up a fresh task per `Step.ref`"). It is scoped to a
+/// single step execution — the whole-kick identity is [`RunId`], and the
+/// work-item identity is [`TaskId`].
+///
+/// Renamed from `TaskId` (`T-` prefix) in the issue #13 ID-hierarchy
+/// reconciliation: Blueprint → Task → Run → Step → Attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StepId(pub String);
+
+impl StepId {
+    /// Mint a fresh id with the `ST-` prefix and a process-unique nonce.
+    pub fn new() -> Self {
+        Self(format!("ST-{}", uid_hex(8)))
+    }
+}
+
+impl Default for StepId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for StepId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Opaque work-item identifier, e.g. `T-<hex>`. One `TaskId` names one unit
+/// of work ("resolve issue #10" + a Blueprint ref + input ctx), persisted in
+/// the task store. A task can be kicked N times; each kick is a [`RunId`].
+///
+/// Not to be confused with [`StepId`] (the per-step id that carried the
+/// `TaskId` name before issue #13).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub String);
 
@@ -32,7 +68,33 @@ impl std::fmt::Display for TaskId {
     }
 }
 
-/// Opaque session identifier, e.g. `S-<hex>`. See [`TaskId`] for the newtype
+/// Opaque run identifier, e.g. `R-<hex>`. One `RunId` names one kick of a
+/// [`TaskId`] — minted server-side when a task is started, propagated
+/// through the engine ctx to every wire frame so steps, workers, and
+/// outputs correlate back to the run.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RunId(pub String);
+
+impl RunId {
+    /// Mint a fresh id with the `R-` prefix and a process-unique nonce.
+    pub fn new() -> Self {
+        Self(format!("R-{}", uid_hex(8)))
+    }
+}
+
+impl Default for RunId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Opaque session identifier, e.g. `S-<hex>`. See [`StepId`] for the newtype
 /// rationale.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub String);
@@ -50,7 +112,7 @@ impl Default for SessionId {
     }
 }
 
-/// Opaque worker identifier, e.g. `W-<hex>`. See [`TaskId`] for the newtype
+/// Opaque worker identifier, e.g. `W-<hex>`. See [`StepId`] for the newtype
 /// rationale.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerId(pub String);

@@ -5,7 +5,7 @@
 //! know about Operators. Middleware watches `Ctx.operator` and branches on
 //! it.
 
-use crate::types::TaskId;
+use crate::types::StepId;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ctx {
     /// The task this attempt belongs to.
-    pub task_id: TaskId,
+    pub task_id: StepId,
     /// 1-based attempt counter for `task_id` (bumped by
     /// `Engine::dispatch_attempt_with` on every dispatch).
     pub attempt: u32,
@@ -36,7 +36,7 @@ pub struct Ctx {
 impl Ctx {
     /// Build a fresh `Ctx` with default `meta` and `operator`
     /// (`OperatorInfo::default()`, i.e. `Automate` / no bridges).
-    pub fn new(task_id: TaskId, attempt: u32, agent: impl Into<String>) -> Self {
+    pub fn new(task_id: StepId, attempt: u32, agent: impl Into<String>) -> Self {
         Self {
             task_id,
             attempt,
@@ -319,7 +319,7 @@ pub trait SeniorBridge: Send + Sync {
     /// Ask the Senior a question and wait for the answer (`Value`). The
     /// implementation is free — a CLI prompt, an MCP modal, another
     /// process, whatever.
-    async fn ask(&self, task_id: &TaskId, question: Value) -> Result<Value, String>;
+    async fn ask(&self, task_id: &StepId, question: Value) -> Result<Value, String>;
 }
 
 /// Pre-/post-spawn observation and gating hook fired by

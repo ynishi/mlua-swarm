@@ -23,7 +23,7 @@
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
 use crate::middleware::SpawnerLayer;
-use crate::types::{CapToken, TaskId};
+use crate::types::{CapToken, StepId};
 use crate::worker::adapter::{SpawnError, SpawnerAdapter, WorkerError};
 use crate::worker::{wrap_join, Worker};
 use async_trait::async_trait;
@@ -183,7 +183,7 @@ impl SpawnerAdapter for LuaWrapped {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {
@@ -241,7 +241,7 @@ fn wrap_completion_with_lua_pool(
     pool: Arc<AsyncIslePool>,
     engine: Engine,
     token: crate::types::CapToken,
-    task_id: TaskId,
+    task_id: StepId,
     attempt: u32,
 ) -> Box<dyn Worker> {
     wrap_join(handle, move |signal| async move {
@@ -264,7 +264,7 @@ async fn apply_lua_after_pool(
     pool: &AsyncIslePool,
     engine: &Engine,
     token: &crate::types::CapToken,
-    task_id: &TaskId,
+    task_id: &StepId,
     attempt: u32,
 ) -> Result<(), WorkerError> {
     // Pull the existing Final from the tail (only Inline is fed through Lua; FileRef passes through as-is).

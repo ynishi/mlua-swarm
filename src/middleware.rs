@@ -60,7 +60,7 @@ pub mod worker_binding;
 use crate::core::ctx::{Ctx, OperatorKind};
 use crate::core::engine::Engine;
 use crate::core::state::Event;
-use crate::types::{CapToken, TaskId};
+use crate::types::{CapToken, StepId};
 use crate::worker::adapter::{SpawnError, SpawnerAdapter};
 use crate::worker::output::{ContentRef, OutputEvent};
 use crate::worker::{wrap_join, MiddlewareWorker, Worker, WorkerJoinHandler};
@@ -74,7 +74,7 @@ use tokio::sync::broadcast;
 /// for both `Inline` and `FileRef` content).
 async fn pull_final_value_ok(
     engine: &Engine,
-    task_id: &TaskId,
+    task_id: &StepId,
     attempt: u32,
 ) -> Option<(Value, bool)> {
     let tail = engine.output_tail(task_id, attempt).await;
@@ -266,7 +266,7 @@ impl SpawnerAdapter for AuditWrapped {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {
@@ -314,7 +314,7 @@ impl SpawnerAdapter for MainAIWrapped {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {
@@ -410,7 +410,7 @@ impl SpawnerAdapter for SeniorWrapped {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {
@@ -548,7 +548,7 @@ impl SpawnerAdapter for OperatorDelegateWrapped {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {
@@ -698,7 +698,7 @@ impl SpawnerAdapter for LongHoldWrapped {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {
@@ -780,7 +780,7 @@ mod operator_delegate_worker_binding_tests {
             &self,
             _engine: &Engine,
             _ctx: &Ctx,
-            _task_id: TaskId,
+            _task_id: StepId,
             _attempt: u32,
             _token: CapToken,
         ) -> Result<Box<dyn Worker>, SpawnError> {
@@ -788,7 +788,7 @@ mod operator_delegate_worker_binding_tests {
         }
     }
 
-    async fn seeded_engine() -> (Engine, CapToken, TaskId) {
+    async fn seeded_engine() -> (Engine, CapToken, StepId) {
         let engine = Engine::new(EngineCfg::default());
         let op_token = engine
             .attach("ut-op", Role::Operator, Duration::from_secs(30))

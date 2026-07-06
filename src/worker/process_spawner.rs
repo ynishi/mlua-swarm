@@ -52,7 +52,7 @@
 
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
-use crate::types::{CapToken, TaskId, WorkerId};
+use crate::types::{CapToken, StepId, WorkerId};
 use crate::worker::adapter::{SpawnError, SpawnerAdapter, WorkerError, WorkerResult};
 use crate::worker::output::{ContentRef, OutputEvent};
 use crate::worker::{Worker, WorkerJoinHandler};
@@ -183,7 +183,7 @@ impl SpawnerAdapter for ProcessSpawner {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {
@@ -335,7 +335,7 @@ async fn run_streaming_mode(
     mut child: tokio::process::Child,
     engine: &Engine,
     token: &CapToken,
-    task_id: &TaskId,
+    task_id: &StepId,
     attempt: u32,
     cancel: CancellationToken,
 ) -> Result<WorkerResult, WorkerError> {
@@ -396,7 +396,7 @@ async fn run_streaming_mode(
 async fn forward_event(
     engine: &Engine,
     token: &CapToken,
-    task_id: &TaskId,
+    task_id: &StepId,
     attempt: u32,
     ev: OutputEvent,
     last_final: &mut Option<(Value, bool)>,
@@ -425,7 +425,7 @@ async fn read_ndjson(
     stdout: tokio::process::ChildStdout,
     engine: &Engine,
     token: &CapToken,
-    task_id: &TaskId,
+    task_id: &StepId,
     attempt: u32,
     cancel: CancellationToken,
 ) -> Result<Option<(Value, bool)>, WorkerError> {
@@ -457,7 +457,7 @@ async fn read_sse(
     stdout: tokio::process::ChildStdout,
     engine: &Engine,
     token: &CapToken,
-    task_id: &TaskId,
+    task_id: &StepId,
     attempt: u32,
     cancel: CancellationToken,
 ) -> Result<Option<(Value, bool)>, WorkerError> {
@@ -509,7 +509,7 @@ async fn read_length_prefixed(
     mut stdout: tokio::process::ChildStdout,
     engine: &Engine,
     token: &CapToken,
-    task_id: &TaskId,
+    task_id: &StepId,
     attempt: u32,
     cancel: CancellationToken,
 ) -> Result<Option<(Value, bool)>, WorkerError> {

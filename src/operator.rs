@@ -27,7 +27,7 @@ pub use render::{render_system, slots_from_prompt, RenderError};
 
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
-use crate::types::{CapToken, TaskId, WorkerId};
+use crate::types::{CapToken, StepId, WorkerId};
 use crate::worker::adapter::{SpawnError, SpawnerAdapter, WorkerError, WorkerResult};
 use crate::worker::output::{ContentRef, OutputEvent};
 use crate::worker::{Worker, WorkerJoinHandler};
@@ -172,7 +172,7 @@ impl SpawnerAdapter for OperatorSpawner {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {

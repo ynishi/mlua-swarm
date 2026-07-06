@@ -40,7 +40,7 @@ use axum::{
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     Json,
 };
-use mlua_swarm::{CapToken, ContentRef, OutputEvent, TaskId, WorkerPayload};
+use mlua_swarm::{CapToken, ContentRef, OutputEvent, StepId, WorkerPayload};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -63,7 +63,7 @@ pub async fn worker_prompt(
     headers: HeaderMap,
     Query(q): Query<PromptQuery>,
 ) -> Result<Json<WorkerPayload>, ApiError> {
-    let task_id = TaskId(q.task_id.clone());
+    let task_id = StepId(q.task_id.clone());
     let bearer = extract_bearer_raw(&headers)?;
     let payload = if let Some(handle) = parse_worker_handle(&bearer) {
         // Short-handle path: verify handle → task_id (security: confirm the handle is bound to this task).
@@ -126,7 +126,7 @@ pub async fn worker_result(
     Json(req): Json<WorkerResultReq>,
 ) -> Result<StatusCode, ApiError> {
     let token = decode_worker_bearer(&headers)?;
-    let task_id = TaskId(req.task_id);
+    let task_id = StepId(req.task_id);
 
     // Use body-explicit attempt if provided; otherwise the current task.attempt.
     let attempt = match req.attempt {

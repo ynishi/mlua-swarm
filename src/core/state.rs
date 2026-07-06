@@ -7,7 +7,7 @@
 //! event log tail). It sits on the Domain side of the Data / Domain split
 //! and is unchanged by the Data-plane (`output_store` module) refactor.
 
-use crate::types::{CapToken, Role, SessionId, TaskId};
+use crate::types::{CapToken, Role, SessionId, StepId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ impl ResumeKey {
     /// Deterministic key for a Senior-escalation suspend on `task_id`
     /// (`R-senior-<task_id>`), so repeated escalations on the same task
     /// are addressable without extra bookkeeping.
-    pub fn for_senior(task_id: &TaskId) -> Self {
+    pub fn for_senior(task_id: &StepId) -> Self {
         Self(format!("R-senior-{}", task_id.0))
     }
 }
@@ -78,7 +78,7 @@ pub struct TaskSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskState {
     /// Unique task identifier (assigned by `start_task`).
-    pub id: TaskId,
+    pub id: StepId,
     /// The static spec this task was created from.
     pub spec: TaskSpec,
     /// Current lifecycle status.
@@ -106,7 +106,7 @@ pub struct TaskState {
 impl TaskState {
     /// Construct a new `Pending` task with `attempt = 0` and
     /// `spawn_depth = 0`; `created_at`/`updated_at` are set to now.
-    pub fn new(id: TaskId, spec: TaskSpec) -> Self {
+    pub fn new(id: StepId, spec: TaskSpec) -> Self {
         let now = crate::types::now_unix();
         Self {
             id,
@@ -164,7 +164,7 @@ pub struct OperatorSession {
     pub attached: bool,
     /// Task IDs started by this session (via `start_task` while this
     /// session's token was current).
-    pub owned_task_ids: Vec<TaskId>,
+    pub owned_task_ids: Vec<StepId>,
     /// Nonce of the `CapToken` this session was attached with; used to
     /// look sessions up by token in `with_state` closures.
     pub token_nonce: String,
@@ -248,7 +248,7 @@ pub struct CapTokenRecord {
     ///      Operator tokens (minted at attach time) leave this `None`, so
     ///      they can touch any task.
     #[serde(default)]
-    pub task_id: Option<TaskId>,
+    pub task_id: Option<StepId>,
 }
 
 impl CapTokenRecord {
@@ -265,7 +265,7 @@ impl CapTokenRecord {
 
     /// Convenience constructor used when minting a Worker token — binds
     /// the record to the target task.
-    pub fn from_worker_token(token: CapToken, task_id: TaskId) -> Self {
+    pub fn from_worker_token(token: CapToken, task_id: StepId) -> Self {
         Self {
             uses_left: token.max_uses,
             token,
@@ -326,20 +326,20 @@ pub enum Event {
     /// A new task was created via `start_task`.
     TaskCreated {
         /// The newly created task.
-        task_id: TaskId,
+        task_id: StepId,
     },
     /// An attempt began dispatching (not currently emitted by
     /// `dispatch_attempt_with`; reserved for future use).
     TaskAttemptStarted {
         /// The task being dispatched.
-        task_id: TaskId,
+        task_id: StepId,
         /// The attempt number.
         attempt: u32,
     },
     /// An attempt finished, Pass or Blocked, with the resulting value.
     TaskAttemptCompleted {
         /// The task whose attempt completed.
-        task_id: TaskId,
+        task_id: StepId,
         /// The attempt number that completed.
         attempt: u32,
         /// The result value produced by the attempt.
@@ -348,21 +348,21 @@ pub enum Event {
     /// The task attempt completed with `ok = true`.
     TaskPass {
         /// The task that passed.
-        task_id: TaskId,
+        task_id: StepId,
         /// The result value.
         result: Value,
     },
     /// The task attempt completed with `ok = false`.
     TaskBlocked {
         /// The task that was blocked.
-        task_id: TaskId,
+        task_id: StepId,
         /// The result/error value.
         result: Value,
     },
     /// A worker appended an `OutputEvent` via `submit_output`.
     WorkerOutput {
         /// The task the output belongs to.
-        task_id: TaskId,
+        task_id: StepId,
         /// The attempt the output belongs to.
         attempt: u32,
         /// The appended output event.
@@ -371,33 +371,33 @@ pub enum Event {
     /// The task suspended pending a `resume` for `key`.
     TaskSuspended {
         /// The suspended task.
-        task_id: TaskId,
+        task_id: StepId,
         /// The key needed to `resume` it.
         key: ResumeKey,
     },
     /// The task resumed after `resume(key, ..)` was called.
     TaskResumed {
         /// The resumed task.
-        task_id: TaskId,
+        task_id: StepId,
         /// The key that was resumed.
         key: ResumeKey,
     },
     /// The task was cancelled via `cancel_task`.
     TaskCancelled {
         /// The cancelled task.
-        task_id: TaskId,
+        task_id: StepId,
     },
     /// `query_senior` was called, asking `question` on behalf of `task_id`.
     SeniorQueried {
         /// The task that triggered the query.
-        task_id: TaskId,
+        task_id: StepId,
         /// The question posed to the Senior.
         question: Value,
     },
     /// A Senior's `answer` was stored via `resume`.
     SeniorAnswered {
         /// The task the answer applies to.
-        task_id: TaskId,
+        task_id: StepId,
         /// The Senior's answer.
         answer: Value,
     },
@@ -446,20 +446,20 @@ impl Default for ResumePending {
 /// there).
 #[derive(Debug)]
 pub struct EngineState {
-    /// All known tasks, keyed by `TaskId`.
-    pub tasks: HashMap<TaskId, TaskState>,
+    /// All known tasks, keyed by `StepId`.
+    pub tasks: HashMap<StepId, TaskState>,
     /// All attached/detached sessions, keyed by `SessionId`.
     pub sessions: HashMap<SessionId, OperatorSession>,
     /// Per-`(task_id, attempt)` prompt/directive text, seeded from
     /// `TaskSpec.initial_directive` and fetched via `fetch_prompt`.
-    pub prompts: HashMap<(TaskId, u32), String>,
+    pub prompts: HashMap<(StepId, u32), String>,
     /// Per-attempt `system_prompt`: `AgentDef.profile.system_prompt` is
     /// baked at compile time, rendered inside `OperatorSpawner::spawn`,
     /// and stashed here for the SubAgent to fetch alongside its prompt via
     /// `HTTP /v1/worker/prompt`. The value is `Option<String>` so a missing
     /// profile can be distinguished: an absent key means "not yet baked",
     /// while `Some(None)` means "baked and profile is explicitly absent".
-    pub systems: HashMap<(TaskId, u32), Option<String>>,
+    pub systems: HashMap<(StepId, u32), Option<String>>,
     /// All minted `CapToken` records, keyed by token nonce.
     pub tokens: HashMap<String, CapTokenRecord>, // key = token nonce
     /// Short worker handle (`wh-XXXXXXXX`, 12 chars) → token-nonce lookup
@@ -474,14 +474,14 @@ pub struct EngineState {
     /// Per-task notifier — `notify_waiters` fires on every task-status
     /// change. Used by `poll_task` on the caller side, and by callers that
     /// need to `await` again after detach/reattach.
-    pub task_notifies: HashMap<TaskId, Arc<Notify>>,
+    pub task_notifies: HashMap<StepId, Arc<Notify>>,
     /// Arbitrary named resources set via `set_resource` and read via
     /// `fetch_data`.
     pub resources: HashMap<String, Value>,
     /// Per-attempt output-event log. The `SpawnerAdapter` appends via
     /// `submit_output`; the dispatch path pulls the terminal
     /// `OutputEvent::Final` off the tail and decides Pass / Blocked.
-    pub output_store: HashMap<(TaskId, u32), Vec<crate::worker::output::OutputEvent>>,
+    pub output_store: HashMap<(StepId, u32), Vec<crate::worker::output::OutputEvent>>,
     /// Bounded in-process tail of recent `Event`s (most recent last),
     /// trimmed to `event_log_max` by `push_event`.
     pub event_log_tail: Vec<Event>,
@@ -510,7 +510,7 @@ impl EngineState {
     }
 
     /// Ensure a per-task `Notify` exists; return the existing one if any.
-    pub fn ensure_task_notify(&mut self, task_id: &TaskId) -> Arc<Notify> {
+    pub fn ensure_task_notify(&mut self, task_id: &StepId) -> Arc<Notify> {
         self.task_notifies
             .entry(task_id.clone())
             .or_insert_with(|| Arc::new(Notify::new()))

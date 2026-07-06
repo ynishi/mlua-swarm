@@ -12,7 +12,7 @@
 
 use async_trait::async_trait;
 use mlua_swarm::{
-    CapToken, Ctx, Operator, SeniorBridge, SpawnHook, TaskId, WorkerBinding, WorkerError,
+    CapToken, Ctx, Operator, SeniorBridge, SpawnHook, StepId, WorkerBinding, WorkerError,
     WorkerResult,
 };
 use serde_json::Value;
@@ -119,7 +119,7 @@ impl WSOperatorSession {
 
 #[async_trait]
 impl SeniorBridge for WSOperatorSession {
-    async fn ask(&self, task_id: &TaskId, question: Value) -> Result<Value, String> {
+    async fn ask(&self, task_id: &StepId, question: Value) -> Result<Value, String> {
         let req_id = format!("{}-ask-{}", self.sid, uuid::Uuid::new_v4());
         let msg = ServerMsg::Ask {
             req_id: req_id.clone(),
@@ -626,7 +626,7 @@ mod tests {
     // ─── Issue #7: spawn_halt handling in Operator::execute ──────────────
 
     fn test_ctx(task_id: &str) -> mlua_swarm::Ctx {
-        mlua_swarm::Ctx::new(mlua_swarm::TaskId(task_id.into()), 1, "a")
+        mlua_swarm::Ctx::new(mlua_swarm::StepId(task_id.into()), 1, "a")
     }
 
     fn test_worker_binding() -> mlua_swarm::WorkerBinding {

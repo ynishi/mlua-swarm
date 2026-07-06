@@ -38,7 +38,7 @@ pub trait OutputSink: Send + Sync {
 pub struct EngineSink {
     engine: crate::core::engine::Engine,
     token: crate::types::CapToken,
-    task_id: crate::types::TaskId,
+    task_id: crate::types::StepId,
     attempt: u32,
 }
 
@@ -49,7 +49,7 @@ impl EngineSink {
     pub fn new(
         engine: crate::core::engine::Engine,
         token: crate::types::CapToken,
-        task_id: crate::types::TaskId,
+        task_id: crate::types::StepId,
         attempt: u32,
     ) -> Self {
         Self {

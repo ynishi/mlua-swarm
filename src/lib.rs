@@ -111,8 +111,8 @@ pub use store::output::{
     InMemoryOutputStore, OutputRecord, OutputRef, OutputStore, OutputStoreError,
 };
 pub use types::{
-    default_role_verb_table, CapToken, CapTokenDecodeError, Role, RoleVerbGate, SessionId, TaskId,
-    Verb, WorkerId, WorkerPayload,
+    default_role_verb_table, CapToken, CapTokenDecodeError, Role, RoleVerbGate, RunId, SessionId,
+    StepId, TaskId, Verb, WorkerId, WorkerPayload,
 };
 pub use worker::adapter::{
     InProcSpawner, SpawnError, SpawnerAdapter, WorkerError, WorkerFn, WorkerInvocation,

@@ -23,7 +23,7 @@ use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
 use crate::middleware::SpawnerLayer;
 use crate::operator::WorkerBinding;
-use crate::types::{CapToken, TaskId};
+use crate::types::{CapToken, StepId};
 use crate::worker::adapter::{SpawnError, SpawnerAdapter};
 use crate::worker::Worker;
 use async_trait::async_trait;
@@ -70,7 +70,7 @@ impl SpawnerAdapter for WorkerBindingWrapped {
         &self,
         engine: &Engine,
         ctx: &Ctx,
-        task_id: TaskId,
+        task_id: StepId,
         attempt: u32,
         token: CapToken,
     ) -> Result<Box<dyn Worker>, SpawnError> {
@@ -116,7 +116,7 @@ mod tests {
             &self,
             _engine: &Engine,
             ctx: &Ctx,
-            _task_id: TaskId,
+            _task_id: StepId,
             _attempt: u32,
             _token: CapToken,
         ) -> Result<Box<dyn Worker>, SpawnError> {
@@ -146,7 +146,7 @@ mod tests {
         );
         let (stack, seen) = probe_stack(map);
         let engine = Engine::new(EngineCfg::default());
-        let task_id = TaskId("t-1".to_string());
+        let task_id = StepId("t-1".to_string());
         let ctx = Ctx::new(task_id.clone(), 1, "planner");
         let token = engine
             .attach("ut-op", Role::Operator, Duration::from_secs(30))
@@ -169,7 +169,7 @@ mod tests {
     async fn passes_through_untouched_on_miss() {
         let (stack, seen) = probe_stack(HashMap::new());
         let engine = Engine::new(EngineCfg::default());
-        let task_id = TaskId("t-2".to_string());
+        let task_id = StepId("t-2".to_string());
         let ctx = Ctx::new(task_id.clone(), 1, "unbound-agent");
         let token = engine
             .attach("ut-op", Role::Operator, Duration::from_secs(30))

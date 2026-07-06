@@ -1,7 +1,7 @@
 //! `TaskApplication` — the `POST /v1/tasks` entry point.
 //!
 //! Input: `BlueprintRef` (Inline / Id) plus a `TaskSpec`. Output:
-//! `(CapToken, TaskId, version)`. Once the Blueprint is resolved, the
+//! `(CapToken, StepId, version)`. Once the Blueprint is resolved, the
 //! engine-side operations (`bind` + `attach` + `start_task`) are
 //! delegated to [`TaskLaunchService`].
 
