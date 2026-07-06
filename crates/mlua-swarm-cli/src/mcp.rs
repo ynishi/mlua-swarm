@@ -23,7 +23,7 @@ use mlua_swarm::blueprint::Blueprint;
 use mlua_swarm::store::run::{
     InMemoryRunStore, RunContext, RunRecord, RunStatus as StoreRunStatus, RunStore,
 };
-use mlua_swarm::types::{RunId, TaskId};
+use mlua_swarm::types::{RunId, StepId, TaskId};
 use mlua_swarm::{Compiler, Engine, EngineCfg, OperatorKind, Role, TaskLaunchService};
 use operator_client::{ClientError, OperatorClientState};
 use rmcp::handler::server::wrapper::Parameters;
@@ -241,6 +241,44 @@ struct OperatorLeaveReq {
     sid: String,
 }
 
+// ---- worker HTTP tool param schemas ----
+// Pure-MCP replacements for the two Bash curl steps in the mse-worker
+// wrapper agents, so their tools list can drop `Bash` entirely (the curl
+// allowance kept getting repurposed as a grep/find workaround channel).
+
+#[derive(Deserialize, JsonSchema)]
+struct WorkerFetchReq {
+    /// Bearer for `/v1/worker/*`: the `wh-<hex>` short handle from the
+    /// Spawn frame's `worker_handle` field (recommended), or the full
+    /// encoded `capability_token`.
+    worker_handle: String,
+    /// Server HTTP root from the Spawn directive's `base_url` line,
+    /// e.g. `http://127.0.0.1:7777`.
+    base_url: String,
+    /// Step id (`ST-<hex>`) the prompt belongs to — the Spawn frame's
+    /// `task_id` field.
+    task_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct WorkerSubmitReq {
+    /// Bearer for `/v1/worker/*`: the `wh-<hex>` short handle from the
+    /// Spawn frame's `worker_handle` field (recommended), or the full
+    /// encoded `capability_token`.
+    worker_handle: String,
+    /// Server HTTP root from the Spawn directive's `base_url` line,
+    /// e.g. `http://127.0.0.1:7777`.
+    base_url: String,
+    /// Raw result body, POSTed verbatim as `text/plain` (the server strips
+    /// trailing whitespace only; internal newlines are preserved).
+    body: String,
+    /// `false` marks the attempt failed (`?ok=false` — lands as
+    /// `DispatchOutcome::Blocked`, the flow.ir Try catch path). Omitted /
+    /// `true` = normal success.
+    #[serde(default)]
+    ok: Option<bool>,
+}
+
 // ---- tool param schemas ----
 
 #[derive(Deserialize, JsonSchema)]
@@ -448,6 +486,82 @@ impl MseServer {
             .await
             .map_err(client_error_to_mcp)?;
         json_result(&serde_json::json!({ "removed": true }))
+    }
+
+    #[tool(
+        description = "Worker-side fetch: GET <base_url>/v1/worker/prompt?task_id=<task_id> with `Authorization: Bearer <worker_handle>`. Pass the `worker_handle` (`wh-` short handle, recommended) or the full `capability_token` from the Spawn frame. Returns the server's WorkerPayload JSON verbatim ({task_id, attempt, agent, prompt, system?}). Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
+    )]
+    async fn mse_worker_fetch(
+        &self,
+        Parameters(req): Parameters<WorkerFetchReq>,
+    ) -> Result<CallToolResult, McpError> {
+        // Fail fast before any network I/O — the server's typed PromptQuery
+        // would reject a malformed step id with a 400 anyway (issue #14).
+        let task_id = StepId::parse(req.task_id)
+            .map_err(|e| McpError::invalid_params(format!("invalid task_id: {e}"), None))?;
+        let base = req.base_url.trim_end_matches('/');
+        let url = format!("{base}/v1/worker/prompt");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
+        let resp = client
+            .get(&url)
+            .query(&[("task_id", task_id.as_str())])
+            .header("Authorization", format!("Bearer {}", req.worker_handle))
+            .send()
+            .await
+            .map_err(|e| McpError::internal_error(format!("worker fetch: {e}"), None))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(McpError::internal_error(
+                format!("worker fetch: HTTP {} — {body}", status.as_u16()),
+                None,
+            ));
+        }
+        let payload: JsonValue = serde_json::from_str(&body)
+            .map_err(|e| McpError::internal_error(format!("worker fetch decode: {e}"), None))?;
+        json_result(&payload)
+    }
+
+    #[tool(
+        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Optional ok=false marks the attempt failed (flow.ir Try catch path). Expects HTTP 204 and returns {submitted: true}; any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
+    )]
+    async fn mse_worker_submit(
+        &self,
+        Parameters(req): Parameters<WorkerSubmitReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let base = req.base_url.trim_end_matches('/');
+        let url = format!("{base}/v1/worker/submit");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
+        let mut request = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", req.worker_handle))
+            .header("Content-Type", "text/plain");
+        if req.ok == Some(false) {
+            request = request.query(&[("ok", "false")]);
+        }
+        let resp = request
+            .body(req.body)
+            .send()
+            .await
+            .map_err(|e| McpError::internal_error(format!("worker submit: {e}"), None))?;
+        let status = resp.status();
+        if status != reqwest::StatusCode::NO_CONTENT {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(McpError::internal_error(
+                format!(
+                    "worker submit: HTTP {} (expected 204) — {body}",
+                    status.as_u16()
+                ),
+                None,
+            ));
+        }
+        json_result(&serde_json::json!({ "submitted": true }))
     }
 
     #[tool(
@@ -1439,6 +1553,67 @@ mod tests {
                 panic!("branch {i} has neither type nor $ref: {branch}");
             }
         }
+    }
+
+    // ─── worker HTTP tools (mse_worker_fetch / mse_worker_submit) ──────────
+
+    #[tokio::test]
+    async fn mse_worker_fetch_rejects_malformed_task_id_before_network() {
+        let server = MseServer::new();
+        let err = server
+            .mse_worker_fetch(Parameters(WorkerFetchReq {
+                worker_handle: "wh-deadbeef".into(),
+                // Wrong prefix — must fail at parse, before any HTTP I/O
+                // (base_url is a black-hole address on purpose).
+                base_url: "http://127.0.0.1:1".into(),
+                task_id: "T-abc".into(),
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("invalid task_id"), "err: {msg}");
+    }
+
+    /// Round-trips both tools against a real in-process `mse serve` router.
+    /// A bogus (never-minted) handle exercises the full HTTP path — URL
+    /// shape, Bearer header, query encoding, status/error surfacing —
+    /// without needing a live dispatch.
+    #[tokio::test]
+    async fn mse_worker_fetch_and_submit_hit_the_http_endpoints() {
+        let engine = Engine::new(EngineCfg::default());
+        let router = mlua_swarm_server::build_router(engine);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let server = MseServer::new();
+        let err = server
+            .mse_worker_fetch(Parameters(WorkerFetchReq {
+                worker_handle: "wh-deadbeef".into(),
+                base_url: base_url.clone(),
+                task_id: "ST-nope".into(),
+            }))
+            .await
+            .expect_err("unknown handle must surface the HTTP error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("worker fetch: HTTP"), "err: {msg}");
+
+        let err = server
+            .mse_worker_submit(Parameters(WorkerSubmitReq {
+                worker_handle: "wh-deadbeef".into(),
+                base_url,
+                body: "RESULT".into(),
+                ok: None,
+            }))
+            .await
+            .expect_err("unknown handle must surface the HTTP error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("expected 204"), "err: {msg}");
     }
 
     // ─── S3 operator client tools: error paths (no network required) ───────

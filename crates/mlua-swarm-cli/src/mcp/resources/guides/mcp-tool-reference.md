@@ -49,6 +49,16 @@ capability_token included): `mse://guides/id-lifecycle`.
 | `mse_ack` | Ack a pending frame popped via `mse_pending_wait`. Params: `sid`, `req_id`, `kind` (`answer` / `hook_ack` / `spawn_ack` / `spawn_halt`), `value?`, `ok` (default `true`), `error?`. `spawn_halt` (issue #7) is a controlled halt for the current spawn — pass optional `value` (partial ctx merged into the halt marker) and optional `error` (halt reason, reused as the human-readable log line). The step lands as `WorkerResult { ok: true, value: {halted: true, reason, value} }` — a normal termination, not a worker error (distinct from `spawn_ack ok=false`, which stays the fail-loud path). Scope: `spawn_halt` halts the current spawn only; use `swarm_cancel` for swarm-wide cancellation. | Mutating — sends a `ClientMsg` over the session's WS connection. |
 | `mse_operator_leave` | Leave an Operator session: `DELETE /v1/operators/:sid`, abort the WS reader task, drop the local `sid` entry. Params: `sid`. | Mutating — closes the WS session. |
 
+## Worker HTTP client
+
+Pure-MCP replacements for the two `curl` steps a spawned worker performs,
+so worker-side wrapper agents don't need shell access at all.
+
+| tool | purpose | side effect |
+|---|---|---|
+| `mse_worker_fetch` | `GET <base_url>/v1/worker/prompt?task_id=<task_id>` with `Authorization: Bearer <worker_handle>` (the `wh-` short handle from the Spawn frame, or the full `capability_token`). Returns the server's `WorkerPayload` JSON verbatim (`{task_id, attempt, agent, prompt, system?}`). Params: `worker_handle`, `base_url`, `task_id` (`ST-<hex>`; validated before any network I/O). | Read-only; requires the `mse serve` at `base_url` reachable. |
+| `mse_worker_submit` | `POST <base_url>/v1/worker/submit` with the same Bearer and the raw `body` as `text/plain` (`task_id` resolves server-side from the Bearer). `ok=false` marks the attempt failed (`?ok=false`, the flow.ir Try catch path). Expects HTTP 204; returns `{submitted: true}`. Params: `worker_handle`, `base_url`, `body`, `ok?`. | Mutating — lands the attempt result (`submit_output` + `post_result`). |
+
 ## Server control (launchd wrapper)
 
 `mse serve` lifecycle is owned by macOS launchd (`Label = com.mse.server`);
