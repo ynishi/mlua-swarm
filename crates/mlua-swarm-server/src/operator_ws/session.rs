@@ -12,8 +12,8 @@
 
 use async_trait::async_trait;
 use mlua_swarm::{
-    CapToken, Ctx, Operator, SeniorBridge, SpawnHook, StepId, WorkerBinding, WorkerError,
-    WorkerResult,
+    CapToken, Ctx, Operator, SeniorBridge, SessionId, SpawnHook, StepId, WorkerBinding,
+    WorkerError, WorkerResult,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ use super::protocol::{current_parent_req_id, PendingReply, ServerMsg};
 
 /// 1 sid = 1 session. Looked up by sid in the `operator_sessions` store on reconnect.
 pub struct WSOperatorSession {
-    sid: String,
+    sid: SessionId,
     /// The current mpsc sender on the write path. `None` on disconnect;
     /// swapped to `Some(new_tx)` on reconnect.
     tx: Mutex<Option<mpsc::UnboundedSender<ServerMsg>>>,
@@ -49,7 +49,7 @@ impl WSOperatorSession {
     /// (issue #8); `None` falls back to a `mse_doctor`-pointer
     /// placeholder.
     pub(super) fn new_with_base_url(
-        sid: String,
+        sid: SessionId,
         tx: mpsc::UnboundedSender<ServerMsg>,
         base_url: Option<std::sync::Arc<str>>,
     ) -> Self {
@@ -124,7 +124,7 @@ impl SeniorBridge for WSOperatorSession {
         let msg = ServerMsg::Ask {
             req_id: req_id.clone(),
             parent_req_id: current_parent_req_id(),
-            task_id: task_id.0.clone(),
+            task_id: task_id.clone(),
             question,
         };
         match self.send_and_await(req_id, msg).await? {
@@ -149,7 +149,7 @@ impl SpawnHook for WSOperatorSession {
         let msg = ServerMsg::HookBefore {
             req_id: req_id.clone(),
             parent_req_id: current_parent_req_id(),
-            task_id: ctx.task_id.0.clone(),
+            task_id: ctx.task_id.clone(),
             agent: ctx.agent.clone(),
             attempt: ctx.attempt,
         };
@@ -175,7 +175,7 @@ impl SpawnHook for WSOperatorSession {
         let msg = ServerMsg::HookAfter {
             req_id,
             parent_req_id: current_parent_req_id(),
-            task_id: ctx.task_id.0.clone(),
+            task_id: ctx.task_id.clone(),
             agent: ctx.agent.clone(),
             attempt: ctx.attempt,
             result: result.clone(),
@@ -246,7 +246,7 @@ impl Operator for WSOperatorSession {
         let run_id = ctx.meta.runtime.get("run_id").and_then(|v| v.as_str());
         let directive = default_spawn_directive(
             &ctx.agent,
-            &ctx.task_id.0,
+            ctx.task_id.as_str(),
             &worker.variant,
             project_name_alias,
             data_sink_endpoint,
@@ -256,7 +256,7 @@ impl Operator for WSOperatorSession {
         let msg = ServerMsg::Spawn {
             req_id: req_id.clone(),
             parent_req_id: current_parent_req_id(),
-            task_id: ctx.task_id.0.clone(),
+            task_id: ctx.task_id.clone(),
             agent: ctx.agent.clone(),
             attempt: ctx.attempt,
             capability_token: worker_token.encode(),
@@ -743,7 +743,7 @@ mod tests {
     // ─── Issue #7: spawn_halt handling in Operator::execute ──────────────
 
     fn test_ctx(task_id: &str) -> mlua_swarm::Ctx {
-        mlua_swarm::Ctx::new(mlua_swarm::StepId(task_id.into()), 1, "a")
+        mlua_swarm::Ctx::new(mlua_swarm::StepId::parse(task_id).unwrap(), 1, "a")
     }
 
     fn test_worker_binding() -> mlua_swarm::WorkerBinding {
@@ -778,7 +778,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
-            "sid-halt".into(),
+            SessionId::parse("S-halt").unwrap(),
             tx,
             None,
         ));
@@ -789,7 +789,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             session_bg
                 .execute(
-                    &test_ctx("task-halt"),
+                    &test_ctx("ST-halt"),
                     None,
                     "".into(),
                     Some(test_worker_binding()),
@@ -833,7 +833,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
-            "sid-err".into(),
+            SessionId::parse("S-err").unwrap(),
             tx,
             None,
         ));
@@ -842,7 +842,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             session_bg
                 .execute(
-                    &test_ctx("task-err"),
+                    &test_ctx("ST-err"),
                     None,
                     "".into(),
                     Some(test_worker_binding()),

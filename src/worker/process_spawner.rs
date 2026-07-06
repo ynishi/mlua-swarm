@@ -203,7 +203,7 @@ impl SpawnerAdapter for ProcessSpawner {
         cmd.args(&self.args)
             .env("MSE_TOKEN_AGENT_ID", &token.agent_id)
             .env("MSE_TOKEN_NONCE", &token.nonce)
-            .env("MSE_TASK_ID", &task_id.0)
+            .env("MSE_TASK_ID", task_id.as_str())
             .env("MSE_ATTEMPT", attempt.to_string())
             .env("MSE_CTX_AGENT", &ctx.agent)
             .stdin(Stdio::piped())
@@ -232,7 +232,7 @@ impl SpawnerAdapter for ProcessSpawner {
         let cancel_inner = cancel.clone();
         let worker_id = WorkerId::new();
         // issue #11: surface the minted WorkerId in the trace log.
-        tracing::debug!(worker_id = %worker_id.0, step_id = %task_id, "worker spawned (subprocess)");
+        tracing::debug!(worker_id = %worker_id, step_id = %task_id, "worker spawned (subprocess)");
         let (tx, rx) = oneshot::channel();
         // design intent: hand `engine` / `token` to the spawn task so it can emit
         // OutputEvent via submit_output (side-by-side with the WorkerResult

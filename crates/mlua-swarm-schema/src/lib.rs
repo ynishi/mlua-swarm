@@ -62,7 +62,7 @@
 //!     default_operator_kind: None,
 //! };
 //!
-//! assert_eq!(bp.id, "hello");
+//! assert_eq!(bp.id.as_str(), "hello");
 //! assert_eq!(bp.agents.len(), 1);
 //! assert_eq!(bp.strategy.strict_refs, true);
 //! ```
@@ -126,6 +126,101 @@ pub fn current_schema_version() -> semver::Version {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// BlueprintId (human-facing ID newtype)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Identifier for a Blueprint series — the domain name (`coding`,
+/// `design`, `testing`, etc.). Default: [`BlueprintId::main`].
+///
+/// One representation across the workspace (issue #14): this type is
+/// shared by the schema's [`Blueprint::id`] and the engine's store-layer
+/// keys (`mlua-swarm` re-exports it at the old
+/// `blueprint::store::types::BlueprintId` path). The value is
+/// user-supplied — there is no prefix convention to validate, unlike the
+/// engine's minted `T-` / `R-` / `ST-` ids — so construction is
+/// infallible; the inner string is private so call sites go through
+/// [`BlueprintId::new`] and the accessors. `#[serde(transparent)]` keeps
+/// both the JSON wire shape and the generated JSON Schema a plain string.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(transparent)]
+pub struct BlueprintId(String);
+
+impl BlueprintId {
+    /// The default series name used when a caller doesn't pick one.
+    pub const MAIN: &'static str = "main";
+
+    /// Shorthand for `BlueprintId::new(BlueprintId::MAIN)`.
+    pub fn main() -> Self {
+        Self(Self::MAIN.to_string())
+    }
+
+    /// Wrap any string-like value as a `BlueprintId` (user-supplied key;
+    /// nothing to validate).
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// Borrow the inner series name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the id and return the inner series name.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for BlueprintId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for BlueprintId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for BlueprintId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod blueprint_id_tests {
+    use super::*;
+
+    /// issue #14 convergence guard: `Blueprint.id` becoming a newtype must
+    /// not change the generated JSON Schema — the property stays an inline
+    /// plain string (no `$ref`), byte-compatible with the `String` era.
+    #[test]
+    fn blueprint_id_field_schema_stays_a_plain_inline_string() {
+        let schema = schemars::schema_for!(Blueprint);
+        let v = serde_json::to_value(&schema).expect("schema serializes");
+        let id = &v["properties"]["id"];
+        assert_eq!(id["type"], "string", "id must stay a plain string: {id}");
+        assert!(id.get("$ref").is_none(), "id must not become a $ref: {id}");
+    }
+
+    /// The JSON wire shape of the newtype is the bare string.
+    #[test]
+    fn blueprint_id_serde_is_transparent() {
+        let id = BlueprintId::new("coding");
+        assert_eq!(
+            serde_json::to_value(&id).unwrap(),
+            serde_json::json!("coding")
+        );
+        let back: BlueprintId = serde_json::from_value(serde_json::json!("coding")).unwrap();
+        assert_eq!(back, id);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Blueprint (top-level package)
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -139,7 +234,8 @@ pub struct Blueprint {
     #[schemars(with = "String")]
     pub schema_version: semver::Version,
     /// Blueprint identifier (= unique key within the caller's namespace).
-    pub id: String,
+    #[schemars(with = "String")]
+    pub id: BlueprintId,
     /// Embeds the flow.ir Node verbatim (= keeps flow.ir side unpolluted).
     /// Opaque in the JSON Schema (the Node shape is owned by the `mlua-flow-ir`
     /// crate, a separate repo; see its docs for the Node / Expr grammar).

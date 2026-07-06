@@ -85,7 +85,7 @@ mod tests {
 
     fn mk(id: &str, created_at: u64) -> TaskRecord {
         TaskRecord {
-            id: TaskId(id.into()),
+            id: TaskId::parse(id).unwrap(),
             goal: format!("goal for {id}"),
             blueprint_ref: json!({"id": "bp-1"}),
             input_ctx: json!({"k": "v"}),
@@ -99,8 +99,8 @@ mod tests {
     async fn create_then_get() {
         let s = InMemoryTaskStore::new();
         s.create(mk("T-1", 100)).await.unwrap();
-        let got = s.get(&TaskId("T-1".into())).await.unwrap();
-        assert_eq!(got.id, TaskId("T-1".into()));
+        let got = s.get(&TaskId::parse("T-1").unwrap()).await.unwrap();
+        assert_eq!(got.id, TaskId::parse("T-1").unwrap());
         assert_eq!(got.goal, "goal for T-1");
         assert_eq!(got.status, TaskRecordStatus::Pending);
     }
@@ -116,7 +116,7 @@ mod tests {
     #[tokio::test]
     async fn get_missing_returns_not_found() {
         let s = InMemoryTaskStore::new();
-        let err = s.get(&TaskId("nope".into())).await.unwrap_err();
+        let err = s.get(&TaskId::parse("T-nope").unwrap()).await.unwrap_err();
         assert!(matches!(err, TaskStoreError::NotFound(_)));
     }
 
@@ -127,7 +127,7 @@ mod tests {
         s.create(mk("T-2", 300)).await.unwrap();
         s.create(mk("T-3", 200)).await.unwrap();
         let list = s.list().await.unwrap();
-        let ids: Vec<_> = list.iter().map(|r| r.id.0.clone()).collect();
+        let ids: Vec<_> = list.iter().map(|r| r.id.to_string()).collect();
         assert_eq!(ids, vec!["T-2", "T-3", "T-1"]);
     }
 
@@ -135,10 +135,10 @@ mod tests {
     async fn update_status_bumps_updated_at_and_persists_status() {
         let s = InMemoryTaskStore::new();
         s.create(mk("T-1", 100)).await.unwrap();
-        s.update_status(&TaskId("T-1".into()), TaskRecordStatus::Running)
+        s.update_status(&TaskId::parse("T-1").unwrap(), TaskRecordStatus::Running)
             .await
             .unwrap();
-        let got = s.get(&TaskId("T-1".into())).await.unwrap();
+        let got = s.get(&TaskId::parse("T-1").unwrap()).await.unwrap();
         assert_eq!(got.status, TaskRecordStatus::Running);
         assert!(got.updated_at >= got.created_at);
     }
@@ -147,7 +147,7 @@ mod tests {
     async fn update_status_unknown_fails() {
         let s = InMemoryTaskStore::new();
         let err = s
-            .update_status(&TaskId("nope".into()), TaskRecordStatus::Done)
+            .update_status(&TaskId::parse("T-nope").unwrap(), TaskRecordStatus::Done)
             .await
             .unwrap_err();
         assert!(matches!(err, TaskStoreError::NotFound(_)));

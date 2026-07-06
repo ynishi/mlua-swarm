@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use mlua_swarm::application::{BlueprintRef, TaskApplication, TaskApplicationInput};
-use mlua_swarm::blueprint::store::{BlueprintId, BlueprintStore, InMemoryBlueprintStore};
+use mlua_swarm::blueprint::store::{BlueprintStore, InMemoryBlueprintStore};
 use mlua_swarm::blueprint::Blueprint;
 use mlua_swarm::store::run::{
     InMemoryRunStore, RunContext, RunRecord, RunStatus as StoreRunStatus, RunStore,
@@ -461,7 +461,7 @@ impl MseServer {
         // local run store under this id; the HTTP proxy path re-keys to the
         // server-minted run_id once the response arrives.
         let run_id_typed = RunId::new();
-        let run_id = run_id_typed.0.clone();
+        let run_id = run_id_typed.to_string();
         let ttl = Duration::from_secs(req.timeout_secs.unwrap_or(300));
 
         // Normalize BlueprintInput → BlueprintSelector.
@@ -540,7 +540,7 @@ impl MseServer {
                 return json_result(&body);
             }
         };
-        let blueprint_id_str = blueprint.id.clone();
+        let bp_id = blueprint.id.clone();
 
         // "Runtime Global" tier: `Some(_)` — including `Some(Automate)` — is
         // always an explicit request that outranks the BP-level tiers; an
@@ -604,13 +604,12 @@ impl MseServer {
         // Post-action store snapshot. Inline mode does not write to the
         // store, so head=None / history_len=0 is the default; once the Id
         // mode path lands, head + history become populated.
-        let bp_id = BlueprintId::new(blueprint_id_str.clone());
         let store = {
             let inner = self.state.read().await;
             inner.store.clone()
         };
         let head_id: Option<String> = match store.read_head(&bp_id).await {
-            Ok(_traced) => Some(blueprint_id_str.clone()),
+            Ok(_traced) => Some(bp_id.to_string()),
             Err(_) => None,
         };
         let history_len: usize = store
@@ -628,7 +627,7 @@ impl MseServer {
                 RunStatus::Done,
                 serde_json::json!({
                     "run_id": run_id,
-                    "task_id": task_id_typed.0,
+                    "task_id": task_id_typed,
                     "status": "done",
                     "final_ctx": out.final_ctx,
                     "bound_version": out.bound_version.map(|v| format!("{:?}", v)),
@@ -641,7 +640,7 @@ impl MseServer {
                 RunStatus::Failed,
                 serde_json::json!({
                     "run_id": run_id,
-                    "task_id": task_id_typed.0,
+                    "task_id": task_id_typed,
                     "status": "failed",
                     "error": e.to_string(),
                     "head": head_id,
@@ -653,7 +652,7 @@ impl MseServer {
                 RunStatus::Failed,
                 serde_json::json!({
                     "run_id": run_id,
-                    "task_id": task_id_typed.0,
+                    "task_id": task_id_typed,
                     "status": "failed",
                     "error": format!("timeout after {}s", ttl.as_secs()),
                     "head": head_id,
@@ -857,11 +856,14 @@ impl MseServer {
                 });
                 // In-process runs carry a local step trace (issue #13);
                 // HTTP-proxied runs live on the server — drill down there
-                // via GET /v1/runs/:id instead.
-                if let Ok(rec) = run_store.get(&RunId(req.run_id.clone())).await {
-                    body["task_id"] = serde_json::json!(rec.task_id.0);
-                    body["step_entries"] =
-                        serde_json::to_value(&rec.step_entries).unwrap_or(JsonValue::Null);
+                // via GET /v1/runs/:id instead. Both lookups are best-effort
+                // enrichment, so a non-`R-` run_id simply skips the trace.
+                if let Ok(rid) = RunId::parse(req.run_id.clone()) {
+                    if let Ok(rec) = run_store.get(&rid).await {
+                        body["task_id"] = serde_json::json!(rec.task_id);
+                        body["step_entries"] =
+                            serde_json::to_value(&rec.step_entries).unwrap_or(JsonValue::Null);
+                    }
                 }
                 json_result(&body)
             }

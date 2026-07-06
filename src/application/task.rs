@@ -384,7 +384,7 @@ mod tests {
     }
 
     async fn seed(store: &Arc<dyn BlueprintStore>, bp: &Blueprint) -> BlueprintVersion {
-        let id = BlueprintId::new(bp.id.clone());
+        let id = bp.id.clone();
         let v = blueprint_version(bp).expect("hash");
         store
             .write_new(&id, bp, &[], CommitMetadata::seed(id.clone(), v, 0))
@@ -460,7 +460,7 @@ mod tests {
         let v = seed(&store, &bp).await;
         let (got, ver) = app
             .resolve(&BlueprintRef::Id {
-                id: BlueprintId::new(bp.id.clone()),
+                id: bp.id.clone(),
                 version: VersionSelector::Latest,
             })
             .await

@@ -81,7 +81,7 @@ impl EnhanceSettingInput {
     /// (`EnhanceSetting`). The Blueprint's `id` becomes the
     /// setting's `blueprint_id`.
     pub fn into_ref(self) -> (Blueprint, EnhanceSetting) {
-        let blueprint_id = BlueprintId::new(self.blueprint.id.clone());
+        let blueprint_id = self.blueprint.id.clone();
         (
             self.blueprint,
             EnhanceSetting {
@@ -126,7 +126,7 @@ mod tests {
         };
         let (split_bp, setting) = input.into_ref();
         assert_eq!(setting.id, "s1");
-        assert_eq!(setting.blueprint_id.as_str(), bp_id);
+        assert_eq!(setting.blueprint_id, bp_id);
         assert_eq!(setting.ttl_secs, 60);
         assert_eq!(setting.verifier_axes.len(), 4);
         assert_eq!(split_bp.id, bp_id);

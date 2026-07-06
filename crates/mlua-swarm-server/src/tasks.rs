@@ -136,7 +136,8 @@ pub async fn task_get(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<TaskDetailResponse>, ApiError> {
-    let task_id = TaskId(id);
+    let task_id =
+        TaskId::parse(id).map_err(|e| ApiError::bad_request(format!("invalid task id: {e}")))?;
     let task = state
         .task_store
         .get(&task_id)
@@ -171,7 +172,8 @@ pub async fn task_rekick(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<RunKickResponse>), ApiError> {
-    let task_id = TaskId(id);
+    let task_id =
+        TaskId::parse(id).map_err(|e| ApiError::bad_request(format!("invalid task id: {e}")))?;
     let task = state
         .task_store
         .get(&task_id)
@@ -235,7 +237,8 @@ pub async fn run_get(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<RunRecord>, ApiError> {
-    let run_id = RunId(id);
+    let run_id =
+        RunId::parse(id).map_err(|e| ApiError::bad_request(format!("invalid run id: {e}")))?;
     let run = state
         .run_store
         .get(&run_id)
@@ -352,7 +355,7 @@ mod tests {
         // Sanity check for the newtype-struct transparency relied on
         // throughout this module's response shapes (`TaskId` / `RunId`
         // serialize as plain JSON strings, not `{"0": "..."}`).
-        let v = serde_json::to_value(TaskId("T-abc".into())).expect("serialize");
+        let v = serde_json::to_value(TaskId::parse("T-abc").unwrap()).expect("serialize");
         assert_eq!(v, serde_json::json!("T-abc"));
     }
 
@@ -379,7 +382,7 @@ mod tests {
         );
 
         // GET /v1/tasks/:id drills down to the Task + its Run.
-        let detail = task_get(State(state.clone()), Path(task_id.0.clone()))
+        let detail = task_get(State(state.clone()), Path(task_id.to_string()))
             .await
             .expect("task_get")
             .0;
@@ -391,7 +394,7 @@ mod tests {
         assert_eq!(detail.runs[0].status, RunStatus::Done);
 
         // GET /v1/runs/:id returns the same Run directly.
-        let run = run_get(State(state.clone()), Path(run_id.0.clone()))
+        let run = run_get(State(state.clone()), Path(run_id.to_string()))
             .await
             .expect("run_get")
             .0;
@@ -425,14 +428,14 @@ mod tests {
         let task_id = posted.task_id.clone();
         let first_run_id = posted.run_id.clone();
 
-        let (status, rekicked) = task_rekick(State(state.clone()), Path(task_id.0.clone()))
+        let (status, rekicked) = task_rekick(State(state.clone()), Path(task_id.to_string()))
             .await
             .expect("task_rekick");
         assert_eq!(status, StatusCode::CREATED);
         let second_run_id = rekicked.0.run_id.clone();
         assert_ne!(first_run_id, second_run_id);
 
-        let detail = task_get(State(state.clone()), Path(task_id.0.clone()))
+        let detail = task_get(State(state.clone()), Path(task_id.to_string()))
             .await
             .expect("task_get")
             .0;

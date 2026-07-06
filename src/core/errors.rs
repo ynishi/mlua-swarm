@@ -27,8 +27,11 @@ pub enum EngineError {
     #[error("token uses exhausted")]
     TokenUsesExhausted,
 
-    /// No server-side record exists for the token's nonce.
-    #[error("token not found in store (nonce={0})")]
+    /// No server-side record exists for the token. Carries the token
+    /// **fingerprint** (SHA-256 of the nonce, see `CapToken::fingerprint`)
+    /// — never the nonce itself, since this message can surface in HTTP
+    /// error bodies and logs (issue #14).
+    #[error("token not found in store (fp={0})")]
     TokenNotFound(String),
 
     /// The token's `Role` is not allow-listed for the requested `Verb` (see

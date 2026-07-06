@@ -27,7 +27,7 @@
 //! against the session's pending `HashMap` keyed by `req_id`.
 //! See `session::WSOperatorSession::resolve_pending` for details.
 
-use mlua_swarm::WorkerBinding;
+use mlua_swarm::{StepId, WorkerBinding};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -58,8 +58,9 @@ pub enum ServerMsg {
         /// (see [`current_parent_req_id`]).
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_req_id: Option<String>,
-        /// Task the question originates from.
-        task_id: String,
+        /// Task the question originates from. Typed [`StepId`] since issue
+        /// #14 — serde keeps the wire shape a plain string.
+        task_id: StepId,
         /// Free-form question payload produced by the engine middleware.
         question: Value,
     },
@@ -71,7 +72,7 @@ pub enum ServerMsg {
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_req_id: Option<String>,
         /// Task whose spawn is being gated.
-        task_id: String,
+        task_id: StepId,
         /// Agent ref about to be spawned.
         agent: String,
         /// 1-based dispatch attempt counter for this agent step.
@@ -85,7 +86,7 @@ pub enum ServerMsg {
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_req_id: Option<String>,
         /// Task the spawn belonged to.
-        task_id: String,
+        task_id: StepId,
         /// Agent ref that was spawned.
         agent: String,
         /// 1-based dispatch attempt counter for this agent step.
@@ -131,7 +132,7 @@ pub enum ServerMsg {
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_req_id: Option<String>,
         /// Task the delegated spawn belongs to.
-        task_id: String,
+        task_id: StepId,
         /// Agent ref the Operator is asked to execute.
         agent: String,
         /// 1-based dispatch attempt counter for this agent step.

@@ -110,8 +110,8 @@ mod tests {
 
     fn mk(id: &str, task_id: &str, created_at: u64) -> RunRecord {
         RunRecord {
-            id: RunId(id.into()),
-            task_id: TaskId(task_id.into()),
+            id: RunId::parse(id).unwrap(),
+            task_id: TaskId::parse(task_id).unwrap(),
             status: RunStatus::Pending,
             step_entries: vec![],
             operator_sid: None,
@@ -125,8 +125,8 @@ mod tests {
     async fn create_then_get() {
         let s = InMemoryRunStore::new();
         s.create(mk("R-1", "T-1", 100)).await.unwrap();
-        let got = s.get(&RunId("R-1".into())).await.unwrap();
-        assert_eq!(got.task_id, TaskId("T-1".into()));
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
+        assert_eq!(got.task_id, TaskId::parse("T-1").unwrap());
         assert_eq!(got.status, RunStatus::Pending);
         assert!(got.step_entries.is_empty());
     }
@@ -142,7 +142,7 @@ mod tests {
     #[tokio::test]
     async fn get_missing_returns_not_found() {
         let s = InMemoryRunStore::new();
-        let err = s.get(&RunId("nope".into())).await.unwrap_err();
+        let err = s.get(&RunId::parse("R-nope").unwrap()).await.unwrap_err();
         assert!(matches!(err, RunStoreError::NotFound(_)));
     }
 
@@ -152,8 +152,11 @@ mod tests {
         s.create(mk("R-1", "T-1", 300)).await.unwrap();
         s.create(mk("R-2", "T-2", 50)).await.unwrap();
         s.create(mk("R-3", "T-1", 100)).await.unwrap();
-        let list = s.list_by_task(&TaskId("T-1".into())).await.unwrap();
-        let ids: Vec<_> = list.iter().map(|r| r.id.0.clone()).collect();
+        let list = s
+            .list_by_task(&TaskId::parse("T-1").unwrap())
+            .await
+            .unwrap();
+        let ids: Vec<_> = list.iter().map(|r| r.id.to_string()).collect();
         assert_eq!(ids, vec!["R-3", "R-1"]);
     }
 
@@ -162,9 +165,9 @@ mod tests {
         let s = InMemoryRunStore::new();
         s.create(mk("R-1", "T-1", 100)).await.unwrap();
         s.append_step_entry(
-            &RunId("R-1".into()),
+            &RunId::parse("R-1").unwrap(),
             StepEntry {
-                step_id: crate::types::StepId("ST-1".into()),
+                step_id: crate::types::StepId::parse("ST-1").unwrap(),
                 step_ref: Some("step-a".into()),
                 status: Some("dispatched".into()),
                 at: 101,
@@ -173,9 +176,9 @@ mod tests {
         .await
         .unwrap();
         s.append_step_entry(
-            &RunId("R-1".into()),
+            &RunId::parse("R-1").unwrap(),
             StepEntry {
-                step_id: crate::types::StepId("ST-2".into()),
+                step_id: crate::types::StepId::parse("ST-2").unwrap(),
                 step_ref: Some("step-b".into()),
                 status: Some("passed".into()),
                 at: 102,
@@ -183,7 +186,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let got = s.get(&RunId("R-1".into())).await.unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
         assert_eq!(got.step_entries.len(), 2);
         assert_eq!(got.step_entries[0].step_ref, Some("step-a".into()));
         assert_eq!(got.step_entries[1].step_ref, Some("step-b".into()));
@@ -195,9 +198,9 @@ mod tests {
         let s = InMemoryRunStore::new();
         let err = s
             .append_step_entry(
-                &RunId("nope".into()),
+                &RunId::parse("R-nope").unwrap(),
                 StepEntry {
-                    step_id: crate::types::StepId("ST-1".into()),
+                    step_id: crate::types::StepId::parse("ST-1").unwrap(),
                     step_ref: None,
                     status: None,
                     at: 1,
@@ -212,10 +215,10 @@ mod tests {
     async fn update_status_persists() {
         let s = InMemoryRunStore::new();
         s.create(mk("R-1", "T-1", 100)).await.unwrap();
-        s.update_status(&RunId("R-1".into()), RunStatus::Running)
+        s.update_status(&RunId::parse("R-1").unwrap(), RunStatus::Running)
             .await
             .unwrap();
-        let got = s.get(&RunId("R-1".into())).await.unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
         assert_eq!(got.status, RunStatus::Running);
     }
 
@@ -223,10 +226,10 @@ mod tests {
     async fn set_result_persists() {
         let s = InMemoryRunStore::new();
         s.create(mk("R-1", "T-1", 100)).await.unwrap();
-        s.set_result(&RunId("R-1".into()), json!({"ok": true}))
+        s.set_result(&RunId::parse("R-1").unwrap(), json!({"ok": true}))
             .await
             .unwrap();
-        let got = s.get(&RunId("R-1".into())).await.unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
         assert_eq!(got.result_ref, Some(json!({"ok": true})));
     }
 

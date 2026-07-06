@@ -49,8 +49,10 @@ use crate::{ApiError, AppState};
 /// Query params for `GET /v1/worker/prompt`.
 #[derive(Debug, Deserialize)]
 pub struct PromptQuery {
-    /// Task the fetched prompt belongs to; cross-checked against the Bearer handle/token.
-    pub task_id: String,
+    /// Task the fetched prompt belongs to; cross-checked against the Bearer
+    /// handle/token. Typed [`StepId`] since issue #14 — the wire shape stays
+    /// a plain string; a bad prefix is rejected at deserialize.
+    pub task_id: StepId,
 }
 
 /// `GET /v1/worker/prompt?task_id=<tid>`. Bearer = encoded `CapToken` or short `wh-` handle.
@@ -63,7 +65,7 @@ pub async fn worker_prompt(
     headers: HeaderMap,
     Query(q): Query<PromptQuery>,
 ) -> Result<Json<WorkerPayload>, ApiError> {
-    let task_id = StepId(q.task_id.clone());
+    let task_id = q.task_id;
     let bearer = extract_bearer_raw(&headers)?;
     let payload = if let Some(handle) = parse_worker_handle(&bearer) {
         // Short-handle path: verify handle → task_id (security: confirm the handle is bound to this task).
@@ -74,8 +76,7 @@ pub async fn worker_prompt(
             .map_err(|e| ApiError::engine(format!("task_id_from_handle: {e}")))?;
         if resolved != task_id {
             return Err(ApiError::bad_request(format!(
-                "handle {handle} is bound to task {}, not {}",
-                resolved.0, task_id.0
+                "handle {handle} is bound to task {resolved}, not {task_id}"
             )));
         }
         state
@@ -99,8 +100,9 @@ pub async fn worker_prompt(
 /// Body for `POST /v1/worker/result`.
 #[derive(Debug, Deserialize)]
 pub struct WorkerResultReq {
-    /// Task this result belongs to (looked up together with the Bearer token).
-    pub task_id: String,
+    /// Task this result belongs to (looked up together with the Bearer
+    /// token). Typed [`StepId`] since issue #14 (see [`PromptQuery`]).
+    pub task_id: StepId,
     /// `WorkerResult.value` (= the value returned by the Operator: LLM inference result or tool execution result).
     pub value: Value,
     /// `WorkerResult.ok`. `false` makes the dispatch path decide Blocked
@@ -126,7 +128,7 @@ pub async fn worker_result(
     Json(req): Json<WorkerResultReq>,
 ) -> Result<StatusCode, ApiError> {
     let token = decode_worker_bearer(&headers)?;
-    let task_id = StepId(req.task_id);
+    let task_id = req.task_id.clone();
 
     // Use body-explicit attempt if provided; otherwise the current task.attempt.
     let attempt = match req.attempt {

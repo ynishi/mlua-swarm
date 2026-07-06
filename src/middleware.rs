@@ -597,7 +597,7 @@ impl SpawnerAdapter for OperatorDelegateWrapped {
         let worker_id = crate::types::WorkerId::new();
         // issue #11: WorkerId was minted but never observable anywhere;
         // surface it in the trace log, tied to the step it serves.
-        tracing::debug!(worker_id = %worker_id.0, step_id = %task_id, "worker spawned (delegate axis)");
+        tracing::debug!(worker_id = %worker_id, step_id = %task_id, "worker spawned (delegate axis)");
 
         tokio::spawn(async move {
             let result: Result<
@@ -817,14 +817,14 @@ mod operator_delegate_worker_binding_tests {
             vec!["*".into()],
             Duration::from_secs(600),
         );
-        let nonce = worker_token.nonce.clone();
+        let fp = worker_token.fingerprint();
         let record = crate::core::state::CapTokenRecord::from_worker_token(
             worker_token.clone(),
             task_id.clone(),
         );
         engine
             .with_state("test.mint_worker", move |s| {
-                s.tokens.insert(nonce, record);
+                s.tokens.insert(fp, record);
             })
             .await
             .expect("mint worker token");

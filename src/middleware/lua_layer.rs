@@ -113,7 +113,7 @@ struct LuaWrapped {
 /// Serializable view of `Ctx` handed to Lua functions (`Arc<dyn>` fields are excluded since they cannot serde).
 fn ctx_to_serializable(ctx: &Ctx) -> Value {
     serde_json::json!({
-        "task_id": ctx.task_id.0,
+        "task_id": ctx.task_id.as_str(),
         "attempt": ctx.attempt,
         "agent": ctx.agent,
         "operator": {

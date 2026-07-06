@@ -48,8 +48,9 @@ use crate::{ApiError, AppState};
 /// Input for `POST /v1/data/emit`.
 #[derive(Debug, Deserialize)]
 pub struct DataEmitReq {
-    /// Producing task.
-    pub task_id: String,
+    /// Producing task. Typed [`StepId`] since issue #14 — the wire shape
+    /// stays a plain string; a bad prefix is rejected at deserialize.
+    pub task_id: StepId,
     /// Attempt number.
     pub attempt: u32,
     /// Producer agent name.
@@ -65,8 +66,8 @@ pub struct DataEmitReq {
 /// from the path segment, not the body).
 #[derive(Debug, Deserialize)]
 pub struct DataEmitNamedReq {
-    /// Producing task.
-    pub task_id: String,
+    /// Producing task. Typed [`StepId`] since issue #14 (see [`DataEmitReq`]).
+    pub task_id: StepId,
     /// Attempt number.
     pub attempt: u32,
     /// Event body (`Progress` / `Partial` / `Artifact` / `Final`).
@@ -128,16 +129,15 @@ async fn emit_inner(
     req: DataEmitReq,
 ) -> Result<Json<DataEmitResp>, ApiError> {
     let token = extract_captoken(headers, query_token)?;
-    let tid = StepId(req.task_id.clone());
     state
         .engine
-        .verify_token_for_task(&token, Verb::EmitOutput, &tid)
+        .verify_token_for_task(&token, Verb::EmitOutput, &req.task_id)
         .await
         .map_err(|e| ApiError::engine(format!("data_emit verify: {e}")))?;
     let out_id = state
         .data_store
         .append(
-            &req.task_id,
+            req.task_id.as_str(),
             req.attempt,
             &req.producer_agent,
             req.event,

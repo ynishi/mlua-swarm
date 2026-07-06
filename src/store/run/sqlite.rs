@@ -116,9 +116,15 @@ fn row_to_record(row: RunRow) -> Result<RunRecord, RunStoreError> {
         ),
         None => None,
     };
+    // Ids were minted by us before landing in the table; a prefix mismatch
+    // here means the row predates the issue #13 prefix reconciliation or
+    // the file was written by something else — fail loud either way.
+    let id = RunId::parse(id).map_err(|e| RunStoreError::Other(format!("decode id: {e}")))?;
+    let task_id =
+        TaskId::parse(task_id).map_err(|e| RunStoreError::Other(format!("decode task_id: {e}")))?;
     Ok(RunRecord {
-        id: RunId(id),
-        task_id: TaskId(task_id),
+        id,
+        task_id,
         status,
         step_entries,
         operator_sid,
@@ -135,9 +141,9 @@ impl RunStore for SqliteRunStore {
     }
 
     async fn create(&self, record: RunRecord) -> Result<(), RunStoreError> {
-        let id = record.id.0.clone();
+        let id = record.id.to_string();
         let id_for_conflict = record.id.clone();
-        let task_id = record.task_id.0.clone();
+        let task_id = record.task_id.to_string();
         let status_json = serde_json::to_string(&record.status)
             .map_err(|e| RunStoreError::Other(format!("encode status: {e}")))?;
         let step_entries_json = serde_json::to_string(&record.step_entries)
@@ -196,7 +202,7 @@ impl RunStore for SqliteRunStore {
     }
 
     async fn get(&self, id: &RunId) -> Result<RunRecord, RunStoreError> {
-        let id_str = id.0.clone();
+        let id_str = id.to_string();
         let id_for_notfound = id.clone();
         let row = self
             .isle
@@ -229,7 +235,7 @@ impl RunStore for SqliteRunStore {
     }
 
     async fn list_by_task(&self, task_id: &TaskId) -> Result<Vec<RunRecord>, RunStoreError> {
-        let task_id_str = task_id.0.clone();
+        let task_id_str = task_id.to_string();
         let rows = self
             .isle
             .call(move |conn| {
@@ -262,7 +268,7 @@ impl RunStore for SqliteRunStore {
     }
 
     async fn append_step_entry(&self, id: &RunId, entry: StepEntry) -> Result<(), RunStoreError> {
-        let id_str = id.0.clone();
+        let id_str = id.to_string();
         let id_for_notfound = id.clone();
         let updated_at = crate::types::now_unix() as i64;
 
@@ -303,7 +309,7 @@ impl RunStore for SqliteRunStore {
     }
 
     async fn update_status(&self, id: &RunId, status: RunStatus) -> Result<(), RunStoreError> {
-        let id_str = id.0.clone();
+        let id_str = id.to_string();
         let id_for_notfound = id.clone();
         let status_json = serde_json::to_string(&status)
             .map_err(|e| RunStoreError::Other(format!("encode status: {e}")))?;
@@ -330,7 +336,7 @@ impl RunStore for SqliteRunStore {
         id: &RunId,
         result_ref: serde_json::Value,
     ) -> Result<(), RunStoreError> {
-        let id_str = id.0.clone();
+        let id_str = id.to_string();
         let id_for_notfound = id.clone();
         let result_ref_json = serde_json::to_string(&result_ref)
             .map_err(|e| RunStoreError::Other(format!("encode result_ref: {e}")))?;
@@ -364,8 +370,8 @@ mod tests {
 
     fn mk(id: &str, task_id: &str, created_at: u64) -> RunRecord {
         RunRecord {
-            id: RunId(id.into()),
-            task_id: TaskId(task_id.into()),
+            id: RunId::parse(id).unwrap(),
+            task_id: TaskId::parse(task_id).unwrap(),
             status: RunStatus::Pending,
             step_entries: vec![],
             operator_sid: None,
@@ -379,8 +385,8 @@ mod tests {
     async fn create_then_get() {
         let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
         s.create(mk("R-1", "T-1", 100)).await.unwrap();
-        let got = s.get(&RunId("R-1".into())).await.unwrap();
-        assert_eq!(got.task_id, TaskId("T-1".into()));
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
+        assert_eq!(got.task_id, TaskId::parse("T-1").unwrap());
         assert_eq!(got.status, RunStatus::Pending);
         assert!(got.step_entries.is_empty());
         assert_eq!(got.result_ref, None);
@@ -401,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn get_missing_returns_not_found() {
         let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
-        let err = s.get(&RunId("nope".into())).await.unwrap_err();
+        let err = s.get(&RunId::parse("R-nope").unwrap()).await.unwrap_err();
         assert!(matches!(err, RunStoreError::NotFound(_)));
         drop(s);
         driver.shutdown().await.unwrap();
@@ -413,8 +419,11 @@ mod tests {
         s.create(mk("R-1", "T-1", 300)).await.unwrap();
         s.create(mk("R-2", "T-2", 50)).await.unwrap();
         s.create(mk("R-3", "T-1", 100)).await.unwrap();
-        let list = s.list_by_task(&TaskId("T-1".into())).await.unwrap();
-        let ids: Vec<_> = list.iter().map(|r| r.id.0.clone()).collect();
+        let list = s
+            .list_by_task(&TaskId::parse("T-1").unwrap())
+            .await
+            .unwrap();
+        let ids: Vec<_> = list.iter().map(|r| r.id.to_string()).collect();
         assert_eq!(ids, vec!["R-3", "R-1"]);
         drop(s);
         driver.shutdown().await.unwrap();
@@ -425,9 +434,9 @@ mod tests {
         let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
         s.create(mk("R-1", "T-1", 100)).await.unwrap();
         s.append_step_entry(
-            &RunId("R-1".into()),
+            &RunId::parse("R-1").unwrap(),
             StepEntry {
-                step_id: crate::types::StepId("ST-1".into()),
+                step_id: crate::types::StepId::parse("ST-1").unwrap(),
                 step_ref: Some("step-a".into()),
                 status: Some("dispatched".into()),
                 at: 101,
@@ -436,9 +445,9 @@ mod tests {
         .await
         .unwrap();
         s.append_step_entry(
-            &RunId("R-1".into()),
+            &RunId::parse("R-1").unwrap(),
             StepEntry {
-                step_id: crate::types::StepId("ST-2".into()),
+                step_id: crate::types::StepId::parse("ST-2").unwrap(),
                 step_ref: Some("step-b".into()),
                 status: Some("passed".into()),
                 at: 102,
@@ -446,7 +455,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let got = s.get(&RunId("R-1".into())).await.unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
         assert_eq!(got.step_entries.len(), 2);
         assert_eq!(got.step_entries[0].step_ref, Some("step-a".into()));
         assert_eq!(got.step_entries[1].step_ref, Some("step-b".into()));
@@ -459,9 +468,9 @@ mod tests {
         let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
         let err = s
             .append_step_entry(
-                &RunId("nope".into()),
+                &RunId::parse("R-nope").unwrap(),
                 StepEntry {
-                    step_id: crate::types::StepId("ST-1".into()),
+                    step_id: crate::types::StepId::parse("ST-1").unwrap(),
                     step_ref: None,
                     status: None,
                     at: 1,
@@ -478,10 +487,10 @@ mod tests {
     async fn update_status_persists() {
         let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
         s.create(mk("R-1", "T-1", 100)).await.unwrap();
-        s.update_status(&RunId("R-1".into()), RunStatus::Done)
+        s.update_status(&RunId::parse("R-1").unwrap(), RunStatus::Done)
             .await
             .unwrap();
-        let got = s.get(&RunId("R-1".into())).await.unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
         assert_eq!(got.status, RunStatus::Done);
         drop(s);
         driver.shutdown().await.unwrap();
@@ -491,10 +500,10 @@ mod tests {
     async fn set_result_persists() {
         let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
         s.create(mk("R-1", "T-1", 100)).await.unwrap();
-        s.set_result(&RunId("R-1".into()), json!({"ok": true}))
+        s.set_result(&RunId::parse("R-1").unwrap(), json!({"ok": true}))
             .await
             .unwrap();
-        let got = s.get(&RunId("R-1".into())).await.unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
         assert_eq!(got.result_ref, Some(json!({"ok": true})));
         drop(s);
         driver.shutdown().await.unwrap();
@@ -507,11 +516,11 @@ mod tests {
 
         {
             let (s, driver) = SqliteRunStore::open(&path).await.unwrap();
-            s.create(mk("keep", "T-keep", 42)).await.unwrap();
+            s.create(mk("R-keep", "T-keep", 42)).await.unwrap();
             s.append_step_entry(
-                &RunId("keep".into()),
+                &RunId::parse("R-keep").unwrap(),
                 StepEntry {
-                    step_id: crate::types::StepId("ST-1".into()),
+                    step_id: crate::types::StepId::parse("ST-1").unwrap(),
                     step_ref: Some("step-a".into()),
                     status: Some("dispatched".into()),
                     at: 43,
@@ -524,8 +533,8 @@ mod tests {
         }
 
         let (s, driver) = SqliteRunStore::open(&path).await.unwrap();
-        let got = s.get(&RunId("keep".into())).await.unwrap();
-        assert_eq!(got.task_id, TaskId("T-keep".into()));
+        let got = s.get(&RunId::parse("R-keep").unwrap()).await.unwrap();
+        assert_eq!(got.task_id, TaskId::parse("T-keep").unwrap());
         assert_eq!(got.step_entries.len(), 1);
         assert_eq!(got.step_entries[0].step_ref, Some("step-a".into()));
         drop(s);

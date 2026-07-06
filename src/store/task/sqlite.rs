@@ -88,8 +88,12 @@ fn row_to_record(row: TaskRow) -> Result<TaskRecord, TaskStoreError> {
         .map_err(|e| TaskStoreError::Other(format!("decode input_ctx: {e}")))?;
     let status: TaskRecordStatus = serde_json::from_str(&status_json)
         .map_err(|e| TaskStoreError::Other(format!("decode status: {e}")))?;
+    // Ids were minted by us before landing in the table; a prefix mismatch
+    // here means the row predates the issue #13 prefix reconciliation or
+    // the file was written by something else — fail loud either way.
+    let id = TaskId::parse(id).map_err(|e| TaskStoreError::Other(format!("decode id: {e}")))?;
     Ok(TaskRecord {
-        id: TaskId(id),
+        id,
         goal,
         blueprint_ref,
         input_ctx,
@@ -106,7 +110,7 @@ impl TaskStore for SqliteTaskStore {
     }
 
     async fn create(&self, record: TaskRecord) -> Result<(), TaskStoreError> {
-        let id = record.id.0.clone();
+        let id = record.id.to_string();
         let id_for_conflict = record.id.clone();
         let goal = record.goal.clone();
         let blueprint_ref_json = serde_json::to_string(&record.blueprint_ref)
@@ -160,7 +164,7 @@ impl TaskStore for SqliteTaskStore {
     }
 
     async fn get(&self, id: &TaskId) -> Result<TaskRecord, TaskStoreError> {
-        let id_str = id.0.clone();
+        let id_str = id.to_string();
         let id_for_notfound = id.clone();
         let row = self
             .isle
@@ -226,7 +230,7 @@ impl TaskStore for SqliteTaskStore {
         id: &TaskId,
         status: TaskRecordStatus,
     ) -> Result<(), TaskStoreError> {
-        let id_str = id.0.clone();
+        let id_str = id.to_string();
         let id_for_notfound = id.clone();
         let status_json = serde_json::to_string(&status)
             .map_err(|e| TaskStoreError::Other(format!("encode status: {e}")))?;
@@ -260,7 +264,7 @@ mod tests {
 
     fn mk(id: &str, created_at: u64) -> TaskRecord {
         TaskRecord {
-            id: TaskId(id.into()),
+            id: TaskId::parse(id).unwrap(),
             goal: format!("goal for {id}"),
             blueprint_ref: json!({"id": "bp-1"}),
             input_ctx: json!({"k": "v"}),
@@ -274,7 +278,7 @@ mod tests {
     async fn create_then_get() {
         let (s, driver) = SqliteTaskStore::open_in_memory().await.unwrap();
         s.create(mk("T-1", 100)).await.unwrap();
-        let got = s.get(&TaskId("T-1".into())).await.unwrap();
+        let got = s.get(&TaskId::parse("T-1").unwrap()).await.unwrap();
         assert_eq!(got.goal, "goal for T-1");
         assert_eq!(got.status, TaskRecordStatus::Pending);
         assert_eq!(got.blueprint_ref, json!({"id": "bp-1"}));
@@ -295,7 +299,7 @@ mod tests {
     #[tokio::test]
     async fn get_missing_returns_not_found() {
         let (s, driver) = SqliteTaskStore::open_in_memory().await.unwrap();
-        let err = s.get(&TaskId("nope".into())).await.unwrap_err();
+        let err = s.get(&TaskId::parse("T-nope").unwrap()).await.unwrap_err();
         assert!(matches!(err, TaskStoreError::NotFound(_)));
         drop(s);
         driver.shutdown().await.unwrap();
@@ -308,7 +312,7 @@ mod tests {
         s.create(mk("T-2", 300)).await.unwrap();
         s.create(mk("T-3", 200)).await.unwrap();
         let list = s.list().await.unwrap();
-        let ids: Vec<_> = list.iter().map(|r| r.id.0.clone()).collect();
+        let ids: Vec<_> = list.iter().map(|r| r.id.to_string()).collect();
         assert_eq!(ids, vec!["T-2", "T-3", "T-1"]);
         drop(s);
         driver.shutdown().await.unwrap();
@@ -318,10 +322,10 @@ mod tests {
     async fn update_status_persists() {
         let (s, driver) = SqliteTaskStore::open_in_memory().await.unwrap();
         s.create(mk("T-1", 100)).await.unwrap();
-        s.update_status(&TaskId("T-1".into()), TaskRecordStatus::Failed)
+        s.update_status(&TaskId::parse("T-1").unwrap(), TaskRecordStatus::Failed)
             .await
             .unwrap();
-        let got = s.get(&TaskId("T-1".into())).await.unwrap();
+        let got = s.get(&TaskId::parse("T-1").unwrap()).await.unwrap();
         assert_eq!(got.status, TaskRecordStatus::Failed);
         assert!(got.updated_at >= got.created_at);
         drop(s);
@@ -332,7 +336,7 @@ mod tests {
     async fn update_status_unknown_fails() {
         let (s, driver) = SqliteTaskStore::open_in_memory().await.unwrap();
         let err = s
-            .update_status(&TaskId("nope".into()), TaskRecordStatus::Done)
+            .update_status(&TaskId::parse("T-nope").unwrap(), TaskRecordStatus::Done)
             .await
             .unwrap_err();
         assert!(matches!(err, TaskStoreError::NotFound(_)));
@@ -347,14 +351,14 @@ mod tests {
 
         {
             let (s, driver) = SqliteTaskStore::open(&path).await.unwrap();
-            s.create(mk("keep", 42)).await.unwrap();
+            s.create(mk("T-keep", 42)).await.unwrap();
             drop(s);
             driver.shutdown().await.unwrap();
         }
 
         let (s, driver) = SqliteTaskStore::open(&path).await.unwrap();
-        let got = s.get(&TaskId("keep".into())).await.unwrap();
-        assert_eq!(got.goal, "goal for keep");
+        let got = s.get(&TaskId::parse("T-keep").unwrap()).await.unwrap();
+        assert_eq!(got.goal, "goal for T-keep");
         assert_eq!(got.created_at, 42);
         drop(s);
         driver.shutdown().await.unwrap();

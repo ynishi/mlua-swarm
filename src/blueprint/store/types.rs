@@ -112,39 +112,12 @@ impl std::fmt::Display for BlueprintVersion {
 // BlueprintId (human-facing ID newtype)
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Identifier for a Blueprint series — the domain name (`coding`,
-/// `design`, `testing`, etc.). Default: `BlueprintId::main()`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct BlueprintId(
-    /// The human-facing series name.
-    pub String,
-);
-
-impl BlueprintId {
-    /// The default series name used when a caller doesn't pick one.
-    pub const MAIN: &'static str = "main";
-
-    /// Shorthand for `BlueprintId::new(BlueprintId::MAIN)`.
-    pub fn main() -> Self {
-        BlueprintId(Self::MAIN.to_string())
-    }
-
-    /// Wrap any string-like value as a `BlueprintId`.
-    pub fn new(s: impl Into<String>) -> Self {
-        BlueprintId(s.into())
-    }
-
-    /// Borrow the inner series name.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for BlueprintId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+// The type converged onto the schema crate in issue #14 — `Blueprint.id`
+// and the store layer used to carry two representations of the same
+// concept (plain `String` vs a store-local newtype). It is re-exported
+// here so every existing `blueprint::store::types::BlueprintId` path
+// keeps working.
+pub use mlua_swarm_schema::BlueprintId;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Trace / Traced<T> / TraceRef / TraceOrigin

@@ -92,7 +92,8 @@ use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
 use mlua_swarm::{
     CapToken, Compiler, Engine, LayerRegistry, LuaInProcessSpawnerFactory, MainAIMiddleware,
     OperatorDelegateMiddleware, OperatorSpawnerFactory, Role, RunId, RustFnInProcessSpawnerFactory,
-    SeniorEscalationMiddleware, SpawnerRegistry, SubprocessProcessSpawnerFactory, TaskId,
+    SeniorEscalationMiddleware, SessionId, SpawnerRegistry, SubprocessProcessSpawnerFactory,
+    TaskId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -101,10 +102,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-/// In-memory `sid → CapToken` map backing `/v1/sessions` attach/detach.
+/// In-memory session map backing `/v1/sessions` attach/detach.
+///
+/// The `sid` handed to the client on this REST path is the token nonce
+/// itself (a bearer secret), so the server never uses it as a map key —
+/// entries are keyed by its fingerprint
+/// (`mlua_swarm::types::token_fingerprint`; issue #14).
 #[derive(Default)]
 pub struct SessionStore {
-    /// Live session tokens keyed by `sid` (the token's `nonce`).
+    /// Live session tokens keyed by the sid's fingerprint.
     pub map: HashMap<String, CapToken>,
 }
 
@@ -135,13 +141,13 @@ pub struct AppState {
     /// `OperatorSessionEntry`. This is the sole session store for the WS
     /// Operator role. See `operator_ws::login` module doc.
     pub operator_sessions:
-        Arc<Mutex<HashMap<String, Arc<crate::operator_ws::login::OperatorSessionEntry>>>>,
+        Arc<Mutex<HashMap<SessionId, Arc<crate::operator_ws::login::OperatorSessionEntry>>>>,
     /// S1 login-flow roles-exclusivity map. Role name → owning `sid`. Checked
     /// (and updated) atomically under a single lock in
     /// `operator_ws::login::operators_create` — a role already present here
     /// causes `POST /v1/operators` to return `409 CONFLICT`. Entries are
     /// released on `DELETE /v1/operators/:sid`.
-    pub roles_to_sid: Arc<Mutex<HashMap<String, String>>>,
+    pub roles_to_sid: Arc<Mutex<HashMap<String, SessionId>>>,
     /// Persistence for `Task` records (issue #13 ID-hierarchy work-item
     /// identity; see `mlua_swarm::store::task` module doc). Default =
     /// `InMemoryTaskStore` (constructed inside `build_router_full`); callers
@@ -416,8 +422,11 @@ async fn sessions_attach(
         .attach(req.agent_id, role, Duration::from_secs(req.ttl_secs))
         .await
         .map_err(ApiError::engine)?;
+    // The wire `session_id` stays the nonce (Bearer credential contract);
+    // the server-side map key is its fingerprint (issue #14).
     let sid = token.nonce.clone();
-    state.sessions.lock().await.map.insert(sid.clone(), token);
+    let key = token.fingerprint();
+    state.sessions.lock().await.map.insert(key, token);
     Ok(Json(AttachResp {
         session_id: sid,
         role: req.role,
@@ -731,13 +740,17 @@ async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksR
 // ─── helpers ─────────────────────────────────────────────────────────────
 
 async fn take_session_token(state: &AppState, sid: &str) -> Result<CapToken, ApiError> {
+    // `sid` on this path is the token nonce itself (a bearer secret), so
+    // both the map key and the not-found diagnostic use its fingerprint
+    // (issue #14 — never echo the nonce back in an error body).
+    let key = mlua_swarm::types::token_fingerprint(sid);
     state
         .sessions
         .lock()
         .await
         .map
-        .remove(sid)
-        .ok_or_else(|| ApiError::not_found(format!("session: {sid}")))
+        .remove(&key)
+        .ok_or_else(|| ApiError::not_found(format!("session: fp={key}")))
 }
 
 /// Extracts sid from `Authorization: Bearer <sid>`. Strict — does not accept any other scheme prefix.

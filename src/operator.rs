@@ -222,7 +222,7 @@ impl SpawnerAdapter for OperatorSpawner {
         let cancel_inner = cancel.clone();
         let worker_id = WorkerId::new();
         // issue #11: surface the minted WorkerId in the trace log.
-        tracing::debug!(worker_id = %worker_id.0, step_id = %task_id, "worker spawned (operator spawner)");
+        tracing::debug!(worker_id = %worker_id, step_id = %task_id, "worker spawned (operator spawner)");
 
         tokio::spawn(async move {
             let result: Result<WorkerResult, WorkerError> = tokio::select! {

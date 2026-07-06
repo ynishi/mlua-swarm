@@ -24,9 +24,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use mlua_swarm::blueprint::store::{
-    blueprint_version, BlueprintId, BlueprintStore, CommitMetadata,
-};
+use mlua_swarm::blueprint::store::{blueprint_version, BlueprintStore, CommitMetadata};
 use mlua_swarm::blueprint::Blueprint;
 use mlua_swarm::enhance::{EnhanceSetting, EnhanceSettingInput};
 use mlua_swarm::store::enhance_setting::{
@@ -80,7 +78,7 @@ async fn commit_blueprint(
     blueprint: &Blueprint,
     rationale: String,
 ) -> Result<(), (StatusCode, String)> {
-    let bp_id = BlueprintId::new(blueprint.id.clone());
+    let bp_id = blueprint.id.clone();
     let v = blueprint_version(blueprint).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

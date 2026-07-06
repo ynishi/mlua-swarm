@@ -23,16 +23,20 @@ use tokio::sync::{broadcast, Notify};
 pub struct ResumeKey(pub String);
 
 impl ResumeKey {
-    /// Generate a random key (`R-<12 hex bytes>`).
+    /// Generate a random key (`RK-<12 hex bytes>`).
+    ///
+    /// The prefix moved from `R-` to `RK-` in issue #14: `R-` is reserved
+    /// for [`crate::types::RunId`], and sharing it would let a resume key
+    /// pass a run-id prefix check.
     pub fn new() -> Self {
-        Self(format!("R-{}", crate::types::uid_hex(12)))
+        Self(format!("RK-{}", crate::types::uid_hex(12)))
     }
 
     /// Deterministic key for a Senior-escalation suspend on `task_id`
-    /// (`R-senior-<task_id>`), so repeated escalations on the same task
+    /// (`RK-senior-<task_id>`), so repeated escalations on the same task
     /// are addressable without extra bookkeeping.
     pub fn for_senior(task_id: &StepId) -> Self {
-        Self(format!("R-senior-{}", task_id.0))
+        Self(format!("RK-senior-{}", task_id))
     }
 }
 
@@ -165,9 +169,12 @@ pub struct OperatorSession {
     /// Task IDs started by this session (via `start_task` while this
     /// session's token was current).
     pub owned_task_ids: Vec<StepId>,
-    /// Nonce of the `CapToken` this session was attached with; used to
-    /// look sessions up by token in `with_state` closures.
-    pub token_nonce: String,
+    /// Fingerprint (`CapToken::fingerprint`, SHA-256 of the nonce) of the
+    /// `CapToken` this session was attached with; used to look sessions up
+    /// by token in `with_state` closures. Holds the fingerprint rather
+    /// than the nonce so the session table carries no secret material
+    /// (issue #14).
+    pub token_fp: String,
     /// The Operator's `kind`, plus IDs of
     /// the `SeniorBridge` / `SpawnHook` registered on the engine's
     /// `BridgeRegistry`. Persisted (all `String`; no `Arc<dyn ...>`). At
@@ -460,14 +467,16 @@ pub struct EngineState {
     /// profile can be distinguished: an absent key means "not yet baked",
     /// while `Some(None)` means "baked and profile is explicitly absent".
     pub systems: HashMap<(StepId, u32), Option<String>>,
-    /// All minted `CapToken` records, keyed by token nonce.
-    pub tokens: HashMap<String, CapTokenRecord>, // key = token nonce
-    /// Short worker handle (`wh-XXXXXXXX`, 12 chars) → token-nonce lookup
-    /// map. Resolves the `worker_handle` field a SubAgent receives with its
-    /// prompt. There is no signature verification: `task_id` is resolved by
-    /// a plain `HashMap` lookup — deliberately thin for the local
-    /// running over WebSocket, and adopted specifically to remove the
-    /// base64 copy-paste failure mode.
+    /// All minted `CapToken` records, keyed by token fingerprint
+    /// (`CapToken::fingerprint` = SHA-256 of the nonce; issue #14 — the
+    /// key is loggable, the nonce is not).
+    pub tokens: HashMap<String, CapTokenRecord>, // key = token fingerprint
+    /// Short worker handle (`wh-XXXXXXXX`, 12 chars) → token-fingerprint
+    /// lookup map. Resolves the `worker_handle` field a SubAgent receives
+    /// with its prompt. There is no signature verification: `task_id` is
+    /// resolved by a plain `HashMap` lookup — deliberately thin for the
+    /// local running over WebSocket, and adopted specifically to remove
+    /// the base64 copy-paste failure mode.
     pub worker_handles: HashMap<String, String>,
     /// Outstanding `query_senior` suspensions awaiting `resume`.
     pub pending_resumes: HashMap<ResumeKey, ResumePending>,

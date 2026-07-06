@@ -226,11 +226,12 @@ impl Engine {
             });
         }
         // (4) server-side uses_left consume
-        self.with_state("token.consume", |s| {
+        let fp = token.fingerprint();
+        self.with_state("token.consume", move |s| {
             let rec = s
                 .tokens
-                .get_mut(token.id())
-                .ok_or_else(|| EngineError::TokenNotFound(token.id().to_string()))?;
+                .get_mut(&fp)
+                .ok_or_else(|| EngineError::TokenNotFound(fp.clone()))?;
             rec.consume()
                 .map_err(|_: crate::core::state::CapTokenConsumeError| {
                     EngineError::TokenUsesExhausted
@@ -263,21 +264,17 @@ impl Engine {
         if token.role != Role::Worker {
             return Ok(());
         }
-        let nonce = token.nonce.clone();
+        let fp = token.fingerprint();
         let arg_tid = task_id.clone();
         self.with_state("token.ownership_gate", move |s| {
-            let bound = s
-                .tokens
-                .get(&nonce)
-                .and_then(|r| r.task_id.as_ref())
-                .cloned();
+            let bound = s.tokens.get(&fp).and_then(|r| r.task_id.as_ref()).cloned();
             match bound {
                 Some(t) if t == arg_tid => Ok(()),
                 Some(t) => Err(EngineError::TokenTaskMismatch {
-                    bound: t.0,
-                    arg: arg_tid.0,
+                    bound: t.into_string(),
+                    arg: arg_tid.into_string(),
                 }),
-                None => Err(EngineError::TokenNotFound(nonce.clone())),
+                None => Err(EngineError::TokenNotFound(fp.clone())),
             }
         })
         .await??;
@@ -295,13 +292,13 @@ impl Engine {
                 verb: Verb::PostResult,
             });
         }
-        let nonce = token.nonce.clone();
+        let fp = token.fingerprint();
         self.with_state("task_id_from_token", move |s| {
             s.tokens
-                .get(&nonce)
+                .get(&fp)
                 .and_then(|r| r.task_id.as_ref())
                 .cloned()
-                .ok_or_else(|| EngineError::TokenNotFound(nonce.clone()))
+                .ok_or_else(|| EngineError::TokenNotFound(fp.clone()))
         })
         .await?
     }
@@ -313,16 +310,16 @@ impl Engine {
     pub async fn task_id_from_handle(&self, handle: &str) -> Result<StepId, EngineError> {
         let h = handle.to_string();
         self.with_state("task_id_from_handle", move |s| {
-            let nonce = s
+            let fp = s
                 .worker_handles
                 .get(&h)
                 .cloned()
                 .ok_or_else(|| EngineError::TokenNotFound(format!("handle={h}")))?;
             s.tokens
-                .get(&nonce)
+                .get(&fp)
                 .and_then(|r| r.task_id.as_ref())
                 .cloned()
-                .ok_or_else(|| EngineError::TokenNotFound(format!("nonce={nonce}")))
+                .ok_or_else(|| EngineError::TokenNotFound(format!("fp={fp}")))
         })
         .await?
     }
@@ -375,9 +372,9 @@ impl Engine {
     /// Mint a short handle and register it in the `worker_handles` map.
     /// Called immediately after the worker-token mint inside
     /// `dispatch_attempt_with`, and issues a handle bound to the same
-    /// nonce. Format is `wh-<8 hex chars>` (11 chars total), designed to
-    /// remove the base64 copy-paste failure mode.
-    async fn mint_worker_handle(&self, worker_nonce: String) -> Result<String, EngineError> {
+    /// token fingerprint. Format is `wh-<8 hex chars>` (11 chars total),
+    /// designed to remove the base64 copy-paste failure mode.
+    async fn mint_worker_handle(&self, worker_fp: String) -> Result<String, EngineError> {
         // The handle is a sole bearer secret on the `/v1/worker/submit`
         // short-handle path (`submit_worker_result_trusted` skips token
         // verification), so it must be unguessable — OS RNG, not the
@@ -387,9 +384,8 @@ impl Engine {
         let short = crate::types::secure_hex(4);
         let handle = format!("wh-{short}");
         let h = handle.clone();
-        let n = worker_nonce.clone();
         self.with_state("mint_worker_handle", move |s| {
-            s.worker_handles.insert(h, n);
+            s.worker_handles.insert(h, worker_fp);
         })
         .await?;
         Ok(handle)
@@ -534,13 +530,13 @@ impl Engine {
             .signer
             .session(operator_id.clone(), role, vec!["*".into()], ttl);
         let session_id = SessionId::new();
-        let nonce = token.nonce.clone();
+        let fp = token.fingerprint();
         let now = now_unix();
         let token_for_store = token.clone();
 
         self.with_state("attach_with_ids", |s| {
             s.tokens
-                .insert(nonce.clone(), CapTokenRecord::from_token(token_for_store));
+                .insert(fp.clone(), CapTokenRecord::from_token(token_for_store));
             s.sessions.insert(
                 session_id.clone(),
                 OperatorSession {
@@ -551,7 +547,7 @@ impl Engine {
                     last_seen: now,
                     attached: true,
                     owned_task_ids: Vec::new(),
-                    token_nonce: nonce.clone(),
+                    token_fp: fp.clone(),
                     operator_kind: kind,
                     runtime_agent_kinds: operator_kind_overrides,
                     bp_agent_kinds,
@@ -708,13 +704,13 @@ impl Engine {
             .signer
             .session(operator_id.clone(), role, vec!["*".into()], ttl);
         let session_id = SessionId::new();
-        let nonce = token.nonce.clone();
+        let fp = token.fingerprint();
         let now = now_unix();
         let token_for_store = token.clone();
 
         self.with_state("attach_with", |s| {
             s.tokens
-                .insert(nonce.clone(), CapTokenRecord::from_token(token_for_store));
+                .insert(fp.clone(), CapTokenRecord::from_token(token_for_store));
             s.sessions.insert(
                 session_id.clone(),
                 OperatorSession {
@@ -725,7 +721,7 @@ impl Engine {
                     last_seen: now,
                     attached: true,
                     owned_task_ids: Vec::new(),
-                    token_nonce: nonce.clone(),
+                    token_fp: fp.clone(),
                     operator_kind: Some(kind),
                     runtime_agent_kinds: HashMap::new(),
                     bp_agent_kinds: HashMap::new(),
@@ -754,11 +750,12 @@ impl Engine {
     /// carrying the same registered bridge/hook IDs can pick them back up.
     pub async fn detach(&self, token: &CapToken) -> Result<(), EngineError> {
         self.verify_token(token, Verb::DetachSession).await?;
-        self.with_state("detach", |s| {
+        let fp = token.fingerprint();
+        self.with_state("detach", move |s| {
             let sid = s
                 .sessions
                 .iter()
-                .find(|(_, sess)| sess.token_nonce == token.nonce)
+                .find(|(_, sess)| sess.token_fp == fp)
                 .map(|(id, _)| id.clone());
             if let Some(sid) = sid {
                 if let Some(sess) = s.sessions.get_mut(&sid) {
@@ -780,12 +777,9 @@ impl Engine {
     pub async fn heartbeat(&self, token: &CapToken) -> Result<(), EngineError> {
         self.verify_token(token, Verb::Heartbeat).await?;
         let now = now_unix();
-        self.with_state("heartbeat", |s| {
-            if let Some(sess) = s
-                .sessions
-                .values_mut()
-                .find(|sess| sess.token_nonce == token.nonce)
-            {
+        let fp = token.fingerprint();
+        self.with_state("heartbeat", move |s| {
+            if let Some(sess) = s.sessions.values_mut().find(|sess| sess.token_fp == fp) {
                 sess.last_seen = now;
                 sess.attached = true;
             }
@@ -812,7 +806,7 @@ impl Engine {
         let task_id = StepId::new();
         let directive = spec.initial_directive.clone();
         let task_id_clone = task_id.clone();
-        let nonce = token.nonce.clone();
+        let fp = token.fingerprint();
         let max_depth = self.inner.cfg.max_spawn_depth;
         self.with_state("start_task", move |s| {
             // Recursive swarm depth gate (recursion guard):
@@ -821,7 +815,7 @@ impl Engine {
             // error. Operator tokens (parent_task_id=None) start at depth 0.
             let parent_depth_opt = s
                 .tokens
-                .get(&nonce)
+                .get(&fp)
                 .and_then(|rec| rec.task_id.as_ref())
                 .and_then(|tid| s.tasks.get(tid))
                 .map(|t| t.spawn_depth);
@@ -843,11 +837,7 @@ impl Engine {
             s.tasks.insert(task_id_clone.clone(), task);
             s.prompts.insert((task_id_clone.clone(), 1), directive);
             // Link to the owner session (only Operator tokens match; Worker tokens have no session).
-            if let Some(sess) = s
-                .sessions
-                .values_mut()
-                .find(|sess| sess.token_nonce == nonce)
-            {
+            if let Some(sess) = s.sessions.values_mut().find(|sess| sess.token_fp == fp) {
                 sess.owned_task_ids.push(task_id_clone.clone());
             }
             s.push_event(Event::TaskCreated {
@@ -876,7 +866,7 @@ impl Engine {
             s.tasks
                 .get(&task_id)
                 .cloned()
-                .ok_or_else(|| EngineError::TaskNotFound(task_id.0.clone()))
+                .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))
         })
         .await?
     }
@@ -891,7 +881,7 @@ impl Engine {
             let task = s
                 .tasks
                 .get_mut(&tid)
-                .ok_or_else(|| EngineError::TaskNotFound(tid.0.clone()))?;
+                .ok_or_else(|| EngineError::TaskNotFound(tid.to_string()))?;
             task.status = TaskStatus::Cancelled;
             task.updated_at = now_unix();
             s.push_event(Event::TaskCancelled {
@@ -939,14 +929,14 @@ impl Engine {
 
         // 1) Under the lock: increment the attempt number, mark Running, snapshot the
         //    prompt, and pull `operator_info` from the session so we can inject it into Ctx.
-        let nonce = token.nonce.clone();
+        let fp = token.fingerprint();
         let tid_for_prep = task_id.clone();
         let (attempt, agent, session_snapshot) = self
             .with_state("dispatch.prep", move |s| {
                 let task = s
                     .tasks
                     .get_mut(&tid_for_prep)
-                    .ok_or_else(|| EngineError::TaskNotFound(tid_for_prep.0.clone()))?;
+                    .ok_or_else(|| EngineError::TaskNotFound(tid_for_prep.to_string()))?;
                 task.attempt += 1;
                 task.status = TaskStatus::Running;
                 task.updated_at = now_unix();
@@ -962,7 +952,7 @@ impl Engine {
                 let task = s
                     .tasks
                     .get(&tid_for_prep)
-                    .ok_or_else(|| EngineError::TaskNotFound(tid_for_prep.0.clone()))?;
+                    .ok_or_else(|| EngineError::TaskNotFound(tid_for_prep.to_string()))?;
                 let agent = task.spec.agent.clone();
                 // Session snapshot (looked up by token nonce). When no session
                 // exists (worker token invoked directly / test injection), fall
@@ -970,7 +960,7 @@ impl Engine {
                 let sess_clone = s
                     .sessions
                     .values()
-                    .find(|sess| sess.token_nonce == nonce)
+                    .find(|sess| sess.token_fp == fp)
                     .cloned();
                 Ok::<_, EngineError>((attempt, agent, sess_clone))
             })
@@ -994,12 +984,12 @@ impl Engine {
             vec!["*".into()],
             Duration::from_secs(1800),
         );
-        let worker_nonce = worker_token.nonce.clone();
+        let worker_fp = worker_token.fingerprint();
         let task_id_for_worker = task_id.clone();
         let worker_token_for_store = worker_token.clone();
         self.with_state("dispatch.mint_worker", move |s| {
             s.tokens.insert(
-                worker_nonce.clone(),
+                worker_fp,
                 CapTokenRecord::from_worker_token(worker_token_for_store, task_id_for_worker),
             );
         })
@@ -1008,7 +998,7 @@ impl Engine {
         // Mint a short handle (`wh-XXXXXXXX`) and register it in worker_handles.
         // Used by the simplified Bearer path for SubAgents (short-handle form
         // avoids base64 copy-paste incidents).
-        let worker_handle = self.mint_worker_handle(worker_token.nonce.clone()).await?;
+        let worker_handle = self.mint_worker_handle(worker_token.fingerprint()).await?;
 
         let mut ctx = Ctx::new(task_id.clone(), attempt, agent.clone());
         ctx.operator = operator_info; // activates MainAIMiddleware / Senior bridge
@@ -1018,7 +1008,7 @@ impl Engine {
         if let Some(rid) = run_id {
             ctx.meta
                 .runtime
-                .insert("run_id".to_string(), Value::String(rid.0.clone()));
+                .insert("run_id".to_string(), Value::String(rid.to_string()));
         }
 
         let worker = spawner
@@ -1069,7 +1059,7 @@ impl Engine {
         let outcome = self
             .with_state("dispatch.apply", |s| {
                 if !s.tasks.contains_key(&task_id) {
-                    return Err(EngineError::TaskNotFound(task_id.0.clone()));
+                    return Err(EngineError::TaskNotFound(task_id.to_string()));
                 }
                 match value_ok {
                     Ok((value, ok)) => {
@@ -1148,14 +1138,14 @@ impl Engine {
             let task = s
                 .tasks
                 .get(&task_id)
-                .ok_or_else(|| EngineError::TaskNotFound(task_id.0.clone()))?;
+                .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
             s.prompts
                 .get(&(task_id.clone(), task.attempt.max(1)))
                 .cloned()
                 .ok_or_else(|| {
                     EngineError::ResourceNotFound(format!(
                         "prompt({}, attempt={})",
-                        task_id.0, task.attempt
+                        task_id, task.attempt
                     ))
                 })
         })
@@ -1182,7 +1172,7 @@ impl Engine {
             let task = s
                 .tasks
                 .get(&task_id_clone)
-                .ok_or_else(|| EngineError::TaskNotFound(task_id_clone.0.clone()))?;
+                .ok_or_else(|| EngineError::TaskNotFound(task_id_clone.to_string()))?;
             let attempt = task.attempt.max(1);
             let prompt = s
                 .prompts
@@ -1191,7 +1181,7 @@ impl Engine {
                 .ok_or_else(|| {
                     EngineError::ResourceNotFound(format!(
                         "prompt({}, attempt={})",
-                        task_id_clone.0, attempt
+                        task_id_clone, attempt
                     ))
                 })?;
             let system = s
@@ -1201,7 +1191,7 @@ impl Engine {
                 .unwrap_or(None);
             let agent = task.spec.agent.clone();
             Ok::<_, EngineError>(crate::types::WorkerPayload {
-                task_id: task_id_clone.0.clone(),
+                task_id: task_id_clone.clone(),
                 attempt,
                 agent,
                 prompt,
@@ -1226,7 +1216,7 @@ impl Engine {
             let task = s
                 .tasks
                 .get(&task_id_clone)
-                .ok_or_else(|| EngineError::TaskNotFound(task_id_clone.0.clone()))?;
+                .ok_or_else(|| EngineError::TaskNotFound(task_id_clone.to_string()))?;
             let attempt = task.attempt.max(1);
             let prompt = s
                 .prompts
@@ -1235,7 +1225,7 @@ impl Engine {
                 .ok_or_else(|| {
                     EngineError::ResourceNotFound(format!(
                         "prompt({}, attempt={})",
-                        task_id_clone.0, attempt
+                        task_id_clone, attempt
                     ))
                 })?;
             let system = s
@@ -1245,7 +1235,7 @@ impl Engine {
                 .unwrap_or(None);
             let agent = task.spec.agent.clone();
             Ok::<_, EngineError>(crate::types::WorkerPayload {
-                task_id: task_id_clone.0.clone(),
+                task_id: task_id_clone.clone(),
                 attempt,
                 agent,
                 prompt,
@@ -1264,7 +1254,7 @@ impl Engine {
             s.tasks
                 .get(&task_id)
                 .map(|t| t.attempt)
-                .ok_or_else(|| EngineError::TaskNotFound(task_id.0.clone()))
+                .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))
         })
         .await?
     }
@@ -1375,7 +1365,7 @@ impl Engine {
             let task = s
                 .tasks
                 .get_mut(&task_id)
-                .ok_or_else(|| EngineError::TaskNotFound(task_id.0.clone()))?;
+                .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
             task.last_result = Some(result_clone);
             task.updated_at = now_unix();
             Ok::<(), EngineError>(())
@@ -1434,7 +1424,7 @@ impl Engine {
             let task = s
                 .tasks
                 .get_mut(&task_id_inner)
-                .ok_or_else(|| EngineError::TaskNotFound(task_id_inner.0.clone()))?;
+                .ok_or_else(|| EngineError::TaskNotFound(task_id_inner.to_string()))?;
             task.status = TaskStatus::Suspended;
             task.suspended_on = Some(key_clone.clone());
             task.updated_at = now_unix();
@@ -1603,7 +1593,7 @@ impl Engine {
                     .tasks
                     .get(&task_id_inner)
                     .cloned()
-                    .ok_or_else(|| EngineError::TaskNotFound(task_id_inner.0.clone()))?;
+                    .ok_or_else(|| EngineError::TaskNotFound(task_id_inner.to_string()))?;
                 let notify = s.ensure_task_notify(&task_id_inner);
                 Ok::<_, EngineError>((task, notify))
             })
@@ -1632,7 +1622,7 @@ impl Engine {
             s.tasks
                 .get(&task_id_inner)
                 .cloned()
-                .ok_or_else(|| EngineError::TaskNotFound(task_id_inner.0.clone()))
+                .ok_or_else(|| EngineError::TaskNotFound(task_id_inner.to_string()))
         })
         .await?
     }
@@ -1709,6 +1699,65 @@ impl Engine {
     }
 }
 
+// ─── UT: issue #14 — token store keyed by fingerprint, not nonce ────────────
+#[cfg(test)]
+mod token_fingerprint_store_tests {
+    use super::*;
+
+    /// A token that was never attached fails verify with a `TokenNotFound`
+    /// that carries the fingerprint — never the nonce. The error string can
+    /// surface in HTTP error bodies, so this is the secret-hygiene contract.
+    #[tokio::test]
+    async fn verify_unknown_token_reports_fingerprint_not_nonce() {
+        let engine = Engine::new(EngineCfg::default());
+        // Signed by the engine's own signer (sig passes) but never inserted
+        // into the store — verify must fail at step (4), the store lookup.
+        let token = engine.signer().session(
+            "ghost",
+            Role::Operator,
+            vec!["*".into()],
+            Duration::from_secs(60),
+        );
+        let err = engine
+            .verify_token(&token, Verb::ReadTaskState)
+            .await
+            .expect_err("token is not in the store");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&token.fingerprint()),
+            "error must carry the fingerprint: {msg}"
+        );
+        assert!(
+            !msg.contains(&token.nonce),
+            "error must not leak the nonce: {msg}"
+        );
+    }
+
+    /// attach → verify → heartbeat → detach all resolve the session /
+    /// token record through fingerprint keys (mint/verify lifecycle
+    /// regression guard for the issue #14 key migration).
+    #[tokio::test]
+    async fn attach_verify_heartbeat_detach_cycle_with_fp_keying() {
+        let engine = Engine::new(EngineCfg::default());
+        let token = engine
+            .attach("op-1", Role::Operator, Duration::from_secs(60))
+            .await
+            .expect("attach");
+        engine
+            .verify_token(&token, Verb::ReadTaskState)
+            .await
+            .expect("verify consumes via fp key");
+        engine
+            .heartbeat(&token)
+            .await
+            .expect("heartbeat finds the session by fp");
+        engine
+            .detach(&token)
+            .await
+            .expect("detach finds the session by fp");
+    }
+}
+
 // ─── UT: `OperatorKind` "Runtime Global" tier — `Option` semantics ─────────
 //
 // Regression coverage for the "explicit Automate is indistinguishable from
@@ -1747,7 +1796,7 @@ mod resolve_operator_info_runtime_global_tests {
             .with_state("test.find_session", |s| {
                 s.sessions
                     .values()
-                    .find(|sess| sess.token_nonce == token.nonce)
+                    .find(|sess| sess.token_fp == token.fingerprint())
                     .cloned()
             })
             .await
@@ -1851,7 +1900,7 @@ mod dispatch_attempt_with_run_id_tests {
         let observed = dispatch_with_probe(Some(&run_id)).await;
         assert_eq!(
             observed.meta.runtime.get("run_id").and_then(|v| v.as_str()),
-            Some(run_id.0.as_str()),
+            Some(run_id.as_str()),
             "ctx.meta.runtime[\"run_id\"] must carry the run_id passed to dispatch_attempt_with"
         );
     }

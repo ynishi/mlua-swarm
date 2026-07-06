@@ -206,7 +206,7 @@ mod tests {
             let bp: Blueprint = serde_json::from_str(&body)
                 .unwrap_or_else(|e| panic!("{uri}: not a valid Blueprint: {e}"));
             assert!(
-                !bp.id.is_empty(),
+                !bp.id.as_str().is_empty(),
                 "{uri}: sample Blueprint must carry a non-empty id"
             );
         }

@@ -146,7 +146,7 @@ mod tests {
         );
         let (stack, seen) = probe_stack(map);
         let engine = Engine::new(EngineCfg::default());
-        let task_id = StepId("t-1".to_string());
+        let task_id = StepId::parse("ST-1").unwrap();
         let ctx = Ctx::new(task_id.clone(), 1, "planner");
         let token = engine
             .attach("ut-op", Role::Operator, Duration::from_secs(30))
@@ -169,7 +169,7 @@ mod tests {
     async fn passes_through_untouched_on_miss() {
         let (stack, seen) = probe_stack(HashMap::new());
         let engine = Engine::new(EngineCfg::default());
-        let task_id = StepId("t-2".to_string());
+        let task_id = StepId::parse("ST-2").unwrap();
         let ctx = Ctx::new(task_id.clone(), 1, "unbound-agent");
         let token = engine
             .attach("ut-op", Role::Operator, Duration::from_secs(30))

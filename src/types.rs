@@ -8,133 +8,172 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ─── ID newtypes ───────────────────────────────────────────────────────────
 
-/// Opaque per-step identifier, e.g. `ST-<hex>`. Newtype over `String` so
-/// step, session, and worker ids can't be swapped by accident at call sites.
+/// Error returned when an ID string does not carry the expected prefix.
 ///
-/// One `StepId` is minted per dispatched Blueprint step (the engine's
-/// dispatcher "spins up a fresh task per `Step.ref`"). It is scoped to a
-/// single step execution — the whole-kick identity is [`RunId`], and the
-/// work-item identity is [`TaskId`].
+/// Produced by the fallible constructors on the ID newtypes
+/// ([`StepId::parse`], [`TaskId::parse`], ...) and by their serde
+/// `Deserialize` impls (which route through `TryFrom<String>`), so a
+/// misrouted or malformed id fails at the boundary instead of deep inside
+/// a store lookup.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid {kind} id `{got}`: expected `{expected}` prefix")]
+pub struct IdParseError {
+    /// Human-readable ID kind (`"step"`, `"task"`, ...).
+    pub kind: &'static str,
+    /// The prefix this ID kind requires, e.g. `ST-`.
+    pub expected: &'static str,
+    /// The rejected input.
+    pub got: String,
+}
+
+/// Defines a prefix-validated ID newtype.
 ///
-/// Renamed from `TaskId` (`T-` prefix) in the issue #13 ID-hierarchy
-/// reconciliation: Blueprint → Task → Run → Step → Attempt.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct StepId(pub String);
+/// The generated type keeps its inner `String` **private**: the only ways
+/// to obtain a value are `new()` (mint) and `parse()` / `TryFrom<String>` /
+/// `FromStr` (validated) — which is what makes the prefix check impossible
+/// to bypass at call sites. Serde deserialization routes through
+/// `TryFrom<String>` (`#[serde(try_from = "String")]`), and serialization
+/// stays the plain inner string, so the wire format is byte-for-byte
+/// unchanged from the `pub String` era.
+macro_rules! id_newtype {
+    ($(#[$meta:meta])* $name:ident, $prefix:literal, $kind:literal) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "String")]
+        pub struct $name(String);
 
-impl StepId {
-    /// Mint a fresh id with the `ST-` prefix and a process-unique nonce.
-    pub fn new() -> Self {
-        Self(format!("ST-{}", uid_hex(8)))
-    }
+        impl $name {
+            /// The prefix this ID kind carries on the wire.
+            pub const PREFIX: &'static str = $prefix;
+
+            /// Mint a fresh id with the kind prefix and a process-unique
+            /// nonce (see [`uid_hex`]).
+            pub fn new() -> Self {
+                Self(format!(concat!($prefix, "{}"), uid_hex(8)))
+            }
+
+            /// Parse an externally-supplied string, rejecting values that
+            /// do not start with the kind prefix or carry nothing after it.
+            pub fn parse(s: impl Into<String>) -> Result<Self, IdParseError> {
+                let s = s.into();
+                if s.len() > $prefix.len() && s.starts_with($prefix) {
+                    Ok(Self(s))
+                } else {
+                    Err(IdParseError {
+                        kind: $kind,
+                        expected: $prefix,
+                        got: s,
+                    })
+                }
+            }
+
+            /// View the id as a string slice.
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            /// Consume the id and return the inner string.
+            pub fn into_string(self) -> String {
+                self.0
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = IdParseError;
+            fn try_from(s: String) -> Result<Self, IdParseError> {
+                Self::parse(s)
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = IdParseError;
+            fn from_str(s: &str) -> Result<Self, IdParseError> {
+                Self::parse(s)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(id: $name) -> String {
+                id.0
+            }
+        }
+    };
 }
 
-impl Default for StepId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+id_newtype!(
+    /// Opaque per-step identifier, e.g. `ST-<hex>`. Newtype over `String` so
+    /// step, session, and worker ids can't be swapped by accident at call
+    /// sites.
+    ///
+    /// One `StepId` is minted per dispatched Blueprint step (the engine's
+    /// dispatcher "spins up a fresh task per `Step.ref`"). It is scoped to a
+    /// single step execution — the whole-kick identity is [`RunId`], and the
+    /// work-item identity is [`TaskId`].
+    ///
+    /// Renamed from `TaskId` (`T-` prefix) in the issue #13 ID-hierarchy
+    /// reconciliation: Blueprint → Task → Run → Step → Attempt.
+    StepId, "ST-", "step"
+);
 
-impl std::fmt::Display for StepId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+id_newtype!(
+    /// Opaque work-item identifier, e.g. `T-<hex>`. One `TaskId` names one
+    /// unit of work ("resolve issue #10" + a Blueprint ref + input ctx),
+    /// persisted in the task store. A task can be kicked N times; each kick
+    /// is a [`RunId`].
+    ///
+    /// Not to be confused with [`StepId`] (the per-step id that carried the
+    /// `TaskId` name before issue #13).
+    TaskId, "T-", "task"
+);
 
-/// Opaque work-item identifier, e.g. `T-<hex>`. One `TaskId` names one unit
-/// of work ("resolve issue #10" + a Blueprint ref + input ctx), persisted in
-/// the task store. A task can be kicked N times; each kick is a [`RunId`].
-///
-/// Not to be confused with [`StepId`] (the per-step id that carried the
-/// `TaskId` name before issue #13).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TaskId(pub String);
+id_newtype!(
+    /// Opaque run identifier, e.g. `R-<hex>`. One `RunId` names one kick of a
+    /// [`TaskId`] — minted server-side when a task is started, propagated
+    /// through the engine ctx to every wire frame so steps, workers, and
+    /// outputs correlate back to the run.
+    ///
+    /// The `R-` prefix is reserved for run ids; the engine's resume keys
+    /// moved to `RK-` in issue #14 so the two can't shadow each other under
+    /// prefix validation.
+    RunId, "R-", "run"
+);
 
-impl TaskId {
-    /// Mint a fresh id with the `T-` prefix and a process-unique nonce.
-    pub fn new() -> Self {
-        Self(format!("T-{}", uid_hex(8)))
-    }
-}
+id_newtype!(
+    /// Opaque session identifier, e.g. `S-<hex>`. See [`StepId`] for the
+    /// newtype rationale.
+    ///
+    /// This is the one session-id shape across the system (issue #11): the
+    /// engine mints it for attached operator sessions, and the server's
+    /// `POST /v1/operators` login path mints the WS operator `sid` in the
+    /// same shape (the old `op-<uuid>` sid form is retired). A `SessionId`
+    /// is an identifier, not a credential — bearer secrets use `secure_hex`
+    /// tokens.
+    SessionId, "S-", "session"
+);
 
-impl Default for TaskId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for TaskId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Opaque run identifier, e.g. `R-<hex>`. One `RunId` names one kick of a
-/// [`TaskId`] — minted server-side when a task is started, propagated
-/// through the engine ctx to every wire frame so steps, workers, and
-/// outputs correlate back to the run.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RunId(pub String);
-
-impl RunId {
-    /// Mint a fresh id with the `R-` prefix and a process-unique nonce.
-    pub fn new() -> Self {
-        Self(format!("R-{}", uid_hex(8)))
-    }
-}
-
-impl Default for RunId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for RunId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Opaque session identifier, e.g. `S-<hex>`. See [`StepId`] for the newtype
-/// rationale.
-///
-/// This is the one session-id shape across the system (issue #11): the
-/// engine mints it for attached operator sessions, and the server's
-/// `POST /v1/operators` login path mints the WS operator `sid` in the same
-/// shape (the old `op-<uuid>` sid form is retired). A `SessionId` is an
-/// identifier, not a credential — bearer secrets use `secure_hex` tokens.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(pub String);
-
-impl SessionId {
-    /// Mint a fresh id with the `S-` prefix and a process-unique nonce.
-    pub fn new() -> Self {
-        Self(format!("S-{}", uid_hex(8)))
-    }
-}
-
-impl Default for SessionId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Opaque worker identifier, e.g. `W-<hex>`. See [`StepId`] for the newtype
-/// rationale.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WorkerId(pub String);
-
-impl WorkerId {
-    /// Mint a fresh id with the `W-` prefix and a process-unique nonce.
-    pub fn new() -> Self {
-        Self(format!("W-{}", uid_hex(8)))
-    }
-}
-
-impl Default for WorkerId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+id_newtype!(
+    /// Opaque worker identifier, e.g. `W-<hex>`. See [`StepId`] for the
+    /// newtype rationale.
+    WorkerId, "W-", "worker"
+);
 
 // ─── Role × Verb ───────────────────────────────────────────────────────────
 
@@ -356,18 +395,25 @@ pub struct CapToken {
     /// Remaining-use budget: `None` = unlimited (session token), `Some(n)`
     /// = at most `n` uses (one-time when `n == 1`).
     pub max_uses: Option<u32>,
-    /// Random per-mint value; also serves as the token's server-side
-    /// lookup key (see [`CapToken::id`]).
+    /// Random per-mint value — **secret material** (it rides inside
+    /// `encode()` and the `MSE_TOKEN_NONCE` env). The server-side lookup
+    /// key is [`CapToken::fingerprint`] (its SHA-256), never the nonce
+    /// itself (issue #14).
     pub nonce: String,
     /// Hex-encoded HMAC-SHA256 signature over [`CapToken::signing_input`].
     pub sig_hex: String,
 }
 
 impl CapToken {
-    /// Use the `nonce` as the token identifier — the server-side
-    /// record key.
-    pub fn id(&self) -> &str {
-        &self.nonce
+    /// Server-side lookup key for this token: hex SHA-256 of the `nonce`.
+    ///
+    /// The nonce is the token's secret material, so the server never uses
+    /// it directly as a map key or prints it in diagnostics — the
+    /// fingerprint is the loggable identity (issue #14; the sibling
+    /// pattern is the operator login flow's sid / token split). Replaces
+    /// the former `id()` accessor, which returned the raw nonce.
+    pub fn fingerprint(&self) -> String {
+        token_fingerprint(&self.nonce)
     }
 
     /// Input for the HMAC signature — the concatenation of every field
@@ -428,8 +474,9 @@ impl CapToken {
 ///   `task.attempt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerPayload {
-    /// The task this payload was fetched for.
-    pub task_id: String,
+    /// The task this payload was fetched for. Typed [`StepId`] since issue
+    /// #14 — serde keeps the wire shape a plain string.
+    pub task_id: StepId,
     /// 1-based attempt number, matching the current `task.attempt`.
     pub attempt: u32,
     /// Name of the agent this dispatch is targeting.
@@ -605,7 +652,18 @@ pub fn secure_hex(bytes: usize) -> String {
     hex::encode(buf)
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+/// Hex SHA-256 of a token nonce / bearer string — the lookup-key shape
+/// used by [`CapToken::fingerprint`]. Standalone so callers holding only
+/// the bearer string (not a decoded token) can derive the same key.
+pub fn token_fingerprint(nonce: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(Sha256::digest(nonce.as_bytes()))
+}
+
+/// Constant-time byte-slice equality (XOR accumulate). Public so bearer
+/// comparisons outside this module (e.g. the operator login token check)
+/// can avoid the timing side channel of `==`.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -614,6 +672,102 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod id_newtype_tests {
+    use super::*;
+
+    #[test]
+    fn parse_accepts_prefixed_ids() {
+        assert_eq!(StepId::parse("ST-abc123").unwrap().as_str(), "ST-abc123");
+        assert_eq!(TaskId::parse("T-abc123").unwrap().as_str(), "T-abc123");
+        assert_eq!(RunId::parse("R-abc123").unwrap().as_str(), "R-abc123");
+        assert_eq!(SessionId::parse("S-abc123").unwrap().as_str(), "S-abc123");
+        assert_eq!(WorkerId::parse("W-abc123").unwrap().as_str(), "W-abc123");
+    }
+
+    #[test]
+    fn parse_rejects_wrong_prefix_and_empty_suffix() {
+        // Wrong prefix (including another kind's prefix).
+        assert!(StepId::parse("T-abc").is_err());
+        assert!(TaskId::parse("ST-abc").is_err());
+        assert!(
+            RunId::parse("RK-abc").is_err(),
+            "resume keys are not run ids"
+        );
+        assert!(SessionId::parse("W-abc").is_err());
+        assert!(WorkerId::parse("S-abc").is_err());
+        // Case-sensitive.
+        assert!(StepId::parse("st-abc").is_err());
+        // Prefix alone (nothing after it).
+        assert!(TaskId::parse("T-").is_err());
+        // Garbage / empty.
+        assert!(RunId::parse("nope").is_err());
+        assert!(WorkerId::parse("").is_err());
+    }
+
+    #[test]
+    fn parse_error_carries_kind_prefix_and_input() {
+        let err = TaskId::parse("R-xyz").unwrap_err();
+        assert_eq!(err.kind, "task");
+        assert_eq!(err.expected, "T-");
+        assert_eq!(err.got, "R-xyz");
+        assert_eq!(
+            err.to_string(),
+            "invalid task id `R-xyz`: expected `T-` prefix"
+        );
+    }
+
+    #[test]
+    fn minted_ids_round_trip_through_parse() {
+        assert!(StepId::parse(StepId::new().into_string()).is_ok());
+        assert!(TaskId::parse(TaskId::new().into_string()).is_ok());
+        assert!(RunId::parse(RunId::new().into_string()).is_ok());
+        assert!(SessionId::parse(SessionId::new().into_string()).is_ok());
+        assert!(WorkerId::parse(WorkerId::new().into_string()).is_ok());
+    }
+
+    #[test]
+    fn serde_wire_format_is_a_plain_string() {
+        let id = TaskId::parse("T-abc").unwrap();
+        assert_eq!(
+            serde_json::to_value(&id).unwrap(),
+            serde_json::json!("T-abc")
+        );
+        let back: TaskId = serde_json::from_value(serde_json::json!("T-abc")).unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn serde_deserialize_validates_prefix() {
+        let err = serde_json::from_value::<TaskId>(serde_json::json!("ST-abc"));
+        assert!(err.is_err(), "deserialize must route through parse");
+    }
+}
+
+#[cfg(test)]
+mod cap_token_fingerprint_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn fingerprint_is_sha256_of_nonce_and_not_the_nonce() {
+        let signer = TokenSigner::new("test-secret");
+        let token = signer.session("a", Role::Worker, vec!["*".into()], Duration::from_secs(60));
+        let fp = token.fingerprint();
+        // 32-byte SHA-256, hex-encoded.
+        assert_eq!(fp.len(), 64);
+        // The lookup key must never equal (or contain) the secret nonce.
+        assert_ne!(fp, token.nonce);
+        assert!(!fp.contains(&token.nonce));
+        // Standalone helper derives the same key from the bare bearer string.
+        assert_eq!(fp, token_fingerprint(&token.nonce));
+        // Deterministic per token, distinct across mints.
+        assert_eq!(fp, token.fingerprint());
+        let other = signer.session("a", Role::Worker, vec!["*".into()], Duration::from_secs(60));
+        assert_ne!(fp, other.fingerprint());
+    }
 }
 
 #[cfg(test)]

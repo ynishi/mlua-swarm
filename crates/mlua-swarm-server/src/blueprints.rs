@@ -182,7 +182,7 @@ async fn seed_blueprint(
             .map_err(|e| (StatusCode::BAD_REQUEST, parse_error_with_schema_hint(&e)))?
     };
     let store = state.store;
-    if id != body.id {
+    if id != body.id.as_str() {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("path id={id} != body.id={}", body.id),

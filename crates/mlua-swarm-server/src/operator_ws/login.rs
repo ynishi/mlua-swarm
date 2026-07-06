@@ -44,7 +44,7 @@ use axum::{
     Json,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use mlua_swarm::{Operator, SeniorBridge, SpawnHook};
+use mlua_swarm::{Operator, SeniorBridge, SessionId, SpawnHook};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -60,8 +60,8 @@ use crate::AppState;
 /// on reconnect the same `WSOperatorSession` is reused (`replace_tx`) rather
 /// than re-registered.
 pub struct OperatorSessionEntry {
-    /// Server-minted session id (`S-<hex>`, the shared `SessionId` shape).
-    pub sid: String,
+    /// Server-minted session id (typed [`SessionId`] since issue #14).
+    pub sid: SessionId,
     /// Bearer auth token (10-hex-char) required on the WS upgrade and admin routes.
     pub token: String,
     /// Role aliases claimed by this session (roles-exclusivity set).
@@ -83,8 +83,9 @@ pub struct OperatorsCreateReq {
 /// Response for `POST /v1/operators`.
 #[derive(Debug, Serialize)]
 pub struct OperatorsCreateResp {
-    /// Newly minted session id (`S-<hex>`, the shared `SessionId` shape).
-    pub sid: String,
+    /// Newly minted session id (typed [`SessionId`]; serializes as the
+    /// plain `S-<hex>` string — the wire shape is unchanged).
+    pub sid: SessionId,
     /// Bearer auth token required on the WS upgrade and admin routes.
     pub token: String,
     /// Echoes the granted role aliases.
@@ -111,7 +112,7 @@ pub async fn operators_create(
     // `op-<uuid>` shape collided with the operator-backend registry prefix).
     // It is an identifier, not a secret: `token` (secure_hex) is the sole
     // bearer credential on this path.
-    let sid = mlua_swarm::types::SessionId::new().0;
+    let sid = SessionId::new();
     let token = mlua_swarm::types::secure_hex(5);
 
     {
@@ -184,6 +185,10 @@ pub async fn operators_ws_connect(
         Ok(t) => t,
         Err(resp) => return *resp,
     };
+    // A string that doesn't even parse as a SessionId can't be a known sid.
+    let Ok(sid) = SessionId::parse(sid) else {
+        return (StatusCode::NOT_FOUND, "unknown sid").into_response();
+    };
 
     let entry = {
         let map = state.operator_sessions.lock().await;
@@ -193,7 +198,7 @@ pub async fn operators_ws_connect(
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "unknown sid").into_response(),
     };
-    if entry.token != bearer {
+    if !mlua_swarm::types::ct_eq(entry.token.as_bytes(), bearer.as_bytes()) {
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
@@ -355,6 +360,9 @@ pub async fn operators_delete(
         Ok(t) => t,
         Err(resp) => return *resp,
     };
+    let Ok(sid) = SessionId::parse(sid) else {
+        return (StatusCode::NOT_FOUND, "unknown sid").into_response();
+    };
 
     let entry = {
         let map = state.operator_sessions.lock().await;
@@ -364,15 +372,15 @@ pub async fn operators_delete(
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "unknown sid").into_response(),
     };
-    if entry.token != bearer {
+    if !mlua_swarm::types::ct_eq(entry.token.as_bytes(), bearer.as_bytes()) {
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
-    state.engine.unregister_senior_bridge(&sid).await;
-    state.engine.unregister_spawn_hook(&sid).await;
-    state.engine.unregister_operator(&sid).await;
+    state.engine.unregister_senior_bridge(sid.as_str()).await;
+    state.engine.unregister_spawn_hook(sid.as_str()).await;
+    state.engine.unregister_operator(sid.as_str()).await;
     if let Some(factory) = &state.ws_operator_factory {
-        factory.unregister_operator(&sid);
+        factory.unregister_operator(sid.as_str());
     }
     for role in &entry.roles {
         state.engine.unregister_operator(role).await;
@@ -390,7 +398,7 @@ pub async fn operators_delete(
     {
         let mut map = state.roles_to_sid.lock().await;
         for role in &entry.roles {
-            if map.get(role).map(String::as_str) == Some(sid.as_str()) {
+            if map.get(role) == Some(&sid) {
                 map.remove(role);
             }
         }
@@ -405,7 +413,7 @@ pub async fn operators_delete(
 #[derive(Debug, Serialize)]
 pub struct OperatorsInfoResp {
     /// Echoes the requested session id.
-    pub sid: String,
+    pub sid: SessionId,
     /// Role aliases held by this session.
     pub roles: Vec<String>,
     /// Whether a WS is currently attached (not merely that the session ever connected).
@@ -424,6 +432,9 @@ pub async fn operators_info(
         Ok(t) => t,
         Err(resp) => return *resp,
     };
+    let Ok(sid) = SessionId::parse(sid) else {
+        return (StatusCode::NOT_FOUND, "unknown sid").into_response();
+    };
 
     let entry = {
         let map = state.operator_sessions.lock().await;
@@ -433,7 +444,7 @@ pub async fn operators_info(
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "unknown sid").into_response(),
     };
-    if entry.token != bearer {
+    if !mlua_swarm::types::ct_eq(entry.token.as_bytes(), bearer.as_bytes()) {
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 

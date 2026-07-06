@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use mlua_swarm::StepId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpStream;
@@ -50,14 +51,16 @@ enum ServerMsgMirror {
         req_id: String,
         #[serde(default)]
         parent_req_id: Option<String>,
-        task_id: String,
+        // Typed `StepId` (issue #14): the mirror's job is shape validation,
+        // and the prefix check is part of the shape.
+        task_id: StepId,
         question: Value,
     },
     HookBefore {
         req_id: String,
         #[serde(default)]
         parent_req_id: Option<String>,
-        task_id: String,
+        task_id: StepId,
         agent: String,
         attempt: u32,
     },
@@ -65,7 +68,7 @@ enum ServerMsgMirror {
         req_id: String,
         #[serde(default)]
         parent_req_id: Option<String>,
-        task_id: String,
+        task_id: StepId,
         agent: String,
         attempt: u32,
         result: Value,
@@ -74,7 +77,7 @@ enum ServerMsgMirror {
         req_id: String,
         #[serde(default)]
         parent_req_id: Option<String>,
-        task_id: String,
+        task_id: StepId,
         agent: String,
         attempt: u32,
         capability_token: String,
@@ -507,18 +510,19 @@ mod tests {
 
     #[test]
     fn parse_server_frame_ask() {
-        let text = r#"{"type":"ask","req_id":"r1","task_id":"t1","question":{"q":"?"}}"#;
+        let text = r#"{"type":"ask","req_id":"r1","task_id":"ST-1","question":{"q":"?"}}"#;
         let frame = parse_server_frame(text).expect("should parse");
         assert_eq!(frame.req_id, "r1");
         assert_eq!(frame.kind, "ask");
-        assert_eq!(frame.payload["task_id"], "t1");
+        assert_eq!(frame.payload["task_id"], "ST-1");
         assert_eq!(frame.payload["question"], serde_json::json!({"q": "?"}));
         assert!(frame.payload.get("type").is_none(), "type key stripped");
     }
 
     #[test]
     fn parse_server_frame_hook_before() {
-        let text = r#"{"type":"hook_before","req_id":"r2","task_id":"t1","agent":"a","attempt":1}"#;
+        let text =
+            r#"{"type":"hook_before","req_id":"r2","task_id":"ST-1","agent":"a","attempt":1}"#;
         let frame = parse_server_frame(text).expect("should parse");
         assert_eq!(frame.req_id, "r2");
         assert_eq!(frame.kind, "hook_before");
@@ -528,7 +532,7 @@ mod tests {
 
     #[test]
     fn parse_server_frame_hook_after() {
-        let text = r#"{"type":"hook_after","req_id":"r3","task_id":"t1","agent":"a","attempt":2,"result":{"ok":true}}"#;
+        let text = r#"{"type":"hook_after","req_id":"r3","task_id":"ST-1","agent":"a","attempt":2,"result":{"ok":true}}"#;
         let frame = parse_server_frame(text).expect("should parse");
         assert_eq!(frame.req_id, "r3");
         assert_eq!(frame.kind, "hook_after");
@@ -537,7 +541,7 @@ mod tests {
 
     #[test]
     fn parse_server_frame_spawn() {
-        let text = r#"{"type":"spawn","req_id":"r4","task_id":"t1","agent":"a","attempt":1,"capability_token":"tok","directive":"do it"}"#;
+        let text = r#"{"type":"spawn","req_id":"r4","task_id":"ST-1","agent":"a","attempt":1,"capability_token":"tok","directive":"do it"}"#;
         let frame = parse_server_frame(text).expect("should parse");
         assert_eq!(frame.req_id, "r4");
         assert_eq!(frame.kind, "spawn");
@@ -548,7 +552,7 @@ mod tests {
 
     #[test]
     fn parse_server_frame_spawn_with_worker_handle() {
-        let text = r#"{"type":"spawn","req_id":"r5","task_id":"t1","agent":"a","attempt":1,"capability_token":"tok","worker_handle":"wh-abc","directive":"do it"}"#;
+        let text = r#"{"type":"spawn","req_id":"r5","task_id":"ST-1","agent":"a","attempt":1,"capability_token":"tok","worker_handle":"wh-abc","directive":"do it"}"#;
         let frame = parse_server_frame(text).expect("should parse");
         assert_eq!(frame.payload["worker_handle"], "wh-abc");
     }
