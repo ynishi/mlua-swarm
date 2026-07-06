@@ -126,6 +126,14 @@ pub struct AppState {
     /// causes `POST /v1/operators` to return `409 CONFLICT`. Entries are
     /// released on `DELETE /v1/operators/:sid`.
     pub roles_to_sid: Arc<Mutex<HashMap<String, String>>>,
+    /// Public HTTP base URL the server is reachable at (e.g.
+    /// `"http://127.0.0.1:7777"`), sourced from the binary at boot time.
+    /// When `Some`, `WSOperatorSession` renders it literally into the
+    /// Spawn `directive`'s `base_url` line so the receiving operator can
+    /// paste the frame into a SubAgent prompt without a `mse_doctor`
+    /// detour (issue #8). `None` preserves the historical fallback
+    /// (a placeholder that points at `mse_doctor`).
+    pub base_url: Option<Arc<str>>,
 }
 
 /// Minimal entry point: builds a router with [`default_registry`] and no
@@ -193,6 +201,30 @@ pub fn build_router_with_ws_factory_and_output(
     ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
     output_store: Option<Arc<dyn mlua_swarm::store::output::OutputStore>>,
 ) -> Router {
+    build_router_full(
+        engine,
+        registry,
+        store,
+        ws_operator_factory,
+        output_store,
+        None,
+    )
+}
+
+/// 6-argument variant of [`build_router_with_ws_factory_and_output`].
+/// Passing `base_url = Some(...)` (e.g. `"http://127.0.0.1:7777"`) makes
+/// `WSOperatorSession` render the actual server bind into the Spawn
+/// directive's `base_url` line, so the receiving operator can copy the
+/// frame straight into a SubAgent prompt (issue #8). `None` preserves
+/// the historical fallback (`<check with mse_doctor>` placeholder).
+pub fn build_router_full(
+    engine: Engine,
+    registry: SpawnerRegistry,
+    store: Option<Arc<dyn BlueprintStore>>,
+    ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+    output_store: Option<Arc<dyn mlua_swarm::store::output::OutputStore>>,
+    base_url: Option<Arc<str>>,
+) -> Router {
     let compiler = Compiler::new(registry);
     let launch = Arc::new(TaskLaunchService::new(engine.clone(), compiler));
     let task_app = Arc::new(match store {
@@ -211,6 +243,7 @@ pub fn build_router_with_ws_factory_and_output(
         data_store,
         operator_sessions: Arc::new(Mutex::new(HashMap::new())),
         roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
+        base_url,
     };
     Router::new()
         .route("/v1/healthz", get(healthz))

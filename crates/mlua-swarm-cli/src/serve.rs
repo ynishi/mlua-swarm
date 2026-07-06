@@ -35,7 +35,7 @@ use mlua_swarm::{
 };
 use mlua_swarm_server::{
     build_blueprints_router_with_refs, build_enhance_log_router, build_enhance_settings_router,
-    build_issues_router, build_router_with_ws_factory_and_output, default_layer_registry,
+    build_issues_router, build_router_full, default_layer_registry,
     default_registry_with_enhance_flow,
     doctor::{build_doctor_router, DoctorInfo},
 };
@@ -293,13 +293,19 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         None => Some(Arc::new(InMemoryOutputStore::new())),
     };
 
+    // Issue #8: source the public base URL from the same bind the
+    // listener will use, so `WSOperatorSession` can render it into
+    // Spawn directives literally (no example port drift).
+    let base_url: std::sync::Arc<str> = format!("http://{}", cfg.bind).into();
+
     // Router assembly (fixed combined mode): merges task, ws_operator_factory, and every enhance route.
-    let mut app = build_router_with_ws_factory_and_output(
+    let mut app = build_router_full(
         engine.clone(),
         make_registry(),
         Some(store.clone()),
         Some(op_factory.clone()),
         output_store,
+        Some(base_url),
     );
 
     let compiler = Compiler::new(make_registry());

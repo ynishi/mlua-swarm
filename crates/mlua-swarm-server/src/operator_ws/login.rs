@@ -211,7 +211,11 @@ async fn handle_operator_socket(
             ws_session
         }
         None => {
-            let ws_session = Arc::new(WSOperatorSession::new(entry.sid.clone(), tx.clone()));
+            let ws_session = Arc::new(WSOperatorSession::new_with_base_url(
+                entry.sid.clone(),
+                tx.clone(),
+                state.base_url.clone(),
+            ));
             state
                 .engine
                 .register_senior_bridge(

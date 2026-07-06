@@ -30,17 +30,34 @@ pub struct WSOperatorSession {
     /// `req_id` → pending oneshot. Resolved when `answer` / `hook_ack` /
     /// `spawn_ack` arrives.
     pending: Mutex<HashMap<String, oneshot::Sender<PendingReply>>>,
+    /// Public HTTP base URL the server is reachable at (from
+    /// `AppState.base_url`, sourced from the binary at boot time).
+    /// Rendered literally into the Spawn `directive`'s `base_url` line
+    /// when `Some`; `None` falls back to a `mse_doctor`-pointer
+    /// placeholder (issue #8).
+    base_url: Option<std::sync::Arc<str>>,
 }
 
 impl WSOperatorSession {
     /// `login.rs::handle_operator_socket` is the sole constructor call site.
     /// Auth (Bearer token match) is checked there against `OperatorSessionEntry.token`
     /// *before* upgrade — this struct no longer carries its own auth_token copy.
-    pub(super) fn new(sid: String, tx: mpsc::UnboundedSender<ServerMsg>) -> Self {
+    ///
+    /// `base_url` is the server's public HTTP root (e.g.
+    /// `"http://127.0.0.1:7777"`), threaded from `AppState.base_url`.
+    /// When `Some`, it is rendered literally into Spawn directives
+    /// (issue #8); `None` falls back to a `mse_doctor`-pointer
+    /// placeholder.
+    pub(super) fn new_with_base_url(
+        sid: String,
+        tx: mpsc::UnboundedSender<ServerMsg>,
+        base_url: Option<std::sync::Arc<str>>,
+    ) -> Self {
         Self {
             sid,
             tx: Mutex::new(Some(tx)),
             pending: Mutex::new(HashMap::new()),
+            base_url,
         }
     }
 
@@ -228,6 +245,7 @@ impl Operator for WSOperatorSession {
             &worker.variant,
             project_name_alias,
             data_sink_endpoint,
+            self.base_url.as_deref(),
         );
         let msg = ServerMsg::Spawn {
             req_id: req_id.clone(),
@@ -311,12 +329,19 @@ impl Operator for WSOperatorSession {
 /// to another `subagent_type` here: if the named SubAgent definition is not
 /// registered, the MainAI is instructed to fail the SpawnAck loud rather than
 /// silently substitute a different one.
+/// `base_url` is the server's public HTTP root (e.g.
+/// `"http://127.0.0.1:7777"`). When `Some`, it is rendered verbatim into
+/// the SubAgent prompt block so the operator can copy the frame
+/// straight through without a `mse_doctor` lookup (issue #8). When
+/// `None`, a fallback placeholder points the reader at `mse_doctor` —
+/// no fake port number appears in the directive.
 pub(super) fn default_spawn_directive(
     agent: &str,
     task_id: &str,
     subagent_type: &str,
     project_name_alias: Option<&str>,
     data_sink_endpoint: Option<&str>,
+    base_url: Option<&str>,
 ) -> String {
     // Expanded only when Blueprint.metadata.project_name_alias is Some.
     // Presents a discipline reminder to the MainAI plus the literal line the
@@ -366,6 +391,13 @@ pub(super) fn default_spawn_directive(
         ),
         None => String::new(),
     };
+    // Issue #8: render the actual server bind literally when it was
+    // sourced at boot; fall back to a pointer at `mse_doctor` rather
+    // than a fake port number.
+    let base_url_line = match base_url {
+        Some(u) => u.to_string(),
+        None => "<your server's actual bind — check with mse_doctor>".to_string(),
+    };
     format!(
         "[agent_primitive dispatch=@{agent}]\n\
          worker endpoint:\n  \
@@ -383,7 +415,7 @@ pub(super) fn default_spawn_directive(
          \n  \
          agent_id: {agent}\n  \
          worker_handle: <THIS Spawn payload's `worker_handle` field (short string `wh-XXXXXXXX`)>\n  \
-         base_url: <server HTTP root, e.g. http://127.0.0.1:7786>\n  \
+         base_url: {base_url_line}\n  \
          task_id: {task_id}\n\
          \n\
          The SubAgent self-fetches system + prompt via GET (Bearer = handle), \
@@ -407,7 +439,7 @@ mod tests {
 
     #[test]
     fn directive_omits_project_name_alias_when_none() {
-        let d = default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None);
+        let d = default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
         assert!(!d.contains("project_name_alias:"));
         assert!(!d.contains("LDS Session Alias"));
         assert!(!d.contains("session_create"));
@@ -420,6 +452,7 @@ mod tests {
             "task-x",
             "mse-worker-coder",
             Some("mse-task-7785"),
+            None,
             None,
         );
         // Header line (expanded verbatim from the value).
@@ -458,7 +491,7 @@ mod tests {
 
     #[test]
     fn directive_omits_data_endpoint_when_none() {
-        let d = default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None);
+        let d = default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
         assert!(!d.contains("[Data path endpoint"));
         assert!(!d.contains("DATA_EMIT"));
         assert!(!d.contains("DATA_GET"));
@@ -467,8 +500,14 @@ mod tests {
     #[test]
     fn directive_emits_data_endpoint_when_some() {
         let base = "http://127.0.0.1:7785";
-        let d =
-            default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, Some(base));
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            Some(base),
+            None,
+        );
         assert!(
             d.contains("[Data path endpoint"),
             "directive missing data endpoint block header: {d}"
@@ -497,7 +536,7 @@ mod tests {
 
     #[test]
     fn directive_carries_declared_subagent_type_and_has_no_fallback() {
-        let d = default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None);
+        let d = default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
         assert!(
             d.contains("subagent_type=\"mse-worker-coder\""),
             "directive must carry the Blueprint-declared subagent_type literally: {d}"
@@ -519,6 +558,69 @@ mod tests {
             d.contains("FAIL LOUD"),
             "directive must instruct the MainAI to fail loud instead of falling back: {d}"
         );
+    }
+
+    // ─── Issue #8: base_url rendering + fallback framing ─────────────────
+
+    /// Layer 1: when `base_url` is `Some`, it must land verbatim in the
+    /// SubAgent-prompt block, so the operator can copy the frame
+    /// through without a `mse_doctor` lookup.
+    #[test]
+    fn directive_renders_actual_base_url_when_some() {
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            Some("http://127.0.0.1:8888"),
+        );
+        assert!(
+            d.contains("base_url: http://127.0.0.1:8888"),
+            "directive must render the actual bind literally: {d}"
+        );
+        assert!(
+            !d.contains("mse_doctor"),
+            "no mse_doctor detour when bind is known: {d}"
+        );
+    }
+
+    /// Layer 3: when `base_url` is `None` (unit tests, mock harnesses,
+    /// pre-serve rendering) the fallback line must point the reader at
+    /// `mse_doctor` — never a fake port number.
+    #[test]
+    fn directive_falls_back_to_mse_doctor_pointer_when_none() {
+        let d =
+            default_spawn_directive("impl-lead", "task-x", "mse-worker-coder", None, None, None);
+        assert!(
+            d.contains("check with mse_doctor"),
+            "fallback must point at mse_doctor: {d}"
+        );
+    }
+
+    /// Regression guard: the historical `7786` example port (the whole
+    /// origin of issue #8) must not survive in the rendered directive
+    /// under any input combination.
+    #[test]
+    fn directive_never_contains_stale_example_port_7786() {
+        for base in [
+            None,
+            Some("http://127.0.0.1:7777"),
+            Some("http://192.0.2.1:9000"),
+        ] {
+            let d = default_spawn_directive(
+                "impl-lead",
+                "task-x",
+                "mse-worker-coder",
+                Some("mse-task-alias"),
+                Some("http://127.0.0.1:7785"),
+                base,
+            );
+            assert!(
+                !d.contains("7786"),
+                "stale example port 7786 leaked: base={base:?}, d={d}"
+            );
+        }
     }
 
     // ─── Issue #7: spawn_halt handling in Operator::execute ──────────────
@@ -558,7 +660,11 @@ mod tests {
         use tokio::sync::mpsc;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let session = std::sync::Arc::new(WSOperatorSession::new("sid-halt".into(), tx));
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            "sid-halt".into(),
+            tx,
+            None,
+        ));
 
         // Kick execute() in a background task so we can grab the
         // req_id the server assigns and inject a matching SpawnHalt.
@@ -609,7 +715,11 @@ mod tests {
         use tokio::sync::mpsc;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let session = std::sync::Arc::new(WSOperatorSession::new("sid-err".into(), tx));
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            "sid-err".into(),
+            tx,
+            None,
+        ));
 
         let session_bg = session.clone();
         let handle = tokio::spawn(async move {
