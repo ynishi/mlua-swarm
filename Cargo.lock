@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "mlua-swarm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "agent-block-core",
  "agent-block-types",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "mlua-swarm-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "mlua-swarm-schema"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "mlua-flow-ir",
  "schemars",
@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "mlua-swarm-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
