@@ -11,6 +11,7 @@
 //! For the detailed S↔C message flow, see the overview figure in `mod.rs`.
 
 use async_trait::async_trait;
+use mlua_swarm::middleware::task_input::{TASK_PROJECT_ROOT_KEY, TASK_WORK_DIR_KEY};
 use mlua_swarm::{
     CapToken, Ctx, Operator, SeniorBridge, SessionId, SpawnHook, StepId, WorkerBinding,
     WorkerError, WorkerResult,
@@ -244,6 +245,23 @@ impl Operator for WSOperatorSession {
         // `Ctx.meta.runtime["run_id"]`; `None` on launches with no run
         // tracing (see `Engine::dispatch_attempt_with`'s `run_id` param).
         let run_id = ctx.meta.runtime.get("run_id").and_then(|v| v.as_str());
+        // issue #17: task-level execution context (`project_root` /
+        // `work_dir`) injected into `Ctx.meta.runtime` by
+        // `TaskInputMiddleware` (see `mlua_swarm::middleware::task_input`)
+        // from the launch request's `init_ctx` body. Each key is
+        // independent and absent when `TaskInputMiddleware` was never
+        // layered (no fields present in `init_ctx`) or the caller omitted
+        // this particular field.
+        let project_root = ctx
+            .meta
+            .runtime
+            .get(TASK_PROJECT_ROOT_KEY)
+            .and_then(|v| v.as_str());
+        let work_dir = ctx
+            .meta
+            .runtime
+            .get(TASK_WORK_DIR_KEY)
+            .and_then(|v| v.as_str());
         let directive = default_spawn_directive(
             &ctx.agent,
             ctx.task_id.as_str(),
@@ -252,6 +270,8 @@ impl Operator for WSOperatorSession {
             data_sink_endpoint,
             self.base_url.as_deref(),
             run_id,
+            project_root,
+            work_dir,
         );
         let msg = ServerMsg::Spawn {
             req_id: req_id.clone(),
@@ -348,6 +368,18 @@ impl Operator for WSOperatorSession {
 /// route hint below (`GET /v1/runs/{run_id}`) so a MainAI reading the
 /// directive can drill into that specific kick's `RunRecord.step_entries`
 /// trace. `None` falls back to a generic `<run_id>` placeholder.
+///
+/// # `project_root` / `work_dir` (issue #17 task-level execution context)
+///
+/// When the launch request's `init_ctx` body carries `project_root` and/or
+/// `work_dir`, `TaskInputMiddleware` (see
+/// `mlua_swarm::middleware::task_input`) inserts them into
+/// `Ctx.meta.runtime` under `TASK_PROJECT_ROOT_KEY` / `TASK_WORK_DIR_KEY`.
+/// Each is independently `Some`/`None` — mirroring `project_name_alias`'s
+/// splice pattern above, each renders as its own header line
+/// (`project_root: {p}` / `work_dir: {w}`) when present and is omitted
+/// entirely (no empty-string placeholder) when absent.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn default_spawn_directive(
     agent: &str,
     task_id: &str,
@@ -356,12 +388,28 @@ pub(super) fn default_spawn_directive(
     data_sink_endpoint: Option<&str>,
     base_url: Option<&str>,
     run_id: Option<&str>,
+    project_root: Option<&str>,
+    work_dir: Option<&str>,
 ) -> String {
     // Expanded only when Blueprint.metadata.project_name_alias is Some.
     // Presents a discipline reminder to the MainAI plus the literal line the
     // SubAgent prompt should inject.
     let project_alias_line = match project_name_alias {
         Some(a) => format!("project_name_alias: {a}\n"),
+        None => String::new(),
+    };
+    // issue #17: task-level `project_root` / `work_dir` header lines,
+    // spliced the same way as `project_alias_line` above — present only
+    // when `TaskInputMiddleware` populated the corresponding
+    // `Ctx.meta.runtime` key; absent means no line at all (not an empty
+    // value), matching `TaskInputMiddleware`'s own "insert nothing when
+    // absent" contract.
+    let project_root_line = match project_root {
+        Some(p) => format!("project_root: {p}\n"),
+        None => String::new(),
+    };
+    let work_dir_line = match work_dir {
+        Some(w) => format!("work_dir: {w}\n"),
         None => String::new(),
     };
     // Endpoint hint for the Data path (Big Response routing). Only when
@@ -429,6 +477,8 @@ pub(super) fn default_spawn_directive(
          task_id: {task_id}\n\
          agent_id: {agent}\n\
          {project_alias_line}\
+         {project_root_line}\
+         {work_dir_line}\
          {data_endpoint_block}\
          {main_ai_reminder}\
          Kick a SubAgent via Agent tool with subagent_type=\"{subagent_type}\" (= project-local \
@@ -469,6 +519,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(!d.contains("project_name_alias:"));
         assert!(!d.contains("LDS Session Alias"));
@@ -482,6 +534,8 @@ mod tests {
             "task-x",
             "mse-worker-coder",
             Some("mse-task-7785"),
+            None,
+            None,
             None,
             None,
             None,
@@ -530,6 +584,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(!d.contains("[Data path endpoint"));
         assert!(!d.contains("DATA_EMIT"));
@@ -545,6 +601,8 @@ mod tests {
             "mse-worker-coder",
             None,
             Some(base),
+            None,
+            None,
             None,
             None,
         );
@@ -580,6 +638,8 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
+            None,
+            None,
             None,
             None,
             None,
@@ -623,6 +683,8 @@ mod tests {
             None,
             Some("http://127.0.0.1:8888"),
             None,
+            None,
+            None,
         );
         assert!(
             d.contains("base_url: http://127.0.0.1:8888"),
@@ -643,6 +705,8 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
+            None,
+            None,
             None,
             None,
             None,
@@ -672,6 +736,8 @@ mod tests {
                 Some("http://127.0.0.1:7785"),
                 base,
                 None,
+                None,
+                None,
             );
             assert!(
                 !d.contains("7786"),
@@ -695,6 +761,8 @@ mod tests {
             None,
             None,
             Some("R-abc123"),
+            None,
+            None,
         );
         assert!(
             !d.contains("/v1/tasks/{id}") && !d.contains("/v1/tasks/{{id}}"),
@@ -714,6 +782,8 @@ mod tests {
             None,
             None,
             Some("R-abc123"),
+            None,
+            None,
         );
         assert!(
             d.contains("GET <base_url>/v1/runs/R-abc123"),
@@ -733,11 +803,81 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(
             d.contains("GET <base_url>/v1/runs/<run_id>"),
             "directive missing placeholder observation route: {d}"
         );
+    }
+
+    // ─── Issue #17: project_root / work_dir header lines ─────────────────
+
+    /// Both absent → neither header line appears (no empty-string
+    /// placeholder either).
+    #[test]
+    fn directive_omits_project_root_and_work_dir_when_both_none() {
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!d.contains("project_root:"));
+        assert!(!d.contains("work_dir:"));
+    }
+
+    /// Both present → both header lines render literally, alongside
+    /// `project_name_alias`'s existing splice.
+    #[test]
+    fn directive_splices_project_root_and_work_dir_when_both_present() {
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+            Some("/repo"),
+            Some("/repo/work"),
+        );
+        assert!(
+            d.contains("project_root: /repo"),
+            "directive missing project_root header: {d}"
+        );
+        assert!(
+            d.contains("work_dir: /repo/work"),
+            "directive missing work_dir header: {d}"
+        );
+    }
+
+    /// Partial: `project_root` present, `work_dir` absent — each field is
+    /// independent, so only the present one renders.
+    #[test]
+    fn directive_splices_project_root_only_when_work_dir_absent() {
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+            Some("/repo"),
+            None,
+        );
+        assert!(
+            d.contains("project_root: /repo"),
+            "directive missing project_root header: {d}"
+        );
+        assert!(!d.contains("work_dir:"));
     }
 
     // ─── Issue #7: spawn_halt handling in Operator::execute ──────────────
@@ -870,5 +1010,195 @@ mod tests {
 
         let err = handle.await.expect("join").expect_err("must be error");
         assert!(matches!(err, WorkerError::Failed(msg) if msg.contains("real crash")));
+    }
+
+    // ─── Issue #17: end-to-end `execute()` splice (ctx.meta.runtime → Spawn.directive) ───
+
+    /// `Ctx.meta.runtime` carrying both `project_root` and `work_dir`
+    /// (the `TaskInputMiddleware` injection shape) must land in the
+    /// `ServerMsg::Spawn.directive` actually sent over the wire — not
+    /// just in the pure `default_spawn_directive` helper.
+    #[tokio::test]
+    async fn execute_splices_project_root_and_work_dir_from_ctx_meta_runtime() {
+        use mlua_swarm::Operator;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-ctxroot").unwrap(),
+            tx,
+            None,
+        ));
+
+        let mut ctx = test_ctx("ST-ctxroot");
+        ctx.meta.runtime.insert(
+            TASK_PROJECT_ROOT_KEY.to_string(),
+            serde_json::json!("/repo"),
+        );
+        ctx.meta.runtime.insert(
+            TASK_WORK_DIR_KEY.to_string(),
+            serde_json::json!("/repo/work"),
+        );
+
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &ctx,
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        let sent = rx.recv().await.expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn {
+                req_id, directive, ..
+            } => {
+                assert!(
+                    directive.contains("project_root: /repo"),
+                    "directive missing project_root splice: {directive}"
+                );
+                assert!(
+                    directive.contains("work_dir: /repo/work"),
+                    "directive missing work_dir splice: {directive}"
+                );
+                req_id
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnAck {
+                    value: serde_json::json!({}),
+                    ok: true,
+                    error: None,
+                },
+            )
+            .await;
+        handle.await.expect("join").expect("execute Ok");
+    }
+
+    /// Partial: only `project_root` present in `ctx.meta.runtime` (no
+    /// `TaskInputMiddleware`-populated `work_dir`) — the splice is
+    /// per-field independent, matching `TaskInputMiddleware`'s own
+    /// per-field-optional contract.
+    #[tokio::test]
+    async fn execute_splices_project_root_only_when_ctx_meta_runtime_partial() {
+        use mlua_swarm::Operator;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-ctxpartial").unwrap(),
+            tx,
+            None,
+        ));
+
+        let mut ctx = test_ctx("ST-ctxpartial");
+        ctx.meta.runtime.insert(
+            TASK_PROJECT_ROOT_KEY.to_string(),
+            serde_json::json!("/repo"),
+        );
+
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &ctx,
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        let sent = rx.recv().await.expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn {
+                req_id, directive, ..
+            } => {
+                assert!(
+                    directive.contains("project_root: /repo"),
+                    "directive missing project_root splice: {directive}"
+                );
+                assert!(!directive.contains("work_dir:"));
+                req_id
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnAck {
+                    value: serde_json::json!({}),
+                    ok: true,
+                    error: None,
+                },
+            )
+            .await;
+        handle.await.expect("join").expect("execute Ok");
+    }
+
+    /// Neither present in `ctx.meta.runtime` (no `TaskInputMiddleware`
+    /// layered for this launch) — the directive carries neither header
+    /// line, matching pre-issue-#17 behavior exactly.
+    #[tokio::test]
+    async fn execute_omits_project_root_and_work_dir_when_ctx_meta_runtime_absent() {
+        use mlua_swarm::Operator;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-ctxabsent").unwrap(),
+            tx,
+            None,
+        ));
+
+        let ctx = test_ctx("ST-ctxabsent");
+
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &ctx,
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        let sent = rx.recv().await.expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn {
+                req_id, directive, ..
+            } => {
+                assert!(!directive.contains("project_root:"));
+                assert!(!directive.contains("work_dir:"));
+                req_id
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnAck {
+                    value: serde_json::json!({}),
+                    ok: true,
+                    error: None,
+                },
+            )
+            .await;
+        handle.await.expect("join").expect("execute Ok");
     }
 }

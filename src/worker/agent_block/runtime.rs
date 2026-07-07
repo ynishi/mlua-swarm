@@ -32,6 +32,26 @@
 //! }
 //! ```
 //!
+//! ## `project_root` resolution (issue #17)
+//!
+//! `spec.project_root` (above) is only the **compile-time fallback**
+//! tier — resolved once in [`AgentBlockInProcessSpawnerFactory::build`],
+//! before any `Ctx` exists. At spawn time,
+//! [`AgentBlockCtxAwareSpawner::spawn`] re-resolves the actual worker
+//! cwd per invocation with this priority (highest first):
+//!
+//! 1. `ctx.meta.runtime["work_dir"]` — Task-level, set by
+//!    `TaskInputMiddleware` from the launch's `init_ctx.work_dir`.
+//! 2. `ctx.meta.runtime["project_root"]` — same middleware,
+//!    `init_ctx.project_root`.
+//! 3. `spec.project_root` / `std::env::current_dir()` (the compile-time
+//!    fallback baked into [`AgentBlockSettings`] above).
+//!
+//! This lets a single Blueprint's `AgentDef.spec.project_root` (fixed at
+//! compile time) be overridden per task launch, so the same Blueprint
+//! can run against different caller-supplied project roots without a
+//! `spec` edit.
+//!
 //! ## SDK paths introduced from v0.22.0 through v0.27.0
 //!
 //! | Version | Feature | Use case |
@@ -43,7 +63,14 @@
 //! | v0.26.0 | `ScriptSource` / `PromptSource` / `SecretKeySource` enums plus the embedded `DefaultAgent` invoker (breaking) | Script becomes optional at the SDK level |
 //! | v0.27.0 | Embed the `compile_loop` StdPkg into core | `require("compile_loop")` hits directly |
 
-use crate::worker::adapter::{InProcSpawner, WorkerError, WorkerInvocation, WorkerResult};
+use crate::core::ctx::Ctx;
+use crate::core::engine::Engine;
+use crate::middleware::task_input::{TASK_PROJECT_ROOT_KEY, TASK_WORK_DIR_KEY};
+use crate::types::{CapToken, StepId};
+use crate::worker::adapter::{
+    InProcSpawner, SpawnError, SpawnerAdapter, WorkerError, WorkerInvocation, WorkerResult,
+};
+use crate::worker::Worker;
 use agent_block_core::bus::dispatcher::Handler;
 use agent_block_core::host::{PromptSource, ScriptSource};
 use agent_block_core::{run, BlockConfig};
@@ -328,6 +355,19 @@ fn json_array_to_lua_literal(arr: &[Value]) -> String {
 
 // ─── SpawnerFactory ───────────────────────────────────────────────────────
 
+/// The compile-time (`spec` / `env::current_dir()`) fallback tier of the
+/// `project_root` priority chain (issue #17) — the tail two links of
+/// **`ctx.meta.runtime` `work_dir` > `ctx.meta.runtime` `project_root` >
+/// `spec.project_root` > `env::current_dir()`**. Extracted as a standalone
+/// pure fn so it is independently testable without needing a full `Ctx` /
+/// `SpawnerAdapter` round-trip.
+fn resolve_spec_project_root(spec: &Value) -> PathBuf {
+    match spec.get("project_root").and_then(|v| v.as_str()) {
+        Some(s) => PathBuf::from(s),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
 /// The `SpawnerFactory` for AgentBlock. `KIND = AgentKind::AgentBlock`.
 ///
 /// **State-less.** One factory per process; every `AgentDef` uses it
@@ -398,31 +438,112 @@ impl crate::blueprint::compiler::SpawnerFactory for AgentBlockInProcessSpawnerFa
             None => build_inline_agent_invoker(&needed_mcp_servers),
         };
 
-        let project_root = match spec.get("project_root").and_then(|v| v.as_str()) {
-            Some(s) => PathBuf::from(s),
-            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        };
+        // issue #17: this is the compile-time fallback tier only —
+        // `spec.project_root`, then `env::current_dir()`. No `Ctx` exists
+        // yet at `build()` time, so the higher-priority
+        // `ctx.meta.runtime` tier cannot be consulted here; it is
+        // re-resolved per invocation by `AgentBlockCtxAwareSpawner::spawn`
+        // below (see the module-level "`project_root` resolution" doc).
+        let project_root = resolve_spec_project_root(spec);
         let mcp_rpc_timeout = match spec.get("mcp_rpc_timeout_ms").and_then(|v| v.as_u64()) {
             Some(ms) => Duration::from_millis(ms),
             None => Duration::from_secs(30),
         };
         let profile_context = agent_def.profile.as_ref().map(|p| p.system_prompt.clone());
 
-        let settings = Arc::new(AgentBlockSettings {
+        let base_settings = Arc::new(AgentBlockSettings {
             script,
             project_root,
             mcp_rpc_timeout,
             profile_context,
         });
 
+        Ok(Arc::new(AgentBlockCtxAwareSpawner {
+            agent_name,
+            base_settings,
+        }))
+    }
+}
+
+/// `SpawnerAdapter` wrapper that re-resolves this AgentBlock invocation's
+/// `project_root` from `ctx.meta.runtime` at spawn time (issue #17),
+/// honoring the **`ctx.meta.runtime` `work_dir` > `ctx.meta.runtime`
+/// `project_root` > `spec.project_root` > `env::current_dir()`**
+/// priority chain — see the module-level "`project_root` resolution"
+/// doc for the full rationale.
+///
+/// `AgentBlockInProcessSpawnerFactory::build` bakes the `spec`/`env`
+/// fallback tier into `base_settings` at compile time, since no `Ctx`
+/// exists yet at that point. This wrapper is the first place a `Ctx` —
+/// and therefore `ctx.meta.runtime` — becomes available: `spawn()` is
+/// the per-attempt entry point every `SpawnerAdapter` implements.
+///
+/// Delegates the actual invocation to a freshly built
+/// `InProcSpawner<AgentBlockWorker>` holding a single `agent_name`
+/// registry entry closed over the per-invocation-resolved settings —
+/// the same shape `AgentBlockInProcessSpawnerFactory::build` used to
+/// build directly, just constructed per spawn instead of once at
+/// compile time (this factory produces exactly one route per
+/// `AgentDef`, so a 1-entry registry built fresh per call carries no
+/// meaningful overhead over the old compile-time-built one).
+struct AgentBlockCtxAwareSpawner {
+    /// The agent name this route serves (`AgentDef.name`, same value the
+    /// compiled `CompiledAgentTable` looks this adapter up under).
+    agent_name: String,
+    /// Compile-time-resolved fallback settings (script / mcp timeout /
+    /// profile context are invocation-invariant; `project_root` here is
+    /// the `spec` / `env::current_dir()` tail of the priority chain).
+    base_settings: Arc<AgentBlockSettings>,
+}
+
+impl AgentBlockCtxAwareSpawner {
+    /// Applies the `ctx.meta.runtime` override tier on top of
+    /// `base_settings.project_root`. `work_dir` outranks `project_root`
+    /// (it names the exact directory this specific worker should run
+    /// from); either, if present, overrides the compile-time baseline
+    /// entirely. Neither present → the baseline settings are reused
+    /// as-is (no clone).
+    fn resolve_settings(&self, ctx: &Ctx) -> Arc<AgentBlockSettings> {
+        let override_path = ctx
+            .meta
+            .runtime
+            .get(TASK_WORK_DIR_KEY)
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                ctx.meta
+                    .runtime
+                    .get(TASK_PROJECT_ROOT_KEY)
+                    .and_then(|v| v.as_str())
+            });
+        match override_path {
+            Some(p) => {
+                let mut settings = (*self.base_settings).clone();
+                settings.project_root = PathBuf::from(p);
+                Arc::new(settings)
+            }
+            None => self.base_settings.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl SpawnerAdapter for AgentBlockCtxAwareSpawner {
+    async fn spawn(
+        &self,
+        engine: &Engine,
+        ctx: &Ctx,
+        task_id: StepId,
+        attempt: u32,
+        token: CapToken,
+    ) -> Result<Box<dyn Worker>, SpawnError> {
+        let settings = self.resolve_settings(ctx);
         let worker_fn: crate::worker::adapter::WorkerFn = Arc::new(move |inv| {
             let settings = settings.clone();
             Box::pin(run_agent_block_worker(settings, inv))
         });
-
         let mut sp: InProcSpawner<AgentBlockWorker> = InProcSpawner::<AgentBlockWorker>::typed();
-        sp.registry.insert(agent_name, worker_fn);
-        Ok(Arc::new(sp))
+        sp.registry.insert(self.agent_name.clone(), worker_fn);
+        sp.spawn(engine, ctx, task_id, attempt, token).await
     }
 }
 
@@ -633,5 +754,121 @@ mod tests {
         };
         let _spawner = factory.build(&ad, None).expect("factory build");
         // = ScriptSource::Path path; caller-provided script; host_handler single sink.
+    }
+
+    // ─── Issue #17: `project_root` priority chain ─────────────────────────
+
+    #[test]
+    fn resolve_spec_project_root_uses_spec_value_when_present() {
+        let resolved =
+            resolve_spec_project_root(&serde_json::json!({ "project_root": "/spec-root" }));
+        assert_eq!(resolved, PathBuf::from("/spec-root"));
+    }
+
+    #[test]
+    fn resolve_spec_project_root_falls_back_to_env_current_dir_when_spec_absent() {
+        let resolved = resolve_spec_project_root(&serde_json::json!({}));
+        assert_eq!(
+            resolved,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        );
+    }
+
+    fn test_settings(project_root: &str) -> Arc<AgentBlockSettings> {
+        Arc::new(AgentBlockSettings {
+            script: build_inline_agent_invoker(&[]),
+            project_root: PathBuf::from(project_root),
+            mcp_rpc_timeout: Duration::from_secs(30),
+            profile_context: None,
+        })
+    }
+
+    fn ctx_with_runtime(pairs: &[(&str, &str)]) -> Ctx {
+        let mut ctx = Ctx::new(StepId::parse("ST-project-root").unwrap(), 1, "writer");
+        for (k, v) in pairs {
+            ctx.meta
+                .runtime
+                .insert((*k).to_string(), serde_json::json!(v));
+        }
+        ctx
+    }
+
+    #[test]
+    fn resolve_settings_falls_back_to_spec_project_root_when_ctx_meta_runtime_absent() {
+        let spawner = AgentBlockCtxAwareSpawner {
+            agent_name: "writer".into(),
+            base_settings: test_settings("/spec-root"),
+        };
+        let ctx = ctx_with_runtime(&[]);
+        let resolved = spawner.resolve_settings(&ctx);
+        assert_eq!(resolved.project_root, PathBuf::from("/spec-root"));
+    }
+
+    #[test]
+    fn resolve_settings_prefers_ctx_meta_runtime_project_root_over_spec() {
+        let spawner = AgentBlockCtxAwareSpawner {
+            agent_name: "writer".into(),
+            base_settings: test_settings("/spec-root"),
+        };
+        let ctx = ctx_with_runtime(&[(TASK_PROJECT_ROOT_KEY, "/ctx-root")]);
+        let resolved = spawner.resolve_settings(&ctx);
+        assert_eq!(resolved.project_root, PathBuf::from("/ctx-root"));
+    }
+
+    #[test]
+    fn resolve_settings_prefers_ctx_meta_runtime_work_dir_over_project_root() {
+        let spawner = AgentBlockCtxAwareSpawner {
+            agent_name: "writer".into(),
+            base_settings: test_settings("/spec-root"),
+        };
+        let ctx = ctx_with_runtime(&[
+            (TASK_PROJECT_ROOT_KEY, "/ctx-root"),
+            (TASK_WORK_DIR_KEY, "/ctx-work"),
+        ]);
+        let resolved = spawner.resolve_settings(&ctx);
+        assert_eq!(resolved.project_root, PathBuf::from("/ctx-work"));
+    }
+
+    /// End-to-end: a real `Ctx.meta.runtime["project_root"]` override
+    /// reaches the AgentBlock spawn path through
+    /// `AgentBlockCtxAwareSpawner::spawn` — not just the pure
+    /// `resolve_settings` helper above. `spawn()` on an agent name that
+    /// is not `ctx.agent` fails fast with `SpawnError::NotRegistered`
+    /// (mirrors the pre-issue-#17 `InProcSpawner` registry-miss
+    /// behavior), which is enough to prove the ctx-aware wrapper reached
+    /// the inner `InProcSpawner::spawn` dispatch — settings resolution
+    /// itself is covered by the `resolve_settings` tests above.
+    #[tokio::test]
+    async fn spawn_delegates_to_inner_spawner_and_fails_fast_on_agent_mismatch() {
+        use crate::core::config::EngineCfg;
+        use crate::types::Role;
+
+        let spawner = AgentBlockCtxAwareSpawner {
+            agent_name: "writer".into(),
+            base_settings: test_settings("/spec-root"),
+        };
+        let ctx = ctx_with_runtime(&[(TASK_PROJECT_ROOT_KEY, "/ctx-root")]);
+        let mut mismatched_ctx = ctx.clone();
+        mismatched_ctx.agent = "not-writer".into();
+
+        let engine = Engine::new(EngineCfg::default());
+        let token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let task_id = StepId::parse("ST-project-root").unwrap();
+        let result = spawner
+            .spawn(&engine, &mismatched_ctx, task_id, 1, token)
+            .await;
+        // `Box<dyn Worker>` (the `Ok` payload) does not implement `Debug`,
+        // so a plain `match` is used instead of `expect_err`/`unwrap_err`.
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("agent name mismatch must fail fast"),
+        };
+        assert!(
+            matches!(&err, SpawnError::NotRegistered(name) if name == "not-writer"),
+            "expected NotRegistered(\"not-writer\"), got: {err:?}"
+        );
     }
 }
