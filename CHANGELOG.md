@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/ynishi/mlua-swarm/compare/v0.4.1...v0.5.0) - 2026-07-07
+
+### Added
+
+- *(engine)* propagate run_id through dispatch and record step entries
+- *(store)* add TaskStore and RunStore (inmemory + sqlite)
+- *(server)* persist tasks/runs and expose GET drill-down routes
+- *(mcp)* auto-resolve worker route from worker_handle in worker tools
+- *(mcp)* add mse_worker_fetch / mse_worker_submit worker HTTP tools
+- *(mcp)* adopt typed run/task ids and expose step trace in swarm_status
+
+### Fixed
+
+- *(worker)* surface WorkerId in the spawn trace log
+- *(ids)* unify the operator sid on the SessionId shape (S-<hex>)
+
+### Other
+
+- *(ids)* [**breaking**] prefix-validated ID newtypes, token fingerprint keys, BlueprintId convergence
+- *(types)* [**breaking**] rename per-step TaskId to StepId; add TaskId/RunId newtypes
+- apply cargo fmt to pre-existing drift in cli/server sources
+- *(mcp)* add the mse://guides/id-lifecycle canonical ID inventory
+- *(mcp)* document the ID hierarchy and run-trace drill-down
+
 ## [0.4.1](https://github.com/ynishi/mlua-swarm/compare/v0.4.0...v0.4.1) - 2026-07-06
 
 ### Other
