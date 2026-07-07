@@ -25,6 +25,7 @@ use crate::core::ctx::OperatorKind;
 use crate::core::engine::Engine;
 use crate::core::errors::EngineError;
 use crate::middleware::project_name_alias::ProjectNameAliasMiddleware;
+use crate::middleware::task_input::TaskInputMiddleware;
 use crate::middleware::worker_binding::WorkerBindingMiddleware;
 use crate::middleware::SpawnerStack;
 use crate::operator::WorkerBinding;
@@ -304,6 +305,16 @@ impl TaskLaunchService {
             SpawnerStack::new(spawner)
                 .layer(WorkerBindingMiddleware::new(worker_bindings))
                 .build()
+        };
+
+        // Task-level execution context (`project_root` / `work_dir` /
+        // `task_metadata`), extracted from the request's `init_ctx` body
+        // (issue #17) — same conditional-layering shape as the alias /
+        // worker-binding blocks above, except the source is `init_ctx`
+        // (request-level) rather than `Blueprint` (compile-level).
+        let spawner = match TaskInputMiddleware::from_init_ctx(&input.init_ctx) {
+            Some(task_input) => SpawnerStack::new(spawner).layer(task_input).build(),
+            None => spawner,
         };
 
         // "BP Agent-level" (`OperatorDef.kind` via `operator_ref`) + "BP

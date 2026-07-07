@@ -43,18 +43,19 @@
 //!      as plain data.
 //!
 //! `AgentResolver`, `ProjectNameAliasMiddleware`, `SinkMiddleware`,
-//! `InputInjectMiddleware`, `LuaMiddleware`, `SeniorEscalationMiddleware`
-//! all follow this shape: edit `ctx` / wrap the worker, call the inner
-//! spawner, append observable output. Note `LuaMiddleware`'s scripts are
-//! host-constructed — embedding Lua source in a Blueprint is the IN-side
-//! dialect this discipline forbids, and would require its own guard
-//! design if ever revisited).
+//! `InputInjectMiddleware`, `LuaMiddleware`, `SeniorEscalationMiddleware`,
+//! `TaskInputMiddleware` all follow this shape: edit `ctx` / wrap the
+//! worker, call the inner spawner, append observable output. Note
+//! `LuaMiddleware`'s scripts are host-constructed — embedding Lua source
+//! in a Blueprint is the IN-side dialect this discipline forbids, and
+//! would require its own guard design if ever revisited).
 
 pub mod input_inject;
 pub mod lua_layer;
 pub mod project_name_alias;
 pub mod resolver;
 pub mod sink;
+pub mod task_input;
 pub mod worker_binding;
 
 use crate::core::ctx::{Ctx, OperatorKind};

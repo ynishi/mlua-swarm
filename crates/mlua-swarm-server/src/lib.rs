@@ -462,6 +462,16 @@ async fn sessions_detach(
 #[derive(Deserialize)]
 struct FlowTasksReq {
     blueprint: BlueprintRef,
+    /// flow.ir's initial `ctx` — every `Step.in` `$.<path>` reads from
+    /// here. Three top-level keys are additionally recognized as
+    /// task-level execution context (issue #17), each independently
+    /// optional and additive to whatever free-form JSON the caller
+    /// already puts here (backward compat, no stripping):
+    /// `project_root` (string), `work_dir` (string), `task_metadata`
+    /// (object, free-form). `TaskLaunchService::launch` extracts them via
+    /// `TaskInputMiddleware::from_init_ctx` and — only when at least one
+    /// is present — layers `TaskInputMiddleware` on the spawner stack so
+    /// every spawn's `Ctx.meta.runtime` carries them.
     init_ctx: Value,
     /// TTL in seconds. When unspecified (`None`), falls back in this order:
     /// (1) `metadata.default_run_ttl_secs` from the resolved BP,
