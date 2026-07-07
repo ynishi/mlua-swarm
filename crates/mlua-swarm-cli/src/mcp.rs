@@ -735,6 +735,7 @@ impl MseServer {
             hook_id: None,
             operator_backend_id: None,
             operator_kind_overrides,
+            task_input: None,
         };
 
         // Trace this kick in the local run store (in-memory; issue #13).

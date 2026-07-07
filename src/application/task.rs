@@ -10,7 +10,9 @@ use super::Application;
 use crate::blueprint::store::{BlueprintId, BlueprintStore, BlueprintStoreError, BlueprintVersion};
 use crate::blueprint::Blueprint;
 use crate::core::ctx::OperatorKind;
-use crate::service::{TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService};
+use crate::service::{
+    TaskInputSpec, TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService,
+};
 use crate::store::run::RunContext;
 use crate::types::{CapToken, Role};
 use async_trait::async_trait;
@@ -101,6 +103,14 @@ pub struct TaskApplicationInput {
     /// default. See `crate::core::ctx::collapse_operator_kind` for the full tier
     /// list.
     pub operator_kind_overrides: HashMap<String, OperatorKind>,
+    /// Task-level canonical execution context (issue #19 ST2). When
+    /// `Some`, the resolved sibling fields (`project_root` / `work_dir`
+    /// / `task_metadata`) are threaded down to [`TaskLaunchInput`] and
+    /// consumed by
+    /// [`crate::middleware::task_input::TaskInputMiddleware::new_from_fields`].
+    /// `None` — no Task-level context is layered on the spawner stack
+    /// (default; keeps the wire body opt-in).
+    pub task_input: Option<TaskInputSpec>,
 }
 
 impl TaskApplicationInput {
@@ -129,6 +139,7 @@ impl TaskApplicationInput {
             hook_id: None,
             operator_backend_id: None,
             operator_kind_overrides: HashMap::new(),
+            task_input: None,
         }
     }
 }
@@ -276,6 +287,7 @@ impl TaskApplication {
                 operator_kind_overrides: input.operator_kind_overrides,
                 init_ctx: input.init_ctx,
                 run_ctx,
+                task_input: input.task_input,
             })
             .await?;
         Ok(TaskApplicationOutput {
@@ -429,6 +441,7 @@ mod tests {
             hook_id: Some("hk-y".into()),
             operator_backend_id: None,
             operator_kind_overrides: HashMap::new(),
+            task_input: None,
         };
         assert!(matches!(input.operator_kind, Some(OperatorKind::MainAi)));
         assert_eq!(input.bridge_id.as_deref(), Some("br-x"));

@@ -8,4 +8,6 @@ pub mod linker;
 pub mod task_launch;
 
 pub use linker::link;
-pub use task_launch::{TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService};
+pub use task_launch::{
+    TaskInputSpec, TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService,
+};

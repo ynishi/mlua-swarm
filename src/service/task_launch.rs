@@ -117,6 +117,31 @@ pub enum TaskLaunchError {
     FlowEval(String),
 }
 
+/// Canonical bag of Task-level fields (`project_root` / `work_dir` /
+/// `task_metadata`) — [`TaskLaunchInput::task_input`]'s type.
+///
+/// Issue #19 ST2: replaces the ST1 `resolve_task_level_init_ctx`
+/// fold-back-into-`init_ctx` bridge (removed from
+/// `mlua-swarm-server`'s `run_flow_form`). Callers resolve these three
+/// fields once at the wire boundary — sibling body field first, falling
+/// back to the legacy shape (same three keys nested directly inside
+/// `init_ctx`) only there — and hand the result straight through here;
+/// `init_ctx` itself is no longer mutated to carry them, so it stays a
+/// pure flow-ir eval seed identical to whatever the caller sent.
+///
+/// Each field is independently optional — see
+/// [`crate::middleware::task_input::TaskInputMiddleware::new_from_fields`],
+/// which this is built for.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskInputSpec {
+    /// Task-level project root path.
+    pub project_root: Option<String>,
+    /// Task-level working directory path.
+    pub work_dir: Option<String>,
+    /// Task-level arbitrary metadata bag (a JSON object, or `None`).
+    pub task_metadata: Option<Value>,
+}
+
 /// Input to [`TaskLaunchService::launch`].
 #[derive(Debug, Clone)]
 pub struct TaskLaunchInput {
@@ -158,8 +183,16 @@ pub struct TaskLaunchInput {
     pub operator_kind_overrides: HashMap<String, OperatorKind>,
     /// The initial `ctx` (JSON `Value`) that flow.ir's `eval_async`
     /// starts from. Every `Step.in` `$.<path>` reference reads from
-    /// here.
+    /// here. Issue #19 ST2: a pure flow-ir eval seed — no Task-level
+    /// field is folded into it anymore; see [`Self::task_input`].
     pub init_ctx: Value,
+    /// Task-level canonical fields (issue #19 ST2). `Some` layers a
+    /// [`crate::middleware::task_input::TaskInputMiddleware`] (built via
+    /// [`crate::middleware::task_input::TaskInputMiddleware::new_from_fields`])
+    /// onto the spawner stack just before spawn; `None` is a no-op,
+    /// identical to today's behavior for callers with no Task-level
+    /// fields to propagate.
+    pub task_input: Option<TaskInputSpec>,
     /// Issue #13 run_id propagation: when `Some`, every step this launch
     /// dispatches is traced into `RunRecord.step_entries` and exposes its
     /// `run_id` via `Ctx.meta.runtime["run_id"]` (see
@@ -176,8 +209,9 @@ impl TaskLaunchInput {
     /// (`OperatorKind::Automate`) decide — this preserves today's
     /// behaviour for every existing caller without silently forcing
     /// `Automate` as an explicit override that would outrank a BP-declared
-    /// `MainAi`/`Composite` kind. `run_ctx` defaults to `None` (no run
-    /// tracing); construct the struct literal directly to set it.
+    /// `MainAi`/`Composite` kind. `run_ctx` and `task_input` both default
+    /// to `None` (no run tracing, no Task-level fields); construct the
+    /// struct literal directly to set either.
     pub fn automate(
         blueprint: Blueprint,
         operator_id: impl Into<String>,
@@ -196,6 +230,7 @@ impl TaskLaunchInput {
             operator_backend_id: None,
             operator_kind_overrides: HashMap::new(),
             init_ctx,
+            task_input: None,
             run_ctx: None,
         }
     }
@@ -308,11 +343,18 @@ impl TaskLaunchService {
         };
 
         // Task-level execution context (`project_root` / `work_dir` /
-        // `task_metadata`), extracted from the request's `init_ctx` body
-        // (issue #17) — same conditional-layering shape as the alias /
-        // worker-binding blocks above, except the source is `init_ctx`
-        // (request-level) rather than `Blueprint` (compile-level).
-        let spawner = match TaskInputMiddleware::from_init_ctx(&input.init_ctx) {
+        // `task_metadata`) — same conditional-layering shape as the alias /
+        // worker-binding blocks above. Issue #19 ST2: read directly off
+        // `input.task_input` (already resolved by the caller) instead of
+        // extracting it back out of `input.init_ctx` — `init_ctx` is a pure
+        // flow-ir eval seed now, never folded with these keys.
+        let spawner = match input.task_input.as_ref().and_then(|spec| {
+            TaskInputMiddleware::new_from_fields(
+                spec.project_root.clone(),
+                spec.work_dir.clone(),
+                spec.task_metadata.clone(),
+            )
+        }) {
             Some(task_input) => SpawnerStack::new(spawner).layer(task_input).build(),
             None => spawner,
         };
@@ -751,6 +793,89 @@ mod tests {
             input.run_ctx.is_none(),
             "automate() defaults run_ctx to None"
         );
+        let out = svc.launch(input).await.expect("launch ok");
+        assert_eq!(out.final_ctx["out"], "hi");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // issue #19 ST2: `TaskLaunchInput.task_input` (direct-sibling-read
+    // replacement for the ST1 `from_init_ctx(&input.init_ctx)` call)
+    // ──────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn launch_with_task_input_leaves_init_ctx_object_seed_unmutated() {
+        // Issue #19 ST2 invariant: `init_ctx` is a pure flow-ir eval seed —
+        // `task_input` must not be folded into it. Regression guard for the
+        // ST1 `resolve_task_level_init_ctx` fold-back this subtask removes:
+        // if it ever crept back in here, `project_root` / `work_dir` /
+        // `task_metadata` would leak into `final_ctx` as extra top-level
+        // keys nobody wrote via a `Step.out`.
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "echoed": inv.prompt }),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        let mut input = launch_input(blueprint, json!({ "input": "hi" }));
+        input.task_input = Some(TaskInputSpec {
+            project_root: Some("/repo".to_string()),
+            work_dir: Some("/repo/work".to_string()),
+            task_metadata: Some(json!({ "issue": 19 })),
+        });
+        let out = svc.launch(input).await.expect("launch ok");
+        assert_eq!(out.final_ctx["out"]["echoed"], "hi");
+        assert!(
+            out.final_ctx.get("project_root").is_none(),
+            "task_input must not be folded into the flow-ir ctx seed, got {:?}",
+            out.final_ctx
+        );
+        assert!(out.final_ctx.get("work_dir").is_none());
+        assert!(out.final_ctx.get("task_metadata").is_none());
+    }
+
+    #[tokio::test]
+    async fn launch_with_task_input_none_is_a_no_op() {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!(inv.prompt),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        let mut input = launch_input(blueprint, json!({ "input": "hi" }));
+        assert!(input.task_input.is_none(), "automate() defaults to None");
+        input.task_input = None;
+        let out = svc.launch(input).await.expect("launch ok");
+        assert_eq!(out.final_ctx["out"], "hi");
+    }
+
+    #[tokio::test]
+    async fn launch_with_task_input_all_fields_absent_is_a_no_op() {
+        // `Some(TaskInputSpec::default())` — outer Some, all 3 inner fields
+        // None — must behave identically to `task_input: None` (mirrors
+        // `TaskInputMiddleware::new_from_fields`'s own no-op contract).
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!(inv.prompt),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        let mut input = launch_input(blueprint, json!({ "input": "hi" }));
+        input.task_input = Some(TaskInputSpec::default());
         let out = svc.launch(input).await.expect("launch ok");
         assert_eq!(out.final_ctx["out"], "hi");
     }

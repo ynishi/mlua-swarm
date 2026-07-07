@@ -642,15 +642,16 @@ async fn run_flow_form(
     let input_ctx_snapshot = req.init_ctx.clone();
     let goal = req.goal.clone().unwrap_or_default();
 
-    // issue #19 2-stage resolution: sibling top-level fields take
+    // issue #19 ST2: resolve the Task-level canonical fields
+    // (`project_root` / `work_dir` / `task_metadata`) once, at the wire
+    // boundary. Sibling top-level fields on the request body take
     // priority; the pre-#19 shape (same key nested inside `init_ctx`) is
-    // the fallback. The resolved values are folded back into a clone of
-    // `init_ctx` so the existing, unmodified
-    // `TaskInputMiddleware::from_init_ctx` extraction (invoked downstream
-    // inside `TaskLaunchService::launch`) picks them up unchanged — a
-    // transitional bridge; ST2 replaces this with direct sibling-field
-    // extraction and drops the `init_ctx`-nested fallback.
-    let resolved_init_ctx = resolve_task_level_init_ctx(&req);
+    // only a fallback for legacy callers. The result is threaded straight
+    // through as `TaskApplicationInput.task_input` — `init_ctx` itself is
+    // NOT mutated, so it stays a pure flow-ir eval seed identical to
+    // whatever the caller sent.
+    let task_input_spec = build_task_input_spec_from_request(&req);
+    let init_ctx = req.init_ctx.clone();
 
     let mut op_req = req.operator.unwrap_or_default();
 
@@ -756,12 +757,13 @@ async fn run_flow_form(
                 operator_id: operator_id.clone(),
                 role: Role::Operator,
                 ttl: Duration::from_secs(ttl_secs),
-                init_ctx: resolved_init_ctx,
+                init_ctx,
                 operator_kind,
                 bridge_id: op_req.senior_bridge_id,
                 hook_id: op_req.spawn_hook_id,
                 operator_backend_id: op_req.operator_backend_id,
                 operator_kind_overrides,
+                task_input: task_input_spec,
             },
             Some(run_ctx),
         )
@@ -781,19 +783,23 @@ async fn run_flow_form(
     })
 }
 
-/// issue #19 2-stage resolution + merge-back bridge for the 3 Task-level
-/// fields (`project_root` / `work_dir` / `task_metadata`): the sibling
-/// top-level body field takes priority; when a given field is absent
-/// there, the pre-#19 shape (the same key nested inside `init_ctx`) is
-/// used as a fallback. The resolved values are folded into a clone of
-/// `init_ctx` (only when it is a JSON object — a non-object `init_ctx`
-/// is left untouched, same as `TaskInputMiddleware::from_init_ctx`'s own
-/// no-op-for-non-object contract) so the existing, unmodified
-/// `TaskInputMiddleware::from_init_ctx` extraction — invoked downstream
-/// inside `TaskLaunchService::launch` — picks the resolved values up
-/// unchanged. Transitional: ST2 replaces this bridge with direct
-/// sibling-field extraction and drops the `init_ctx`-nested fallback.
-fn resolve_task_level_init_ctx(req: &TaskLaunchRequest) -> Value {
+/// issue #19 ST2 direct sibling-field resolver — extracts the three
+/// Task-level canonical fields (`project_root` / `work_dir` /
+/// `task_metadata`) once at the wire boundary. Sibling top-level body
+/// fields take priority; the pre-#19 shape (same key nested inside
+/// `init_ctx`) is only a fallback for legacy callers. Unlike the ST1
+/// `resolve_task_level_init_ctx` bridge this replaced, `init_ctx` is
+/// NOT mutated — the resolved values are handed straight to
+/// [`mlua_swarm::service::TaskLaunchInput::task_input`], keeping
+/// `init_ctx` a pure flow-ir eval seed.
+///
+/// Returns `None` when all three fields resolve to `None` (no
+/// middleware is layered onto the spawner stack downstream — the
+/// [`mlua_swarm::middleware::task_input::TaskInputMiddleware::new_from_fields`]
+/// contract).
+fn build_task_input_spec_from_request(
+    req: &TaskLaunchRequest,
+) -> Option<mlua_swarm::service::TaskInputSpec> {
     let project_root = req.project_root.clone().or_else(|| {
         req.init_ctx
             .get("project_root")
@@ -813,19 +819,15 @@ fn resolve_task_level_init_ctx(req: &TaskLaunchRequest) -> Value {
             .cloned()
     });
 
-    let mut merged = req.init_ctx.clone();
-    if let Value::Object(map) = &mut merged {
-        if let Some(v) = project_root {
-            map.insert("project_root".to_string(), Value::String(v));
-        }
-        if let Some(v) = work_dir {
-            map.insert("work_dir".to_string(), Value::String(v));
-        }
-        if let Some(v) = task_metadata {
-            map.insert("task_metadata".to_string(), v);
-        }
+    if project_root.is_none() && work_dir.is_none() && task_metadata.is_none() {
+        None
+    } else {
+        Some(mlua_swarm::service::TaskInputSpec {
+            project_root,
+            work_dir,
+            task_metadata,
+        })
     }
-    merged
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────
@@ -1000,7 +1002,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // issue #19: `resolve_task_level_init_ctx` 2-stage resolution
+    // issue #19 ST2: `build_task_input_spec_from_request` direct resolver
     // ──────────────────────────────────────────────────────────────────
 
     fn task_req(
@@ -1026,31 +1028,26 @@ mod tests {
     }
 
     /// (a) Sibling fields only — no legacy keys in `init_ctx` — are
-    /// promoted into the merged ctx, and pre-existing free-form
-    /// `init_ctx` keys are preserved untouched.
+    /// returned in the `TaskInputSpec` unchanged. `init_ctx` itself is
+    /// untouched by this resolver (checked separately at the call site).
     #[test]
-    fn resolve_task_level_init_ctx_sibling_field_promotes_into_init_ctx() {
+    fn build_task_input_spec_from_request_returns_sibling_fields_when_present() {
         let req = task_req(
             json!({"free": "form"}),
             Some("/repo/sibling"),
             Some("/repo/sibling/work"),
             Some(json!({"issue": 19})),
         );
-        let merged = resolve_task_level_init_ctx(&req);
-        assert_eq!(merged["project_root"], json!("/repo/sibling"));
-        assert_eq!(merged["work_dir"], json!("/repo/sibling/work"));
-        assert_eq!(merged["task_metadata"], json!({"issue": 19}));
-        assert_eq!(
-            merged["free"],
-            json!("form"),
-            "pre-existing free-form init_ctx keys must be preserved"
-        );
+        let spec = build_task_input_spec_from_request(&req).expect("spec must be Some");
+        assert_eq!(spec.project_root.as_deref(), Some("/repo/sibling"));
+        assert_eq!(spec.work_dir.as_deref(), Some("/repo/sibling/work"));
+        assert_eq!(spec.task_metadata, Some(json!({"issue": 19})));
     }
 
     /// (b) No sibling fields — the pre-#19 shape (same 3 keys nested
-    /// inside `init_ctx`) is used as-is via the fallback path.
+    /// inside `init_ctx`) is used as the fallback source.
     #[test]
-    fn resolve_task_level_init_ctx_falls_back_to_legacy_init_ctx_shape() {
+    fn build_task_input_spec_from_request_falls_back_to_legacy_init_ctx_shape() {
         let req = task_req(
             json!({
                 "project_root": "/repo/legacy",
@@ -1061,16 +1058,16 @@ mod tests {
             None,
             None,
         );
-        let merged = resolve_task_level_init_ctx(&req);
-        assert_eq!(merged["project_root"], json!("/repo/legacy"));
-        assert_eq!(merged["work_dir"], json!("/repo/legacy/work"));
-        assert_eq!(merged["task_metadata"], json!({"issue": 17}));
+        let spec = build_task_input_spec_from_request(&req).expect("spec must be Some");
+        assert_eq!(spec.project_root.as_deref(), Some("/repo/legacy"));
+        assert_eq!(spec.work_dir.as_deref(), Some("/repo/legacy/work"));
+        assert_eq!(spec.task_metadata, Some(json!({"issue": 17})));
     }
 
     /// (c) Both present — the sibling field must win over the legacy
     /// `init_ctx`-nested value.
     #[test]
-    fn resolve_task_level_init_ctx_sibling_wins_over_legacy_init_ctx_shape() {
+    fn build_task_input_spec_from_request_sibling_wins_over_legacy_shape() {
         let req = task_req(
             json!({
                 "project_root": "/repo/legacy",
@@ -1081,13 +1078,21 @@ mod tests {
             Some("/repo/sibling/work"),
             Some(json!({"issue": 19})),
         );
-        let merged = resolve_task_level_init_ctx(&req);
+        let spec = build_task_input_spec_from_request(&req).expect("spec must be Some");
         assert_eq!(
-            merged["project_root"],
-            json!("/repo/sibling"),
+            spec.project_root.as_deref(),
+            Some("/repo/sibling"),
             "sibling field must win over the legacy init_ctx-nested value"
         );
-        assert_eq!(merged["work_dir"], json!("/repo/sibling/work"));
-        assert_eq!(merged["task_metadata"], json!({"issue": 19}));
+        assert_eq!(spec.work_dir.as_deref(), Some("/repo/sibling/work"));
+        assert_eq!(spec.task_metadata, Some(json!({"issue": 19})));
+    }
+
+    /// (d) All three fields absent from both sibling and legacy shapes —
+    /// resolver returns `None`, and no middleware is layered downstream.
+    #[test]
+    fn build_task_input_spec_from_request_returns_none_when_no_fields_present() {
+        let req = task_req(json!({"unrelated": "value"}), None, None, None);
+        assert!(build_task_input_spec_from_request(&req).is_none());
     }
 }

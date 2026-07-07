@@ -106,7 +106,9 @@ pub use middleware::{
     OperatorDelegateMiddleware, SeniorEscalationMiddleware, SpawnerLayer, SpawnerStack,
 };
 pub use operator::{Operator, OperatorSpawner, WorkerBinding};
-pub use service::{TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService};
+pub use service::{
+    TaskInputSpec, TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService,
+};
 pub use store::output::{
     InMemoryOutputStore, OutputRecord, OutputRef, OutputStore, OutputStoreError,
 };

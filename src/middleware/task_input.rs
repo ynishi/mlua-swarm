@@ -1,17 +1,22 @@
 //! `TaskInputMiddleware` — a `SpawnerLayer` that propagates task-level
-//! execution context from `POST /v1/tasks`'s `init_ctx` body into
+//! execution context (`project_root` / `work_dir` / `task_metadata`) into
 //! `Ctx.meta.runtime`.
 //!
-//! `init_ctx` (the flow.ir initial `ctx` value) may optionally carry three
-//! top-level fields — `project_root`, `work_dir`, `task_metadata` —
-//! alongside whatever free-form JSON callers already put there (backward
-//! compat: existing `init_ctx` shapes are untouched, these are additive
-//! top-level keys). [`TaskInputMiddleware::from_init_ctx`] extracts them
-//! once at launch time; [`crate::service::task_launch::TaskLaunchService::launch`]
-//! layers this middleware on the stack only when at least one field is
-//! present, mirroring the [`crate::middleware::project_name_alias
-//! ::ProjectNameAliasMiddleware`] / [`crate::middleware::worker_binding
-//! ::WorkerBindingMiddleware`] conditional-layering convention.
+//! Issue #19 ST2: these three fields are canonical Task-level data, kept
+//! independent of `init_ctx` (the flow.ir initial `ctx` value, a pure eval
+//! seed). [`crate::service::task_launch::TaskLaunchService::launch`] reads
+//! them off [`crate::service::task_launch::TaskLaunchInput::task_input`]
+//! (a [`crate::service::task_launch::TaskInputSpec`]) and builds this layer
+//! via [`Self::new_from_fields`], layering it onto the spawner stack only
+//! when at least one field is present — mirroring the
+//! [`crate::middleware::project_name_alias::ProjectNameAliasMiddleware`] /
+//! [`crate::middleware::worker_binding::WorkerBindingMiddleware`]
+//! conditional-layering convention. Resolving `task_input` itself — sibling
+//! body field first, falling back to the legacy shape where these three
+//! keys were nested directly inside `init_ctx` — happens once at the wire
+//! boundary (`mlua-swarm-server`'s `run_flow_form`), not here; see
+//! [`Self::from_init_ctx`] for the now-deprecated constructor that used to
+//! do that extraction inline.
 //!
 //! Downstream Operator / Spawner code (for example `mlua-swarm-server`'s
 //! `Operator::execute`) reads the injected keys back via
@@ -62,7 +67,10 @@ pub struct TaskInputMiddleware {
 
 impl TaskInputMiddleware {
     /// Builds a layer from already-resolved field values. Prefer
-    /// [`Self::from_init_ctx`] when the source is a raw `init_ctx` body.
+    /// [`Self::new_from_fields`] (or [`Self::from_init_ctx`] when the
+    /// source is a raw `init_ctx` body) when the "all three absent → no
+    /// layer" contract matters to the caller — this constructor always
+    /// returns a (possibly no-op) `Self`, never `None`.
     pub fn new(
         project_root: Option<String>,
         work_dir: Option<String>,
@@ -73,6 +81,29 @@ impl TaskInputMiddleware {
             work_dir,
             task_metadata,
         }
+    }
+
+    /// Issue #19 ST2 preferred constructor: builds from already-resolved
+    /// canonical Task-level field values (the wire boundary — e.g.
+    /// `mlua-swarm-server`'s `run_flow_form` — resolves sibling body
+    /// fields, falling back to the legacy `init_ctx`-nested shape only
+    /// there) rather than pulling them back out of `init_ctx` itself.
+    /// `init_ctx` stays a pure flow-ir eval seed with no promoted keys
+    /// folded back in.
+    ///
+    /// Returns `None` when all three fields are absent — same no-op
+    /// contract as [`Self::from_init_ctx`], so callers can use
+    /// `Option::map`/`match` uniformly regardless of which constructor
+    /// produced the layer.
+    pub fn new_from_fields(
+        project_root: Option<String>,
+        work_dir: Option<String>,
+        task_metadata: Option<Value>,
+    ) -> Option<Self> {
+        if project_root.is_none() && work_dir.is_none() && task_metadata.is_none() {
+            return None;
+        }
+        Some(Self::new(project_root, work_dir, task_metadata))
     }
 
     /// Extracts `project_root` (string) / `work_dir` (string) /
@@ -87,6 +118,18 @@ impl TaskInputMiddleware {
     /// are the request layer's concern). Callers only layer the returned
     /// middleware onto the spawner stack when this is `Some`, keeping the
     /// no-op path identical to today's behavior.
+    ///
+    /// Deprecated (issue #19 ST2): `TaskLaunchService::launch` no longer
+    /// calls this — it now reads [`crate::service::task_launch::TaskLaunchInput::task_input`]
+    /// (built via [`Self::new_from_fields`]) instead of extracting from
+    /// `init_ctx`. Kept for callers still relying on the nested-in-`init_ctx`
+    /// shape being pulled directly out of an arbitrary `Value` (not
+    /// currently exercised inside this crate, but a public, documented
+    /// constructor — removing it outright would be a breaking API change
+    /// for downstream users of this middleware in isolation).
+    #[deprecated(
+        note = "issue #19 ST2: prefer new_from_fields (or resolve the wire's legacy init_ctx-nested shape at the wire boundary and pass the result through TaskLaunchInput.task_input instead)"
+    )]
     pub fn from_init_ctx(init_ctx: &Value) -> Option<Self> {
         let obj = init_ctx.as_object()?;
         let project_root = obj
@@ -278,6 +321,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn from_init_ctx_extracts_all_three_fields() {
         let init_ctx = json!({
             "project_root": "/repo",
@@ -292,6 +336,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn from_init_ctx_partial_fields_present() {
         let init_ctx = json!({ "project_root": "/repo" });
         let layer = TaskInputMiddleware::from_init_ctx(&init_ctx).expect("one field present");
@@ -301,23 +346,59 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn from_init_ctx_no_recognized_fields_returns_none() {
         let init_ctx = json!({ "input": "hi" });
         assert!(TaskInputMiddleware::from_init_ctx(&init_ctx).is_none());
     }
 
     #[test]
+    #[allow(deprecated)]
     fn from_init_ctx_non_object_init_ctx_returns_none() {
         assert!(TaskInputMiddleware::from_init_ctx(&json!("just a string")).is_none());
         assert!(TaskInputMiddleware::from_init_ctx(&json!(null)).is_none());
     }
 
     #[test]
+    #[allow(deprecated)]
     fn from_init_ctx_wrong_typed_field_is_treated_as_absent() {
         // work_dir as a number is not the documented `Object` /
         // `String` shape — treated the same as absent rather than
         // erroring (best-effort convenience injection, not a validator).
         let init_ctx = json!({ "work_dir": 42, "task_metadata": "not-an-object" });
         assert!(TaskInputMiddleware::from_init_ctx(&init_ctx).is_none());
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // issue #19 ST2: `new_from_fields` (already-resolved fields, no
+    // `init_ctx` extraction — the direct-sibling-read replacement for
+    // `from_init_ctx`)
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_from_fields_all_present_returns_some() {
+        let layer = TaskInputMiddleware::new_from_fields(
+            Some("/repo".to_string()),
+            Some("/repo/work".to_string()),
+            Some(json!({ "issue": 19 })),
+        )
+        .expect("all three present");
+        assert_eq!(layer.project_root.as_deref(), Some("/repo"));
+        assert_eq!(layer.work_dir.as_deref(), Some("/repo/work"));
+        assert_eq!(layer.task_metadata, Some(json!({ "issue": 19 })));
+    }
+
+    #[test]
+    fn new_from_fields_partial_present_returns_some() {
+        let layer = TaskInputMiddleware::new_from_fields(Some("/repo".to_string()), None, None)
+            .expect("one field present");
+        assert_eq!(layer.project_root.as_deref(), Some("/repo"));
+        assert!(layer.work_dir.is_none());
+        assert!(layer.task_metadata.is_none());
+    }
+
+    #[test]
+    fn new_from_fields_none_present_returns_none() {
+        assert!(TaskInputMiddleware::new_from_fields(None, None, None).is_none());
     }
 }
