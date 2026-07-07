@@ -258,6 +258,20 @@ struct SessionEntry {
     reader_task: JoinHandle<()>,
 }
 
+/// Route info for one spawned worker, captured from a Spawn frame as it
+/// passes through [`OperatorClientState::pending_wait`]. Keyed by the
+/// frame's `worker_handle`, it lets the worker HTTP tools
+/// (`mse_worker_fetch` / `mse_worker_submit`) resolve `base_url` /
+/// `task_id` from the handle alone — the MainAI only has to relay the
+/// handle to the SubAgent.
+#[derive(Debug, Clone)]
+pub struct WorkerRoute {
+    /// HTTP root of the server this process is joined to.
+    pub base_url: String,
+    /// Step id the spawn belongs to (the frame's `task_id`).
+    pub task_id: String,
+}
+
 /// Errors surfaced to the MCP tool layer (mapped to `McpError` in `main.rs`).
 #[derive(Debug)]
 pub enum ClientError {
@@ -290,6 +304,11 @@ impl std::error::Error for ClientError {}
 pub struct OperatorClientState {
     sessions: Mutex<HashMap<String, Arc<SessionEntry>>>,
     http_base: String,
+    /// `worker_handle → WorkerRoute` captured from Spawn frames (see
+    /// [`Self::record_spawn_route`]). Entries live for the process
+    /// lifetime — a handful of short strings per dispatch, so no eviction
+    /// is needed at realistic session sizes.
+    worker_routes: Mutex<HashMap<String, WorkerRoute>>,
 }
 
 impl OperatorClientState {
@@ -297,6 +316,7 @@ impl OperatorClientState {
         Self {
             sessions: Mutex::new(HashMap::new()),
             http_base: resolve_http_base(),
+            worker_routes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -305,6 +325,7 @@ impl OperatorClientState {
         Self {
             sessions: Mutex::new(HashMap::new()),
             http_base: http_base.into(),
+            worker_routes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -400,7 +421,42 @@ impl OperatorClientState {
         timeout_ms: u64,
     ) -> Result<Option<PendingFrame>, ClientError> {
         let entry = self.get_entry(sid).await?;
-        Ok(entry.pending.wait(Duration::from_millis(timeout_ms)).await)
+        let frame = entry.pending.wait(Duration::from_millis(timeout_ms)).await;
+        if let Some(f) = &frame {
+            self.record_spawn_route(f).await;
+        }
+        Ok(frame)
+    }
+
+    /// Captures `worker_handle → {base_url, task_id}` from a Spawn frame so
+    /// the worker HTTP tools can later resolve the route from the handle
+    /// alone. No-op for non-spawn frames and frames without a handle. The
+    /// MainAI always pops the Spawn frame (via `mse_pending_wait`) before
+    /// dispatching the SubAgent that uses the handle, so recording at pop
+    /// time is ordered before any lookup by construction.
+    async fn record_spawn_route(&self, frame: &PendingFrame) {
+        if frame.kind != "spawn" {
+            return;
+        }
+        let (Some(handle), Some(task_id)) = (
+            frame.payload.get("worker_handle").and_then(Value::as_str),
+            frame.payload.get("task_id").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        self.worker_routes.lock().await.insert(
+            handle.to_string(),
+            WorkerRoute {
+                base_url: self.http_base.clone(),
+                task_id: task_id.to_string(),
+            },
+        );
+    }
+
+    /// Looks up the route captured for `worker_handle` (see
+    /// [`Self::record_spawn_route`]).
+    pub async fn worker_route(&self, worker_handle: &str) -> Option<WorkerRoute> {
+        self.worker_routes.lock().await.get(worker_handle).cloned()
     }
 
     /// Sends the `ClientMsg` corresponding to `kind` over `sid`'s WS
@@ -555,6 +611,32 @@ mod tests {
         let text = r#"{"type":"spawn","req_id":"r5","task_id":"ST-1","agent":"a","attempt":1,"capability_token":"tok","worker_handle":"wh-abc","directive":"do it"}"#;
         let frame = parse_server_frame(text).expect("should parse");
         assert_eq!(frame.payload["worker_handle"], "wh-abc");
+    }
+
+    // ─── worker route capture (issue: wrapper Bash removal follow-up) ────
+
+    #[tokio::test]
+    async fn spawn_route_recorded_and_resolvable_by_handle() {
+        let state = OperatorClientState::with_http_base("http://127.0.0.1:7777");
+        let frame = parse_server_frame(
+            r#"{"type":"spawn","req_id":"r9","task_id":"ST-9","agent":"a","attempt":1,"capability_token":"tok","worker_handle":"wh-route","directive":"d"}"#,
+        )
+        .expect("should parse");
+        state.record_spawn_route(&frame).await;
+        let route = state.worker_route("wh-route").await.expect("route cached");
+        assert_eq!(route.base_url, "http://127.0.0.1:7777");
+        assert_eq!(route.task_id, "ST-9");
+        assert!(state.worker_route("wh-unknown").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_spawn_frames_do_not_record_routes() {
+        let state = OperatorClientState::with_http_base("http://x");
+        let frame =
+            parse_server_frame(r#"{"type":"ask","req_id":"r1","task_id":"ST-1","question":{}}"#)
+                .expect("should parse");
+        state.record_spawn_route(&frame).await;
+        assert!(state.worker_route("ST-1").await.is_none());
     }
 
     #[test]

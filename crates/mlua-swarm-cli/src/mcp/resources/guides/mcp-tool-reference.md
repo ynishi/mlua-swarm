@@ -54,10 +54,17 @@ capability_token included): `mse://guides/id-lifecycle`.
 Pure-MCP replacements for the two `curl` steps a spawned worker performs,
 so worker-side wrapper agents don't need shell access at all.
 
+Route auto-resolution: when a Spawn frame is popped via `mse_pending_wait`,
+this process records `worker_handle → {base_url, task_id}`. Both tools
+resolve those fields from the handle alone, so the MainAI only has to
+relay `worker_handle` to the SubAgent; explicit params override the
+recorded route (and are required when the Bearer is a full
+`capability_token`, which has no recorded route).
+
 | tool | purpose | side effect |
 |---|---|---|
-| `mse_worker_fetch` | `GET <base_url>/v1/worker/prompt?task_id=<task_id>` with `Authorization: Bearer <worker_handle>` (the `wh-` short handle from the Spawn frame, or the full `capability_token`). Returns the server's `WorkerPayload` JSON verbatim (`{task_id, attempt, agent, prompt, system?}`). Params: `worker_handle`, `base_url`, `task_id` (`ST-<hex>`; validated before any network I/O). | Read-only; requires the `mse serve` at `base_url` reachable. |
-| `mse_worker_submit` | `POST <base_url>/v1/worker/submit` with the same Bearer and the raw `body` as `text/plain` (`task_id` resolves server-side from the Bearer). `ok=false` marks the attempt failed (`?ok=false`, the flow.ir Try catch path). Expects HTTP 204; returns `{submitted: true}`. Params: `worker_handle`, `base_url`, `body`, `ok?`. | Mutating — lands the attempt result (`submit_output` + `post_result`). |
+| `mse_worker_fetch` | `GET <base_url>/v1/worker/prompt?task_id=<task_id>` with `Authorization: Bearer <worker_handle>` (the `wh-` short handle from the Spawn frame, or the full `capability_token`). Returns the server's `WorkerPayload` JSON verbatim (`{task_id, attempt, agent, prompt, system?}`). Params: `worker_handle`, `base_url?`, `task_id?` (`ST-<hex>`; validated before any network I/O; both auto-resolve from the recorded route). | Read-only; requires the `mse serve` at `base_url` reachable. |
+| `mse_worker_submit` | `POST <base_url>/v1/worker/submit` with the same Bearer and the raw `body` as `text/plain` (`task_id` resolves server-side from the Bearer). `ok=false` marks the attempt failed (`?ok=false`, the flow.ir Try catch path). Expects HTTP 204; returns `{submitted: true}`. Params: `worker_handle`, `body`, `base_url?` (auto-resolves from the recorded route), `ok?`. | Mutating — lands the attempt result (`submit_output` + `post_result`). |
 
 ## Server control (launchd wrapper)
 

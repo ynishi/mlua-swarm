@@ -252,12 +252,16 @@ struct WorkerFetchReq {
     /// Spawn frame's `worker_handle` field (recommended), or the full
     /// encoded `capability_token`.
     worker_handle: String,
-    /// Server HTTP root from the Spawn directive's `base_url` line,
-    /// e.g. `http://127.0.0.1:7777`.
-    base_url: String,
-    /// Step id (`ST-<hex>`) the prompt belongs to — the Spawn frame's
-    /// `task_id` field.
-    task_id: String,
+    /// Server HTTP root, e.g. `http://127.0.0.1:7777`. Usually omitted:
+    /// this process records it per `worker_handle` when the Spawn frame
+    /// passes through `mse_pending_wait`. Pass explicitly to override, or
+    /// when the Bearer is a full `capability_token` (no recorded route).
+    #[serde(default)]
+    base_url: Option<String>,
+    /// Step id (`ST-<hex>`) the prompt belongs to. Usually omitted — same
+    /// auto-resolution as `base_url` (from the Spawn frame's `task_id`).
+    #[serde(default)]
+    task_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -266,9 +270,12 @@ struct WorkerSubmitReq {
     /// Spawn frame's `worker_handle` field (recommended), or the full
     /// encoded `capability_token`.
     worker_handle: String,
-    /// Server HTTP root from the Spawn directive's `base_url` line,
-    /// e.g. `http://127.0.0.1:7777`.
-    base_url: String,
+    /// Server HTTP root, e.g. `http://127.0.0.1:7777`. Usually omitted:
+    /// this process records it per `worker_handle` when the Spawn frame
+    /// passes through `mse_pending_wait`. Pass explicitly to override, or
+    /// when the Bearer is a full `capability_token` (no recorded route).
+    #[serde(default)]
+    base_url: Option<String>,
     /// Raw result body, POSTed verbatim as `text/plain` (the server strips
     /// trailing whitespace only; internal newlines are preserved).
     body: String,
@@ -489,17 +496,44 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Worker-side fetch: GET <base_url>/v1/worker/prompt?task_id=<task_id> with `Authorization: Bearer <worker_handle>`. Pass the `worker_handle` (`wh-` short handle, recommended) or the full `capability_token` from the Spawn frame. Returns the server's WorkerPayload JSON verbatim ({task_id, attempt, agent, prompt, system?}). Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
+        description = "Worker-side fetch: GET <base_url>/v1/worker/prompt?task_id=<task_id> with `Authorization: Bearer <worker_handle>`. Normally the `worker_handle` (`wh-` short handle from the Spawn frame) is the ONLY required param — base_url and task_id auto-resolve from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass them explicitly to override (or when the Bearer is a full capability_token). Returns the server's WorkerPayload JSON verbatim ({task_id, attempt, agent, prompt, system?}). Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
     )]
     async fn mse_worker_fetch(
         &self,
         Parameters(req): Parameters<WorkerFetchReq>,
     ) -> Result<CallToolResult, McpError> {
+        // Explicit params win; otherwise fall back to the route captured
+        // from the Spawn frame (keyed by worker_handle) at pending_wait
+        // time — the MainAI only has to relay the handle to the SubAgent.
+        let route = self.op_client.worker_route(&req.worker_handle).await;
+        let base_url = req
+            .base_url
+            .or_else(|| route.as_ref().map(|r| r.base_url.clone()))
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "base_url not given and no Spawn route is recorded for this worker_handle \
+                     — pass base_url explicitly (routes are recorded when the Spawn frame is \
+                     popped via mse_pending_wait in this process)"
+                        .to_string(),
+                    None,
+                )
+            })?;
+        let task_id_raw = req
+            .task_id
+            .or_else(|| route.as_ref().map(|r| r.task_id.clone()))
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "task_id not given and no Spawn route is recorded for this worker_handle \
+                     — pass task_id explicitly"
+                        .to_string(),
+                    None,
+                )
+            })?;
         // Fail fast before any network I/O — the server's typed PromptQuery
         // would reject a malformed step id with a 400 anyway (issue #14).
-        let task_id = StepId::parse(req.task_id)
+        let task_id = StepId::parse(task_id_raw)
             .map_err(|e| McpError::invalid_params(format!("invalid task_id: {e}"), None))?;
-        let base = req.base_url.trim_end_matches('/');
+        let base = base_url.trim_end_matches('/');
         let url = format!("{base}/v1/worker/prompt");
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -526,13 +560,30 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Optional ok=false marks the attempt failed (flow.ir Try catch path). Expects HTTP 204 and returns {submitted: true}; any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
+        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Normally `worker_handle` + `body` are the ONLY required params — base_url auto-resolves from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass it explicitly to override (or when the Bearer is a full capability_token). Optional ok=false marks the attempt failed (flow.ir Try catch path). Expects HTTP 204 and returns {submitted: true}; any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
     )]
     async fn mse_worker_submit(
         &self,
         Parameters(req): Parameters<WorkerSubmitReq>,
     ) -> Result<CallToolResult, McpError> {
-        let base = req.base_url.trim_end_matches('/');
+        let base_url = match req.base_url {
+            Some(b) => b,
+            None => self
+                .op_client
+                .worker_route(&req.worker_handle)
+                .await
+                .map(|r| r.base_url)
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "base_url not given and no Spawn route is recorded for this \
+                         worker_handle — pass base_url explicitly (routes are recorded when \
+                         the Spawn frame is popped via mse_pending_wait in this process)"
+                            .to_string(),
+                        None,
+                    )
+                })?,
+        };
+        let base = base_url.trim_end_matches('/');
         let url = format!("{base}/v1/worker/submit");
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -1565,13 +1616,43 @@ mod tests {
                 worker_handle: "wh-deadbeef".into(),
                 // Wrong prefix — must fail at parse, before any HTTP I/O
                 // (base_url is a black-hole address on purpose).
-                base_url: "http://127.0.0.1:1".into(),
-                task_id: "T-abc".into(),
+                base_url: Some("http://127.0.0.1:1".into()),
+                task_id: Some("T-abc".into()),
             }))
             .await
             .unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("invalid task_id"), "err: {msg}");
+    }
+
+    /// Without an explicit base_url and with no Spawn frame having passed
+    /// through this process, the tools must fail loud with guidance instead
+    /// of guessing an endpoint.
+    #[tokio::test]
+    async fn mse_worker_tools_require_a_route_or_explicit_params() {
+        let server = MseServer::new();
+        let err = server
+            .mse_worker_fetch(Parameters(WorkerFetchReq {
+                worker_handle: "wh-noroute".into(),
+                base_url: None,
+                task_id: None,
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("no Spawn route"), "err: {msg}");
+
+        let err = server
+            .mse_worker_submit(Parameters(WorkerSubmitReq {
+                worker_handle: "wh-noroute".into(),
+                base_url: None,
+                body: "RESULT".into(),
+                ok: None,
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("no Spawn route"), "err: {msg}");
     }
 
     /// Round-trips both tools against a real in-process `mse serve` router.
@@ -1595,8 +1676,8 @@ mod tests {
         let err = server
             .mse_worker_fetch(Parameters(WorkerFetchReq {
                 worker_handle: "wh-deadbeef".into(),
-                base_url: base_url.clone(),
-                task_id: "ST-nope".into(),
+                base_url: Some(base_url.clone()),
+                task_id: Some("ST-nope".into()),
             }))
             .await
             .expect_err("unknown handle must surface the HTTP error");
@@ -1606,7 +1687,7 @@ mod tests {
         let err = server
             .mse_worker_submit(Parameters(WorkerSubmitReq {
                 worker_handle: "wh-deadbeef".into(),
-                base_url,
+                base_url: Some(base_url),
                 body: "RESULT".into(),
                 ok: None,
             }))
