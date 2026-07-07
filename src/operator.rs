@@ -32,6 +32,7 @@ use crate::worker::adapter::{SpawnError, SpawnerAdapter, WorkerError, WorkerResu
 use crate::worker::output::{ContentRef, OutputEvent};
 use crate::worker::{Worker, WorkerJoinHandler};
 use async_trait::async_trait;
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -97,7 +98,7 @@ pub trait Operator: Send + Sync {
         &self,
         ctx: &Ctx,
         system: Option<String>,
-        prompt: String,
+        prompt: Value,
         worker: Option<WorkerBinding>,
         worker_token: CapToken,
     ) -> Result<WorkerResult, WorkerError>;

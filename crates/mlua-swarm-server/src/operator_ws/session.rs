@@ -194,9 +194,12 @@ impl Operator for WSOperatorSession {
     /// (= `bake_worker_system_prompt` in `OperatorSpawner.spawn` + the existing
     /// `fetch_prompt` path). This impl encodes `worker_token` and hands it to
     /// the MainAI in a single Spawn message; the SubAgent then hits
-    /// `/v1/worker/prompt` + `/v1/worker/result` itself over HTTP. The `system`
-    /// / `prompt` arguments are intentionally **not used here** (= heavy payloads
-    /// are not carried on WS — thin-path discipline).
+    /// `/v1/worker/prompt` + `/v1/worker/result` itself over HTTP. `system` is
+    /// intentionally **not used here** (heavy payloads are not carried on WS —
+    /// thin-path discipline); `prompt` (issue #18) is used only to recover a
+    /// `Value` for the `Spawn.directive` reminder line (see
+    /// `default_spawn_directive_with_task_directive`) — the SubAgent still
+    /// self-fetches the full prompt over HTTP, unchanged.
     ///
     /// The SubAgent's result post (= HTTP POST `/v1/worker/result`) appends
     /// `Final` to `output_tail`; when the MainAI returns `SpawnAck`, this
@@ -212,7 +215,7 @@ impl Operator for WSOperatorSession {
         &self,
         ctx: &Ctx,
         _system: Option<String>,
-        _prompt: String,
+        prompt: Value,
         worker: Option<WorkerBinding>,
         worker_token: CapToken,
     ) -> Result<WorkerResult, WorkerError> {
@@ -262,7 +265,13 @@ impl Operator for WSOperatorSession {
             .runtime
             .get(TASK_WORK_DIR_KEY)
             .and_then(|v| v.as_str());
-        let directive = default_spawn_directive(
+        // issue #18: `prompt` is `TaskSpec.initial_directive`, threaded as
+        // `Value` end-to-end through `EngineState.prompts` /
+        // `Engine::fetch_prompt`. The WS Spawn frame text render is the
+        // sole String boundary on this axis — no re-parse round trip,
+        // and Object / Array / Number seeds keep their structural shape
+        // all the way to the render call.
+        let directive = default_spawn_directive_with_task_directive(
             &ctx.agent,
             ctx.task_id.as_str(),
             &worker.variant,
@@ -272,6 +281,7 @@ impl Operator for WSOperatorSession {
             run_id,
             project_root,
             work_dir,
+            &prompt,
         );
         let msg = ServerMsg::Spawn {
             req_id: req_id.clone(),
@@ -503,6 +513,55 @@ pub(super) fn default_spawn_directive(
          error explaining the missing `.claude/agents/{subagent_type}.md` — do NOT fall back \
          to another subagent_type."
     )
+}
+
+/// Wraps [`default_spawn_directive`]'s routing/reminder text as the WS
+/// `Spawn.directive` `Value` (issue #18), additionally splicing in a
+/// `task_directive` line built from `TaskSpec.initial_directive` when the
+/// task was seeded with one.
+///
+/// This is the sole place the render from `Value` (`task_directive`) down
+/// to `String` literal happens for the WS Spawn path — the coercion that
+/// used to sit in `EngineDispatcher::dispatch` moved here. `task_directive
+/// == Value::Null` (no seed, or the caller could not recover one) omits
+/// the line entirely, leaving the output byte-identical to
+/// [`default_spawn_directive`]'s own text — this preserves every existing
+/// [`default_spawn_directive`] test unchanged, since that function's
+/// signature and body are untouched by issue #18.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn default_spawn_directive_with_task_directive(
+    agent: &str,
+    task_id: &str,
+    subagent_type: &str,
+    project_name_alias: Option<&str>,
+    data_sink_endpoint: Option<&str>,
+    base_url: Option<&str>,
+    run_id: Option<&str>,
+    project_root: Option<&str>,
+    work_dir: Option<&str>,
+    task_directive: &Value,
+) -> String {
+    let base = default_spawn_directive(
+        agent,
+        task_id,
+        subagent_type,
+        project_name_alias,
+        data_sink_endpoint,
+        base_url,
+        run_id,
+        project_root,
+        work_dir,
+    );
+    // Strings pass through verbatim; anything else (Object / Array /
+    // Number / Bool) is serde-stringified — the same coercion pattern
+    // `EngineDispatcher::dispatch` used to apply eagerly, now applied
+    // lazily at this render boundary only.
+    let task_directive_line = match task_directive {
+        Value::Null => String::new(),
+        Value::String(s) => format!("task_directive: {s}\n"),
+        other => format!("task_directive: {other}\n"),
+    };
+    format!("{base}{task_directive_line}")
 }
 
 #[cfg(test)]
@@ -1058,6 +1117,10 @@ mod tests {
             ServerMsg::Spawn {
                 req_id, directive, ..
             } => {
+                // issue #18: `Spawn.directive` is now `Value`; extract the
+                // `String` it wraps (always a `Value::String` on this
+                // path — see `default_spawn_directive_with_task_directive`).
+                let directive = directive.as_str();
                 assert!(
                     directive.contains("project_root: /repo"),
                     "directive missing project_root splice: {directive}"
@@ -1124,6 +1187,7 @@ mod tests {
             ServerMsg::Spawn {
                 req_id, directive, ..
             } => {
+                let directive = directive.as_str();
                 assert!(
                     directive.contains("project_root: /repo"),
                     "directive missing project_root splice: {directive}"
@@ -1182,8 +1246,160 @@ mod tests {
             ServerMsg::Spawn {
                 req_id, directive, ..
             } => {
+                let directive = directive.as_str();
                 assert!(!directive.contains("project_root:"));
                 assert!(!directive.contains("work_dir:"));
+                req_id
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnAck {
+                    value: serde_json::json!({}),
+                    ok: true,
+                    error: None,
+                },
+            )
+            .await;
+        handle.await.expect("join").expect("execute Ok");
+    }
+
+    // ─── Issue #18: `Value` pass-through render boundary
+    //     (`default_spawn_directive_with_task_directive`) ───
+
+    /// A `String` seed splices in verbatim, unquoted (matching
+    /// `Value::String(s) => s.clone()` — no JSON-quoting artifact).
+    #[test]
+    fn with_task_directive_splices_string_seed_verbatim() {
+        let directive = default_spawn_directive_with_task_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &serde_json::json!("do the thing"),
+        );
+        let text = directive.as_str();
+        assert!(
+            text.contains("task_directive: do the thing"),
+            "missing task_directive line for a String seed: {text}"
+        );
+    }
+
+    /// An Object seed renders as its JSON literal (issue #18 Invariant 3 —
+    /// same shape `Engine::start_task` / `Engine::dispatch_attempt_with`
+    /// produce for the Worker HTTP path via `render_directive_to_string`).
+    #[test]
+    fn with_task_directive_renders_object_seed_as_json_literal() {
+        let directive = default_spawn_directive_with_task_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &serde_json::json!({"key": "value"}),
+        );
+        let text = directive.as_str();
+        assert!(
+            text.contains(r#"task_directive: {"key":"value"}"#),
+            "missing JSON-literal task_directive line for an Object seed: {text}"
+        );
+    }
+
+    /// `Value::Null` (no seed recovered) omits the line entirely — the
+    /// output is byte-identical to `default_spawn_directive`'s own text,
+    /// preserving every pre-issue-#18 caller unchanged.
+    #[test]
+    fn with_task_directive_omits_line_when_null() {
+        let wrapped = default_spawn_directive_with_task_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &serde_json::Value::Null,
+        );
+        let plain = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            wrapped,
+            serde_json::Value::String(plain),
+            "Value::Null seed must not add a task_directive line"
+        );
+    }
+
+    /// End-to-end via `execute()`: an Object-shaped `Step.in` seed, once
+    /// rendered to a JSON-literal `String` by the engine (the Worker HTTP
+    /// path's `render_directive_to_string`), reaches `ServerMsg::Spawn`
+    /// with the same JSON literal spliced into `directive` — the WS
+    /// render layer is the sole `Value → String` coercion point on this
+    /// path (issue #18).
+    #[tokio::test]
+    async fn execute_splices_json_literal_task_directive_for_object_seed() {
+        use mlua_swarm::Operator;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-objseed").unwrap(),
+            tx,
+            None,
+        ));
+
+        let ctx = test_ctx("ST-objseed");
+        // Issue #18: `Value` flows end-to-end from `Step.in` through the
+        // engine, so the Object seed reaches `execute()` as `Value` — no
+        // stringification upstream. Only the WS Spawn frame render
+        // performs the `Value → String` coercion.
+        let rendered_prompt = serde_json::json!({"key": "value"});
+
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &ctx,
+                    None,
+                    rendered_prompt,
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        let sent = rx.recv().await.expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn {
+                req_id, directive, ..
+            } => {
+                let directive = directive.as_str();
+                assert!(
+                    directive.contains(r#"task_directive: {"key":"value"}"#),
+                    "directive missing JSON-literal task_directive splice: {directive}"
+                );
                 req_id
             }
             other => panic!("expected Spawn, got {other:?}"),

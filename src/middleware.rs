@@ -764,7 +764,7 @@ mod operator_delegate_worker_binding_tests {
             &self,
             _ctx: &Ctx,
             _system: Option<String>,
-            _prompt: String,
+            _prompt: Value,
             worker: Option<WorkerBinding>,
             _worker_token: CapToken,
         ) -> Result<WorkerResult, WorkerError> {
@@ -804,7 +804,7 @@ mod operator_delegate_worker_binding_tests {
                 &op_token,
                 TaskSpec {
                     agent: "planner".to_string(),
-                    initial_directive: "do the thing".to_string(),
+                    initial_directive: "do the thing".into(),
                 },
             )
             .await

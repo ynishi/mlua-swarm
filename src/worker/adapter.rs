@@ -259,6 +259,10 @@ impl<W: Worker + From<crate::worker::WorkerJoinHandler> + Send + Sync + 'static>
             .fetch_prompt(&token, &task_id)
             .await
             .map_err(|e| SpawnError::Internal(format!("fetch_prompt: {e}")))?;
+        // In-process WorkerInvocation consumes `prompt` as `String` (issue #18
+        // boundary render): Value flows end-to-end through the engine, and is
+        // stringified here for the RustFn / Lua worker.
+        let prompt = crate::core::engine::render_directive_to_string(&prompt);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cancel = tokio_util::sync::CancellationToken::new();

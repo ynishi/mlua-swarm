@@ -198,6 +198,9 @@ impl SpawnerAdapter for ProcessSpawner {
             .fetch_prompt(&token, &task_id)
             .await
             .map_err(|e| SpawnError::Internal(format!("fetch_prompt: {e}")))?;
+        // Subprocess spawner consumes `directive` as `String` (command arg /
+        // stdin). Issue #18 boundary render — Value flows end-to-end upstream.
+        let directive = crate::core::engine::render_directive_to_string(&directive);
 
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args)

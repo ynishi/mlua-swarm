@@ -466,8 +466,13 @@ impl CapToken {
 ///
 /// - `system`: the rendered `AgentDef.profile.system_prompt` (`None`
 ///   when the profile is absent).
-/// - `prompt`: `TaskSpec.initial_directive` — the value baked into the
-///   prompts table during dispatch preparation.
+/// - `prompt`: `TaskSpec.initial_directive` rendered to `String` at
+///   this boundary (issue #18). The engine stores
+///   `initial_directive` as `Value` end-to-end
+///   (`EngineState.prompts` / `Engine::fetch_prompt`); the coercion
+///   to `String` (strings verbatim, anything else serde-stringified)
+///   happens here in `Engine::fetch_worker_payload*` because the
+///   `/v1/worker/prompt` HTTP wire format is a plain string.
 /// - `agent`: `TaskSpec.agent` — the agent name this dispatch is
 ///   targeting.
 /// - `attempt`: the 1-based attempt number, matching the current

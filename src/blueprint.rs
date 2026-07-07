@@ -105,21 +105,22 @@ impl EngineDispatcher {
 #[async_trait]
 impl AsyncDispatcher for EngineDispatcher {
     async fn dispatch(&self, ref_: &str, input: Value) -> Result<Value, EvalError> {
-        // Turn the evaluated Step.in value into a directive. Strings pass
-        // through verbatim; anything else is serde-stringified (the worker
-        // is expected to re-parse it).
-        let directive = match &input {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-
+        // issue #18: the evaluated Step.in value passes straight through
+        // as `TaskSpec.initial_directive` — no premature `Value → String`
+        // coercion here. Consumers that need a rendered `String` do so at
+        // their own late boundary: `Engine::start_task` /
+        // `Engine::dispatch_attempt_with` render it into the
+        // `EngineState.prompts` table for the Worker HTTP path
+        // (`/v1/worker/prompt`), and
+        // `operator_ws::session::default_spawn_directive_with_task_directive`
+        // renders it into the WS `Spawn.directive` reminder text.
         let tid = self
             .engine
             .start_task(
                 &self.op_token,
                 TaskSpec {
                     agent: ref_.to_string(),
-                    initial_directive: directive,
+                    initial_directive: input,
                 },
             )
             .await

@@ -1091,7 +1091,7 @@ mod operator_spawner_factory_worker_binding_tests {
             &self,
             _ctx: &Ctx,
             _system: Option<String>,
-            _prompt: String,
+            _prompt: Value,
             _worker: Option<WorkerBinding>,
             _worker_token: CapToken,
         ) -> Result<WorkerResult, WorkerError> {

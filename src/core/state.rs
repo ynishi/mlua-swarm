@@ -67,13 +67,19 @@ pub enum TaskStatus {
 }
 
 /// Static task definition supplied to `start_task`: which agent runs it
-/// and the initial prompt/directive text.
+/// and the initial prompt/directive value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSpec {
     /// Name of the agent that should execute this task.
     pub agent: String,
-    /// Prompt/directive text seeded for attempt 1.
-    pub initial_directive: String,
+    /// Prompt/directive value seeded for attempt 1. Passed through
+    /// verbatim from the evaluated `Step.in` (issue #18 — no premature
+    /// `Value → String` coercion at this layer). Consumers that need a
+    /// rendered `String` (the `EngineState.prompts` table feeding the
+    /// Worker HTTP path, and the WS `Spawn.directive` reminder text)
+    /// render it at their own late boundary; strings pass through
+    /// verbatim, anything else is serde-stringified.
+    pub initial_directive: Value,
 }
 
 /// The full mutable record of one task: its static `spec`, current
@@ -457,9 +463,18 @@ pub struct EngineState {
     pub tasks: HashMap<StepId, TaskState>,
     /// All attached/detached sessions, keyed by `SessionId`.
     pub sessions: HashMap<SessionId, OperatorSession>,
-    /// Per-`(task_id, attempt)` prompt/directive text, seeded from
-    /// `TaskSpec.initial_directive` and fetched via `fetch_prompt`.
-    pub prompts: HashMap<(StepId, u32), String>,
+    /// Per-`(task_id, attempt)` prompt/directive value, seeded from
+    /// `TaskSpec.initial_directive` and fetched via `fetch_prompt`. Held
+    /// as `serde_json::Value` end-to-end (issue #18): the render down to
+    /// `String` (strings verbatim, anything else serde-stringified)
+    /// happens only at the two consumer boundaries — the Worker HTTP
+    /// path (`Engine::fetch_worker_payload*` → `WorkerPayload.prompt:
+    /// String`) and the WS Spawn frame text render
+    /// (`operator_ws::session::default_spawn_directive_with_task_directive`).
+    /// Engine-internal storage and `Engine::fetch_prompt` keep the
+    /// `Value` end-to-end, so `Step.in` `Object` / `Array` seeds are not
+    /// prematurely flattened.
+    pub prompts: HashMap<(StepId, u32), Value>,
     /// Per-attempt `system_prompt`: `AgentDef.profile.system_prompt` is
     /// baked at compile time, rendered inside `OperatorSpawner::spawn`,
     /// and stashed here for the SubAgent to fetch alongside its prompt via

@@ -156,6 +156,12 @@ pub enum ServerMsg {
         worker: Option<WorkerBinding>,
         /// Literal natural-language instruction for the MainAI (see the
         /// variant doc above for why this is embedded in the payload).
+        /// Rendered by
+        /// `operator_ws::session::default_spawn_directive_with_task_directive`
+        /// — the sole `Value → String` boundary on the WS render axis
+        /// (issue #18). `TaskSpec.initial_directive` (`Value`) is
+        /// spliced into the reminder text at that render call; the
+        /// wire always carries a plain `String` here.
         directive: String,
     },
 }

@@ -83,6 +83,12 @@ enum ServerMsgMirror {
         capability_token: String,
         #[serde(default)]
         worker_handle: Option<String>,
+        // issue #18 (mlua-swarm): `TaskSpec.initial_directive` /
+        // `EngineState.prompts` / `Engine::fetch_prompt` carry `Value`
+        // end-to-end; the WS `Spawn.directive` stays `String` (the wire
+        // shape unchanged) because
+        // `default_spawn_directive_with_task_directive` renders the
+        // reminder text down to a plain string just before send.
         directive: String,
     },
 }

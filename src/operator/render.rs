@@ -108,14 +108,17 @@ pub fn render_system(template: &str, slots: &serde_json::Value) -> Result<String
     Ok(rendered)
 }
 
-/// If `prompt` parses as a JSON object, treat it as the slot map;
-/// otherwise wrap it as `{"directive": prompt}`. Corresponds to the
+/// If `prompt` is a JSON object, treat it as the slot map; otherwise
+/// wrap it as `{"directive": prompt}`. Corresponds to the
 /// `initial_directive` intake convention on the caller side
-/// (`OperatorSpawner`).
-pub fn slots_from_prompt(prompt: &str) -> serde_json::Value {
-    match serde_json::from_str::<serde_json::Value>(prompt) {
-        Ok(v @ serde_json::Value::Object(_)) => v,
-        _ => serde_json::json!({ "directive": prompt }),
+/// (`OperatorSpawner`). Takes `Value` directly (issue #18): `Value`
+/// flows end-to-end through `EngineState.prompts` and
+/// `Engine::fetch_prompt`; parsing a JSON literal `String` back into
+/// an `Object` is no longer required at this boundary.
+pub fn slots_from_prompt(prompt: &serde_json::Value) -> serde_json::Value {
+    match prompt {
+        v @ serde_json::Value::Object(_) => v.clone(),
+        other => serde_json::json!({ "directive": other }),
     }
 }
 
@@ -183,21 +186,21 @@ mod tests {
 
     #[test]
     fn slots_from_prompt_object() {
-        let v = slots_from_prompt(r#"{"directive":"do-X","intent":"fix"}"#);
+        let v = slots_from_prompt(&json!({"directive":"do-X","intent":"fix"}));
         assert_eq!(v["directive"], "do-X");
         assert_eq!(v["intent"], "fix");
     }
 
     #[test]
     fn slots_from_prompt_plain_string() {
-        let v = slots_from_prompt("just a plain instruction");
+        let v = slots_from_prompt(&json!("just a plain instruction"));
         assert_eq!(v["directive"], "just a plain instruction");
     }
 
     #[test]
     fn slots_from_prompt_json_array_falls_back_to_directive() {
         // A top-level array is not an object, so fall back to wrapping in `directive`.
-        let v = slots_from_prompt(r#"["a","b"]"#);
-        assert_eq!(v["directive"], r#"["a","b"]"#);
+        let v = slots_from_prompt(&json!(["a", "b"]));
+        assert_eq!(v["directive"], json!(["a", "b"]));
     }
 }

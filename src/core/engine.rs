@@ -61,6 +61,25 @@ struct EngineInner {
     layer_registry: crate::middleware::LayerRegistry,
 }
 
+/// Renders a `TaskSpec.initial_directive` / `EngineState.prompts`
+/// `Value` down to the `String` shape that string-consuming boundaries
+/// require (issue #18). Strings pass through verbatim; anything else
+/// (Object / Array / Number / Bool / Null) is serde-stringified. This
+/// is the single canonical rendering — the coercion that used to sit
+/// inside `EngineDispatcher::dispatch` moved here and is invoked only
+/// at consumer boundaries: `WorkerPayload.prompt` (HTTP
+/// `/v1/worker/prompt`), `WorkerInvocation.prompt` (in-process
+/// spawners), the subprocess spawner's directive arg/stdin, and the
+/// WS Spawn frame text render (`operator_ws::session`). Everything
+/// upstream (Blueprint dispatch → engine state → `fetch_prompt` →
+/// `Operator::execute`) keeps the `Value` end-to-end.
+pub(crate) fn render_directive_to_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 impl Engine {
     /// Backwards-compatible constructor that starts the engine without a
     /// layer registry, preserving the signature already used by ~88
@@ -804,7 +823,7 @@ impl Engine {
     ) -> Result<StepId, EngineError> {
         self.verify_token(token, Verb::StartTask).await?;
         let task_id = StepId::new();
-        let directive = spec.initial_directive.clone();
+        let initial_directive = spec.initial_directive.clone();
         let task_id_clone = task_id.clone();
         let fp = token.fingerprint();
         let max_depth = self.inner.cfg.max_spawn_depth;
@@ -835,7 +854,8 @@ impl Engine {
             let mut task = TaskState::new(task_id_clone.clone(), spec);
             task.spawn_depth = depth;
             s.tasks.insert(task_id_clone.clone(), task);
-            s.prompts.insert((task_id_clone.clone(), 1), directive);
+            s.prompts
+                .insert((task_id_clone.clone(), 1), initial_directive);
             // Link to the owner session (only Operator tokens match; Worker tokens have no session).
             if let Some(sess) = s.sessions.values_mut().find(|sess| sess.token_fp == fp) {
                 sess.owned_task_ids.push(task_id_clone.clone());
@@ -1123,14 +1143,18 @@ impl Engine {
     // Worker-side API (= prompt / data fetch + result post)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Fetch the directive/prompt string for `task_id`'s current attempt.
+    /// Fetch the directive/prompt `Value` for `task_id`'s current attempt.
     /// Falls back to `initial_directive` when no prompt has been recorded
-    /// yet for that attempt.
+    /// yet for that attempt. Returns the `Value` end-to-end (issue #18);
+    /// the render down to `String` happens only at the two consumer
+    /// boundaries — the Worker HTTP path (`fetch_worker_payload*` →
+    /// `WorkerPayload.prompt: String`) and the WS Spawn frame text
+    /// render (`operator_ws::session`).
     pub async fn fetch_prompt(
         &self,
         token: &CapToken,
         task_id: &StepId,
-    ) -> Result<String, EngineError> {
+    ) -> Result<Value, EngineError> {
         self.verify_token_for_task(token, Verb::FetchPrompt, task_id)
             .await?;
         let task_id = task_id.clone();
@@ -1194,7 +1218,7 @@ impl Engine {
                 task_id: task_id_clone.clone(),
                 attempt,
                 agent,
-                prompt,
+                prompt: render_directive_to_string(&prompt),
                 system,
             })
         })
@@ -1238,7 +1262,7 @@ impl Engine {
                 task_id: task_id_clone.clone(),
                 attempt,
                 agent,
-                prompt,
+                prompt: render_directive_to_string(&prompt),
                 system,
             })
         })
@@ -1912,5 +1936,130 @@ mod dispatch_attempt_with_run_id_tests {
             !observed.meta.runtime.contains_key("run_id"),
             "no run_id key must be injected when dispatch_attempt_with is called with None"
         );
+    }
+}
+
+// ─── issue #18: `TaskSpec.initial_directive` `Value` pass-through ──────────
+#[cfg(test)]
+mod initial_directive_value_passthrough_tests {
+    use super::*;
+
+    async fn seeded_engine(initial_directive: Value) -> (Engine, CapToken, StepId) {
+        let engine = Engine::new(EngineCfg::default());
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let task_id = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: "planner".to_string(),
+                    initial_directive,
+                },
+            )
+            .await
+            .expect("start_task");
+        (engine, op_token, task_id)
+    }
+
+    /// Mint + register a `Role::Worker` token the same way
+    /// `dispatch_attempt_with` does — `fetch_prompt` is worker-verb-gated.
+    async fn mint_worker_token(engine: &Engine, task_id: &StepId) -> CapToken {
+        let worker_token = engine.signer().session(
+            format!("worker-of-{task_id}"),
+            Role::Worker,
+            vec!["*".into()],
+            Duration::from_secs(600),
+        );
+        let fp = worker_token.fingerprint();
+        let record = CapTokenRecord::from_worker_token(worker_token.clone(), task_id.clone());
+        engine
+            .with_state("test.mint_worker", move |s| {
+                s.tokens.insert(fp, record);
+            })
+            .await
+            .expect("mint worker token");
+        worker_token
+    }
+
+    /// `EngineDispatcher::dispatch` no longer stringifies the evaluated
+    /// `Step.in` value before seeding `TaskSpec.initial_directive` — an
+    /// Object seed must round-trip through `start_task` /
+    /// `read_task_state` byte-for-byte as the same `Value::Object`, not a
+    /// JSON-stringified `Value::String`.
+    #[tokio::test]
+    async fn object_seed_passes_through_task_spec_unchanged() {
+        let seed = serde_json::json!({"key": "value"});
+        let (engine, token, task_id) = seeded_engine(seed.clone()).await;
+        let state = engine
+            .read_task_state(&token, &task_id)
+            .await
+            .expect("read_task_state");
+        assert_eq!(
+            state.spec.initial_directive, seed,
+            "TaskSpec.initial_directive must equal the raw Object seed, not a stringified copy"
+        );
+    }
+
+    /// `Engine::fetch_prompt` returns the `Value` end-to-end (issue #18):
+    /// an Object seed stays a `Value::Object` and is not stringified in
+    /// the engine layer. The Worker HTTP boundary
+    /// (`fetch_worker_payload*`) is what performs the render down to a
+    /// JSON literal `String` for `WorkerPayload.prompt`.
+    #[tokio::test]
+    async fn object_seed_passes_through_fetch_prompt_as_value() {
+        let seed = serde_json::json!({"key": "value"});
+        let (engine, _token, task_id) = seeded_engine(seed.clone()).await;
+        let worker_token = mint_worker_token(&engine, &task_id).await;
+        let prompt = engine
+            .fetch_prompt(&worker_token, &task_id)
+            .await
+            .expect("fetch_prompt");
+        assert_eq!(
+            prompt, seed,
+            "fetch_prompt must return the raw Object Value, not a stringified copy"
+        );
+    }
+
+    /// The Worker HTTP boundary is the render point: `fetch_worker_payload*`
+    /// coerces the stored `Value` down to `WorkerPayload.prompt: String`
+    /// (JSON-literal shape for non-strings). Verifies the boundary render
+    /// stays intact for an Object seed.
+    #[tokio::test]
+    async fn object_seed_renders_as_json_literal_at_worker_payload_boundary() {
+        let seed = serde_json::json!({"key": "value"});
+        let (engine, _token, task_id) = seeded_engine(seed).await;
+        let worker_token = mint_worker_token(&engine, &task_id).await;
+        let payload = engine
+            .fetch_worker_payload(&worker_token, &task_id)
+            .await
+            .expect("fetch_worker_payload");
+        assert_eq!(
+            payload.prompt, r#"{"key":"value"}"#,
+            "WorkerPayload.prompt must be the JSON literal String render of the Value seed"
+        );
+    }
+
+    /// A `String` seed is unaffected — still passes through verbatim, both
+    /// as the `TaskSpec.initial_directive` `Value` and as the Worker
+    /// `fetch_prompt` return (issue #18 Invariant 2).
+    #[tokio::test]
+    async fn string_seed_passes_through_unchanged() {
+        let (engine, token, task_id) = seeded_engine(serde_json::json!("do the thing")).await;
+        let state = engine
+            .read_task_state(&token, &task_id)
+            .await
+            .expect("read_task_state");
+        assert_eq!(
+            state.spec.initial_directive,
+            serde_json::json!("do the thing")
+        );
+        let worker_token = mint_worker_token(&engine, &task_id).await;
+        let prompt = engine
+            .fetch_prompt(&worker_token, &task_id)
+            .await
+            .expect("fetch_prompt");
+        assert_eq!(prompt, serde_json::json!("do the thing"));
     }
 }
