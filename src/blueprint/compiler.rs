@@ -445,19 +445,36 @@ impl SpawnerFactory for SubprocessProcessSpawnerFactory {
     }
 }
 
-/// Factory for `AgentKind::Lua`. At `build` time it looks the `fn_id`
-/// up in its internal registry and returns an [`InProcSpawner`] with the
-/// Lua-eval `WorkerFn` registered under `agent_name` — one `InProcSpawner`
+/// Factory for `AgentKind::Lua`. At `build` time it inspects the
+/// `AgentDef.spec` and returns an [`InProcSpawner`] with the Lua-eval
+/// `WorkerFn` registered under `agent_name` — one `InProcSpawner`
 /// instance per agent.
 ///
 /// Naming convention: `<WorkerIMPL><AdapterType>SpawnerFactory` (Lua
 /// worker on InProcess adapter). One half of the old
 /// `InProcSpawnerFactory`, split into Lua and RustFn variants.
 ///
-/// Spec shape:
+/// Spec shape (choose one; `source` wins when both are present):
+///
 /// ```jsonc
-/// { "fn_id": "patch-spawner" }     // Lua source id pre-registered with the factory
+/// // (a) Registry lookup — Lua source id pre-registered with the
+/// //     factory via `register_lua` (used by the enhance flow's built-in
+/// //     workers). Requires the factory to know the id at construction
+/// //     time.
+/// { "fn_id": "patch-spawner" }
+///
+/// // (b) Inline source — a Lua chunk carried by the Blueprint itself,
+/// //     wrapped on the fly at `build` time. Combined with the loader's
+/// //     `$file` ref expansion (`"source": {"$file": "gates/foo.lua"}`)
+/// //     this lets a BP ship deterministic Lua gates without any
+/// //     pre-registration. `label` is optional and defaults to
+/// //     `"<agent_name>.lua"` for error messages.
+/// { "source": "return { value = 42, ok = true }",
+///   "label": "psim-gate.lua" }
 /// ```
+///
+/// Host bridges registered on the factory (see [`Self::with_bridge`])
+/// apply to both spec shapes.
 pub struct LuaInProcessSpawnerFactory {
     registry: HashMap<String, WorkerFn>,
     bridges: HashMap<String, HostBridge>,
@@ -682,6 +699,29 @@ impl SpawnerFactory for LuaInProcessSpawnerFactory {
         agent_def: &AgentDef,
         _hint: Option<&Value>,
     ) -> Result<Arc<dyn SpawnerAdapter>, CompileError> {
+        // Inline `spec.source` (a Lua chunk carried by the BP itself) takes
+        // precedence over `spec.fn_id`. This is the path a BP author uses to
+        // ship a deterministic Lua gate without pre-registering it with the
+        // factory — the plumbing (`run_lua_worker` / `LuaScriptSource`) is
+        // the same, only the entry point differs.
+        if let Some(source) = agent_def.spec.get("source").and_then(|v| v.as_str()) {
+            let label = agent_def
+                .spec
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}.lua", agent_def.name));
+            let script = Arc::new(LuaScriptSource::new(source.to_string(), label));
+            let bridges = Arc::new(self.bridges.clone());
+            let wrapped: WorkerFn = Arc::new(move |inv| {
+                let source = script.clone();
+                let bridges = bridges.clone();
+                Box::pin(run_lua_worker(source, bridges, inv))
+            });
+            let mut sp: InProcSpawner<LuaWorker> = InProcSpawner::<LuaWorker>::typed();
+            sp.registry.insert(agent_def.name.to_string(), wrapped);
+            return Ok(Arc::new(sp));
+        }
         build_inproc_from_registry::<LuaWorker>(&self.registry, agent_def, "lua")
     }
 }
@@ -1145,5 +1185,114 @@ mod operator_spawner_factory_worker_binding_tests {
             factory.build(&def, None).is_ok(),
             "backends that don't require a binding must not be gated by its absence"
         );
+    }
+}
+
+// ─── LuaInProcessSpawnerFactory: inline `spec.source` support ─────────────
+//
+// Issue `ab3d1145`: BPs served by `mse serve` couldn't declare `kind: lua`
+// without pre-registering a `fn_id` on the factory. These tests cover the
+// new inline path — `spec.source = "<lua chunk>"` (optionally with `label`)
+// wraps a fresh `LuaScriptSource` at `build` time and runs it through the
+// same `run_lua_worker` plumbing as the registry path.
+#[cfg(test)]
+mod lua_inline_source_tests {
+    use super::*;
+    use crate::types::{CapToken, Role, StepId};
+
+    fn agent(name: &str, spec: Value) -> AgentDef {
+        AgentDef {
+            name: name.to_string(),
+            kind: AgentKind::Lua,
+            spec,
+            profile: None,
+            meta: None,
+        }
+    }
+
+    fn test_invocation(prompt: &str) -> crate::worker::adapter::WorkerInvocation {
+        crate::worker::adapter::WorkerInvocation {
+            token: CapToken {
+                agent_id: "a".into(),
+                role: Role::Worker,
+                scopes: vec!["*".into()],
+                issued_at: 0,
+                expire_at: u64::MAX / 2,
+                max_uses: None,
+                nonce: "test-nonce".into(),
+                sig_hex: "".into(),
+            },
+            task_id: StepId::parse("ST-test").expect("StepId parse"),
+            attempt: 1,
+            agent: "g".into(),
+            prompt: prompt.into(),
+            sink: None,
+            cancel_token: None,
+        }
+    }
+
+    #[test]
+    fn build_accepts_inline_source_without_pre_registration() {
+        let factory = LuaInProcessSpawnerFactory::new();
+        let def = agent(
+            "g",
+            serde_json::json!({ "source": "return { value = 42, ok = true }" }),
+        );
+        assert!(
+            factory.build(&def, None).is_ok(),
+            "inline spec.source must build without a pre-registered fn_id"
+        );
+    }
+
+    #[test]
+    fn build_rejects_when_neither_source_nor_fn_id_is_present() {
+        let factory = LuaInProcessSpawnerFactory::new();
+        let def = agent("g", serde_json::json!({}));
+        match factory.build(&def, None) {
+            Err(CompileError::InvalidSpec { msg, .. }) => {
+                assert!(
+                    msg.contains("fn_id"),
+                    "empty spec must still surface the fn_id-required message: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidSpec, got a different CompileError: {other}"),
+            // `SpawnerAdapter` is not Debug, so we can't `unwrap_err()` /
+            // pattern-print the Ok arm — describe the mismatch directly.
+            Ok(_) => panic!("expected InvalidSpec, got Ok(SpawnerAdapter)"),
+        }
+    }
+
+    /// The inline path shares `run_lua_worker` with the registry path, so
+    /// exercising the marshaller once through it is enough to prove the
+    /// wrap is faithful.
+    #[tokio::test]
+    async fn inline_source_evaluates_and_marshals_result() {
+        let source =
+            LuaScriptSource::new("return { value = _PROMPT .. '!', ok = true }", "smoke.lua");
+        let out = run_lua_worker(
+            std::sync::Arc::new(source),
+            std::sync::Arc::new(HashMap::new()),
+            test_invocation("hello"),
+        )
+        .await
+        .expect("lua worker ok");
+        assert_eq!(out.value, serde_json::json!("hello!"));
+        assert!(out.ok);
+    }
+
+    #[tokio::test]
+    async fn inline_source_can_signal_agent_level_failure() {
+        // Deterministic gate pattern: return `ok = false` to flip the
+        // dispatch outcome to `Blocked` (the flow.ir Try catch path).
+        let source = LuaScriptSource::new("return { value = 'nope', ok = false }", "gate.lua");
+        let out = run_lua_worker(
+            std::sync::Arc::new(source),
+            std::sync::Arc::new(HashMap::new()),
+            test_invocation("input"),
+        )
+        .await
+        .expect("lua worker ok");
+        assert_eq!(out.value, serde_json::json!("nope"));
+        assert!(!out.ok);
     }
 }

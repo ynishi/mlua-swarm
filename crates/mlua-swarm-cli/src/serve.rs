@@ -32,8 +32,8 @@ use mlua_swarm::{
     TaskLaunchService,
 };
 use mlua_swarm::{
-    OperatorSpawnerFactory, RustFnInProcessSpawnerFactory, SpawnerRegistry,
-    SubprocessProcessSpawnerFactory,
+    LuaInProcessSpawnerFactory, OperatorSpawnerFactory, RustFnInProcessSpawnerFactory,
+    SpawnerRegistry, SubprocessProcessSpawnerFactory,
 };
 use mlua_swarm_server::{
     build_blueprints_router_with_refs, build_enhance_log_router, build_enhance_settings_router,
@@ -237,6 +237,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 SubprocessProcessSpawnerFactory,
             ));
             r.register::<RustFnInProcessSpawnerFactory>(Arc::new(rustfn_factory));
+            // Same rationale as `default_registry` in `mlua-swarm-server`:
+            // register an empty `LuaInProcessSpawnerFactory` so BPs on this
+            // (non-enhance) path can still declare `kind: lua` via inline
+            // `spec.source`. The enhance-flow branch above already carries
+            // its own Lua factory (with the enhance-flow `fn_id`s baked in).
+            r.register::<LuaInProcessSpawnerFactory>(Arc::new(LuaInProcessSpawnerFactory::new()));
             r.register::<OperatorSpawnerFactory>(op_factory.clone());
             r
         };

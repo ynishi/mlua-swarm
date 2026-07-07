@@ -358,6 +358,13 @@ pub fn default_registry() -> SpawnerRegistry {
     let mut reg = SpawnerRegistry::new();
     reg.register::<SubprocessProcessSpawnerFactory>(Arc::new(SubprocessProcessSpawnerFactory));
     reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(rustfn_factory));
+    // Empty `LuaInProcessSpawnerFactory`: no `fn_id` is pre-registered here,
+    // but BP agents can still declare `kind: lua` by carrying an inline
+    // `spec.source` (or a `$file`-expanded Lua chunk). This lets a BP ship
+    // deterministic Lua gates on the vanilla registry, without opting into
+    // the enhance flow. See `LuaInProcessSpawnerFactory` docs for the spec
+    // shape.
+    reg.register::<LuaInProcessSpawnerFactory>(Arc::new(LuaInProcessSpawnerFactory::new()));
     reg.register::<OperatorSpawnerFactory>(Arc::new(OperatorSpawnerFactory::new()));
     reg
 }
