@@ -17,7 +17,7 @@
 //! Authorization follows the same convention as the existing `POST /v1/tasks`
 //! entry: no `Authorization` header is required (the route is open), and the
 //! only Operator-session correlation available is the request-body-level
-//! `operator_sid` (see `crate::FlowTasksReq` doc) — this module invents no
+//! `operator_sid` (see `crate::TaskLaunchRequest` doc) — this module invents no
 //! new auth mechanism.
 
 use axum::{
@@ -337,12 +337,15 @@ mod tests {
         }
     }
 
-    fn post_tasks_req(goal: &str) -> crate::FlowTasksReq {
-        crate::FlowTasksReq {
+    fn post_tasks_req(goal: &str) -> crate::TaskLaunchRequest {
+        crate::TaskLaunchRequest {
             blueprint: BlueprintRef::Inline {
                 value: Box::new(identity_blueprint()),
             },
             init_ctx: serde_json::json!({"in": "hello"}),
+            project_root: None,
+            work_dir: None,
+            task_metadata: None,
             ttl_secs: None,
             operator: None,
             operator_sid: None,

@@ -460,19 +460,33 @@ async fn sessions_detach(
 /// (kind / spawn_hook / senior_bridge). Expressing a one-shot task as a 1-Step
 /// Blueprint is the only correct model.
 #[derive(Deserialize)]
-struct FlowTasksReq {
+struct TaskLaunchRequest {
     blueprint: BlueprintRef,
     /// flow.ir's initial `ctx` — every `Step.in` `$.<path>` reads from
-    /// here. Three top-level keys are additionally recognized as
-    /// task-level execution context (issue #17), each independently
-    /// optional and additive to whatever free-form JSON the caller
-    /// already puts here (backward compat, no stripping):
-    /// `project_root` (string), `work_dir` (string), `task_metadata`
-    /// (object, free-form). `TaskLaunchService::launch` extracts them via
-    /// `TaskInputMiddleware::from_init_ctx` and — only when at least one
-    /// is present — layers `TaskInputMiddleware` on the spawner stack so
-    /// every spawn's `Ctx.meta.runtime` carries them.
+    /// here. This field's role is limited to the flow-ir eval seed
+    /// (issue #19); the Task-level execution context lives in the
+    /// sibling top-level fields below (`project_root` / `work_dir` /
+    /// `task_metadata`), promoted out of `init_ctx` to remove the
+    /// prior "free bag nested in free JSON" duplication.
+    ///
+    /// Backward compat: the pre-#19 shape — the same three keys nested
+    /// directly inside this object — is still honored as a fallback
+    /// when the sibling field is absent; see `run_flow_form`'s 2-stage
+    /// resolution and `TaskInputMiddleware::from_init_ctx`.
     init_ctx: Value,
+    /// Task-level project root (issue #19 canonical Task IF field —
+    /// promoted out of `init_ctx`). Takes priority over a same-named
+    /// key nested inside `init_ctx` (backward-compat fallback).
+    #[serde(default)]
+    project_root: Option<String>,
+    /// Task-level working directory (issue #19), same priority rule as
+    /// `project_root`.
+    #[serde(default)]
+    work_dir: Option<String>,
+    /// Task-level arbitrary metadata bag (issue #19), same priority
+    /// rule as `project_root`.
+    #[serde(default)]
+    task_metadata: Option<Value>,
     /// TTL in seconds. When unspecified (`None`), falls back in this order:
     /// (1) `metadata.default_run_ttl_secs` from the resolved BP,
     /// (2) if absent, the server global `default_run_ttl()` (1800s).
@@ -564,7 +578,7 @@ fn parse_operator_kind_str(s: &str) -> Result<mlua_swarm::OperatorKind, ApiError
 }
 
 #[derive(Serialize)]
-struct FlowTasksResp {
+struct TaskLaunchResponse {
     final_ctx: Value,
     bound_version: Option<String>,
     /// Resolved TTL (seconds) actually applied to the run. Exposes the
@@ -595,11 +609,11 @@ enum TtlSource {
 /// (kind / spawn_hook / senior_bridge) can be injected per request body.
 /// `operator_sid` (S2, runtime Operator match stage 1) additionally
 /// lets the caller pin the task to a specific already-registered Operator
-/// session sid, bypassing BP-level alias lookup — see `FlowTasksReq` doc.
+/// session sid, bypassing BP-level alias lookup — see `TaskLaunchRequest` doc.
 async fn tasks_start(
     State(state): State<AppState>,
-    Json(req): Json<FlowTasksReq>,
-) -> Result<Json<FlowTasksResp>, ApiError> {
+    Json(req): Json<TaskLaunchRequest>,
+) -> Result<Json<TaskLaunchResponse>, ApiError> {
     let resp = run_flow_form(&state, req).await?;
     Ok(Json(resp))
 }
@@ -614,7 +628,10 @@ async fn tasks_start(
 /// `senior_bridge_id` / `operator_backend_id`) is registered on
 /// `state.engine.register_*` at WS connect time — the engine is the SoT.
 /// See the `operator_ws` module doc for details.
-async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksResp, ApiError> {
+async fn run_flow_form(
+    state: &AppState,
+    req: TaskLaunchRequest,
+) -> Result<TaskLaunchResponse, ApiError> {
     use mlua_swarm::application::{BlueprintRef as AppBlueprintRef, TaskApplicationInput};
     use mlua_swarm::OperatorKind;
 
@@ -625,12 +642,22 @@ async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksR
     let input_ctx_snapshot = req.init_ctx.clone();
     let goal = req.goal.clone().unwrap_or_default();
 
+    // issue #19 2-stage resolution: sibling top-level fields take
+    // priority; the pre-#19 shape (same key nested inside `init_ctx`) is
+    // the fallback. The resolved values are folded back into a clone of
+    // `init_ctx` so the existing, unmodified
+    // `TaskInputMiddleware::from_init_ctx` extraction (invoked downstream
+    // inside `TaskLaunchService::launch`) picks them up unchanged — a
+    // transitional bridge; ST2 replaces this with direct sibling-field
+    // extraction and drops the `init_ctx`-nested fallback.
+    let resolved_init_ctx = resolve_task_level_init_ctx(&req);
+
     let mut op_req = req.operator.unwrap_or_default();
 
     // S2: explicit `operator_sid` override (runtime Operator match stage 1).
     // Resolved *before* building `operator_kind` / dispatching so an
     // unknown sid fails fast with a 400, never silently falling back to the
-    // BP-level alias lookup. See `FlowTasksReq::operator_sid` doc for the
+    // BP-level alias lookup. See `TaskLaunchRequest::operator_sid` doc for the
     // disconnected-vs-unknown distinction.
     if let Some(sid) = &req.operator_sid {
         let known_ids = state.engine.list_operator_ids().await;
@@ -729,7 +756,7 @@ async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksR
                 operator_id: operator_id.clone(),
                 role: Role::Operator,
                 ttl: Duration::from_secs(ttl_secs),
-                init_ctx: req.init_ctx,
+                init_ctx: resolved_init_ctx,
                 operator_kind,
                 bridge_id: op_req.senior_bridge_id,
                 hook_id: op_req.spawn_hook_id,
@@ -744,7 +771,7 @@ async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksR
         .await
         .map_err(|e| ApiError::bad_request(format!("run: {e}")))?;
 
-    Ok(FlowTasksResp {
+    Ok(TaskLaunchResponse {
         final_ctx: out.final_ctx,
         bound_version: out.bound_version.map(|v| format!("{:?}", v)),
         effective_ttl_secs: ttl_secs,
@@ -752,6 +779,53 @@ async fn run_flow_form(state: &AppState, req: FlowTasksReq) -> Result<FlowTasksR
         task_id,
         run_id,
     })
+}
+
+/// issue #19 2-stage resolution + merge-back bridge for the 3 Task-level
+/// fields (`project_root` / `work_dir` / `task_metadata`): the sibling
+/// top-level body field takes priority; when a given field is absent
+/// there, the pre-#19 shape (the same key nested inside `init_ctx`) is
+/// used as a fallback. The resolved values are folded into a clone of
+/// `init_ctx` (only when it is a JSON object — a non-object `init_ctx`
+/// is left untouched, same as `TaskInputMiddleware::from_init_ctx`'s own
+/// no-op-for-non-object contract) so the existing, unmodified
+/// `TaskInputMiddleware::from_init_ctx` extraction — invoked downstream
+/// inside `TaskLaunchService::launch` — picks the resolved values up
+/// unchanged. Transitional: ST2 replaces this bridge with direct
+/// sibling-field extraction and drops the `init_ctx`-nested fallback.
+fn resolve_task_level_init_ctx(req: &TaskLaunchRequest) -> Value {
+    let project_root = req.project_root.clone().or_else(|| {
+        req.init_ctx
+            .get("project_root")
+            .and_then(Value::as_str)
+            .map(String::from)
+    });
+    let work_dir = req.work_dir.clone().or_else(|| {
+        req.init_ctx
+            .get("work_dir")
+            .and_then(Value::as_str)
+            .map(String::from)
+    });
+    let task_metadata = req.task_metadata.clone().or_else(|| {
+        req.init_ctx
+            .get("task_metadata")
+            .filter(|v| v.is_object())
+            .cloned()
+    });
+
+    let mut merged = req.init_ctx.clone();
+    if let Value::Object(map) = &mut merged {
+        if let Some(v) = project_root {
+            map.insert("project_root".to_string(), Value::String(v));
+        }
+        if let Some(v) = work_dir {
+            map.insert("work_dir".to_string(), Value::String(v));
+        }
+        if let Some(v) = task_metadata {
+            map.insert("task_metadata".to_string(), v);
+        }
+    }
+    merged
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────
@@ -923,5 +997,97 @@ mod tests {
     fn resolve_ttl_from_metadata_some_returns_value() {
         assert_eq!(resolve_ttl_from_metadata(Some(7200)), 7200);
         assert_eq!(resolve_ttl_from_metadata(Some(60)), 60);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // issue #19: `resolve_task_level_init_ctx` 2-stage resolution
+    // ──────────────────────────────────────────────────────────────────
+
+    fn task_req(
+        init_ctx: Value,
+        project_root: Option<&str>,
+        work_dir: Option<&str>,
+        task_metadata: Option<Value>,
+    ) -> TaskLaunchRequest {
+        TaskLaunchRequest {
+            blueprint: BlueprintRef::Id {
+                id: mlua_swarm::blueprint::store::BlueprintId::new("ut"),
+                version: Default::default(),
+            },
+            init_ctx,
+            project_root: project_root.map(String::from),
+            work_dir: work_dir.map(String::from),
+            task_metadata,
+            ttl_secs: None,
+            operator: None,
+            operator_sid: None,
+            goal: None,
+        }
+    }
+
+    /// (a) Sibling fields only — no legacy keys in `init_ctx` — are
+    /// promoted into the merged ctx, and pre-existing free-form
+    /// `init_ctx` keys are preserved untouched.
+    #[test]
+    fn resolve_task_level_init_ctx_sibling_field_promotes_into_init_ctx() {
+        let req = task_req(
+            json!({"free": "form"}),
+            Some("/repo/sibling"),
+            Some("/repo/sibling/work"),
+            Some(json!({"issue": 19})),
+        );
+        let merged = resolve_task_level_init_ctx(&req);
+        assert_eq!(merged["project_root"], json!("/repo/sibling"));
+        assert_eq!(merged["work_dir"], json!("/repo/sibling/work"));
+        assert_eq!(merged["task_metadata"], json!({"issue": 19}));
+        assert_eq!(
+            merged["free"],
+            json!("form"),
+            "pre-existing free-form init_ctx keys must be preserved"
+        );
+    }
+
+    /// (b) No sibling fields — the pre-#19 shape (same 3 keys nested
+    /// inside `init_ctx`) is used as-is via the fallback path.
+    #[test]
+    fn resolve_task_level_init_ctx_falls_back_to_legacy_init_ctx_shape() {
+        let req = task_req(
+            json!({
+                "project_root": "/repo/legacy",
+                "work_dir": "/repo/legacy/work",
+                "task_metadata": {"issue": 17},
+            }),
+            None,
+            None,
+            None,
+        );
+        let merged = resolve_task_level_init_ctx(&req);
+        assert_eq!(merged["project_root"], json!("/repo/legacy"));
+        assert_eq!(merged["work_dir"], json!("/repo/legacy/work"));
+        assert_eq!(merged["task_metadata"], json!({"issue": 17}));
+    }
+
+    /// (c) Both present — the sibling field must win over the legacy
+    /// `init_ctx`-nested value.
+    #[test]
+    fn resolve_task_level_init_ctx_sibling_wins_over_legacy_init_ctx_shape() {
+        let req = task_req(
+            json!({
+                "project_root": "/repo/legacy",
+                "work_dir": "/repo/legacy/work",
+                "task_metadata": {"issue": 17},
+            }),
+            Some("/repo/sibling"),
+            Some("/repo/sibling/work"),
+            Some(json!({"issue": 19})),
+        );
+        let merged = resolve_task_level_init_ctx(&req);
+        assert_eq!(
+            merged["project_root"],
+            json!("/repo/sibling"),
+            "sibling field must win over the legacy init_ctx-nested value"
+        );
+        assert_eq!(merged["work_dir"], json!("/repo/sibling/work"));
+        assert_eq!(merged["task_metadata"], json!({"issue": 19}));
     }
 }
