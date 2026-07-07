@@ -83,6 +83,35 @@ fn derive_worker_bindings(blueprint: &Blueprint) -> HashMap<String, WorkerBindin
         .collect()
 }
 
+/// Issue #19 ST3: shallow-merge the "BP Global" default `init_ctx`
+/// (`Blueprint.default_init_ctx`) with the Task-level `init_ctx` — the
+/// second layer of the (eventual 4-layer) init-ctx cascade, following the
+/// same "BP default, Task overrides" shape as the `OperatorKind` cascade
+/// (see `derive_bp_agent_kinds` / `TaskLaunchInput::operator_kind`).
+///
+/// Semantics (deliberately a single rule, no deep merge / JSON Patch):
+///
+/// - `bp_default = None` → `task_init_ctx` passes through unchanged
+///   (pre-#19 Blueprints keep today's exact behavior).
+/// - Both sides are `Value::Object` → shallow key-wise merge, Task wins
+///   on collision (`task_init_ctx`'s keys are applied last).
+/// - `task_init_ctx` is present but not an `Object` (`Null` / `String` /
+///   `Array` / `Number` / `Bool`) → Task fully replaces the BP default;
+///   the caller's non-Object seed is respected as-is.
+fn merge_init_ctx(bp_default: Option<&Value>, task_init_ctx: &Value) -> Value {
+    match (bp_default, task_init_ctx) {
+        (Some(Value::Object(bp_map)), Value::Object(task_map)) => {
+            let mut merged = bp_map.clone();
+            for (k, v) in task_map {
+                merged.insert(k.clone(), v.clone());
+            }
+            Value::Object(merged)
+        }
+        (None, _) => task_init_ctx.clone(),
+        (_, task) => task.clone(),
+    }
+}
+
 fn derive_bp_agent_kinds(blueprint: &Blueprint) -> HashMap<String, OperatorKind> {
     let mut out = HashMap::new();
     if blueprint.operators.is_empty() {
@@ -390,9 +419,16 @@ impl TaskLaunchService {
             Some(run_ctx) => dispatcher.with_run(run_ctx),
             None => dispatcher,
         };
+        // Issue #19 ST3: BP default + Task init_ctx → merged init_ctx (the
+        // 2-layer slice of the eventual 4-layer cascade; Run override is
+        // ST4 carry). `input.blueprint.default_init_ctx` is `None` for
+        // every pre-#19 Blueprint, so `merge_init_ctx` is a no-op then and
+        // this preserves today's behavior byte-for-byte.
+        let merged_init_ctx =
+            merge_init_ctx(input.blueprint.default_init_ctx.as_ref(), &input.init_ctx);
         let final_ctx = mlua_flow_ir::eval_async_externs(
             &input.blueprint.flow,
-            input.init_ctx,
+            merged_init_ctx,
             &dispatcher,
             &*self.externs,
         )
@@ -462,6 +498,7 @@ mod tests {
             spawner_hints: Default::default(),
             default_agent_kind: AgentKind::Operator,
             default_operator_kind: None,
+            default_init_ctx: None,
         }
     }
 
@@ -878,5 +915,75 @@ mod tests {
         input.task_input = Some(TaskInputSpec::default());
         let out = svc.launch(input).await.expect("launch ok");
         assert_eq!(out.final_ctx["out"], "hi");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // issue #19 ST3: `merge_init_ctx` (BP default + Task init_ctx)
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_init_ctx_bp_default_only_passes_through_when_task_is_empty_object() {
+        let bp_default = json!({ "seeded": "from-bp" });
+        let task = json!({});
+        let merged = merge_init_ctx(Some(&bp_default), &task);
+        assert_eq!(merged, json!({ "seeded": "from-bp" }));
+    }
+
+    #[test]
+    fn merge_init_ctx_task_only_passes_through_when_bp_default_is_empty_object() {
+        let bp_default = json!({});
+        let task = json!({ "seeded": "from-task" });
+        let merged = merge_init_ctx(Some(&bp_default), &task);
+        assert_eq!(merged, json!({ "seeded": "from-task" }));
+    }
+
+    #[test]
+    fn merge_init_ctx_both_objects_task_wins_on_key_collision() {
+        let bp_default = json!({ "a": "bp", "b": "bp-only" });
+        let task = json!({ "a": "task", "c": "task-only" });
+        let merged = merge_init_ctx(Some(&bp_default), &task);
+        assert_eq!(
+            merged,
+            json!({ "a": "task", "b": "bp-only", "c": "task-only" })
+        );
+    }
+
+    #[test]
+    fn merge_init_ctx_non_object_task_fully_replaces_bp_default() {
+        let bp_default = json!({ "seeded": "from-bp" });
+        let task = json!("plain-string-seed");
+        let merged = merge_init_ctx(Some(&bp_default), &task);
+        assert_eq!(merged, json!("plain-string-seed"));
+    }
+
+    #[test]
+    fn merge_init_ctx_no_bp_default_is_a_no_op() {
+        let task = json!({ "input": "hi" });
+        let merged = merge_init_ctx(None, &task);
+        assert_eq!(merged, task);
+    }
+
+    #[tokio::test]
+    async fn launch_merges_bp_default_init_ctx_into_task_init_ctx() {
+        // End-to-end guard: `Blueprint.default_init_ctx` actually reaches
+        // `eval_async_externs` — not merely unit-tested in isolation.
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!(inv.prompt),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let mut blueprint = bp(
+            step("echo", path("$.greeting"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        blueprint.default_init_ctx = Some(json!({ "greeting": "hello from bp" }));
+        // Task supplies an empty object — BP default alone seeds `$.greeting`.
+        let out = svc
+            .launch(launch_input(blueprint, json!({})))
+            .await
+            .expect("launch ok");
+        assert_eq!(out.final_ctx["out"], "hello from bp");
     }
 }

@@ -312,6 +312,7 @@ mod tests {
             spawner_hints: Default::default(),
             default_agent_kind: AgentKind::Operator,
             default_operator_kind: None,
+            default_init_ctx: None,
         }
     }
 

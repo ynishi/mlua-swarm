@@ -60,6 +60,7 @@
 //!     spawner_hints: Default::default(),
 //!     default_agent_kind: AgentKind::Operator,
 //!     default_operator_kind: None,
+//!     default_init_ctx: None,
 //! };
 //!
 //! assert_eq!(bp.id.as_str(), "hello");
@@ -91,6 +92,7 @@
 //!     spawner_hints: Default::default(),
 //!     default_agent_kind: AgentKind::Operator,
 //!     default_operator_kind: None,
+//!     default_init_ctx: None,
 //! };
 //!
 //! let json = serde_json::to_string(&bp).unwrap();
@@ -296,6 +298,15 @@ pub struct Blueprint {
     /// per-agent when resolving operator info.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_operator_kind: Option<OperatorKind>,
+    /// Blueprint-level default initial `ctx` for flow-ir eval.
+    /// `TaskLaunchService::launch` shallow-merges this with the
+    /// Task-level `init_ctx` (Task wins on key collision when both
+    /// are `Object`; if Task's `init_ctx` is not an `Object`, it
+    /// full-replaces the default). `None` — no default is merged;
+    /// backward-compat with pre-#19 Blueprints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Value>")]
+    pub default_init_ctx: Option<Value>,
 }
 
 /// Global default `AgentKind` at the Schema impl Default layer. Bottom of the 4-layer cascade.
@@ -679,6 +690,7 @@ mod tests {
             "spawner_hints",
             "default_agent_kind",
             "default_operator_kind",
+            "default_init_ctx",
         ] {
             assert!(props.contains_key(key), "missing property: {key}");
         }
@@ -715,5 +727,63 @@ mod tests {
         );
         let back: AgentProfile = serde_json::from_value(json).expect("deserializes");
         assert_eq!(back.worker_binding, None);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // issue #19 ST3: `Blueprint.default_init_ctx`
+    // ──────────────────────────────────────────────────────────────
+
+    fn minimal_bp(default_init_ctx: Option<Value>) -> Blueprint {
+        Blueprint {
+            schema_version: current_schema_version(),
+            id: "bp-init-ctx-ut".into(),
+            flow: FlowNode::Seq { children: vec![] },
+            agents: vec![],
+            operators: vec![],
+            hints: Default::default(),
+            strategy: Default::default(),
+            metadata: Default::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx,
+        }
+    }
+
+    #[test]
+    fn blueprint_default_init_ctx_roundtrips_when_some() {
+        let bp = minimal_bp(Some(serde_json::json!({ "seeded": true })));
+        let json = serde_json::to_string(&bp).expect("serializes");
+        let back: Blueprint = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(
+            back.default_init_ctx,
+            Some(serde_json::json!({ "seeded": true }))
+        );
+        assert_eq!(bp, back);
+    }
+
+    #[test]
+    fn blueprint_default_init_ctx_omitted_when_none() {
+        let bp = minimal_bp(None);
+        let json = serde_json::to_value(&bp).expect("serializes");
+        // `skip_serializing_if = "Option::is_none"` — the key must not appear at all
+        // (pre-#19 Blueprints round-trip byte-identical through this path).
+        assert!(
+            json.as_object().unwrap().get("default_init_ctx").is_none(),
+            "default_init_ctx key must be absent when None: {json}"
+        );
+        let back: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.default_init_ctx, None);
+        assert_eq!(bp, back);
+    }
+
+    #[test]
+    fn blueprint_json_schema_exports_default_init_ctx_as_nullable_value() {
+        let schema = schemars::schema_for!(Blueprint);
+        let v = serde_json::to_value(&schema).expect("schema serializes");
+        assert!(
+            v["properties"]["default_init_ctx"].is_object(),
+            "default_init_ctx must appear in the exported schema: {v}"
+        );
     }
 }
