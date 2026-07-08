@@ -74,7 +74,7 @@ pub use operator_ws::{
     operators_create, operators_delete, operators_info, operators_ws_connect, ClientMsg,
     OperatorSessionEntry, ServerMsg, WSOperatorSession,
 };
-pub use tasks::{RunKickResponse, TaskDetailResponse};
+pub use tasks::{RunKickRequest, RunKickResponse, TaskDetailResponse};
 pub use worker::{worker_prompt, worker_result, PromptQuery, WorkerResultReq};
 
 use axum::{
@@ -459,8 +459,19 @@ async fn sessions_detach(
 /// `/v1/tasks` POST schema. Uses the flow-eval path and supports Operator inject
 /// (kind / spawn_hook / senior_bridge). Expressing a one-shot task as a 1-Step
 /// Blueprint is the only correct model.
-#[derive(Deserialize)]
-struct TaskLaunchRequest {
+///
+/// `pub` (issue #19 ST5) so its `schemars`-derived JSON Schema can be
+/// generated cross-crate by `mlua-swarm-cli`'s `mse://api/http-endpoints`
+/// MCP resource; fields stay module-private (no public field-level API
+/// surface is intended).
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct TaskLaunchRequest {
+    /// `BlueprintRef` selects Inline (a full Blueprint value) or Id (a
+    /// store lookup). Left opaque here — its own schema nests the full
+    /// `Blueprint` schema (owned by `mse://api/blueprint-schema`), and
+    /// mixing the two into this HTTP-endpoint resource would violate
+    /// their separation of concerns (see the resource's module doc).
+    #[schemars(with = "Value")]
     blueprint: BlueprintRef,
     /// flow.ir's initial `ctx` — every `Step.in` `$.<path>` reads from
     /// here. This field's role is limited to the flow-ir eval seed
@@ -473,6 +484,7 @@ struct TaskLaunchRequest {
     /// directly inside this object — is still honored as a fallback
     /// when the sibling field is absent; see `run_flow_form`'s 2-stage
     /// resolution and `TaskInputMiddleware::from_init_ctx`.
+    #[schemars(with = "Value")]
     init_ctx: Value,
     /// Task-level project root (issue #19 canonical Task IF field —
     /// promoted out of `init_ctx`). Takes priority over a same-named
@@ -486,6 +498,7 @@ struct TaskLaunchRequest {
     /// Task-level arbitrary metadata bag (issue #19), same priority
     /// rule as `project_root`.
     #[serde(default)]
+    #[schemars(with = "Option<Value>")]
     task_metadata: Option<Value>,
     /// TTL in seconds. When unspecified (`None`), falls back in this order:
     /// (1) `metadata.default_run_ttl_secs` from the resolved BP,
@@ -528,8 +541,12 @@ struct TaskLaunchRequest {
     goal: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
-struct OperatorReq {
+/// Operator inject sub-schema of [`TaskLaunchRequest`] (`kind` / `id` /
+/// `spawn_hook_id` / `senior_bridge_id` / `operator_backend_id` /
+/// `per_agent_kinds`). `pub` for the same cross-crate schema-generation
+/// reason as `TaskLaunchRequest`.
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub struct OperatorReq {
     /// `main_ai` / `automate` / `composite`. This is the "Runtime Global"
     /// tier of the 4-tier `OperatorKind` cascade (see `mlua_swarm
     /// ::ctx::collapse_operator_kind`); when unspecified, falls through to
@@ -577,29 +594,46 @@ fn parse_operator_kind_str(s: &str) -> Result<mlua_swarm::OperatorKind, ApiError
     }
 }
 
-#[derive(Serialize)]
-struct TaskLaunchResponse {
+/// `/v1/tasks` POST response body. `pub` for the same cross-crate
+/// schema-generation reason as [`TaskLaunchRequest`].
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct TaskLaunchResponse {
+    /// The final flow.ir `ctx` after every `Step.out` has been written.
+    #[schemars(with = "Value")]
     final_ctx: Value,
+    /// Debug-formatted `BlueprintVersion` the run resolved against, when
+    /// the Blueprint came from a store lookup (`None` for `Inline` refs).
     bound_version: Option<String>,
     /// Resolved TTL (seconds) actually applied to the run. Exposes the
     /// 3-layer cascade (request body → BP metadata → server default) so
     /// clients can verify which value took effect without re-deriving it.
     effective_ttl_secs: u64,
+    /// Which layer of the TTL cascade won.
     ttl_source: TtlSource,
     /// The `TaskRecord` minted for this request (issue #13 ID-hierarchy
     /// persistence). `GET /v1/tasks/:id` re-fetches it; `POST
     /// /v1/tasks/:id/runs` re-kicks it under a fresh `RunId`.
+    #[schemars(with = "String")]
     task_id: TaskId,
     /// The `RunRecord` minted for this specific kick. `GET /v1/runs/:id`
     /// re-fetches it (`step_entries` included).
+    #[schemars(with = "String")]
     run_id: RunId,
 }
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+/// Which layer of the TTL cascade (request body → BP metadata → server
+/// default) resolved [`TaskLaunchResponse::effective_ttl_secs`]. `pub` for
+/// the same cross-crate schema-generation reason as `TaskLaunchRequest`.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum TtlSource {
+pub enum TtlSource {
+    /// The request body's `ttl_secs` was set explicitly.
     RequestBody,
+    /// The request body omitted `ttl_secs`; the resolved Blueprint's
+    /// `metadata.default_run_ttl_secs` was set.
     BpMetadata,
+    /// Both the request body and the Blueprint metadata omitted a TTL;
+    /// the server-global `default_run_ttl()` (1800s) applied.
     ServerDefault,
 }
 

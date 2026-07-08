@@ -16,6 +16,7 @@
 //! mse://guides/<slug>
 //! mse://blueprints/samples/<slug>
 //! mse://api/blueprint-schema
+//! mse://api/http-endpoints
 //! ```
 //!
 //! ## Current resources
@@ -30,6 +31,14 @@
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
 //! | `mse://api/blueprint-schema`                 | Live Blueprint JSON Schema (generated per read).    |
+//! | `mse://api/http-endpoints`                   | Live HTTP wire-body JSON Schemas, keyed by endpoint (issue #19 ST5). |
+//!
+//! `mse://api/http-endpoints` is deliberately a separate resource from
+//! `mse://api/blueprint-schema` — the two schemas serve different
+//! readers (HTTP wire body vs. the Blueprint document format) and mixing
+//! them into one JSON document would blur that boundary. Fields whose
+//! type is the Blueprint document itself (`TaskLaunchRequest.blueprint`)
+//! stay opaque here; see [`http_endpoints_schema_value`].
 
 use mlua_swarm::blueprint::Blueprint;
 
@@ -39,6 +48,9 @@ pub enum ResourceBody {
     Static(&'static str),
     /// Body is generated at `read_resource` time (the Blueprint JSON Schema).
     BlueprintSchema,
+    /// Body is generated at `read_resource` time (the HTTP wire-body JSON
+    /// Schemas, keyed by endpoint; see [`http_endpoints_schema_value`]).
+    HttpEndpoints,
 }
 
 /// One MCP Resource entry exposed under the `mse://` scheme.
@@ -123,6 +135,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         mime_type: "application/json",
         body: ResourceBody::BlueprintSchema,
     },
+    ResourceEntry {
+        uri: "mse://api/http-endpoints",
+        title: "HTTP endpoint wire-body JSON Schemas",
+        description: "Live schemars-generated request/response JSON Schemas for /v1/blueprints, /v1/tasks, and /v1/tasks/:id/runs, keyed by endpoint. A separate resource from mse://api/blueprint-schema (issue #19 ST5).",
+        mime_type: "application/json",
+        body: ResourceBody::HttpEndpoints,
+    },
 ];
 
 /// Look up a resource entry by its full URI. Returns `None` for unknown URIs.
@@ -139,14 +158,70 @@ pub fn blueprint_schema_value() -> Result<serde_json::Value, serde_json::Error> 
     serde_json::to_value(&schema)
 }
 
+/// Generate the HTTP endpoint wire-body JSON Schemas (issue #19 ST5) as a
+/// `serde_json::Value`, keyed by endpoint. Shared by the
+/// `mse://api/http-endpoints` dynamic resource; regenerated on every call
+/// so it never drifts from the wire structs' current shape.
+///
+/// Form (endpoint-unit map, easy to extend — `must_not_simplify #5`):
+/// `{"endpoints": {"<METHOD PATH>": {"request"?, "response"?}}}`. Endpoints
+/// whose request body *is* the Blueprint document (`POST
+/// /v1/blueprints/:id`) point at `mse://api/blueprint-schema` by URI
+/// instead of duplicating that schema here — the two resources stay
+/// separate documents (see the module doc / `must_not_simplify #1` /
+/// `#6`). Thin endpoints (`doctor` / `healthz`) are out of this
+/// subtask's scope; adding one later is one more map entry.
+pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Error> {
+    let task_launch_request_schema = schemars::schema_for!(mlua_swarm_server::TaskLaunchRequest);
+    let task_launch_request = serde_json::to_value(&task_launch_request_schema)?;
+    let task_launch_response_schema = schemars::schema_for!(mlua_swarm_server::TaskLaunchResponse);
+    let task_launch_response = serde_json::to_value(&task_launch_response_schema)?;
+    let task_detail_response_schema = schemars::schema_for!(mlua_swarm_server::TaskDetailResponse);
+    let task_detail_response = serde_json::to_value(&task_detail_response_schema)?;
+    let run_kick_request_schema = schemars::schema_for!(mlua_swarm_server::RunKickRequest);
+    let run_kick_request = serde_json::to_value(&run_kick_request_schema)?;
+    let run_kick_response_schema = schemars::schema_for!(mlua_swarm_server::RunKickResponse);
+    let run_kick_response = serde_json::to_value(&run_kick_response_schema)?;
+
+    Ok(serde_json::json!({
+        "endpoints": {
+            "POST /v1/blueprints/:id": {
+                "request": {
+                    "$comment": "Body is a Blueprint document verbatim; see mse://api/blueprint-schema for its schema.",
+                    "schema_ref": "mse://api/blueprint-schema",
+                },
+                "response": {
+                    "$comment": "Ad-hoc JSON {id, version, seeded} (201/200); not yet a typed schemars struct.",
+                },
+            },
+            "POST /v1/tasks": {
+                "request": task_launch_request,
+                "response": task_launch_response,
+            },
+            "GET /v1/tasks/:id": {
+                "response": task_detail_response,
+            },
+            "POST /v1/tasks/:id/runs": {
+                "request": run_kick_request,
+                "response": run_kick_response,
+            },
+        },
+    }))
+}
+
 /// Resolve a resource entry's body as a `String`. Static entries return
-/// instantly; the schema entry generates fresh JSON on every call so it
-/// never drifts from the `Blueprint` type.
+/// instantly; the schema entries generate fresh JSON on every call so
+/// they never drift from the underlying Rust types.
 pub fn body_for(entry: &ResourceEntry) -> Result<String, String> {
     match entry.body {
         ResourceBody::Static(s) => Ok(s.to_string()),
         ResourceBody::BlueprintSchema => {
             let value = blueprint_schema_value().map_err(|e| format!("schema serialize: {e}"))?;
+            serde_json::to_string_pretty(&value).map_err(|e| format!("schema stringify: {e}"))
+        }
+        ResourceBody::HttpEndpoints => {
+            let value =
+                http_endpoints_schema_value().map_err(|e| format!("schema serialize: {e}"))?;
             serde_json::to_string_pretty(&value).map_err(|e| format!("schema stringify: {e}"))
         }
     }
@@ -189,6 +264,57 @@ mod tests {
         assert!(
             parsed.get("properties").is_some(),
             "schema must expose properties"
+        );
+    }
+
+    #[test]
+    fn http_endpoints_resource_generates_valid_json_with_expected_endpoints() {
+        let entry = find_by_uri("mse://api/http-endpoints").expect("resource must exist");
+        let body = body_for(entry).expect("http-endpoints resource body generation must succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("body must be valid JSON");
+        let endpoints = parsed
+            .get("endpoints")
+            .expect("body must expose an endpoints map")
+            .as_object()
+            .expect("endpoints must be a JSON object");
+        for key in [
+            "POST /v1/blueprints/:id",
+            "POST /v1/tasks",
+            "GET /v1/tasks/:id",
+            "POST /v1/tasks/:id/runs",
+        ] {
+            assert!(
+                endpoints.contains_key(key),
+                "endpoints map must include {key}, got keys: {:?}",
+                endpoints.keys().collect::<Vec<_>>()
+            );
+        }
+        // POST /v1/tasks request schema must expose the TaskLaunchRequest
+        // properties, and must NOT inline the Blueprint schema (must_not_simplify #1/#6).
+        let tasks_request = &endpoints["POST /v1/tasks"]["request"];
+        let props = tasks_request
+            .get("properties")
+            .expect("POST /v1/tasks request must expose properties");
+        assert!(
+            props.get("init_ctx").is_some(),
+            "TaskLaunchRequest schema must expose init_ctx: {tasks_request}"
+        );
+        assert!(
+            props.get("blueprint").is_some(),
+            "TaskLaunchRequest schema must expose blueprint (opaque): {tasks_request}"
+        );
+        // must_not_simplify #6: the blueprint field stays opaque here — no
+        // nested Blueprint-schema properties (e.g. `flow`/`agents`) leak in.
+        assert!(
+            tasks_request.get("flow").is_none(),
+            "Blueprint schema must not be inlined into the http-endpoints resource"
+        );
+        // POST /v1/blueprints/:id cross-refs the existing blueprint-schema
+        // resource instead of duplicating it.
+        assert_eq!(
+            endpoints["POST /v1/blueprints/:id"]["request"]["schema_ref"],
+            serde_json::json!("mse://api/blueprint-schema")
         );
     }
 

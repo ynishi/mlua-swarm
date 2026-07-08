@@ -35,7 +35,7 @@ pub use sqlite::SqliteRunStore;
 
 /// Lifecycle status of a [`RunRecord`] — the outcome of one specific kick
 /// of a Task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     /// Minted, not yet dispatched.
@@ -51,9 +51,10 @@ pub enum RunStatus {
 /// One entry in a Run's step trace — appended as the engine dispatches
 /// (and finishes) each step. Purely observational: no field here is
 /// consulted for flow control.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StepEntry {
     /// The step this entry traces.
+    #[schemars(with = "String")]
     pub step_id: StepId,
     /// The Blueprint step ref (`Step.ref`) that was dispatched, if known.
     pub step_ref: Option<String>,
@@ -65,11 +66,13 @@ pub struct StepEntry {
 }
 
 /// One persisted `Run` row — one kick of a [`crate::store::task::TaskRecord`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunRecord {
     /// Run identifier.
+    #[schemars(with = "String")]
     pub id: RunId,
     /// The Task this Run was kicked from.
+    #[schemars(with = "String")]
     pub task_id: TaskId,
     /// Current lifecycle status.
     pub status: RunStatus,
@@ -80,6 +83,7 @@ pub struct RunRecord {
     pub operator_sid: Option<String>,
     /// The Run's terminal result payload, set once by
     /// [`RunStore::set_result`]. `None` while the Run is in flight.
+    #[schemars(with = "Option<serde_json::Value>")]
     pub result_ref: Option<serde_json::Value>,
     /// Unix epoch seconds — creation time.
     pub created_at: u64,

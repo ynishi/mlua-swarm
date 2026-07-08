@@ -196,7 +196,7 @@ pub enum TaskLaunchError {
 /// (JSON) for rekick to resolve back out of. Every field is
 /// `#[serde(default)]` so a caller may omit any subset (or send `{}`) and
 /// still deserialize.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TaskInputSpec {
     /// Task-level project root path.
     #[serde(default)]
@@ -206,6 +206,7 @@ pub struct TaskInputSpec {
     pub work_dir: Option<String>,
     /// Task-level arbitrary metadata bag (a JSON object, or `None`).
     #[serde(default)]
+    #[schemars(with = "Option<Value>")]
     pub task_metadata: Option<Value>,
 }
 

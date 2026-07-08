@@ -130,7 +130,7 @@ pub async fn tasks_list(
 }
 
 /// Response body for `GET /v1/tasks/:id`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct TaskDetailResponse {
     /// The Task's own record.
     pub task: TaskRecord,
@@ -164,7 +164,7 @@ pub async fn task_get(
 /// [`task_rekick`]'s `Option<Json<Self>>` parameter); a caller that sends
 /// no body, or `{}`, or omits a field gets exactly today's rekick
 /// behavior for that layer.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, schemars::JsonSchema)]
 pub struct RunKickRequest {
     /// Per-Run override for the flow-ir initial ctx. Merged on top of
     /// `TaskRecord.input_ctx` (itself already merged on top of
@@ -175,6 +175,7 @@ pub struct RunKickRequest {
     /// a no-op: the BP+Task merge alone seeds this kick, identical to
     /// pre-#19 rekick.
     #[serde(default)]
+    #[schemars(with = "Option<Value>")]
     pub init_ctx_override: Option<Value>,
     /// Per-Run override for the Task-level canonical fields
     /// (`project_root` / `work_dir` / `task_metadata`). `None` falls back
@@ -187,11 +188,13 @@ pub struct RunKickRequest {
 }
 
 /// Response body for `POST /v1/tasks/:id/runs`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct RunKickResponse {
     /// The re-kicked Task's id (echoes the path param).
+    #[schemars(with = "String")]
     pub task_id: TaskId,
     /// The freshly minted Run id for this kick.
+    #[schemars(with = "String")]
     pub run_id: RunId,
 }
 

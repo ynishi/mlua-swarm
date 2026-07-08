@@ -22,7 +22,10 @@ directive, so wire frames and outputs correlate back to one Run. Server
 drill-down: `GET /v1/tasks` → `GET /v1/tasks/:id` (runs included) →
 `GET /v1/runs/:id` (step trace); `POST /v1/tasks/:id/runs` re-kicks an
 existing Task. Full inventory (sid / worker_handle / req_id /
-capability_token included): `mse://guides/id-lifecycle`.
+capability_token included): `mse://guides/id-lifecycle`. HTTP wire body
+schemas for the `POST /v1/tasks` / `GET /v1/tasks/:id` / `POST
+/v1/tasks/:id/runs` request/response shapes above (and `POST
+/v1/blueprints/:id`): `mse://api/http-endpoints`.
 
 ## Blueprint run / schema
 
@@ -84,3 +87,6 @@ these tools are thin wrappers, not a second process-management layer.
 - Blueprint shape reference: `mse://guides/blueprint-authoring`.
 - Worked samples to feed straight into `swarm_run`: `mse://blueprints/samples/*`.
 - Entry points and quickstart: `mse://guides/getting-started`.
+- Blueprint JSON Schema: `mse://api/blueprint-schema`.
+- HTTP endpoint wire-body JSON Schemas (`/v1/blueprints`, `/v1/tasks`,
+  `/v1/tasks/:id/runs`): `mse://api/http-endpoints`.

@@ -38,7 +38,7 @@ pub use sqlite::SqliteTaskStore;
 /// Coarser than [`crate::store::run::RunStatus`]: a Task's status tracks
 /// "is there work in flight / did the most recent kick finish", while a
 /// Run's status tracks one specific kick's own outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRecordStatus {
     /// Created, no [`crate::store::run::RunRecord`] started yet.
@@ -52,9 +52,10 @@ pub enum TaskRecordStatus {
 }
 
 /// One persisted `Task` row — the work-item identity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TaskRecord {
     /// Task identifier.
+    #[schemars(with = "String")]
     pub id: TaskId,
     /// Human-facing goal / description (e.g. "resolve issue #10").
     pub goal: String,
@@ -62,8 +63,10 @@ pub struct TaskRecord {
     /// `POST /v1/tasks` body's `BlueprintSelector`). Kept as a bare
     /// `serde_json::Value` so the store layer does not depend on the
     /// selector's Rust type — callers decode/encode at the API boundary.
+    #[schemars(with = "serde_json::Value")]
     pub blueprint_ref: serde_json::Value,
     /// Input context supplied at task creation.
+    #[schemars(with = "serde_json::Value")]
     pub input_ctx: serde_json::Value,
     /// Issue #19 ST4: Task-level canonical fields (`project_root` /
     /// `work_dir` / `task_metadata`) snapshot for rekick, stored as JSON
@@ -73,6 +76,7 @@ pub struct TaskRecord {
     /// (backward compat) and for callers whose request carried no
     /// Task-level fields at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
     pub task_input_spec: Option<serde_json::Value>,
     /// Current lifecycle status.
     pub status: TaskRecordStatus,
