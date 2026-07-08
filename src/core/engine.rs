@@ -8,6 +8,7 @@
 //! plus its paired `SpawnerLayer`s and passes through here without the
 //! engine core needing to grow.
 
+use crate::core::agent_context::RUN_ID_KEY;
 use crate::core::config::EngineCfg;
 use crate::core::ctx::{Ctx, OperatorInfo, OperatorKind, SeniorBridge, SpawnHook};
 use crate::core::errors::EngineError;
@@ -1028,7 +1029,7 @@ impl Engine {
         if let Some(rid) = run_id {
             ctx.meta
                 .runtime
-                .insert("run_id".to_string(), Value::String(rid.to_string()));
+                .insert(RUN_ID_KEY.to_string(), Value::String(rid.to_string()));
         }
 
         let worker = spawner
@@ -1214,12 +1215,17 @@ impl Engine {
                 .cloned()
                 .unwrap_or(None);
             let agent = task.spec.agent.clone();
+            let context = s
+                .agent_contexts
+                .get(&(task_id_clone.clone(), attempt))
+                .cloned();
             Ok::<_, EngineError>(crate::types::WorkerPayload {
                 task_id: task_id_clone.clone(),
                 attempt,
                 agent,
                 prompt: render_directive_to_string(&prompt),
                 system,
+                context,
             })
         })
         .await?
@@ -1258,12 +1264,17 @@ impl Engine {
                 .cloned()
                 .unwrap_or(None);
             let agent = task.spec.agent.clone();
+            let context = s
+                .agent_contexts
+                .get(&(task_id_clone.clone(), attempt))
+                .cloned();
             Ok::<_, EngineError>(crate::types::WorkerPayload {
                 task_id: task_id_clone.clone(),
                 attempt,
                 agent,
                 prompt: render_directive_to_string(&prompt),
                 system,
+                context,
             })
         })
         .await?

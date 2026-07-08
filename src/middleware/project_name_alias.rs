@@ -30,7 +30,14 @@ use std::sync::Arc;
 
 /// Key under `ctx.meta.runtime` that downstream Operator code reads with
 /// `get`.
-pub const PROJECT_NAME_ALIAS_KEY: &str = "project_name_alias";
+///
+/// GH #20: canonical definition moved to
+/// [`crate::core::agent_context::PROJECT_NAME_ALIAS_KEY`]; re-exported
+/// here so existing import paths
+/// (`crate::middleware::project_name_alias::PROJECT_NAME_ALIAS_KEY`, and
+/// the crate-root `mlua_swarm::PROJECT_NAME_ALIAS_KEY` re-export) stay
+/// valid.
+pub use crate::core::agent_context::PROJECT_NAME_ALIAS_KEY;
 
 /// `SpawnerLayer` that drops the received alias into `ctx` just before spawn.
 pub struct ProjectNameAliasMiddleware {

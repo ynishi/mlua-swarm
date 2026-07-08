@@ -42,14 +42,27 @@ use serde_json::Value;
 use std::sync::Arc;
 
 /// Key under `ctx.meta.runtime` that carries the project root path.
-pub const TASK_PROJECT_ROOT_KEY: &str = "project_root";
+///
+/// GH #20: canonical definition moved to
+/// [`crate::core::agent_context::TASK_PROJECT_ROOT_KEY`]; re-exported here
+/// so existing import paths (`crate::middleware::task_input::TASK_PROJECT_ROOT_KEY`)
+/// stay valid.
+pub use crate::core::agent_context::TASK_PROJECT_ROOT_KEY;
 
 /// Key under `ctx.meta.runtime` that carries the work dir path.
-pub const TASK_WORK_DIR_KEY: &str = "work_dir";
+///
+/// GH #20: canonical definition moved to
+/// [`crate::core::agent_context::TASK_WORK_DIR_KEY`]; re-exported here so
+/// existing import paths stay valid.
+pub use crate::core::agent_context::TASK_WORK_DIR_KEY;
 
 /// Key under `ctx.meta.runtime` that carries the free-form task metadata
 /// object.
-pub const TASK_METADATA_KEY: &str = "task_metadata";
+///
+/// GH #20: canonical definition moved to
+/// [`crate::core::agent_context::TASK_METADATA_KEY`]; re-exported here so
+/// existing import paths stay valid.
+pub use crate::core::agent_context::TASK_METADATA_KEY;
 
 /// `SpawnerLayer` that drops task-level execution context (`project_root` /
 /// `work_dir` / `task_metadata`) into `ctx` just before spawn.

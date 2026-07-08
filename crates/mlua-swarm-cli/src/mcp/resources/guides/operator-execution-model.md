@@ -65,25 +65,38 @@ translate the runtime context into a header the MainAI (an LLM) can read
 straight through, alongside the routing fields the SubAgent needs to
 self-fetch (`worker_handle`, `base_url`, `task_id`).
 
-Splice source is `Ctx.meta.runtime`; the renderer lives in
+**Resolved by GH #20 (Contract C — `AgentContextView`)**: the splice
+source is now one materialized view, not individual `Ctx.meta.runtime`
+reads. `AgentContextMiddleware` (`src/middleware/agent_context.rs`, the
+innermost spawner layer) builds an `AgentContextView`
+(`src/core/agent_context.rs`) from `Ctx` exactly once per spawn and fans
+it out on two rails: (a) `EngineState.agent_contexts[(task_id, attempt)]`
+— the Worker axis source (hop 4 below), and (b)
+`ctx.meta.runtime[AGENT_CONTEXT_KEY]` (JSON-serialized) — the Spawner
+axis source this hop reads back via `AgentContextView::materialized_or_from_ctx`.
+
+The renderer lives in
 `crates/mlua-swarm-server/src/operator_ws/session.rs`
-(`default_spawn_directive_with_task_directive`). Every key it splices
-comes out as a `key: value` header line at the top of the directive.
+(`default_spawn_directive_with_task_directive`, taking `view:
+&AgentContextView` in place of the old individual params). Header lines
+come from `AgentContextView::to_directive_header`, which renders one
+`key: value` line per present field, in this order:
 
-Currently spliced (as of this doc's write date):
-
+- `project_name_alias: <value>` — from `Blueprint.metadata.project_name_alias`.
 - `project_root: <value>` — from `Ctx.meta.runtime["project_root"]`.
 - `work_dir: <value>` — from `Ctx.meta.runtime["work_dir"]`.
-- `run_id: <value>` — from `Ctx.meta.runtime["run_id"]`.
-- `project_name_alias: <value>` — from `Blueprint.metadata.project_name_alias`.
+- `task_metadata: <compact-json>` — from `Ctx.meta.runtime["task_metadata"]`
+  (the F2 gap this section used to track — closed as of GH #20: a
+  MainAI reading the directive can now see `task_metadata`'s inner keys
+  directly, without falling back to convention or `issue.md`'s body).
+- One `<extra key>: <compact-json>` line per `AgentContextView.extra`
+  entry — the injectable surface future supply-axis fields (FlowIr ctx /
+  StepMeta) land on. A field added there reaches this splice with no
+  further wiring.
 
-**Gap (open follow-up)**: `task_metadata`'s inner keys are not spliced
-yet. A MainAI reading a directive today cannot see them, and neither can
-the SubAgent (see hop 3). The splice is a straightforward extension
-of `default_spawn_directive_with_task_directive`; until then MainAIs and
-SubAgents recover the missing fields the same way they did before
-`task_metadata` was formalized — from convention (`work_dir` via the
-workspace layout rules) or from `issue.md`'s body.
+`run_id: <value>` (from `Ctx.meta.runtime["run_id"]`) is rendered
+separately, into the observation route hint (`GET /v1/runs/{run_id}`) —
+not part of the task-level context header above.
 
 ## Hop 3 — Spawn.directive → SubAgent launch prompt (MainAI-owned)
 
@@ -106,9 +119,10 @@ decides. Two conventions worth noting:
 - Task-level path fields (`project_root`, `work_dir`) are typically
   relayed verbatim so the SubAgent starts from the right working
   directory without having to derive it.
-- Task-level metadata that a specific SubAgent needs (once splice
-  completes) is relayed in a form the SubAgent's agent definition
-  expects (typically `key: value` lines matching the directive header).
+- Task-level metadata that a specific SubAgent needs is relayed in a
+  form the SubAgent's agent definition expects (typically `key: value`
+  lines matching the directive header — `task_metadata:` included, as
+  of GH #20).
 
 ## Hop 4 — SubAgent self-fetch + submit (SubAgent-owned)
 
@@ -116,9 +130,20 @@ The SubAgent (`mse-worker`) does not read the directive text itself. Its
 own contract is documented in `mse-worker.md`:
 
 1. `GET <base_url>/v1/worker/prompt?task_id=<task_id>` with
-   `Authorization: Bearer <worker_handle>` — returns
-   `{system, prompt, agent, ...}` where `system` is the agent persona
-   and `prompt` is `TaskSpec.initial_directive` rendered to a string.
+   `Authorization: Bearer <worker_handle>` — returns a `WorkerPayload`
+   JSON body: `{system, prompt, agent, ..., context?}` where `system` is
+   the agent persona, `prompt` is `TaskSpec.initial_directive` rendered
+   to a string, and `context` (GH #20 Contract C, optional — present
+   whenever `AgentContextMiddleware` was layered onto the dispatching
+   spawner stack) carries the same materialized `AgentContextView` hop 2
+   splices into the directive text, as structured JSON instead of
+   header lines — the Worker axis's read-back source, keyed by
+   `(task_id, attempt)` in `EngineState.agent_contexts`. In practice
+   the SubAgent has already been handed whatever it needs as prompt
+   text via hop 3, so consuming `context` here is optional; it exists
+   as a structured fallback for a SubAgent that wants
+   `task_metadata` / `project_root` / `work_dir` as JSON rather than
+   re-parsing header lines out of the prompt it was launched with.
 2. Adopt `system` as its role, take `prompt` as the task input, run.
 3. `POST <base_url>/v1/worker/submit` with the raw output body.
 4. Reply `OUTPUT` on stdin and stop.

@@ -32,25 +32,30 @@
 //! }
 //! ```
 //!
-//! ## `project_root` resolution (issue #17)
+//! ## `project_root` resolution (issue #17, GH #20)
 //!
 //! `spec.project_root` (above) is only the **compile-time fallback**
 //! tier — resolved once in [`AgentBlockInProcessSpawnerFactory::build`],
 //! before any `Ctx` exists. At spawn time,
 //! [`AgentBlockCtxAwareSpawner::spawn`] re-resolves the actual worker
-//! cwd per invocation with this priority (highest first):
+//! cwd per invocation through a materialized
+//! [`crate::core::agent_context::AgentContextView`]
+//! (`AgentContextView::materialized_or_from_ctx`, GH #20 Contract C —
+//! see that module's doc for the full narrative) with this priority
+//! (highest first):
 //!
-//! 1. `ctx.meta.runtime["work_dir"]` — Task-level, set by
-//!    `TaskInputMiddleware` from the launch's `init_ctx.work_dir`.
-//! 2. `ctx.meta.runtime["project_root"]` — same middleware,
-//!    `init_ctx.project_root`.
+//! 1. `view.work_dir` — Task-level, set by `TaskInputMiddleware` from
+//!    the launch's `init_ctx.work_dir`.
+//! 2. `view.project_root` — same middleware, `init_ctx.project_root`.
 //! 3. `spec.project_root` / `std::env::current_dir()` (the compile-time
 //!    fallback baked into [`AgentBlockSettings`] above).
 //!
 //! This lets a single Blueprint's `AgentDef.spec.project_root` (fixed at
 //! compile time) be overridden per task launch, so the same Blueprint
 //! can run against different caller-supplied project roots without a
-//! `spec` edit.
+//! `spec` edit. GH #20 additionally threads `view.task_metadata` into
+//! `AgentBlockSettings::task_metadata` — the pull path this axis
+//! previously lacked entirely.
 //!
 //! ## SDK paths introduced from v0.22.0 through v0.27.0
 //!
@@ -63,9 +68,9 @@
 //! | v0.26.0 | `ScriptSource` / `PromptSource` / `SecretKeySource` enums plus the embedded `DefaultAgent` invoker (breaking) | Script becomes optional at the SDK level |
 //! | v0.27.0 | Embed the `compile_loop` StdPkg into core | `require("compile_loop")` hits directly |
 
+use crate::core::agent_context::AgentContextView;
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
-use crate::middleware::task_input::{TASK_PROJECT_ROOT_KEY, TASK_WORK_DIR_KEY};
 use crate::types::{CapToken, StepId};
 use crate::worker::adapter::{
     InProcSpawner, SpawnError, SpawnerAdapter, WorkerError, WorkerInvocation, WorkerResult,
@@ -179,6 +184,17 @@ struct AgentBlockSettings {
     /// body and frontmatter. `None` maps to `BlockConfig.context = None`
     /// for backwards compatibility with the old path.
     profile_context: Option<String>,
+    /// GH #20 Contract C: `AgentContextView.task_metadata`, re-resolved
+    /// per invocation alongside `project_root` (see
+    /// [`AgentBlockCtxAwareSpawner::resolve_settings`]). `None` at
+    /// compile time (no `Ctx` exists yet in
+    /// [`AgentBlockInProcessSpawnerFactory::build`]) and whenever the
+    /// materialized view carries no task metadata. This is the pull
+    /// path the in-process AgentBlock axis previously lacked entirely —
+    /// the field exists here so a future consumption point (script /
+    /// env sink) has somewhere to read it from; wiring one is a future
+    /// issue.
+    task_metadata: Option<Value>,
 }
 
 /// One invocation's worth of an `agent-block-core` SDK call — the
@@ -456,6 +472,9 @@ impl crate::blueprint::compiler::SpawnerFactory for AgentBlockInProcessSpawnerFa
             project_root,
             mcp_rpc_timeout,
             profile_context,
+            // GH #20: no `Ctx` exists yet at compile time — the ctx-aware
+            // tier is re-resolved per invocation in `resolve_settings`.
+            task_metadata: None,
         });
 
         Ok(Arc::new(AgentBlockCtxAwareSpawner {
@@ -497,32 +516,34 @@ struct AgentBlockCtxAwareSpawner {
 }
 
 impl AgentBlockCtxAwareSpawner {
-    /// Applies the `ctx.meta.runtime` override tier on top of
-    /// `base_settings.project_root`. `work_dir` outranks `project_root`
-    /// (it names the exact directory this specific worker should run
-    /// from); either, if present, overrides the compile-time baseline
-    /// entirely. Neither present → the baseline settings are reused
-    /// as-is (no clone).
+    /// Applies the `AgentContextView` override tier on top of
+    /// `base_settings.project_root` / `.task_metadata` (GH #20 Contract
+    /// C — materializes the view via
+    /// `AgentContextView::materialized_or_from_ctx`, then reads
+    /// `work_dir` / `project_root` / `task_metadata` off it instead of
+    /// pulling individual `ctx.meta.runtime` keys). `work_dir` outranks
+    /// `project_root` (it names the exact directory this specific
+    /// worker should run from); either, if present, overrides the
+    /// compile-time `project_root` baseline entirely. `task_metadata`
+    /// (when present on the view) always overrides the compile-time
+    /// `None` baseline — there is no compile-time equivalent to
+    /// override. Neither `work_dir` nor `project_root` present AND no
+    /// `task_metadata` → the baseline settings are reused as-is (no
+    /// clone).
     fn resolve_settings(&self, ctx: &Ctx) -> Arc<AgentBlockSettings> {
-        let override_path = ctx
-            .meta
-            .runtime
-            .get(TASK_WORK_DIR_KEY)
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                ctx.meta
-                    .runtime
-                    .get(TASK_PROJECT_ROOT_KEY)
-                    .and_then(|v| v.as_str())
-            });
-        match override_path {
-            Some(p) => {
-                let mut settings = (*self.base_settings).clone();
-                settings.project_root = PathBuf::from(p);
-                Arc::new(settings)
-            }
-            None => self.base_settings.clone(),
+        let view = AgentContextView::materialized_or_from_ctx(ctx);
+        let override_path = view.work_dir.as_deref().or(view.project_root.as_deref());
+        if override_path.is_none() && view.task_metadata.is_none() {
+            return self.base_settings.clone();
         }
+        let mut settings = (*self.base_settings).clone();
+        if let Some(p) = override_path {
+            settings.project_root = PathBuf::from(p);
+        }
+        if let Some(meta) = view.task_metadata {
+            settings.task_metadata = Some(meta);
+        }
+        Arc::new(settings)
     }
 }
 
@@ -584,6 +605,7 @@ impl crate::worker::Worker for AgentBlockWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::agent_context::{TASK_METADATA_KEY, TASK_PROJECT_ROOT_KEY, TASK_WORK_DIR_KEY};
 
     #[test]
     fn resolve_needed_mcp_servers_filters_by_tool_prefix() {
@@ -780,6 +802,7 @@ mod tests {
             project_root: PathBuf::from(project_root),
             mcp_rpc_timeout: Duration::from_secs(30),
             profile_context: None,
+            task_metadata: None,
         })
     }
 
@@ -827,6 +850,44 @@ mod tests {
         ]);
         let resolved = spawner.resolve_settings(&ctx);
         assert_eq!(resolved.project_root, PathBuf::from("/ctx-work"));
+    }
+
+    /// GH #20: `task_metadata` on the materialized `AgentContextView`
+    /// (the pull path this axis previously lacked entirely) is threaded
+    /// into `AgentBlockSettings.task_metadata`, overriding the
+    /// compile-time `None` baseline.
+    #[test]
+    fn resolve_settings_picks_up_task_metadata_from_ctx() {
+        let spawner = AgentBlockCtxAwareSpawner {
+            agent_name: "writer".into(),
+            base_settings: test_settings("/spec-root"),
+        };
+        let mut ctx = Ctx::new(StepId::parse("ST-project-root").unwrap(), 1, "writer");
+        ctx.meta.runtime.insert(
+            TASK_METADATA_KEY.to_string(),
+            serde_json::json!({"issue": 20}),
+        );
+        let resolved = spawner.resolve_settings(&ctx);
+        assert_eq!(
+            resolved.task_metadata,
+            Some(serde_json::json!({"issue": 20}))
+        );
+        // No project_root / work_dir override present — the compile-time
+        // project_root baseline is left untouched.
+        assert_eq!(resolved.project_root, PathBuf::from("/spec-root"));
+    }
+
+    /// Absent `task_metadata` in `ctx.meta.runtime` stays `None` — same
+    /// "insert nothing when absent" contract every other field follows.
+    #[test]
+    fn resolve_settings_task_metadata_stays_none_when_absent() {
+        let spawner = AgentBlockCtxAwareSpawner {
+            agent_name: "writer".into(),
+            base_settings: test_settings("/spec-root"),
+        };
+        let ctx = ctx_with_runtime(&[]);
+        let resolved = spawner.resolve_settings(&ctx);
+        assert!(resolved.task_metadata.is_none());
     }
 
     /// End-to-end: a real `Ctx.meta.runtime["project_root"]` override

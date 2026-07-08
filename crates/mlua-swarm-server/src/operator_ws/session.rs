@@ -11,7 +11,7 @@
 //! For the detailed S↔C message flow, see the overview figure in `mod.rs`.
 
 use async_trait::async_trait;
-use mlua_swarm::middleware::task_input::{TASK_PROJECT_ROOT_KEY, TASK_WORK_DIR_KEY};
+use mlua_swarm::core::agent_context::AgentContextView;
 use mlua_swarm::{
     CapToken, Ctx, Operator, SeniorBridge, SessionId, SpawnHook, StepId, WorkerBinding,
     WorkerError, WorkerResult,
@@ -233,11 +233,6 @@ impl Operator for WSOperatorSession {
             .get("worker_handle")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let project_name_alias = ctx
-            .meta
-            .runtime
-            .get("project_name_alias")
-            .and_then(|v| v.as_str());
         let data_sink_endpoint = ctx
             .meta
             .runtime
@@ -248,23 +243,15 @@ impl Operator for WSOperatorSession {
         // `Ctx.meta.runtime["run_id"]`; `None` on launches with no run
         // tracing (see `Engine::dispatch_attempt_with`'s `run_id` param).
         let run_id = ctx.meta.runtime.get("run_id").and_then(|v| v.as_str());
-        // issue #17: task-level execution context (`project_root` /
-        // `work_dir`) injected into `Ctx.meta.runtime` by
-        // `TaskInputMiddleware` (see `mlua_swarm::middleware::task_input`)
-        // from the launch request's `init_ctx` body. Each key is
-        // independent and absent when `TaskInputMiddleware` was never
-        // layered (no fields present in `init_ctx`) or the caller omitted
-        // this particular field.
-        let project_root = ctx
-            .meta
-            .runtime
-            .get(TASK_PROJECT_ROOT_KEY)
-            .and_then(|v| v.as_str());
-        let work_dir = ctx
-            .meta
-            .runtime
-            .get(TASK_WORK_DIR_KEY)
-            .and_then(|v| v.as_str());
+        // GH #20 Contract C: `project_name_alias` / `project_root` /
+        // `work_dir` (previously read individually here) now come off one
+        // materialized `AgentContextView` — reads back the view
+        // `AgentContextMiddleware` stashed into
+        // `ctx.meta.runtime[AGENT_CONTEXT_KEY]`, falling back to a
+        // field-by-field pull off `ctx.meta.runtime` when that middleware
+        // was never layered (backward compat). See the module doc on
+        // `mlua_swarm::core::agent_context` for the full narrative.
+        let view = AgentContextView::materialized_or_from_ctx(ctx);
         // issue #18: `prompt` is `TaskSpec.initial_directive`, threaded as
         // `Value` end-to-end through `EngineState.prompts` /
         // `Engine::fetch_prompt`. The WS Spawn frame text render is the
@@ -275,12 +262,10 @@ impl Operator for WSOperatorSession {
             &ctx.agent,
             ctx.task_id.as_str(),
             &worker.variant,
-            project_name_alias,
+            &view,
             data_sink_endpoint,
             self.base_url.as_deref(),
             run_id,
-            project_root,
-            work_dir,
             &prompt,
         );
         let msg = ServerMsg::Spawn {
@@ -344,17 +329,25 @@ impl Operator for WSOperatorSession {
 /// agent.md `system` (= the body fetched by `GET /v1/worker/prompt`); the
 /// directive is narrowed to the minimum routing information.
 ///
-/// # `project_name_alias` literal expansion
+/// # `project_name_alias` / `project_root` / `work_dir` / `task_metadata`
+/// (GH #20 Contract C — `AgentContextView.to_directive_header`)
 ///
-/// When the caller sets `Blueprint.metadata.project_name_alias = Some(a)`
-/// (schema field defined in `mlua-swarm-blueprint-schema::BlueprintMetadata`),
-/// the value flows into `ctx.meta.runtime["project_name_alias"]` via the
-/// `ProjectNameAliasLayer` SpawnerLayer (see
-/// `mlua_swarm::middleware::project_name_alias`). This function
-/// then expands the alias **literally** into the Spawn directive text — as the
-/// `project_name_alias: {a}` header line and as the "LDS Session Alias" mandatory
-/// reminder block for the MainAI. The engine itself performs no other action on
-/// the alias; the expansion here is what the MainAI actually reads.
+/// These task-level context header lines are no longer read individually
+/// here — they come off one materialized `view: &AgentContextView`
+/// (see `mlua_swarm::core::agent_context` for the full Contract C
+/// narrative) via [`AgentContextView::to_directive_header`], rendered
+/// verbatim at the top of the "worker endpoint" block below. Format is
+/// byte-identical to the pre-#20 individual splices
+/// (`project_name_alias: {a}` / `project_root: {p}` / `work_dir: {w}`,
+/// each independently absent-or-present, no empty-string placeholder) —
+/// the additive change is the new `task_metadata: {compact-json}` line
+/// (closes the F2 gap tracked in the `operator-execution-model` guide)
+/// plus one line per `view.extra` entry.
+///
+/// `project_name_alias` is ALSO used below (via `view.project_name_alias`)
+/// to expand the "LDS Session Alias" mandatory reminder block for the
+/// MainAI — the engine itself performs no other action on the alias; the
+/// expansion here is what the MainAI actually reads.
 ///
 /// # `subagent_type` (Blueprint-baked worker binding)
 ///
@@ -377,51 +370,24 @@ impl Operator for WSOperatorSession {
 /// `Engine::dispatch_attempt_with`), and is rendered into the observation
 /// route hint below (`GET /v1/runs/{run_id}`) so a MainAI reading the
 /// directive can drill into that specific kick's `RunRecord.step_entries`
-/// trace. `None` falls back to a generic `<run_id>` placeholder.
-///
-/// # `project_root` / `work_dir` (issue #17 task-level execution context)
-///
-/// When the launch request's `init_ctx` body carries `project_root` and/or
-/// `work_dir`, `TaskInputMiddleware` (see
-/// `mlua_swarm::middleware::task_input`) inserts them into
-/// `Ctx.meta.runtime` under `TASK_PROJECT_ROOT_KEY` / `TASK_WORK_DIR_KEY`.
-/// Each is independently `Some`/`None` — mirroring `project_name_alias`'s
-/// splice pattern above, each renders as its own header line
-/// (`project_root: {p}` / `work_dir: {w}`) when present and is omitted
-/// entirely (no empty-string placeholder) when absent.
+/// trace. `None` falls back to a generic `<run_id>` placeholder. Kept as
+/// its own parameter (not read off `view`) — the directive's observation
+/// route hint is a separate rendering concern from the task-level context
+/// header.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn default_spawn_directive(
     agent: &str,
     task_id: &str,
     subagent_type: &str,
-    project_name_alias: Option<&str>,
+    view: &AgentContextView,
     data_sink_endpoint: Option<&str>,
     base_url: Option<&str>,
     run_id: Option<&str>,
-    project_root: Option<&str>,
-    work_dir: Option<&str>,
 ) -> String {
-    // Expanded only when Blueprint.metadata.project_name_alias is Some.
-    // Presents a discipline reminder to the MainAI plus the literal line the
-    // SubAgent prompt should inject.
-    let project_alias_line = match project_name_alias {
-        Some(a) => format!("project_name_alias: {a}\n"),
-        None => String::new(),
-    };
-    // issue #17: task-level `project_root` / `work_dir` header lines,
-    // spliced the same way as `project_alias_line` above — present only
-    // when `TaskInputMiddleware` populated the corresponding
-    // `Ctx.meta.runtime` key; absent means no line at all (not an empty
-    // value), matching `TaskInputMiddleware`'s own "insert nothing when
-    // absent" contract.
-    let project_root_line = match project_root {
-        Some(p) => format!("project_root: {p}\n"),
-        None => String::new(),
-    };
-    let work_dir_line = match work_dir {
-        Some(w) => format!("work_dir: {w}\n"),
-        None => String::new(),
-    };
+    // GH #20: task-level context header lines (project_name_alias /
+    // project_root / work_dir / task_metadata / extra), rendered by the
+    // materialized view itself. See the doc above.
+    let context_header = view.to_directive_header();
     // Endpoint hint for the Data path (Big Response routing). Only when
     // Some, inject a convention line telling the MainAgent to pass the Big
     // EMIT POST target URL into the SubAgent prompt or environment when it
@@ -446,7 +412,7 @@ pub(super) fn default_spawn_directive(
         ),
         None => String::new(),
     };
-    let main_ai_reminder = match project_name_alias {
+    let main_ai_reminder = match view.project_name_alias.as_deref() {
         Some(a) => format!(
             "\n\
              [LDS Session Alias Reminder — MainAI mandatory]\n\
@@ -486,9 +452,7 @@ pub(super) fn default_spawn_directive(
          auth: Bearer <worker_handle from THIS Spawn payload (= short `wh-XXXXXXXX` form)>\n\
          task_id: {task_id}\n\
          agent_id: {agent}\n\
-         {project_alias_line}\
-         {project_root_line}\
-         {work_dir_line}\
+         {context_header}\
          {data_endpoint_block}\
          {main_ai_reminder}\
          Kick a SubAgent via Agent tool with subagent_type=\"{subagent_type}\" (= project-local \
@@ -533,24 +497,20 @@ pub(super) fn default_spawn_directive_with_task_directive(
     agent: &str,
     task_id: &str,
     subagent_type: &str,
-    project_name_alias: Option<&str>,
+    view: &AgentContextView,
     data_sink_endpoint: Option<&str>,
     base_url: Option<&str>,
     run_id: Option<&str>,
-    project_root: Option<&str>,
-    work_dir: Option<&str>,
     task_directive: &Value,
 ) -> String {
     let base = default_spawn_directive(
         agent,
         task_id,
         subagent_type,
-        project_name_alias,
+        view,
         data_sink_endpoint,
         base_url,
         run_id,
-        project_root,
-        work_dir,
     );
     // Strings pass through verbatim; anything else (Object / Array /
     // Number / Bool) is serde-stringified — the same coercion pattern
@@ -567,6 +527,28 @@ pub(super) fn default_spawn_directive_with_task_directive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlua_swarm::core::agent_context::{
+        TASK_METADATA_KEY, TASK_PROJECT_ROOT_KEY, TASK_WORK_DIR_KEY,
+    };
+
+    /// Test helper: builds an `AgentContextView` with only
+    /// `project_name_alias` / `project_root` / `work_dir` set (the three
+    /// fields `default_spawn_directive`'s retired individual params used
+    /// to carry) — everything else stays at `Default`. Mirrors the
+    /// pre-#20 call shape so the mechanical rewrite of every existing
+    /// test stays a 1:1 argument swap.
+    fn view_with(
+        alias: Option<&str>,
+        project_root: Option<&str>,
+        work_dir: Option<&str>,
+    ) -> AgentContextView {
+        AgentContextView {
+            project_name_alias: alias.map(String::from),
+            project_root: project_root.map(String::from),
+            work_dir: work_dir.map(String::from),
+            ..AgentContextView::default()
+        }
+    }
 
     #[test]
     fn directive_omits_project_name_alias_when_none() {
@@ -574,9 +556,7 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
-            None,
-            None,
+            &view_with(None, None, None),
             None,
             None,
             None,
@@ -592,9 +572,7 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            Some("mse-task-7785"),
-            None,
-            None,
+            &view_with(Some("mse-task-7785"), None, None),
             None,
             None,
             None,
@@ -639,9 +617,7 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
-            None,
-            None,
+            &view_with(None, None, None),
             None,
             None,
             None,
@@ -658,10 +634,8 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
+            &view_with(None, None, None),
             Some(base),
-            None,
-            None,
             None,
             None,
         );
@@ -697,9 +671,7 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
-            None,
-            None,
+            &view_with(None, None, None),
             None,
             None,
             None,
@@ -738,11 +710,9 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
+            &view_with(None, None, None),
             None,
             Some("http://127.0.0.1:8888"),
-            None,
-            None,
             None,
         );
         assert!(
@@ -764,9 +734,7 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
-            None,
-            None,
+            &view_with(None, None, None),
             None,
             None,
             None,
@@ -791,11 +759,9 @@ mod tests {
                 "impl-lead",
                 "task-x",
                 "mse-worker-coder",
-                Some("mse-task-alias"),
+                &view_with(Some("mse-task-alias"), None, None),
                 Some("http://127.0.0.1:7785"),
                 base,
-                None,
-                None,
                 None,
             );
             assert!(
@@ -816,12 +782,10 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
+            &view_with(None, None, None),
             None,
             None,
             Some("R-abc123"),
-            None,
-            None,
         );
         assert!(
             !d.contains("/v1/tasks/{id}") && !d.contains("/v1/tasks/{{id}}"),
@@ -837,12 +801,10 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
+            &view_with(None, None, None),
             None,
             None,
             Some("R-abc123"),
-            None,
-            None,
         );
         assert!(
             d.contains("GET <base_url>/v1/runs/R-abc123"),
@@ -858,9 +820,7 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
-            None,
-            None,
+            &view_with(None, None, None),
             None,
             None,
             None,
@@ -881,9 +841,7 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
-            None,
-            None,
+            &view_with(None, None, None),
             None,
             None,
             None,
@@ -900,12 +858,10 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
+            &view_with(None, Some("/repo"), Some("/repo/work")),
             None,
             None,
             None,
-            None,
-            Some("/repo"),
-            Some("/repo/work"),
         );
         assert!(
             d.contains("project_root: /repo"),
@@ -925,11 +881,9 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
+            &view_with(None, Some("/repo"), None),
             None,
             None,
-            None,
-            None,
-            Some("/repo"),
             None,
         );
         assert!(
@@ -937,6 +891,52 @@ mod tests {
             "directive missing project_root header: {d}"
         );
         assert!(!d.contains("work_dir:"));
+    }
+
+    // ─── GH #20: task_metadata header line (Contract C, closes the F2 gap) ─
+
+    /// `task_metadata` renders as a new `task_metadata: {compact-json}`
+    /// line — the F2 gap the `operator-execution-model` guide tracked
+    /// (`task_metadata`'s inner keys were never spliced into the
+    /// directive before GH #20).
+    #[test]
+    fn directive_splices_task_metadata_when_some() {
+        let view = AgentContextView {
+            task_metadata: Some(serde_json::json!({"issue": 20})),
+            ..view_with(None, Some("/repo"), None)
+        };
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            &view,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            d.contains(r#"task_metadata: {"issue":20}"#),
+            "directive missing task_metadata header: {d}"
+        );
+        // Additive-only: the pre-existing project_root line still renders.
+        assert!(d.contains("project_root: /repo"));
+    }
+
+    /// `task_metadata: None` (absent) omits the line entirely — no
+    /// empty-string placeholder, matching every other header line's
+    /// absent-field contract.
+    #[test]
+    fn directive_omits_task_metadata_when_none() {
+        let d = default_spawn_directive(
+            "impl-lead",
+            "task-x",
+            "mse-worker-coder",
+            &view_with(None, None, None),
+            None,
+            None,
+            None,
+        );
+        assert!(!d.contains("task_metadata:"));
     }
 
     // ─── Issue #7: spawn_halt handling in Operator::execute ──────────────
@@ -1267,6 +1267,70 @@ mod tests {
         handle.await.expect("join").expect("execute Ok");
     }
 
+    /// GH #20 / F2 gap: `task_metadata` in `ctx.meta.runtime` (the
+    /// `TaskInputMiddleware` injection shape) now reaches the
+    /// `ServerMsg::Spawn.directive` actually sent over the wire, via
+    /// `AgentContextView::materialized_or_from_ctx` falling back to
+    /// `from_ctx` when `AgentContextMiddleware` was not layered.
+    #[tokio::test]
+    async fn execute_splices_task_metadata_from_ctx_meta_runtime() {
+        use mlua_swarm::Operator;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-ctxmeta").unwrap(),
+            tx,
+            None,
+        ));
+
+        let mut ctx = test_ctx("ST-ctxmeta");
+        ctx.meta.runtime.insert(
+            TASK_METADATA_KEY.to_string(),
+            serde_json::json!({"issue": 20}),
+        );
+
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &ctx,
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        let sent = rx.recv().await.expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn {
+                req_id, directive, ..
+            } => {
+                let directive = directive.as_str();
+                assert!(
+                    directive.contains(r#"task_metadata: {"issue":20}"#),
+                    "directive missing task_metadata splice: {directive}"
+                );
+                req_id
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnAck {
+                    value: serde_json::json!({}),
+                    ok: true,
+                    error: None,
+                },
+            )
+            .await;
+        handle.await.expect("join").expect("execute Ok");
+    }
+
     // ─── Issue #18: `Value` pass-through render boundary
     //     (`default_spawn_directive_with_task_directive`) ───
 
@@ -1278,9 +1342,7 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
-            None,
-            None,
+            &view_with(None, None, None),
             None,
             None,
             None,
@@ -1302,9 +1364,7 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
-            None,
-            None,
+            &view_with(None, None, None),
             None,
             None,
             None,
@@ -1326,9 +1386,7 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
-            None,
-            None,
+            &view_with(None, None, None),
             None,
             None,
             None,
@@ -1338,9 +1396,7 @@ mod tests {
             "impl-lead",
             "task-x",
             "mse-worker-coder",
-            None,
-            None,
-            None,
+            &view_with(None, None, None),
             None,
             None,
             None,

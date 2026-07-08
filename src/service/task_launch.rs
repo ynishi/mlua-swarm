@@ -24,6 +24,7 @@ use crate::blueprint::{Blueprint, EngineDispatcher};
 use crate::core::ctx::OperatorKind;
 use crate::core::engine::Engine;
 use crate::core::errors::EngineError;
+use crate::middleware::agent_context::AgentContextMiddleware;
 use crate::middleware::project_name_alias::ProjectNameAliasMiddleware;
 use crate::middleware::task_input::TaskInputMiddleware;
 use crate::middleware::worker_binding::WorkerBindingMiddleware;
@@ -385,6 +386,18 @@ impl TaskLaunchService {
             &input.blueprint.spawner_hints.layers,
             &self.engine,
         );
+        // GH #20 Contract C: materialize an `AgentContextView` exactly
+        // once per spawn, innermost relative to every other layer below
+        // (alias / worker-binding / task-input all insert `ctx.meta.runtime`
+        // keys this layer must observe, so it is added FIRST — later
+        // `.layer()` calls become outer, see `middleware::SpawnerStack`).
+        // Unconditional (always layered): `ContextPolicy::default()` is
+        // pass-all. This is the receptacle for a future Blueprint-driven
+        // policy (e.g. `AgentMeta.context_policy`) — wiring that field is
+        // a future issue, out of scope here.
+        let spawner = SpawnerStack::new(spawner)
+            .layer(AgentContextMiddleware::default())
+            .build();
         // When `Blueprint.metadata.project_name_alias` is Some, layer a
         // `ProjectNameAliasMiddleware` on top of the stack that injects the
         // alias into `Ctx.meta.runtime.project_name_alias` just before spawn.

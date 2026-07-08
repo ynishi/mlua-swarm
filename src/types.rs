@@ -477,10 +477,16 @@ impl CapToken {
 ///   targeting.
 /// - `attempt`: the 1-based attempt number, matching the current
 ///   `task.attempt`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// - `context`: GH #20 Contract C — the materialized
+///   [`crate::core::agent_context::AgentContextView`] for this
+///   `(task_id, attempt)`, when `AgentContextMiddleware` was layered onto
+///   the spawner stack that dispatched it. `None` on pre-#20 payloads
+///   (backward compat) and whenever the middleware was never layered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerPayload {
     /// The task this payload was fetched for. Typed [`StepId`] since issue
     /// #14 — serde keeps the wire shape a plain string.
+    #[schemars(with = "String")]
     pub task_id: StepId,
     /// 1-based attempt number, matching the current `task.attempt`.
     pub attempt: u32,
@@ -491,6 +497,10 @@ pub struct WorkerPayload {
     pub system: Option<String>,
     /// The task's initial directive, baked in at dispatch preparation.
     pub prompt: String,
+    /// GH #20 Contract C: the materialized task-level context view — see
+    /// the struct doc above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::core::agent_context::AgentContextView>,
 }
 
 /// Error returned when `CapToken::decode` fails.
@@ -815,5 +825,59 @@ mod cap_token_transport_tests {
         let bogus = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"oops\":1}");
         let err = CapToken::decode(&bogus).expect_err("should fail json shape");
         assert!(matches!(err, CapTokenDecodeError::Json(_)));
+    }
+}
+
+// GH #20 Contract C: `WorkerPayload.context` backcompat round-trip.
+#[cfg(test)]
+mod worker_payload_context_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_json_without_context_deserializes_to_none() {
+        // Shape a pre-#20 WorkerPayload would have serialized (no
+        // `context` key at all).
+        let legacy = serde_json::json!({
+            "task_id": "ST-1",
+            "attempt": 1,
+            "agent": "planner",
+            "prompt": "do the thing",
+        });
+        let payload: WorkerPayload =
+            serde_json::from_value(legacy).expect("legacy shape must deserialize");
+        assert!(payload.context.is_none());
+    }
+
+    #[test]
+    fn context_none_serializes_with_key_absent() {
+        let payload = WorkerPayload {
+            task_id: StepId::parse("ST-1").unwrap(),
+            attempt: 1,
+            agent: "planner".to_string(),
+            system: None,
+            prompt: "do the thing".to_string(),
+            context: None,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(
+            json.as_object().unwrap().get("context").is_none(),
+            "context: None must not appear in the serialized object"
+        );
+    }
+
+    #[test]
+    fn context_some_round_trips() {
+        let view = crate::core::agent_context::AgentContextView::default();
+        let payload = WorkerPayload {
+            task_id: StepId::parse("ST-1").unwrap(),
+            attempt: 1,
+            agent: "planner".to_string(),
+            system: None,
+            prompt: "do the thing".to_string(),
+            context: Some(view.clone()),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        let round_tripped: WorkerPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped.context, Some(view));
     }
 }

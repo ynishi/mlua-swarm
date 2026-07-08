@@ -50,6 +50,7 @@
 //! in a Blueprint is the IN-side dialect this discipline forbids, and
 //! would require its own guard design if ever revisited).
 
+pub mod agent_context;
 pub mod input_inject;
 pub mod lua_layer;
 pub mod project_name_alias;

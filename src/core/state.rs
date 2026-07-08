@@ -482,6 +482,15 @@ pub struct EngineState {
     /// profile can be distinguished: an absent key means "not yet baked",
     /// while `Some(None)` means "baked and profile is explicitly absent".
     pub systems: HashMap<(StepId, u32), Option<String>>,
+    /// Per-attempt materialized [`crate::core::agent_context::AgentContextView`]
+    /// (Contract C, GH #20) — the Worker axis's read-back source. Written
+    /// by `crate::middleware::agent_context::AgentContextMiddleware`
+    /// (innermost spawner layer) at dispatch time; read by
+    /// `Engine::fetch_worker_payload{,_trusted}` and threaded into
+    /// `WorkerPayload.context`. Keyed the same way as `prompts` /
+    /// `systems` — `Ctx` itself is not stored, so the view has to be
+    /// snapshotted here to still be servable at fetch time.
+    pub agent_contexts: HashMap<(StepId, u32), crate::core::agent_context::AgentContextView>,
     /// All minted `CapToken` records, keyed by token fingerprint
     /// (`CapToken::fingerprint` = SHA-256 of the nonce; issue #14 — the
     /// key is loggable, the nonce is not).
@@ -522,6 +531,7 @@ impl EngineState {
             sessions: HashMap::new(),
             prompts: HashMap::new(),
             systems: HashMap::new(),
+            agent_contexts: HashMap::new(),
             tokens: HashMap::new(),
             worker_handles: HashMap::new(),
             pending_resumes: HashMap::new(),
