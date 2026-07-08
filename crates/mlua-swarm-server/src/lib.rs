@@ -651,6 +651,18 @@ async fn run_flow_form(
     // NOT mutated, so it stays a pure flow-ir eval seed identical to
     // whatever the caller sent.
     let task_input_spec = build_task_input_spec_from_request(&req);
+    // Issue #19 ST4: snapshot the resolved spec into the `TaskRecord` (JSON,
+    // same "bare `Value`" rationale as `blueprint_ref_json` /
+    // `input_ctx_snapshot` above) so `POST /v1/tasks/:id/runs` can resolve
+    // it back out on rekick without re-deriving it from a since-stale
+    // request body. Cloned rather than computed from `task_input_spec`
+    // after the fact — the original is still moved into
+    // `TaskApplicationInput.task_input` below.
+    let task_input_spec_snapshot = task_input_spec
+        .clone()
+        .map(|spec| serde_json::to_value(&spec))
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("task_input_spec snapshot: {e}")))?;
     let init_ctx = req.init_ctx.clone();
 
     let mut op_req = req.operator.unwrap_or_default();
@@ -724,6 +736,7 @@ async fn run_flow_form(
             goal,
             blueprint_ref: blueprint_ref_json,
             input_ctx: input_ctx_snapshot,
+            task_input_spec: task_input_spec_snapshot,
             status: TaskRecordStatus::Running,
             created_at: now,
             updated_at: now,

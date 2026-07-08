@@ -89,6 +89,7 @@ mod tests {
             goal: format!("goal for {id}"),
             blueprint_ref: json!({"id": "bp-1"}),
             input_ctx: json!({"k": "v"}),
+            task_input_spec: None,
             status: TaskRecordStatus::Pending,
             created_at,
             updated_at: created_at,
@@ -156,5 +157,18 @@ mod tests {
     #[tokio::test]
     async fn name_is_in_memory() {
         assert_eq!(InMemoryTaskStore::new().name(), "in-memory");
+    }
+
+    #[tokio::test]
+    async fn task_input_spec_round_trips_through_create_and_get() {
+        // Issue #19 ST4: `TaskRecord.task_input_spec` is a plain field on
+        // this backend (no encode/decode step), but a regression guard
+        // here still catches an accidental drop/clear in `create`/`get`.
+        let s = InMemoryTaskStore::new();
+        let mut record = mk("T-1", 100);
+        record.task_input_spec = Some(json!({"project_root": "/repo"}));
+        s.create(record).await.unwrap();
+        let got = s.get(&TaskId::parse("T-1").unwrap()).await.unwrap();
+        assert_eq!(got.task_input_spec, Some(json!({"project_root": "/repo"})));
     }
 }

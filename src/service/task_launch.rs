@@ -33,6 +33,7 @@ use crate::service::linker;
 use crate::store::run::RunContext;
 use crate::types::{CapToken, Role};
 use mlua_flow_ir::{Externs, NoExterns};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -112,6 +113,33 @@ fn merge_init_ctx(bp_default: Option<&Value>, task_init_ctx: &Value) -> Value {
     }
 }
 
+/// Issue #19 ST4: 3-layer shallow-merge of the init-ctx cascade — BP
+/// default → Task → Run (lowest to highest priority). Built by chaining
+/// [`merge_init_ctx`] twice rather than introducing a distinct 3-way merge
+/// algorithm, so the Run layer inherits exactly the same "shallow Object
+/// merge, non-Object fully replaces" rule [`merge_init_ctx`] already
+/// established for the BP/Task pair (see its doc for the full semantics).
+///
+/// - `run_override: None` is a no-op — the BP+Task merge passes through
+///   unchanged, so `POST /v1/tasks/:id/runs` with no body (or a body that
+///   omits `init_ctx_override`) preserves today's rekick behavior
+///   byte-for-byte.
+/// - `run_override: Some(_)` layers on top exactly like `task_init_ctx`
+///   layers on top of `bp_default` above: both `Object` → shallow
+///   key-wise merge with Run winning collisions; Run non-`Object` →
+///   fully replaces the BP+Task merge.
+pub fn merge_init_ctx_3layer(
+    bp_default: Option<&Value>,
+    task_init_ctx: &Value,
+    run_override: Option<&Value>,
+) -> Value {
+    let bp_task = merge_init_ctx(bp_default, task_init_ctx);
+    match run_override {
+        Some(run) => merge_init_ctx(Some(&bp_task), run),
+        None => bp_task,
+    }
+}
+
 fn derive_bp_agent_kinds(blueprint: &Blueprint) -> HashMap<String, OperatorKind> {
     let mut out = HashMap::new();
     if blueprint.operators.is_empty() {
@@ -161,13 +189,23 @@ pub enum TaskLaunchError {
 /// Each field is independently optional — see
 /// [`crate::middleware::task_input::TaskInputMiddleware::new_from_fields`],
 /// which this is built for.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// Issue #19 ST4: also `Serialize`/`Deserialize` so it can travel over the
+/// wire as `RunKickRequest.task_input_override` (`mlua-swarm-server`'s
+/// `tasks` module) and be snapshotted into `TaskRecord.task_input_spec`
+/// (JSON) for rekick to resolve back out of. Every field is
+/// `#[serde(default)]` so a caller may omit any subset (or send `{}`) and
+/// still deserialize.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskInputSpec {
     /// Task-level project root path.
+    #[serde(default)]
     pub project_root: Option<String>,
     /// Task-level working directory path.
+    #[serde(default)]
     pub work_dir: Option<String>,
     /// Task-level arbitrary metadata bag (a JSON object, or `None`).
+    #[serde(default)]
     pub task_metadata: Option<Value>,
 }
 
@@ -960,6 +998,55 @@ mod tests {
     fn merge_init_ctx_no_bp_default_is_a_no_op() {
         let task = json!({ "input": "hi" });
         let merged = merge_init_ctx(None, &task);
+        assert_eq!(merged, task);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // issue #19 ST4: `merge_init_ctx_3layer` (BP default + Task + Run)
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_init_ctx_3layer_no_run_override_equals_bp_task_merge_only() {
+        // `run_override: None` must be a pure pass-through of the BP+Task
+        // merge — this is the `POST /v1/tasks/:id/runs` no-body rekick
+        // path, which must preserve pre-#19 behavior byte-for-byte.
+        let bp_default = json!({ "a": "bp", "b": "bp-only" });
+        let task = json!({ "a": "task", "c": "task-only" });
+        let three_layer = merge_init_ctx_3layer(Some(&bp_default), &task, None);
+        let two_layer = merge_init_ctx(Some(&bp_default), &task);
+        assert_eq!(three_layer, two_layer);
+        assert_eq!(
+            three_layer,
+            json!({ "a": "task", "b": "bp-only", "c": "task-only" })
+        );
+    }
+
+    #[test]
+    fn merge_init_ctx_3layer_run_object_wins_on_key_collision_over_bp_and_task() {
+        let bp_default = json!({ "a": "bp", "b": "bp-only" });
+        let task = json!({ "a": "task", "c": "task-only" });
+        let run_override = json!({ "a": "run", "d": "run-only" });
+        let merged = merge_init_ctx_3layer(Some(&bp_default), &task, Some(&run_override));
+        assert_eq!(
+            merged,
+            json!({ "a": "run", "b": "bp-only", "c": "task-only", "d": "run-only" }),
+            "Run wins on collision (a); BP-only (b) and Task-only (c) keys survive"
+        );
+    }
+
+    #[test]
+    fn merge_init_ctx_3layer_run_non_object_fully_replaces_bp_task_merge() {
+        let bp_default = json!({ "seeded": "from-bp" });
+        let task = json!({ "seeded": "from-task" });
+        let run_override = json!("plain-string-run-seed");
+        let merged = merge_init_ctx_3layer(Some(&bp_default), &task, Some(&run_override));
+        assert_eq!(merged, json!("plain-string-run-seed"));
+    }
+
+    #[test]
+    fn merge_init_ctx_3layer_no_bp_default_and_no_run_override_is_task_passthrough() {
+        let task = json!({ "input": "hi" });
+        let merged = merge_init_ctx_3layer(None, &task, None);
         assert_eq!(merged, task);
     }
 

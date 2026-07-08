@@ -9,5 +9,6 @@ pub mod task_launch;
 
 pub use linker::link;
 pub use task_launch::{
-    TaskInputSpec, TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService,
+    merge_init_ctx_3layer, TaskInputSpec, TaskLaunchError, TaskLaunchInput, TaskLaunchOutput,
+    TaskLaunchService,
 };

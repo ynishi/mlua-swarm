@@ -65,6 +65,15 @@ pub struct TaskRecord {
     pub blueprint_ref: serde_json::Value,
     /// Input context supplied at task creation.
     pub input_ctx: serde_json::Value,
+    /// Issue #19 ST4: Task-level canonical fields (`project_root` /
+    /// `work_dir` / `task_metadata`) snapshot for rekick, stored as JSON
+    /// (a serialized `TaskInputSpec`) — same "bare `Value`, no Rust-type
+    /// dependency" rationale as [`Self::blueprint_ref`] /
+    /// [`Self::input_ctx`]. `None` for every pre-#19 `TaskRecord`
+    /// (backward compat) and for callers whose request carried no
+    /// Task-level fields at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_input_spec: Option<serde_json::Value>,
     /// Current lifecycle status.
     pub status: TaskRecordStatus,
     /// Unix epoch seconds — creation time.
