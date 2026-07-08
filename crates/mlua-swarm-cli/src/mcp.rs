@@ -223,6 +223,7 @@ struct OperatorAckReq {
     /// for real worker errors).
     kind: String,
     #[serde(default)]
+    #[schemars(schema_with = "any_json_schema")]
     value: Option<JsonValue>,
     /// `true` = pass (default). For `hook_ack`, `false` rejects the spawn.
     /// Ignored for `spawn_halt` (halt is always a normal termination).
@@ -297,6 +298,7 @@ struct SwarmRunReq {
     blueprint: BlueprintInput,
     /// Optional init context passed to the swarm. Default `{}`.
     #[serde(default)]
+    #[schemars(schema_with = "any_object_schema")]
     init_ctx: Option<JsonValue>,
     /// Timeout in seconds. Default 300 (= 5 min).
     #[serde(default)]
@@ -367,6 +369,35 @@ fn bare_blueprint_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Sche
     schemars::json_schema!({
         "type": "object",
         "description": "Backward-compat: bare Blueprint object; treated as {kind: \"inline\", blueprint: <it>}."
+    })
+}
+
+/// JSON Schema pin for `Option<JsonValue>` fields that carry a JSON object
+/// by contract (currently `SwarmRunReq.init_ctx`, the flow.ir root ctx).
+///
+/// GH #24: same shape as [`bare_blueprint_schema`] — declaring the type as
+/// `"object"` keeps MCP clients from dropping the field. Without it,
+/// schemars renders `JsonValue` to the any-schema (`true`) and clients that
+/// filter tool call arguments against the tool inputSchema silently strip
+/// the payload.
+fn any_object_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "description": "Arbitrary JSON object."
+    })
+}
+
+/// JSON Schema pin for `Option<JsonValue>` fields that carry any concrete
+/// JSON value (currently `OperatorAckReq.value`: the ack payload varies by
+/// kind — `answer` reply, `spawn_ack` result, `spawn_halt` partial ctx).
+///
+/// GH #24: same rationale as [`any_object_schema`], with the type widened
+/// to the six concrete JSON types so structured / scalar / null payloads
+/// all survive MCP client filtering.
+fn any_json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["object", "array", "string", "number", "boolean", "null"],
+        "description": "Arbitrary JSON value."
     })
 }
 
@@ -1719,6 +1750,63 @@ mod tests {
             !names.contains(&"mse_ctx_get"),
             "mse_ctx_get must be retired (ST5): {names:?}"
         );
+    }
+
+    /// GH #24 regression: `Option<JsonValue>` fields on the tool surface
+    /// must render with a concrete `type` in the inputSchema. Without the
+    /// `#[schemars(schema_with = ...)]` pin schemars emits the any-schema
+    /// (`true`) — MCP clients that filter arguments against the schema
+    /// then drop the payload silently and callers see the field arrive as
+    /// `None` server-side.
+    ///
+    /// Asserted per tool + field: the JSON Schema fragment at
+    /// `properties.<field>` carries a `type` key (either the string
+    /// `"object"` for `init_ctx`, or a 6-element array for `value`).
+    #[test]
+    fn json_value_fields_pin_a_concrete_type_in_input_schema() {
+        let tools = MseServer::tool_router().list_all();
+        let by_name = |n: &str| {
+            tools
+                .iter()
+                .find(|t| t.name.as_ref() == n)
+                .unwrap_or_else(|| panic!("tool {n} not registered"))
+        };
+
+        // swarm_run.init_ctx → "object" (flow.ir root ctx is an object).
+        let swarm_run_schema = &by_name("swarm_run").input_schema;
+        let init_ctx = swarm_run_schema
+            .get("properties")
+            .and_then(|p| p.get("init_ctx"))
+            .expect("swarm_run.properties.init_ctx present");
+        let init_ctx_type = init_ctx
+            .get("type")
+            .unwrap_or_else(|| panic!("swarm_run.init_ctx missing `type` — schemars any-schema regression (GH #24): {init_ctx:?}"));
+        assert_eq!(
+            init_ctx_type,
+            &JsonValue::String("object".into()),
+            "swarm_run.init_ctx.type must be \"object\": {init_ctx_type:?}"
+        );
+
+        // mse_ack.value → the 6 concrete JSON types (any JSON value).
+        let mse_ack_schema = &by_name("mse_ack").input_schema;
+        let value = mse_ack_schema
+            .get("properties")
+            .and_then(|p| p.get("value"))
+            .expect("mse_ack.properties.value present");
+        let value_type = value.get("type").unwrap_or_else(|| {
+            panic!(
+                "mse_ack.value missing `type` — schemars any-schema regression (GH #24): {value:?}"
+            )
+        });
+        let arr = value_type
+            .as_array()
+            .expect("mse_ack.value.type must be an array of type strings");
+        for expected in ["object", "array", "string", "number", "boolean", "null"] {
+            assert!(
+                arr.iter().any(|v| v == &JsonValue::String(expected.into())),
+                "mse_ack.value.type missing {expected:?}: {arr:?}"
+            );
+        }
     }
 
     // ─── S3 operator client tools: error paths (no network required) ───────
