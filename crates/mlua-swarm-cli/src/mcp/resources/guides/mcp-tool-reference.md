@@ -90,3 +90,6 @@ these tools are thin wrappers, not a second process-management layer.
 - Blueprint JSON Schema: `mse://api/blueprint-schema`.
 - HTTP endpoint wire-body JSON Schemas (`/v1/blueprints`, `/v1/tasks`,
   `/v1/tasks/:id/runs`): `mse://api/http-endpoints`.
+- The three-hop execution model for the WS thin-path (`AgentKind::Operator`
+  → MainAI → SubAgent) and its responsibility boundary:
+  `mse://guides/operator-execution-model`.
