@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/ynishi/mlua-swarm/compare/v0.5.0...v0.6.0) - 2026-07-08
+
+### Added
+
+- *(schema,core)* BP-level declarative context supply tiers (BP-global / Agent / Step) via AgentContextView
+- *(core,server,cli)* unify task-level context exposure via AgentContextView (Contract C)
+- *(schema,mcp)* schemars JsonSchema derives + mse://api/http-endpoints resource
+- *(server,service)* per-Run init_ctx override + 3-layer merge chain + TaskRecord.task_input_spec persistence
+- *(schema,service)* Blueprint.default_init_ctx with BP -> Task merge chain
+- *(operator-ws,agent-block)* splice task-level project_root/work_dir into Direction and priority chain
+- *(middleware)* add TaskInputMiddleware for Task-level context injection
+- *(compiler)* kind=lua reachable on the default registry via inline spec.source
+
+### Other
+
+- TaskInputMiddleware reads sibling fields directly, drop ST1 init_ctx fold-back
+- thread TaskSpec.initial_directive Value end-to-end, render at consumer boundaries only
+- *(server)* rename FlowTasksReq to TaskLaunchRequest and split init_ctx roles
+- *(mcp)* publish mse://guides/operator-execution-model resource
+
 ## [0.5.0](https://github.com/ynishi/mlua-swarm/compare/v0.4.1...v0.5.0) - 2026-07-07
 
 ### Added
