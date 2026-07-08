@@ -397,6 +397,7 @@ mod tests {
                 meta: None,
             }],
             operators: vec![],
+            metas: vec![],
             hints: CompilerHints::default(),
             strategy: CompilerStrategy::default(),
             metadata: BlueprintMetadata::default(),
@@ -404,6 +405,8 @@ mod tests {
             default_agent_kind: AgentKind::Operator,
             default_operator_kind: None,
             default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
         }
     }
 
@@ -628,6 +631,7 @@ mod tests {
                 meta: None,
             }],
             operators: vec![],
+            metas: vec![],
             hints: CompilerHints::default(),
             strategy: CompilerStrategy::default(),
             metadata: BlueprintMetadata::default(),
@@ -635,6 +639,8 @@ mod tests {
             default_agent_kind: AgentKind::Operator,
             default_operator_kind: None,
             default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
         }
     }
 

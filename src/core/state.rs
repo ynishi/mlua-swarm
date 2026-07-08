@@ -80,6 +80,17 @@ pub struct TaskSpec {
     /// render it at their own late boundary; strings pass through
     /// verbatim, anything else is serde-stringified.
     pub initial_directive: Value,
+    /// GH #21 Phase 2 — the Step tier's resolved context bundle, threaded
+    /// through from `EngineDispatcher::dispatch`'s `$step_meta` envelope
+    /// resolution (`None` when the dispatched `Step.in` carried no
+    /// envelope — pre-#21-Phase-2 Blueprints unaffected). Re-read from
+    /// the spec on EVERY `Engine::dispatch_attempt_with` attempt (not
+    /// cached once), so retries and Run-rekicks all carry it; inserted
+    /// into `Ctx.meta.runtime[STEP_CTX_KEY]`
+    /// (`crate::core::agent_context::STEP_CTX_KEY`), consumed by
+    /// `crate::middleware::agent_context::AgentContextMiddleware`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_ctx: Option<Value>,
 }
 
 /// The full mutable record of one task: its static `spec`, current

@@ -21,6 +21,7 @@
 
 use crate::blueprint::compiler::{CompileError, Compiler};
 use crate::blueprint::{Blueprint, EngineDispatcher};
+use crate::core::agent_context::ContextPolicy;
 use crate::core::ctx::OperatorKind;
 use crate::core::engine::Engine;
 use crate::core::errors::EngineError;
@@ -83,6 +84,122 @@ fn derive_worker_bindings(blueprint: &Blueprint) -> HashMap<String, WorkerBindin
             ))
         })
         .collect()
+}
+
+/// Issue #21 Phase 1: build the agent-context supply axis's "BP Global" +
+/// "BP Agent-level" context tiers from a Blueprint — the launch-time
+/// sibling of [`derive_worker_bindings`] (same "no silent default"
+/// discipline: an agent's entry is present only when it declares one).
+/// Consumed by `AgentContextMiddleware`, which shallow-merges the two
+/// tiers per spawn (agent wins) and inserts the result into
+/// `ctx.meta.runtime` only-if-absent (see
+/// `crate::middleware::agent_context`'s module doc for the full merge +
+/// precedence narrative).
+///
+/// - `.0` (global) = [`Blueprint::default_agent_ctx`], unchanged.
+/// - `.1` (per-agent) = `AgentDef.name -> AgentMeta.ctx`, entry present
+///   only for agents whose `meta` is `Some` and who declare a `ctx`
+///   (directly via `meta.ctx`, and/or indirectly via
+///   [`AgentMeta::meta_ref`] — GH #21 Phase 2, see below).
+///
+/// # GH #21 Phase 2: `AgentMeta.meta_ref` resolution
+///
+/// When an agent declares `meta.meta_ref`, it is resolved against
+/// [`derive_step_metas`]'s pool and used as the BASE layer UNDER the
+/// agent's own inline `meta.ctx` (inline wins on key collision, shallow
+/// merge — see [`shallow_merge_inline_wins`]). An unresolved `meta_ref`
+/// at this point means the caller launched a Blueprint that bypassed
+/// `Compiler::compile`'s validation (the loud gate for this case, see
+/// `blueprint::compiler::Compiler::compile`'s `UnresolvedMetaRef` check);
+/// this function stays defensive and never panics — it logs a warning and
+/// skips the base layer, letting the agent's own inline `ctx` (if any)
+/// stand alone.
+fn derive_agent_ctx(blueprint: &Blueprint) -> (Option<Value>, HashMap<String, Value>) {
+    let global = blueprint.default_agent_ctx.clone();
+    let meta_pool = derive_step_metas(blueprint);
+    let per_agent = blueprint
+        .agents
+        .iter()
+        .filter_map(|ad| {
+            let meta = ad.meta.as_ref()?;
+            let inline = meta.ctx.clone();
+            let base = meta.meta_ref.as_ref().and_then(|name| {
+                let resolved = meta_pool.get(name).cloned();
+                if resolved.is_none() {
+                    tracing::warn!(
+                        agent = %ad.name,
+                        meta_ref = %name,
+                        "derive_agent_ctx: AgentMeta.meta_ref names an undefined Blueprint.metas entry; skipping the base layer"
+                    );
+                }
+                resolved
+            });
+            let merged = match (base, inline) {
+                (None, None) => None,
+                (Some(base), None) => Some(base),
+                (None, Some(inline)) => Some(inline),
+                (Some(base), Some(inline)) => Some(shallow_merge_inline_wins(base, inline)),
+            };
+            merged.map(|ctx| (ad.name.clone(), ctx))
+        })
+        .collect();
+    (global, per_agent)
+}
+
+/// GH #21 Phase 2: shallow-merge `base` with `inline`, `inline` winning
+/// key collisions. Both sides being JSON `Object`s is the meaningful case
+/// (per-key merge); a non-`Object` `inline` is used as-is (it "wins"
+/// entirely — the malformed-shape case is left to
+/// `AgentContextMiddleware`'s own tier merge, which already warns + skips
+/// a non-`Object` tier value downstream, never failing the spawn).
+fn shallow_merge_inline_wins(base: Value, inline: Value) -> Value {
+    match (base, inline) {
+        (Value::Object(mut base), Value::Object(inline)) => {
+            for (k, v) in inline {
+                base.insert(k, v);
+            }
+            Value::Object(base)
+        }
+        (_, inline) => inline,
+    }
+}
+
+/// GH #21 Phase 2: build the `Blueprint.metas` named pool (`MetaDef.name
+/// -> MetaDef.ctx`) — the launch-time sibling of [`derive_worker_bindings`]
+/// / [`derive_agent_ctx`], resolving the Step tier's shared pool instead
+/// of a per-agent map. Consumed by `EngineDispatcher::with_step_metas`
+/// (the Step tier's `$step_meta.ref` resolver) and, indirectly, by
+/// [`derive_agent_ctx`]'s `AgentMeta.meta_ref` resolution (the Agent
+/// tier shares the same pool).
+fn derive_step_metas(blueprint: &Blueprint) -> HashMap<String, Value> {
+    blueprint
+        .metas
+        .iter()
+        .map(|m| (m.name.clone(), m.ctx.clone()))
+        .collect()
+}
+
+/// Issue #21 Phase 1: build the [`ContextPolicy`] cascade's "BP Global" +
+/// "BP Agent-level" tiers from a Blueprint — same shape and discipline as
+/// [`derive_agent_ctx`], from `Blueprint.default_context_policy` /
+/// `AgentMeta.context_policy` instead. Consumed by
+/// `AgentContextMiddleware`, which resolves the effective policy per spawn
+/// (per-agent tier outranks the BP-global one; pass-all when neither is
+/// declared for the dispatching agent).
+fn derive_context_policies(
+    blueprint: &Blueprint,
+) -> (Option<ContextPolicy>, HashMap<String, ContextPolicy>) {
+    let default_policy = blueprint.default_context_policy.clone();
+    let per_agent = blueprint
+        .agents
+        .iter()
+        .filter_map(|ad| {
+            let meta = ad.meta.as_ref()?;
+            let policy = meta.context_policy.clone()?;
+            Some((ad.name.clone(), policy))
+        })
+        .collect();
+    (default_policy, per_agent)
 }
 
 /// Issue #19 ST3: shallow-merge the "BP Global" default `init_ctx`
@@ -391,12 +508,26 @@ impl TaskLaunchService {
         // (alias / worker-binding / task-input all insert `ctx.meta.runtime`
         // keys this layer must observe, so it is added FIRST — later
         // `.layer()` calls become outer, see `middleware::SpawnerStack`).
-        // Unconditional (always layered): `ContextPolicy::default()` is
-        // pass-all. This is the receptacle for a future Blueprint-driven
-        // policy (e.g. `AgentMeta.context_policy`) — wiring that field is
-        // a future issue, out of scope here.
+        // Unconditional (always layered): every Blueprint gets this layer
+        // even when it declares no agent-context supply tiers at all
+        // (`derive_agent_ctx` / `derive_context_policies` both return
+        // empty state then, matching the pre-#21 `AgentContextMiddleware`
+        // `Default` behavior byte-for-byte). GH #21 Phase 1: the
+        // receptacle named in the #20 comment above is now wired —
+        // `Blueprint.default_agent_ctx` / `default_context_policy` and
+        // `AgentMeta.ctx` / `context_policy` feed this layer's merge +
+        // policy resolution (see `middleware::agent_context`'s module doc
+        // for the full narrative).
+        let (agent_ctx_global, agent_ctx_per_agent) = derive_agent_ctx(&input.blueprint);
+        let (context_policy_default, context_policy_per_agent) =
+            derive_context_policies(&input.blueprint);
         let spawner = SpawnerStack::new(spawner)
-            .layer(AgentContextMiddleware::default())
+            .layer(AgentContextMiddleware::new(
+                agent_ctx_global,
+                agent_ctx_per_agent,
+                context_policy_default,
+                context_policy_per_agent,
+            ))
             .build();
         // When `Blueprint.metadata.project_name_alias` is Some, layer a
         // `ProjectNameAliasMiddleware` on top of the stack that injects the
@@ -471,6 +602,10 @@ impl TaskLaunchService {
             Some(run_ctx) => dispatcher.with_run(run_ctx),
             None => dispatcher,
         };
+        // GH #21 Phase 2: attach the Step tier's named `MetaDef` pool.
+        // Unconditional — an empty map (every pre-#21-Phase-2 Blueprint)
+        // is a no-op, matching `EngineDispatcher::with_spawner`'s default.
+        let dispatcher = dispatcher.with_step_metas(derive_step_metas(&input.blueprint));
         // Issue #19 ST3: BP default + Task init_ctx → merged init_ctx (the
         // 2-layer slice of the eventual 4-layer cascade; Run override is
         // ST4 carry). `input.blueprint.default_init_ctx` is `None` for
@@ -500,7 +635,7 @@ mod tests {
     use crate::blueprint::compiler::{RustFnInProcessSpawnerFactory, SpawnerRegistry};
     use crate::blueprint::{
         current_schema_version, AgentDef, AgentKind, AgentMeta, BlueprintMetadata, CompilerHints,
-        CompilerStrategy,
+        CompilerStrategy, MetaDef,
     };
     use crate::core::config::EngineCfg;
     use crate::worker::adapter::{WorkerError, WorkerResult};
@@ -544,6 +679,7 @@ mod tests {
             flow,
             agents,
             operators: vec![],
+            metas: vec![],
             hints: CompilerHints::default(),
             strategy: CompilerStrategy::default(),
             metadata: BlueprintMetadata::default(),
@@ -551,6 +687,8 @@ mod tests {
             default_agent_kind: AgentKind::Operator,
             default_operator_kind: None,
             default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
         }
     }
 
@@ -1086,5 +1224,211 @@ mod tests {
             .await
             .expect("launch ok");
         assert_eq!(out.final_ctx["out"], "hello from bp");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // issue #21 Phase 1: `derive_agent_ctx` / `derive_context_policies`
+    // ──────────────────────────────────────────────────────────────────
+
+    fn agent_with_meta(name: &str, fn_id: &str, meta: AgentMeta) -> AgentDef {
+        AgentDef {
+            name: name.to_string(),
+            kind: AgentKind::RustFn,
+            spec: json!({ "fn_id": fn_id }),
+            profile: None,
+            meta: Some(meta),
+        }
+    }
+
+    #[test]
+    fn derive_agent_ctx_empty_blueprint_yields_empty_state() {
+        let blueprint = bp(step("echo", path("$.in"), path("$.out")), vec![]);
+        let (global, per_agent) = derive_agent_ctx(&blueprint);
+        assert_eq!(global, None);
+        assert!(per_agent.is_empty());
+    }
+
+    #[test]
+    fn derive_agent_ctx_populated_blueprint_yields_correct_maps() {
+        let mut blueprint = bp(
+            step("echo", path("$.in"), path("$.out")),
+            vec![
+                agent_with_meta(
+                    "with-ctx",
+                    "echo",
+                    AgentMeta {
+                        ctx: Some(json!({ "org_conventions": "x" })),
+                        ..Default::default()
+                    },
+                ),
+                agent("no-ctx", "echo"),
+            ],
+        );
+        blueprint.default_agent_ctx = Some(json!({ "seeded": "from-bp" }));
+        let (global, per_agent) = derive_agent_ctx(&blueprint);
+        assert_eq!(global, Some(json!({ "seeded": "from-bp" })));
+        assert_eq!(
+            per_agent.len(),
+            1,
+            "agents without AgentMeta.ctx are absent, not defaulted to null: {per_agent:?}"
+        );
+        assert_eq!(
+            per_agent.get("with-ctx"),
+            Some(&json!({ "org_conventions": "x" }))
+        );
+        assert!(!per_agent.contains_key("no-ctx"));
+    }
+
+    #[test]
+    fn derive_context_policies_empty_blueprint_yields_empty_state() {
+        let blueprint = bp(step("echo", path("$.in"), path("$.out")), vec![]);
+        let (default_policy, per_agent) = derive_context_policies(&blueprint);
+        assert_eq!(default_policy, None);
+        assert!(per_agent.is_empty());
+    }
+
+    #[test]
+    fn derive_context_policies_populated_blueprint_yields_correct_maps() {
+        let mut blueprint = bp(
+            step("echo", path("$.in"), path("$.out")),
+            vec![
+                agent_with_meta(
+                    "with-policy",
+                    "echo",
+                    AgentMeta {
+                        context_policy: Some(ContextPolicy {
+                            include: None,
+                            exclude: vec!["work_dir".to_string()],
+                        }),
+                        ..Default::default()
+                    },
+                ),
+                agent("no-policy", "echo"),
+            ],
+        );
+        blueprint.default_context_policy = Some(ContextPolicy {
+            include: Some(vec!["project_root".to_string()]),
+            exclude: vec![],
+        });
+        let (default_policy, per_agent) = derive_context_policies(&blueprint);
+        assert_eq!(
+            default_policy,
+            Some(ContextPolicy {
+                include: Some(vec!["project_root".to_string()]),
+                exclude: vec![],
+            })
+        );
+        assert_eq!(per_agent.len(), 1);
+        assert_eq!(
+            per_agent.get("with-policy"),
+            Some(&ContextPolicy {
+                include: None,
+                exclude: vec!["work_dir".to_string()],
+            })
+        );
+        assert!(!per_agent.contains_key("no-policy"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // issue #21 Phase 2: `derive_step_metas` / `AgentMeta.meta_ref`
+    // resolution inside `derive_agent_ctx`
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn derive_step_metas_empty_blueprint_yields_empty_map() {
+        let blueprint = bp(step("echo", path("$.in"), path("$.out")), vec![]);
+        assert!(derive_step_metas(&blueprint).is_empty());
+    }
+
+    #[test]
+    fn derive_step_metas_populated_blueprint_yields_name_to_ctx_map() {
+        let mut blueprint = bp(step("echo", path("$.in"), path("$.out")), vec![]);
+        blueprint.metas = vec![
+            MetaDef {
+                name: "heavy-scan".to_string(),
+                ctx: json!({ "work_dir": "/x" }),
+            },
+            MetaDef {
+                name: "light-scan".to_string(),
+                ctx: json!({ "work_dir": "/y" }),
+            },
+        ];
+        let metas = derive_step_metas(&blueprint);
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas.get("heavy-scan"), Some(&json!({ "work_dir": "/x" })));
+        assert_eq!(metas.get("light-scan"), Some(&json!({ "work_dir": "/y" })));
+    }
+
+    #[test]
+    fn derive_agent_ctx_meta_ref_resolves_as_base_under_inline_ctx() {
+        let mut blueprint = bp(
+            step("echo", path("$.in"), path("$.out")),
+            vec![agent_with_meta(
+                "with-meta-ref",
+                "echo",
+                AgentMeta {
+                    ctx: Some(json!({ "work_dir": "/inline-wins" })),
+                    meta_ref: Some("shared".to_string()),
+                    ..Default::default()
+                },
+            )],
+        );
+        blueprint.metas = vec![MetaDef {
+            name: "shared".to_string(),
+            ctx: json!({ "work_dir": "/base", "extra": "from-pool" }),
+        }];
+        let (_, per_agent) = derive_agent_ctx(&blueprint);
+        assert_eq!(
+            per_agent.get("with-meta-ref"),
+            Some(&json!({ "work_dir": "/inline-wins", "extra": "from-pool" })),
+            "inline ctx must win the collided key while pool-only keys survive the merge"
+        );
+    }
+
+    #[test]
+    fn derive_agent_ctx_meta_ref_alone_uses_pool_ctx_verbatim() {
+        let mut blueprint = bp(
+            step("echo", path("$.in"), path("$.out")),
+            vec![agent_with_meta(
+                "with-meta-ref-only",
+                "echo",
+                AgentMeta {
+                    meta_ref: Some("shared".to_string()),
+                    ..Default::default()
+                },
+            )],
+        );
+        blueprint.metas = vec![MetaDef {
+            name: "shared".to_string(),
+            ctx: json!({ "work_dir": "/base" }),
+        }];
+        let (_, per_agent) = derive_agent_ctx(&blueprint);
+        assert_eq!(
+            per_agent.get("with-meta-ref-only"),
+            Some(&json!({ "work_dir": "/base" }))
+        );
+    }
+
+    #[test]
+    fn derive_agent_ctx_unresolved_meta_ref_never_panics_and_falls_back_to_inline() {
+        let blueprint = bp(
+            step("echo", path("$.in"), path("$.out")),
+            vec![agent_with_meta(
+                "with-unresolved-meta-ref",
+                "echo",
+                AgentMeta {
+                    ctx: Some(json!({ "work_dir": "/inline-only" })),
+                    meta_ref: Some("missing".to_string()),
+                    ..Default::default()
+                },
+            )],
+        );
+        // No `blueprint.metas` entries at all — `meta_ref` unresolved.
+        let (_, per_agent) = derive_agent_ctx(&blueprint);
+        assert_eq!(
+            per_agent.get("with-unresolved-meta-ref"),
+            Some(&json!({ "work_dir": "/inline-only" })),
+            "an unresolved meta_ref must never panic; the agent's own inline ctx still applies"
+        );
     }
 }

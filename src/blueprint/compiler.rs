@@ -36,7 +36,7 @@ use crate::worker::adapter::{InProcSpawner, SpawnError, SpawnerAdapter, WorkerFn
 use crate::worker::process_spawner::{ProcessSpawner, StreamMode};
 use crate::worker::Worker;
 use async_trait::async_trait;
-use mlua_flow_ir::Node as FlowNode;
+use mlua_flow_ir::{Expr, Node as FlowNode};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,6 +77,21 @@ pub enum CompileError {
         /// The `operator_ref` value that was looked up.
         op_ref: String,
         /// The `OperatorDef.name`s that *are* declared, for the error
+        /// message.
+        defined: Vec<String>,
+    },
+    /// GH #21 Phase 2: an `AgentMeta.meta_ref` or a statically-visible
+    /// `$step_meta.ref` (inside a `Step.in` **Lit** expr) does not match
+    /// any `MetaDef.name` declared in `Blueprint.metas`.
+    #[error("{where_} names an undefined MetaDef: '{meta_ref}' (defined: {defined:?})")]
+    UnresolvedMetaRef {
+        /// Human-readable description of where the reference was found
+        /// (e.g. `"AgentMeta.meta_ref of agent 'planner'"` or `"Step
+        /// 'scout' $step_meta.ref"`).
+        where_: String,
+        /// The `meta_ref` value that was looked up.
+        meta_ref: String,
+        /// The `MetaDef.name`s that *are* declared, for the error
         /// message.
         defined: Vec<String>,
     },
@@ -239,6 +254,39 @@ impl Compiler {
             // A missing `op_ref` is reported through OperatorSpawnerFactory.build under a different error.
         }
 
+        // GH #21 Phase 2: named `MetaDef` pool (`Blueprint.metas`) —
+        // validate every reference against it, mirroring the
+        // `operator_ref` validation above.
+        let metas_defined: Vec<String> = bp.metas.iter().map(|m| m.name.clone()).collect();
+        for ad in &bp.agents {
+            let meta_ref = ad.meta.as_ref().and_then(|m| m.meta_ref.as_ref());
+            if let Some(meta_ref) = meta_ref {
+                if !metas_defined.iter().any(|n| n == meta_ref) {
+                    return Err(CompileError::UnresolvedMetaRef {
+                        where_: format!("AgentMeta.meta_ref of agent '{}'", ad.name),
+                        meta_ref: meta_ref.clone(),
+                        defined: metas_defined.clone(),
+                    });
+                }
+            }
+        }
+        // Best-effort static walk of the flow for `$step_meta.ref`
+        // envelopes embedded in a Step's **Lit** `in` expr — this is a
+        // design-time hint only: a non-`Lit` `Step.in` (e.g. `Path`) is
+        // invisible here and skipped silently; `EngineDispatcher::dispatch`
+        // is the authoritative, loud validation line for those.
+        let mut static_step_meta_refs: Vec<(String, String)> = Vec::new();
+        collect_step_meta_refs(&bp.flow, &mut static_step_meta_refs);
+        for (where_, meta_ref) in static_step_meta_refs {
+            if !metas_defined.iter().any(|n| n == &meta_ref) {
+                return Err(CompileError::UnresolvedMetaRef {
+                    where_,
+                    meta_ref,
+                    defined: metas_defined.clone(),
+                });
+            }
+        }
+
         for ad in &bp.agents {
             if seen.contains_key(&ad.name) {
                 return Err(CompileError::DuplicateAgent(ad.name.clone()));
@@ -319,6 +367,57 @@ fn collect_refs(node: &FlowNode, out: &mut Vec<String>) {
         }
         FlowNode::Assign { .. } => {} // The Assign node carries no ref.
     }
+}
+
+/// GH #21 Phase 2: walk the flow `Node` (same recursion shape as
+/// [`collect_refs`]) and collect every statically-visible `$step_meta.ref`
+/// found inside a Step's `in` **Lit** expr, as `(where_, meta_ref)` pairs
+/// for [`CompileError::UnresolvedMetaRef`] reporting. Non-`Lit` `in`
+/// exprs (e.g. `Expr::Path`) cannot be inspected statically and are
+/// silently skipped — `EngineDispatcher::dispatch` (the `mlua-swarm` core
+/// crate) is the authoritative, loud validation line for those.
+fn collect_step_meta_refs(node: &FlowNode, out: &mut Vec<(String, String)>) {
+    match node {
+        FlowNode::Step { ref_, in_, .. } => {
+            if let Expr::Lit { value } = in_ {
+                if let Some(meta_ref) = static_step_meta_ref(value) {
+                    out.push((format!("Step '{ref_}' $step_meta.ref"), meta_ref));
+                }
+            }
+        }
+        FlowNode::Seq { children } => {
+            for c in children {
+                collect_step_meta_refs(c, out);
+            }
+        }
+        FlowNode::Branch { then_, else_, .. } => {
+            collect_step_meta_refs(then_, out);
+            collect_step_meta_refs(else_, out);
+        }
+        FlowNode::Fanout { body, .. } => collect_step_meta_refs(body, out),
+        FlowNode::Loop { body, .. } => collect_step_meta_refs(body, out),
+        FlowNode::Try { body, catch, .. } => {
+            collect_step_meta_refs(body, out);
+            collect_step_meta_refs(catch, out);
+        }
+        FlowNode::Assign { .. } => {} // The Assign node carries no `in`.
+    }
+}
+
+/// Extract the `$step_meta.ref` string out of a literal `Step.in` value,
+/// if present and well-formed: `{"$step_meta": {"ref": "<name>", ...},
+/// ...}`. Any other shape (no `$step_meta` key, `ref` absent/null, `ref`
+/// not a string) yields `None` — this is a best-effort static hint only;
+/// a malformed envelope is caught loudly at dispatch time instead (see
+/// `EngineDispatcher::dispatch`'s doc in the `mlua-swarm` core crate).
+fn static_step_meta_ref(value: &Value) -> Option<String> {
+    value
+        .as_object()?
+        .get("$step_meta")?
+        .as_object()?
+        .get("ref")?
+        .as_str()
+        .map(str::to_string)
 }
 
 // ─── CompiledAgentTable ───────────────────────────────────────────────────────
@@ -1294,5 +1393,176 @@ mod lua_inline_source_tests {
         .expect("lua worker ok");
         assert_eq!(out.value, serde_json::json!("nope"));
         assert!(!out.ok);
+    }
+}
+
+// ─── GH #21 Phase 2: `Blueprint.metas` / `AgentMeta.meta_ref` / static
+// `$step_meta.ref` compile-time validation ─────────────────────────────────
+#[cfg(test)]
+mod meta_ref_validation_tests {
+    use super::*;
+    use crate::blueprint::{AgentMeta, MetaDef};
+    use crate::worker::adapter::WorkerResult;
+
+    fn registry_with_echo() -> SpawnerRegistry {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: Value::String(inv.prompt),
+                ok: true,
+            })
+        });
+        let mut reg = SpawnerRegistry::new();
+        reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(factory));
+        reg
+    }
+
+    fn rustfn_agent(name: &str) -> AgentDef {
+        AgentDef {
+            name: name.to_string(),
+            kind: AgentKind::RustFn,
+            spec: serde_json::json!({ "fn_id": "echo" }),
+            profile: None,
+            meta: None,
+        }
+    }
+
+    fn simple_flow(agent_ref: &str, in_: Expr) -> FlowNode {
+        FlowNode::Step {
+            ref_: agent_ref.to_string(),
+            in_,
+            out: Expr::Path {
+                at: "$.output".into(),
+            },
+        }
+    }
+
+    fn minimal_bp(agents: Vec<AgentDef>, metas: Vec<MetaDef>, flow: FlowNode) -> Blueprint {
+        Blueprint {
+            schema_version: crate::blueprint::current_schema_version(),
+            id: "meta-ref-ut".into(),
+            flow,
+            agents,
+            operators: vec![],
+            metas,
+            hints: Default::default(),
+            strategy: Default::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+        }
+    }
+
+    #[test]
+    fn valid_meta_ref_compiles() {
+        let mut agent = rustfn_agent("worker");
+        agent.meta = Some(AgentMeta {
+            meta_ref: Some("shared".to_string()),
+            ..Default::default()
+        });
+        let bp = minimal_bp(
+            vec![agent],
+            vec![MetaDef {
+                name: "shared".into(),
+                ctx: serde_json::json!({ "k": "v" }),
+            }],
+            simple_flow(
+                "worker",
+                Expr::Path {
+                    at: "$.input".into(),
+                },
+            ),
+        );
+        let compiler = Compiler::new(registry_with_echo());
+        assert!(
+            compiler.compile(&bp).is_ok(),
+            "a resolvable AgentMeta.meta_ref must compile"
+        );
+    }
+
+    #[test]
+    fn unknown_agent_meta_ref_is_unresolved_meta_ref() {
+        let mut agent = rustfn_agent("worker");
+        agent.meta = Some(AgentMeta {
+            meta_ref: Some("missing".to_string()),
+            ..Default::default()
+        });
+        let bp = minimal_bp(
+            vec![agent],
+            vec![],
+            simple_flow(
+                "worker",
+                Expr::Path {
+                    at: "$.input".into(),
+                },
+            ),
+        );
+        let compiler = Compiler::new(registry_with_echo());
+        match compiler.compile(&bp) {
+            Err(CompileError::UnresolvedMetaRef {
+                where_,
+                meta_ref,
+                defined,
+            }) => {
+                assert!(
+                    where_.contains("worker"),
+                    "where_ must name the agent: {where_}"
+                );
+                assert_eq!(meta_ref, "missing");
+                assert!(defined.is_empty());
+            }
+            Err(other) => {
+                panic!("expected UnresolvedMetaRef, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!("expected compile-time failure, got Ok"),
+        }
+    }
+
+    #[test]
+    fn unknown_static_step_meta_ref_in_lit_is_unresolved_meta_ref() {
+        let agent = rustfn_agent("worker");
+        let in_ = Expr::Lit {
+            value: serde_json::json!({ "$step_meta": { "ref": "missing" }, "$in": "go" }),
+        };
+        let bp = minimal_bp(vec![agent], vec![], simple_flow("worker", in_));
+        let compiler = Compiler::new(registry_with_echo());
+        match compiler.compile(&bp) {
+            Err(CompileError::UnresolvedMetaRef {
+                where_, meta_ref, ..
+            }) => {
+                assert!(
+                    where_.contains("worker"),
+                    "where_ must name the offending step: {where_}"
+                );
+                assert_eq!(meta_ref, "missing");
+            }
+            Err(other) => {
+                panic!("expected UnresolvedMetaRef, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!("expected compile-time failure, got Ok"),
+        }
+    }
+
+    #[test]
+    fn path_op_input_with_no_static_envelope_compiles_fine() {
+        let agent = rustfn_agent("worker");
+        let bp = minimal_bp(
+            vec![agent],
+            vec![],
+            simple_flow(
+                "worker",
+                Expr::Path {
+                    at: "$.input".into(),
+                },
+            ),
+        );
+        let compiler = Compiler::new(registry_with_echo());
+        assert!(
+            compiler.compile(&bp).is_ok(),
+            "a non-Lit Step.in must not trigger the best-effort static $step_meta check"
+        );
     }
 }

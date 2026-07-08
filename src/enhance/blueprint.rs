@@ -361,6 +361,7 @@ mod tests {
                 meta: None,
             }],
             operators: vec![],
+            metas: vec![],
             hints: Default::default(),
             strategy: Default::default(),
             metadata: BlueprintMetadata {
@@ -371,6 +372,8 @@ mod tests {
             default_agent_kind: AgentKind::Operator,
             default_operator_kind: None,
             default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
         }
     }
 

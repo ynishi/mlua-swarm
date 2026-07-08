@@ -98,6 +98,132 @@ come from `AgentContextView::to_directive_header`, which renders one
 separately, into the observation route hint (`GET /v1/runs/{run_id}`) —
 not part of the task-level context header above.
 
+## Supply tiers (GH #21 Phase 1)
+
+Before hop 2 renders the directive header, `AgentContextMiddleware`
+(`src/middleware/agent_context.rs`) resolves *where the `AgentContextView`
+values it materializes come from* — the agent-context supply axis. Each
+tier is declared at a different place and the tiers stack, highest
+priority first:
+
+| Tier | Declared | Mechanism |
+|---|---|---|
+| Run | `POST /v1/tasks/:id/runs` body (`init_ctx_override` / `task_input_override`) | Explicit per-run override |
+| Task | `POST /v1/tasks` body (`project_root` / `work_dir` / `task_metadata`) | `TaskInputMiddleware` inserts into `ctx.meta.runtime` |
+| Step | `$step_meta` envelope in `Step.in` (`{"ref": "<MetaDef.name>", "inline": {...}}`) + `Blueprint.metas` pool | `EngineDispatcher::dispatch` strips the envelope before `start_task`, resolves it against the pool, and threads it through `TaskSpec.step_ctx` |
+| Agent | `AgentMeta.ctx` / `AgentMeta.meta_ref` / `AgentMeta.context_policy` | `AgentContextMiddleware`, only-if-absent |
+| BP-global | `Blueprint.default_agent_ctx` / `default_context_policy` | `AgentContextMiddleware`, only-if-absent |
+
+The precedence needs no priority code: `AgentContextMiddleware` is layered
+**innermost** (see `service::task_launch::TaskLaunchService::launch`), so
+it always runs *after* every outer tier (Run / Task / Step) has already
+inserted its keys into `ctx.meta.runtime`. It merges the Agent and
+BP-global tiers itself (agent wins on collision) and inserts the result
+only-if-absent — a key an outer tier already set is never overwritten.
+Keys matching one of the five named `AgentContextView` fields become
+design-time defaults for those fields; any other key lands in
+`AgentContextView.extra` (and, for in-process workers that read `ctx`
+directly, in `ctx.meta.runtime` too) with no further wiring.
+
+**`default_agent_ctx` vs `default_init_ctx`**: both are BP-global JSON
+defaults, but they feed different things. `Blueprint.default_init_ctx`
+seeds the flow-ir eval `ctx` exactly once at flow start (a pure eval seed
+— see `service::task_launch::merge_init_ctx`). `Blueprint.default_agent_ctx`
+is consumed per-spawn by `AgentContextMiddleware` and lands in the
+Agent/LLM-boundary runtime bag (`ctx.meta.runtime` / `AgentContextView`) —
+it never touches flow-ir eval at all.
+
+### Per-Step meta: `$step_meta` envelope, and the dedicated-agent pattern
+
+Besides the `$step_meta` envelope (the Step tier row above, detailed
+below), per-Step context is also expressible
+**through the Step → Agent binding the Blueprint author controls**: a flow
+step names its agent via `{"kind": "step", "ref": "<agent name>"}`, so
+giving each step its own `AgentDef` entry gives each step its own
+`AgentMeta.ctx`. Two agents may share the same `kind` / `spec` / `profile`
+and differ only in `name` + `meta.ctx`:
+
+```jsonc
+{
+  "flow": { "kind": "seq", "nodes": [
+    { "kind": "step", "ref": "scout-repo", "in": ..., "out": ... },
+    { "kind": "step", "ref": "scout-docs", "in": ..., "out": ... }
+  ]},
+  "agents": [
+    { "name": "scout-repo", "kind": "operator", "spec": { /* same */ },
+      "meta": { "ctx": { "work_dir": "/repo/service-a" } } },
+    { "name": "scout-docs", "kind": "operator", "spec": { /* same */ },
+      "meta": { "ctx": { "work_dir": "/repo/docs" } } }
+  ]
+}
+```
+
+Each spawn resolves `ctx.agent` to its own `AgentMeta.ctx`, so the two
+steps see different `work_dir` (and any `extra` keys) with nothing else
+wired. The Step tier is now wired **BP-side** (GH #21 Phase 2), so a
+per-Step context no longer requires a dedicated `AgentDef` — though the
+pattern above stays fully valid as the alternative for whenever you would
+rather not touch `Step.in` (and `AgentMeta.meta_ref`, below, now lets a
+whole family of those thin per-step agents share one `MetaDef` instead of
+repeating the same `meta.ctx` object on each).
+
+**`Blueprint.metas` pool.** A Blueprint declares a named, shared pool of
+`MetaDef` entries (`{"name": "<logical name>", "ctx": {...}}`) at
+`Blueprint.metas`. Two independent consumers resolve names against this
+pool:
+
+- a `$step_meta` envelope embedded in a Step's evaluated `in` value (this
+  section), and
+- `AgentMeta.meta_ref` (the Agent tier — resolves the same pool as the
+  base layer UNDER the agent's own inline `AgentMeta.ctx`, inline wins on
+  key collision).
+
+**The `$step_meta` envelope.** Wrap the Step's real input under `$in`
+alongside a `$step_meta` key naming (and/or inlining) the context:
+
+```jsonc
+{
+  "op": "lit",
+  "value": {
+    "$step_meta": {
+      "ref": "heavy-scan",
+      "inline": { "work_dir": "/x" }
+    },
+    "$in": "do the thing"
+  }
+}
+```
+
+`EngineDispatcher::dispatch` (`src/blueprint.rs`) strips `$step_meta`
+before calling `Engine::start_task` — it never leaks into
+`prompts[(tid,1)]` or the WS directive text. `ref` resolves against the
+`Blueprint.metas` pool (an unresolved name is a loud dispatch-time error,
+naming the unresolved ref and the defined names — no silent skip);
+`inline` shallow-merges on top (**inline wins** key collisions). The
+resolved object is threaded through as `TaskSpec.step_ctx` and inserted
+into `ctx.meta.runtime` by `AgentContextMiddleware`, only-if-absent,
+**before** the Agent and BP-global tiers (full precedence Run > Task >
+Step > Agent > BP-global — see the table above).
+
+**The `$in` / remainder rule.** After `$step_meta` is stripped, if the
+remaining object still has an `$in` key, that value becomes
+`TaskSpec.initial_directive` (any other sibling keys are ignored for the
+directive). Otherwise the whole remainder becomes the directive; an empty
+remainder (envelope-only input, e.g. `{"$step_meta": {"ref": "..."}}`)
+becomes `""`. Inputs with no `$step_meta` key at all (plain strings,
+plain objects) flow through unchanged — pre-#21-Phase-2 Blueprints are
+byte-identical.
+
+Values that vary **per iteration of a dynamic loop** are still runtime
+data, not design-time meta — they belong in the flow ctx and reach the
+worker through `Step.in` (the prompt), which is already wired. Composing
+a *different* `$step_meta` envelope per iteration depends on what the
+flow-ir `Expr` grammar can express at `Step.in`: only a literal
+`Expr::Lit` is visible to the compiler's best-effort static `meta_ref`
+check (`Compiler::compile`); a computed/`Path`-derived envelope is
+invisible statically and validated only at dispatch time. That
+composition is out of this section's scope.
+
 ## Hop 3 — Spawn.directive → SubAgent launch prompt (MainAI-owned)
 
 The MainAI receives the `Spawn` frame via `mse_pending_wait`. Its job is

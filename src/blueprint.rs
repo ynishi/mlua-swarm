@@ -35,7 +35,8 @@ pub mod loader;
 pub mod store;
 
 use mlua_flow_ir::{AsyncDispatcher, EvalError};
-use serde_json::Value;
+use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // The schema types are owned by the IF crate (mlua-swarm-schema); we re-export them here.
@@ -48,7 +49,7 @@ pub use mlua_swarm_schema::OperatorKind as SchemaOperatorKind;
 pub use mlua_swarm_schema::{
     current_schema_version, default_global_agent_kind, AgentDef, AgentKind, AgentMeta,
     AgentProfile, Blueprint, BlueprintMetadata, BlueprintOrigin, CompilerHints, CompilerStrategy,
-    OperatorDef, SpawnerHints, CURRENT_SCHEMA_VERSION,
+    MetaDef, OperatorDef, SpawnerHints, CURRENT_SCHEMA_VERSION,
 };
 
 /// Bridges `mlua_flow_ir::AsyncDispatcher` to the engine's
@@ -69,17 +70,23 @@ pub use mlua_swarm_schema::{
 /// outcome is known (dispatch is synchronous end-to-end here, so there is
 /// no need for a separate event/notification mechanism — the entry is
 /// written with its final status in one call).
+///
+/// Also carries the GH #21 Phase 2 named `MetaDef` pool (via
+/// [`Self::with_step_metas`]) — the Step tier's dispatch-time resolver;
+/// see [`Self::dispatch`]'s doc for the full envelope contract.
 pub struct EngineDispatcher {
     engine: Engine,
     op_token: CapToken,
     spawner: Arc<dyn SpawnerAdapter>,
     run_ctx: Option<RunContext>,
+    step_metas: HashMap<String, Value>,
 }
 
 impl EngineDispatcher {
-    /// Build a dispatcher with no run-level tracing (`run_ctx = None`) —
-    /// the pre-existing behavior. Use [`Self::with_run`] to opt into
-    /// `RunRecord.step_entries` tracing / `ctx.meta.runtime["run_id"]`.
+    /// Build a dispatcher with no run-level tracing (`run_ctx = None`) and
+    /// no named `MetaDef`s (`step_metas` empty) — the pre-existing
+    /// behavior. Use [`Self::with_run`] / [`Self::with_step_metas`] to
+    /// opt into either.
     pub fn with_spawner(
         engine: Engine,
         op_token: CapToken,
@@ -90,6 +97,7 @@ impl EngineDispatcher {
             op_token,
             spawner,
             run_ctx: None,
+            step_metas: HashMap::new(),
         }
     }
 
@@ -100,6 +108,148 @@ impl EngineDispatcher {
         self.run_ctx = Some(run_ctx);
         self
     }
+
+    /// GH #21 Phase 2: attach the named `MetaDef` pool (`Blueprint.metas`,
+    /// resolved by `service::task_launch::derive_step_metas` into a
+    /// `name -> ctx` map) that [`Self::dispatch`] resolves `$step_meta.ref`
+    /// envelopes against. Unconditional to call — an empty map (the
+    /// pre-#21-Phase-2 default) makes every `$step_meta.ref` lookup miss
+    /// loudly, same as a Blueprint that never declares `Blueprint.metas`.
+    pub fn with_step_metas(mut self, step_metas: HashMap<String, Value>) -> Self {
+        self.step_metas = step_metas;
+        self
+    }
+}
+
+/// GH #21 Phase 2: resolve a `$step_meta` envelope embedded in a Step's
+/// evaluated `in` value into `(initial_directive, step_ctx)` — the Step
+/// tier's dispatch-time entry point, called from [`EngineDispatcher::dispatch`]
+/// BEFORE `Engine::start_task` (critical: `start_task` seeds
+/// `EngineState.prompts[(tid, 1)]` from `TaskSpec.initial_directive`, so
+/// stripping the envelope any later would leak `$step_meta` into the
+/// worker prompt AND the WS `Spawn.directive` text).
+///
+/// Contract:
+///
+/// - `input` is not a JSON `Object`, or is an `Object` with no
+///   `"$step_meta"` key → passthrough unchanged, `step_ctx = None`
+///   (pre-#21-Phase-2 Blueprints are byte-identical through this path).
+/// - `input` IS an `Object` with a `"$step_meta"` key: the key is always
+///   stripped (never reaches the returned directive). Everything past
+///   this point is loud — an error names the offending step (`ref_`) and,
+///   for an unresolved `ref`, the defined `step_metas` names:
+///   - the envelope itself must be an `Object` shaped
+///     `{"ref": Option<String>, "inline": Option<Object>}`; any other
+///     shape is a malformed-envelope error;
+///   - `ref` (when present and non-null) is looked up in `step_metas`; an
+///     unknown name is an error (no silent skip). The resolved `MetaDef`
+///     ctx must itself be an `Object` (or the lookup is treated as
+///     malformed);
+///   - `inline` (when present and non-null) must be an `Object`;
+///   - the resolved Step-tier ctx = the `ref`-resolved ctx shallow-merged
+///     with `inline`, **`inline` wins** key collisions.
+/// - Directive rule (applied to the remaining `Object`, after
+///   `"$step_meta"` is stripped): if it still contains an `"$in"` key,
+///   that value becomes the returned directive (other sibling keys are
+///   ignored for the directive — envelope-only input, e.g. one final
+///   `$step_meta` key, therefore never becomes an empty directive by
+///   accident just because more keys existed alongside it). Otherwise
+///   the whole remainder becomes the directive; an empty remainder
+///   becomes `Value::String(String::new())`.
+fn resolve_step_envelope(
+    step_metas: &HashMap<String, Value>,
+    ref_: &str,
+    input: Value,
+) -> Result<(Value, Option<Value>), EvalError> {
+    let mut obj = match input {
+        Value::Object(obj) => obj,
+        other => return Ok((other, None)),
+    };
+    let Some(envelope) = obj.remove("$step_meta") else {
+        return Ok((Value::Object(obj), None));
+    };
+    let envelope = match envelope {
+        Value::Object(map) => map,
+        other => {
+            return Err(EvalError::DispatcherError {
+                ref_: ref_.to_string(),
+                msg: format!(
+                    "malformed $step_meta envelope for step '{ref_}': expected an object, got {other}"
+                ),
+            });
+        }
+    };
+
+    let ref_ctx: Option<Map<String, Value>> = match envelope.get("ref") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => {
+            let resolved = step_metas.get(name).cloned().ok_or_else(|| {
+                EvalError::DispatcherError {
+                    ref_: ref_.to_string(),
+                    msg: format!(
+                        "$step_meta.ref '{name}' (step '{ref_}') is not a defined Blueprint.metas entry (defined: {:?})",
+                        step_metas.keys().collect::<Vec<_>>()
+                    ),
+                }
+            })?;
+            match resolved {
+                Value::Object(map) => Some(map),
+                other => {
+                    return Err(EvalError::DispatcherError {
+                        ref_: ref_.to_string(),
+                        msg: format!(
+                            "malformed $step_meta: MetaDef '{name}'.ctx must be an object, got {other}"
+                        ),
+                    });
+                }
+            }
+        }
+        Some(other) => {
+            return Err(EvalError::DispatcherError {
+                ref_: ref_.to_string(),
+                msg: format!(
+                    "malformed $step_meta.ref (step '{ref_}'): expected a string, got {other}"
+                ),
+            });
+        }
+    };
+
+    let inline: Option<Map<String, Value>> = match envelope.get("inline") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(map)) => Some(map.clone()),
+        Some(other) => {
+            return Err(EvalError::DispatcherError {
+                ref_: ref_.to_string(),
+                msg: format!(
+                    "malformed $step_meta.inline (step '{ref_}'): expected an object, got {other}"
+                ),
+            });
+        }
+    };
+
+    let step_ctx = match (ref_ctx, inline) {
+        (None, None) => None,
+        (Some(base), None) => Some(Value::Object(base)),
+        (None, Some(inline)) => Some(Value::Object(inline)),
+        (Some(mut base), Some(inline)) => {
+            for (k, v) in inline {
+                base.insert(k, v);
+            }
+            Some(Value::Object(base))
+        }
+    };
+
+    // Directive rule — only reached once a `$step_meta` envelope was
+    // present in `input`.
+    let initial_directive = if let Some(in_value) = obj.remove("$in") {
+        in_value
+    } else if obj.is_empty() {
+        Value::String(String::new())
+    } else {
+        Value::Object(obj)
+    };
+
+    Ok((initial_directive, step_ctx))
 }
 
 #[async_trait]
@@ -114,13 +264,19 @@ impl AsyncDispatcher for EngineDispatcher {
         // (`/v1/worker/prompt`), and
         // `operator_ws::session::default_spawn_directive_with_task_directive`
         // renders it into the WS `Spawn.directive` reminder text.
+        //
+        // GH #21 Phase 2: BEFORE that pass-through, resolve_step_envelope
+        // strips + resolves any `$step_meta` envelope — see its doc for
+        // the full contract. Inputs without one flow through unchanged.
+        let (initial_directive, step_ctx) = resolve_step_envelope(&self.step_metas, ref_, input)?;
         let tid = self
             .engine
             .start_task(
                 &self.op_token,
                 TaskSpec {
                     agent: ref_.to_string(),
-                    initial_directive: input,
+                    initial_directive,
+                    step_ctx,
                 },
             )
             .await
@@ -182,5 +338,233 @@ impl AsyncDispatcher for EngineDispatcher {
                 msg: format!("dispatch_attempt: {e}"),
             }),
         }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// issue #21 Phase 2: `resolve_step_envelope` unit tests + a dispatch-level
+// end-to-end leak-proof test
+// ──────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn metas(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn no_envelope_string_input_passes_through_unchanged() {
+        let (directive, step_ctx) =
+            resolve_step_envelope(&HashMap::new(), "scout", json!("plain string")).unwrap();
+        assert_eq!(directive, json!("plain string"));
+        assert_eq!(step_ctx, None);
+    }
+
+    #[test]
+    fn no_envelope_plain_object_input_passes_through_unchanged() {
+        let input = json!({ "foo": "bar" });
+        let (directive, step_ctx) =
+            resolve_step_envelope(&HashMap::new(), "scout", input.clone()).unwrap();
+        assert_eq!(directive, input);
+        assert_eq!(step_ctx, None);
+    }
+
+    #[test]
+    fn envelope_with_only_ref_resolves_that_metadef_ctx() {
+        let step_metas = metas(&[("heavy-scan", json!({ "work_dir": "/x" }))]);
+        let input = json!({ "$step_meta": { "ref": "heavy-scan" }, "$in": "go" });
+        let (directive, step_ctx) = resolve_step_envelope(&step_metas, "scout", input).unwrap();
+        assert_eq!(directive, json!("go"));
+        assert_eq!(step_ctx, Some(json!({ "work_dir": "/x" })));
+    }
+
+    #[test]
+    fn envelope_with_only_inline_uses_inline_verbatim() {
+        let input = json!({
+            "$step_meta": { "inline": { "work_dir": "/inline-only" } },
+            "$in": "go"
+        });
+        let (directive, step_ctx) = resolve_step_envelope(&HashMap::new(), "scout", input).unwrap();
+        assert_eq!(directive, json!("go"));
+        assert_eq!(step_ctx, Some(json!({ "work_dir": "/inline-only" })));
+    }
+
+    #[test]
+    fn inline_wins_over_ref_on_key_collision() {
+        let step_metas = metas(&[(
+            "heavy-scan",
+            json!({ "work_dir": "/ref", "extra": "from-ref" }),
+        )]);
+        let input = json!({
+            "$step_meta": {
+                "ref": "heavy-scan",
+                "inline": { "work_dir": "/inline-wins" }
+            },
+            "$in": "go"
+        });
+        let (_, step_ctx) = resolve_step_envelope(&step_metas, "scout", input).unwrap();
+        assert_eq!(
+            step_ctx,
+            Some(json!({ "work_dir": "/inline-wins", "extra": "from-ref" })),
+            "inline must win the collided key while ref-only keys survive the merge"
+        );
+    }
+
+    #[test]
+    fn dollar_in_rule_extracts_directive_and_ignores_other_sibling_keys() {
+        let input = json!({
+            "$step_meta": { "inline": { "k": "v" } },
+            "$in": "the real directive",
+            "unrelated_sibling": "ignored"
+        });
+        let (directive, step_ctx) = resolve_step_envelope(&HashMap::new(), "scout", input).unwrap();
+        assert_eq!(directive, json!("the real directive"));
+        assert_eq!(step_ctx, Some(json!({ "k": "v" })));
+    }
+
+    #[test]
+    fn no_dollar_in_remainder_becomes_the_directive() {
+        let input = json!({
+            "$step_meta": { "inline": { "k": "v" } },
+            "other_key": "other_value"
+        });
+        let (directive, _) = resolve_step_envelope(&HashMap::new(), "scout", input).unwrap();
+        assert_eq!(directive, json!({ "other_key": "other_value" }));
+    }
+
+    #[test]
+    fn empty_remainder_becomes_empty_string_directive() {
+        let input = json!({ "$step_meta": { "ref": "heavy-scan" } });
+        let step_metas = metas(&[("heavy-scan", json!({ "work_dir": "/x" }))]);
+        let (directive, step_ctx) = resolve_step_envelope(&step_metas, "scout", input).unwrap();
+        assert_eq!(directive, Value::String(String::new()));
+        assert_eq!(step_ctx, Some(json!({ "work_dir": "/x" })));
+    }
+
+    #[test]
+    fn unresolved_ref_is_a_loud_dispatcher_error_naming_ref_and_defined() {
+        let step_metas = metas(&[("known", json!({}))]);
+        let input = json!({ "$step_meta": { "ref": "unknown" }, "$in": "go" });
+        let err = resolve_step_envelope(&step_metas, "scout", input).unwrap_err();
+        match err {
+            EvalError::DispatcherError { ref_, msg } => {
+                assert_eq!(ref_, "scout");
+                assert!(
+                    msg.contains("unknown"),
+                    "message must name the unresolved ref: {msg}"
+                );
+                assert!(
+                    msg.contains("known"),
+                    "message must list defined names: {msg}"
+                );
+            }
+            other => panic!("expected DispatcherError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_step_meta_not_an_object_is_a_loud_error() {
+        let input = json!({ "$step_meta": "not-an-object" });
+        let err = resolve_step_envelope(&HashMap::new(), "scout", input).unwrap_err();
+        assert!(matches!(err, EvalError::DispatcherError { .. }));
+    }
+
+    #[test]
+    fn malformed_ref_non_string_is_a_loud_error() {
+        let input = json!({ "$step_meta": { "ref": 42 } });
+        let err = resolve_step_envelope(&HashMap::new(), "scout", input).unwrap_err();
+        assert!(matches!(err, EvalError::DispatcherError { .. }));
+    }
+
+    #[test]
+    fn malformed_inline_non_object_is_a_loud_error() {
+        let input = json!({ "$step_meta": { "inline": "not-an-object" } });
+        let err = resolve_step_envelope(&HashMap::new(), "scout", input).unwrap_err();
+        assert!(matches!(err, EvalError::DispatcherError { .. }));
+    }
+
+    #[test]
+    fn ref_resolved_metadef_ctx_non_object_is_a_loud_error() {
+        let step_metas = metas(&[("bad", json!("not-an-object"))]);
+        let input = json!({ "$step_meta": { "ref": "bad" } });
+        let err = resolve_step_envelope(&step_metas, "scout", input).unwrap_err();
+        assert!(matches!(err, EvalError::DispatcherError { .. }));
+    }
+
+    /// End-to-end proof (issue #21 Phase 2 Done Criteria #5): a `$step_meta`
+    /// envelope must never reach `EngineState.prompts[(tid, 1)]` — the
+    /// resolve step runs BEFORE `start_task` seeds that table.
+    #[tokio::test]
+    async fn dispatch_step_meta_envelope_never_leaks_into_stored_prompt() {
+        use crate::blueprint::compiler::{RustFnInProcessSpawnerFactory, SpawnerFactory};
+        use crate::core::config::EngineCfg;
+        use crate::types::{Role, StepId};
+        use crate::worker::adapter::WorkerResult;
+        use std::sync::Mutex as StdMutex;
+        use std::time::Duration;
+
+        let captured_tid: Arc<StdMutex<Option<StepId>>> = Arc::new(StdMutex::new(None));
+        let captured_tid_for_fn = captured_tid.clone();
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", move |inv| {
+            let captured_tid = captured_tid_for_fn.clone();
+            async move {
+                *captured_tid.lock().unwrap() = Some(inv.task_id.clone());
+                Ok(WorkerResult {
+                    value: json!({ "ok": true }),
+                    ok: true,
+                })
+            }
+        });
+        let def = AgentDef {
+            name: "scout".into(),
+            kind: AgentKind::RustFn,
+            spec: json!({ "fn_id": "echo" }),
+            profile: None,
+            meta: None,
+        };
+        let spawner = factory.build(&def, None).expect("build");
+
+        let engine = Engine::new(EngineCfg::default());
+        let token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let step_metas = metas(&[("heavy-scan", json!({ "work_dir": "/x" }))]);
+        let dispatcher = EngineDispatcher::with_spawner(engine.clone(), token, spawner)
+            .with_step_metas(step_metas);
+
+        let input = json!({
+            "$step_meta": { "ref": "heavy-scan" },
+            "$in": "do the thing"
+        });
+        let out = dispatcher
+            .dispatch("scout", input)
+            .await
+            .expect("dispatch ok");
+        assert_eq!(out, json!({ "ok": true }));
+
+        let tid = captured_tid
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("task_id captured");
+        let stored_prompt = engine
+            .with_state("test.read_prompt", move |s| {
+                s.prompts.get(&(tid, 1)).cloned()
+            })
+            .await
+            .expect("with_state")
+            .expect("prompt recorded for attempt 1");
+        assert_eq!(
+            stored_prompt,
+            json!("do the thing"),
+            "the stored prompt must be the post-envelope directive, with no $step_meta leakage"
+        );
     }
 }

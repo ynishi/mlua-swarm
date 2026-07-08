@@ -806,6 +806,7 @@ mod operator_delegate_worker_binding_tests {
                 TaskSpec {
                     agent: "planner".to_string(),
                     initial_directive: "do the thing".into(),
+                    step_ctx: None,
                 },
             )
             .await

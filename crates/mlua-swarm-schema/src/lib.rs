@@ -54,6 +54,7 @@
 //!         meta: None,
 //!     }],
 //!     operators: vec![],
+//!     metas: vec![],
 //!     hints: Default::default(),
 //!     strategy: Default::default(),
 //!     metadata: Default::default(),
@@ -61,6 +62,8 @@
 //!     default_agent_kind: AgentKind::Operator,
 //!     default_operator_kind: None,
 //!     default_init_ctx: None,
+//!     default_agent_ctx: None,
+//!     default_context_policy: None,
 //! };
 //!
 //! assert_eq!(bp.id.as_str(), "hello");
@@ -82,6 +85,7 @@
 //!     flow: Node::Seq { children: vec![] },
 //!     agents: vec![],
 //!     operators: vec![],
+//!     metas: vec![],
 //!     hints: Default::default(),
 //!     strategy: Default::default(),
 //!     metadata: BlueprintMetadata {
@@ -93,6 +97,8 @@
 //!     default_agent_kind: AgentKind::Operator,
 //!     default_operator_kind: None,
 //!     default_init_ctx: None,
+//!     default_agent_ctx: None,
+//!     default_context_policy: None,
 //! };
 //!
 //! let json = serde_json::to_string(&bp).unwrap();
@@ -258,6 +264,18 @@ pub struct Blueprint {
     /// Blueprint declares no Operator agents.
     #[serde(default)]
     pub operators: Vec<OperatorDef>,
+    /// GH #21 Phase 2 — named, BP-scoped pool of [`MetaDef`] entries. Two
+    /// independent consumers resolve names against this pool: a
+    /// `$step_meta.ref` envelope embedded in a Step's evaluated `in`
+    /// value (the Step tier — resolved by `EngineDispatcher` in the
+    /// `mlua-swarm` core crate at dispatch time), and
+    /// [`AgentMeta::meta_ref`] (the Agent tier — resolved at launch
+    /// time). The pool lets multiple Steps and/or Agents share one
+    /// declarative context object by name instead of repeating it
+    /// inline. `[]` = no named `MetaDef`s declared (pre-#21-Phase-2
+    /// Blueprints unaffected).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metas: Vec<MetaDef>,
     /// Swarm extension layer: per-agent hints (interpreted by the Compiler).
     #[serde(default)]
     pub hints: CompilerHints,
@@ -307,6 +325,66 @@ pub struct Blueprint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<Value>")]
     pub default_init_ctx: Option<Value>,
+    /// GH #21 Phase 1 — "BP Global" tier of the agent-context supply axis:
+    /// a declarative object merged into `ctx.meta.runtime` (and, for
+    /// unnamed keys, `AgentContextView.extra`) targeting every agent's
+    /// runtime materialization. Contrast with [`Self::default_init_ctx`]:
+    /// that field seeds the flow-ir eval `ctx` once at flow start, while
+    /// this one is consumed per-spawn by
+    /// `AgentContextMiddleware`/`AgentContextView` (Contract C, GH #20) —
+    /// a pure flow-ir eval seed vs. an Agent/LLM-boundary runtime default.
+    /// `None` = no BP-global default (pre-#21 Blueprints unaffected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Value>")]
+    pub default_agent_ctx: Option<Value>,
+    /// GH #21 Phase 1 — "BP Global" tier of the [`ContextPolicy`] cascade:
+    /// the default filter applied to the materialized `AgentContextView`
+    /// when the targeted agent declares no `AgentMeta.context_policy` of
+    /// its own. `None` = pass-all (the pre-#21 behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_context_policy: Option<ContextPolicy>,
+}
+
+/// Receptacle for a Blueprint-driven filter over the materialized
+/// `AgentContextView` (GH #20/#21). Declared BP-side via
+/// [`Blueprint::default_context_policy`] (BP-global) or
+/// `AgentMeta::context_policy` (per-agent, outranks the BP-global tier) —
+/// resolved and applied by `AgentContextMiddleware` in the `mlua-swarm`
+/// core crate (this crate stays execution-free; see the crate doc).
+/// Default (`include: None, exclude: vec![]`) is pass-all — [`Self::allows`]
+/// returns `true` for every field name.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContextPolicy {
+    /// Field names to keep. `None` means "keep everything" (pass-all).
+    /// Matched against the `AgentContextView` named-field strings
+    /// (`"project_root"` / `"work_dir"` / `"task_metadata"` / `"run_id"` /
+    /// `"project_name_alias"`) and `extra` keys by their own key string.
+    /// Identity fields (`task_id` / `agent` / `attempt`) are never
+    /// filtered regardless of `include`.
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    /// Field names to drop, applied AFTER `include` (exclude wins when a
+    /// name appears in both). Same name-matching rule as `include`.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl ContextPolicy {
+    /// Whether `name` survives this policy: `false` if `exclude` lists it;
+    /// otherwise `true` when `include` is `None` (pass-all) or lists
+    /// `name`. Shared by both the schema crate (tests) and the `mlua-swarm`
+    /// core crate's `AgentContextView::apply_policy`, so the include/exclude
+    /// evaluation rule has exactly one implementation.
+    pub fn allows(&self, name: &str) -> bool {
+        if self.exclude.iter().any(|excluded| excluded == name) {
+            return false;
+        }
+        match &self.include {
+            Some(list) => list.iter().any(|included| included == name),
+            None => true,
+        }
+    }
 }
 
 /// Global default `AgentKind` at the Schema impl Default layer. Bottom of the 4-layer cascade.
@@ -539,6 +617,31 @@ pub struct OperatorDef {
     pub meta: Option<AgentMeta>,
 }
 
+/// Named, multi-step-shared declarative context payload (GH #21 Phase 2).
+///
+/// Lives in the [`Blueprint::metas`] pool and is referenced by name from
+/// two independent consumers: a `$step_meta.ref` envelope embedded in a
+/// Step's evaluated `in` value (the Step tier, resolved by
+/// `EngineDispatcher::dispatch` in the `mlua-swarm` core crate at
+/// dispatch time — see `EngineDispatcher::with_step_metas`), and
+/// [`AgentMeta::meta_ref`] (the Agent tier, resolved at launch time and
+/// merged UNDER the agent's inline `AgentMeta::ctx`). The pool lets
+/// multiple Steps and/or Agents share one declarative context object by
+/// name instead of repeating it inline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MetaDef {
+    /// Logical name (= referenced by `$step_meta.ref` and
+    /// `AgentMeta.meta_ref`; unique within [`Blueprint::metas`]).
+    pub name: String,
+    /// Declarative context payload. Consumers expect a JSON `Object` so
+    /// it can be shallow-merged with an `inline` override / an agent's
+    /// own `ctx` (a non-`Object` value is rejected — loudly at dispatch
+    /// time for the Step tier, defensively (warn + skip) at launch time
+    /// for the Agent tier); the shape is otherwise free-form.
+    pub ctx: Value,
+}
+
 /// Agent / Operator level metadata (description / version / tags).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -552,6 +655,28 @@ pub struct AgentMeta {
     /// Tag list for classification / routing.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// GH #21 Phase 1 — "BP Agent-level" tier of the agent-context supply
+    /// axis: a declarative object merged into `ctx.meta.runtime` for this
+    /// agent's spawns, on top of (and winning over)
+    /// [`Blueprint::default_agent_ctx`]. See that field's doc for the
+    /// contrast with `default_init_ctx`. `None` = this agent declares no
+    /// per-agent context (the BP-global tier alone applies, if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Value>")]
+    pub ctx: Option<Value>,
+    /// GH #21 Phase 1 — "BP Agent-level" tier of the [`ContextPolicy`]
+    /// cascade: outranks [`Blueprint::default_context_policy`] for this
+    /// agent. `None` = fall through to the BP-global policy (or pass-all
+    /// if that is also `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_policy: Option<ContextPolicy>,
+    /// GH #21 Phase 2 — "BP Agent-level" tier of the [`MetaDef`] pool:
+    /// resolves against [`Blueprint::metas`] by name. The resolved
+    /// `ctx` sits UNDER this agent's inline [`Self::ctx`] (inline wins
+    /// on key collision). `None` = this agent declares no shared
+    /// `MetaDef` reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_ref: Option<String>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -684,6 +809,7 @@ mod tests {
             "flow",
             "agents",
             "operators",
+            "metas",
             "hints",
             "strategy",
             "metadata",
@@ -691,6 +817,8 @@ mod tests {
             "default_agent_kind",
             "default_operator_kind",
             "default_init_ctx",
+            "default_agent_ctx",
+            "default_context_policy",
         ] {
             assert!(props.contains_key(key), "missing property: {key}");
         }
@@ -740,6 +868,7 @@ mod tests {
             flow: FlowNode::Seq { children: vec![] },
             agents: vec![],
             operators: vec![],
+            metas: vec![],
             hints: Default::default(),
             strategy: Default::default(),
             metadata: Default::default(),
@@ -747,6 +876,8 @@ mod tests {
             default_agent_kind: AgentKind::Operator,
             default_operator_kind: None,
             default_init_ctx,
+            default_agent_ctx: None,
+            default_context_policy: None,
         }
     }
 
@@ -785,5 +916,239 @@ mod tests {
             v["properties"]["default_init_ctx"].is_object(),
             "default_init_ctx must appear in the exported schema: {v}"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // issue #21 Phase 1: `Blueprint.default_agent_ctx` /
+    // `default_context_policy`, `AgentMeta.ctx` / `context_policy`,
+    // `ContextPolicy`
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn blueprint_default_agent_ctx_and_context_policy_roundtrip_when_some() {
+        let mut bp = minimal_bp(None);
+        bp.default_agent_ctx = Some(serde_json::json!({ "org_conventions": "x" }));
+        bp.default_context_policy = Some(ContextPolicy {
+            include: Some(vec!["project_root".to_string()]),
+            exclude: vec!["work_dir".to_string()],
+        });
+        let json = serde_json::to_string(&bp).expect("serializes");
+        let back: Blueprint = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(bp, back);
+        assert_eq!(
+            back.default_agent_ctx,
+            Some(serde_json::json!({ "org_conventions": "x" }))
+        );
+        assert_eq!(
+            back.default_context_policy,
+            Some(ContextPolicy {
+                include: Some(vec!["project_root".to_string()]),
+                exclude: vec!["work_dir".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn blueprint_default_agent_ctx_and_context_policy_omitted_when_none() {
+        let bp = minimal_bp(None);
+        let json = serde_json::to_value(&bp).expect("serializes");
+        let obj = json.as_object().unwrap();
+        assert!(
+            obj.get("default_agent_ctx").is_none(),
+            "default_agent_ctx key must be absent when None: {json}"
+        );
+        assert!(
+            obj.get("default_context_policy").is_none(),
+            "default_context_policy key must be absent when None: {json}"
+        );
+        let back: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.default_agent_ctx, None);
+        assert_eq!(back.default_context_policy, None);
+        assert_eq!(bp, back);
+    }
+
+    #[test]
+    fn blueprint_json_schema_exports_agent_ctx_and_context_policy() {
+        let schema = schemars::schema_for!(Blueprint);
+        let v = serde_json::to_value(&schema).expect("schema serializes");
+        assert!(
+            v["properties"]["default_agent_ctx"].is_object(),
+            "default_agent_ctx must appear in the exported schema: {v}"
+        );
+        assert!(
+            v["properties"]["default_context_policy"].is_object(),
+            "default_context_policy must appear in the exported schema: {v}"
+        );
+    }
+
+    #[test]
+    fn agent_meta_ctx_and_context_policy_roundtrip_when_some() {
+        let meta = AgentMeta {
+            ctx: Some(serde_json::json!({ "k": "v" })),
+            context_policy: Some(ContextPolicy {
+                include: None,
+                exclude: vec!["run_id".to_string()],
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&meta).expect("serializes");
+        let back: AgentMeta = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn agent_meta_ctx_and_context_policy_omitted_when_none() {
+        let meta = AgentMeta::default();
+        let json = serde_json::to_value(&meta).expect("serializes");
+        let obj = json.as_object().unwrap();
+        assert!(
+            obj.get("ctx").is_none(),
+            "ctx key must be absent when None: {json}"
+        );
+        assert!(
+            obj.get("context_policy").is_none(),
+            "context_policy key must be absent when None: {json}"
+        );
+    }
+
+    #[test]
+    fn agent_meta_json_schema_exports_ctx_context_policy_and_meta_ref() {
+        let schema = schemars::schema_for!(AgentMeta);
+        let v = serde_json::to_value(&schema).expect("schema serializes");
+        let props = v["properties"].as_object().expect("object schema");
+        for key in [
+            "description",
+            "version",
+            "tags",
+            "ctx",
+            "context_policy",
+            "meta_ref",
+        ] {
+            assert!(props.contains_key(key), "missing property: {key}");
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // issue #21 Phase 2: `MetaDef`, `Blueprint.metas`, `AgentMeta.meta_ref`
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn meta_def_roundtrips_through_json() {
+        let def = MetaDef {
+            name: "heavy-scan".to_string(),
+            ctx: serde_json::json!({ "work_dir": "/x" }),
+        };
+        let json = serde_json::to_value(&def).expect("serializes");
+        let back: MetaDef = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, def);
+    }
+
+    #[test]
+    fn blueprint_metas_omitted_when_empty() {
+        let bp = minimal_bp(None);
+        let json = serde_json::to_value(&bp).expect("serializes");
+        assert!(
+            json.as_object().unwrap().get("metas").is_none(),
+            "metas key must be absent when empty: {json}"
+        );
+        let back: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert!(back.metas.is_empty());
+        assert_eq!(bp, back);
+    }
+
+    #[test]
+    fn blueprint_metas_roundtrips_when_non_empty() {
+        let mut bp = minimal_bp(None);
+        bp.metas = vec![MetaDef {
+            name: "heavy-scan".to_string(),
+            ctx: serde_json::json!({ "work_dir": "/x" }),
+        }];
+        let json = serde_json::to_string(&bp).expect("serializes");
+        let back: Blueprint = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(bp, back);
+        assert_eq!(back.metas.len(), 1);
+        assert_eq!(back.metas[0].name, "heavy-scan");
+    }
+
+    #[test]
+    fn blueprint_json_schema_exports_metas() {
+        let schema = schemars::schema_for!(Blueprint);
+        let v = serde_json::to_value(&schema).expect("schema serializes");
+        assert!(
+            v["properties"]["metas"].is_object(),
+            "metas must appear in the exported schema: {v}"
+        );
+        let dump = v.to_string();
+        assert!(dump.contains("MetaDef"), "MetaDef definition in schema");
+    }
+
+    #[test]
+    fn agent_meta_meta_ref_roundtrips_when_some() {
+        let meta = AgentMeta {
+            meta_ref: Some("heavy-scan".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&meta).expect("serializes");
+        assert_eq!(json["meta_ref"], "heavy-scan");
+        let back: AgentMeta = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn agent_meta_meta_ref_omitted_when_none() {
+        let meta = AgentMeta::default();
+        let json = serde_json::to_value(&meta).expect("serializes");
+        assert!(
+            json.as_object().unwrap().get("meta_ref").is_none(),
+            "meta_ref key must be absent when None: {json}"
+        );
+        let back: AgentMeta = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.meta_ref, None);
+    }
+
+    #[test]
+    fn context_policy_default_allows_everything() {
+        let policy = ContextPolicy::default();
+        assert!(policy.allows("project_root"));
+        assert!(policy.allows("anything"));
+    }
+
+    #[test]
+    fn context_policy_include_only_allows_listed_names() {
+        let policy = ContextPolicy {
+            include: Some(vec!["project_root".to_string()]),
+            exclude: vec![],
+        };
+        assert!(policy.allows("project_root"));
+        assert!(!policy.allows("work_dir"));
+    }
+
+    #[test]
+    fn context_policy_exclude_wins_over_include() {
+        let policy = ContextPolicy {
+            include: Some(vec!["project_root".to_string()]),
+            exclude: vec!["project_root".to_string()],
+        };
+        assert!(!policy.allows("project_root"));
+    }
+
+    #[test]
+    fn context_policy_roundtrips_through_json() {
+        let policy = ContextPolicy {
+            include: Some(vec!["a".to_string(), "b".to_string()]),
+            exclude: vec!["c".to_string()],
+        };
+        let json = serde_json::to_value(&policy).expect("serializes");
+        let back: ContextPolicy = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, policy);
+    }
+
+    #[test]
+    fn context_policy_default_roundtrips_as_empty_object() {
+        let policy = ContextPolicy::default();
+        let json = serde_json::to_value(&policy).expect("serializes");
+        assert_eq!(json, serde_json::json!({ "include": null, "exclude": [] }));
+        let back: ContextPolicy = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, policy);
     }
 }

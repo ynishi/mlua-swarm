@@ -8,7 +8,7 @@
 //! plus its paired `SpawnerLayer`s and passes through here without the
 //! engine core needing to grow.
 
-use crate::core::agent_context::RUN_ID_KEY;
+use crate::core::agent_context::{RUN_ID_KEY, STEP_CTX_KEY};
 use crate::core::config::EngineCfg;
 use crate::core::ctx::{Ctx, OperatorInfo, OperatorKind, SeniorBridge, SpawnHook};
 use crate::core::errors::EngineError;
@@ -952,7 +952,7 @@ impl Engine {
         //    prompt, and pull `operator_info` from the session so we can inject it into Ctx.
         let fp = token.fingerprint();
         let tid_for_prep = task_id.clone();
-        let (attempt, agent, session_snapshot) = self
+        let (attempt, agent, session_snapshot, step_ctx) = self
             .with_state("dispatch.prep", move |s| {
                 let task = s
                     .tasks
@@ -975,6 +975,11 @@ impl Engine {
                     .get(&tid_for_prep)
                     .ok_or_else(|| EngineError::TaskNotFound(tid_for_prep.to_string()))?;
                 let agent = task.spec.agent.clone();
+                // GH #21 Phase 2: re-read `TaskSpec.step_ctx` on EVERY
+                // attempt (not cached once at start_task) so retries and
+                // Run-rekicks all carry the Step tier through to Ctx —
+                // see TaskSpec.step_ctx's doc.
+                let step_ctx = task.spec.step_ctx.clone();
                 // Session snapshot (looked up by token nonce). When no session
                 // exists (worker token invoked directly / test injection), fall
                 // back to None → default OperatorInfo.
@@ -983,7 +988,7 @@ impl Engine {
                     .values()
                     .find(|sess| sess.token_fp == fp)
                     .cloned();
-                Ok::<_, EngineError>((attempt, agent, sess_clone))
+                Ok::<_, EngineError>((attempt, agent, sess_clone, step_ctx))
             })
             .await??;
         // BridgeRegistry lookup + per-agent OperatorKind cascade.
@@ -1030,6 +1035,13 @@ impl Engine {
             ctx.meta
                 .runtime
                 .insert(RUN_ID_KEY.to_string(), Value::String(rid.to_string()));
+        }
+        // GH #21 Phase 2: the Step tier's resolved context bundle (from
+        // `TaskSpec.step_ctx`, re-read every attempt above) — consumed by
+        // `AgentContextMiddleware`, which unpacks its keys ahead of the
+        // Agent / BP-global tiers.
+        if let Some(step_ctx) = step_ctx {
+            ctx.meta.runtime.insert(STEP_CTX_KEY.to_string(), step_ctx);
         }
 
         let worker = spawner
@@ -1913,6 +1925,7 @@ mod dispatch_attempt_with_run_id_tests {
                 TaskSpec {
                     agent: "probe".into(),
                     initial_directive: "hi".into(),
+                    step_ctx: None,
                 },
             )
             .await
@@ -1950,6 +1963,119 @@ mod dispatch_attempt_with_run_id_tests {
     }
 }
 
+/// GH #21 Phase 2: `TaskSpec.step_ctx` must land in
+/// `Ctx.meta.runtime[STEP_CTX_KEY]` — re-read from the spec on EVERY
+/// attempt (the prep closure re-reads `task.spec.step_ctx` every call, not
+/// caching it once at `start_task`), so a retry (attempt 2) carries it
+/// too. Same `CtxProbe` shape as `dispatch_attempt_with_run_id_tests`.
+#[cfg(test)]
+mod dispatch_attempt_with_step_ctx_tests {
+    use super::*;
+    use crate::worker::adapter::{SpawnError, SpawnerAdapter};
+    use crate::worker::Worker;
+    use std::sync::Mutex as StdMutex;
+
+    struct CtxProbe {
+        seen: Arc<StdMutex<Option<Ctx>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnerAdapter for CtxProbe {
+        async fn spawn(
+            &self,
+            _engine: &Engine,
+            ctx: &Ctx,
+            _task_id: StepId,
+            _attempt: u32,
+            _token: CapToken,
+        ) -> Result<Box<dyn Worker>, SpawnError> {
+            *self.seen.lock().unwrap() = Some(ctx.clone());
+            Err(SpawnError::Internal("probe stop".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn step_ctx_lands_in_ctx_meta_runtime_on_attempt_1_and_2() {
+        let engine = Engine::new(EngineCfg::default());
+        let token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let tid = engine
+            .start_task(
+                &token,
+                TaskSpec {
+                    agent: "probe".into(),
+                    initial_directive: "hi".into(),
+                    step_ctx: Some(serde_json::json!({ "work_dir": "/step" })),
+                },
+            )
+            .await
+            .expect("start_task");
+        let seen: Arc<StdMutex<Option<Ctx>>> = Arc::new(StdMutex::new(None));
+        let spawner: Arc<dyn SpawnerAdapter> = Arc::new(CtxProbe { seen: seen.clone() });
+
+        // The probe always errors the spawn; only the ctx snapshot matters.
+        let _ = engine
+            .dispatch_attempt_with(&token, &tid, &spawner, None)
+            .await;
+        let first = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("attempt 1 ctx captured");
+        assert_eq!(
+            first.meta.runtime.get(STEP_CTX_KEY),
+            Some(&serde_json::json!({ "work_dir": "/step" })),
+            "attempt 1 must carry TaskSpec.step_ctx in ctx.meta.runtime[STEP_CTX_KEY]"
+        );
+
+        let _ = engine
+            .dispatch_attempt_with(&token, &tid, &spawner, None)
+            .await;
+        let second = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("attempt 2 ctx captured");
+        assert_eq!(
+            second.meta.runtime.get(STEP_CTX_KEY),
+            Some(&serde_json::json!({ "work_dir": "/step" })),
+            "attempt 2 (retry) must ALSO carry TaskSpec.step_ctx — prep re-reads the spec every attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_ctx_key_absent_when_none() {
+        let engine = Engine::new(EngineCfg::default());
+        let token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let tid = engine
+            .start_task(
+                &token,
+                TaskSpec {
+                    agent: "probe".into(),
+                    initial_directive: "hi".into(),
+                    step_ctx: None,
+                },
+            )
+            .await
+            .expect("start_task");
+        let seen: Arc<StdMutex<Option<Ctx>>> = Arc::new(StdMutex::new(None));
+        let spawner: Arc<dyn SpawnerAdapter> = Arc::new(CtxProbe { seen: seen.clone() });
+        let _ = engine
+            .dispatch_attempt_with(&token, &tid, &spawner, None)
+            .await;
+        let observed = seen.lock().unwrap().clone().expect("ctx captured");
+        assert!(
+            !observed.meta.runtime.contains_key(STEP_CTX_KEY),
+            "no step_ctx key must be injected when TaskSpec.step_ctx is None"
+        );
+    }
+}
+
 // ─── issue #18: `TaskSpec.initial_directive` `Value` pass-through ──────────
 #[cfg(test)]
 mod initial_directive_value_passthrough_tests {
@@ -1967,6 +2093,7 @@ mod initial_directive_value_passthrough_tests {
                 TaskSpec {
                     agent: "planner".to_string(),
                     initial_directive,
+                    step_ctx: None,
                 },
             )
             .await

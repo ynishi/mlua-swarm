@@ -38,7 +38,7 @@
 //!         │ ctx (keys present)
 //!         ▼
 //!  AgentContextMiddleware (innermost layer)
-//!    view = ContextPolicy::apply(policy, AgentContextView::from_ctx(ctx))
+//!    view = AgentContextView::from_ctx(ctx).apply_policy(&policy)
 //!    (a) EngineState.agent_contexts[(task_id, attempt)] = view     ← Worker axis source
 //!    (b) ctx.meta.runtime[AGENT_CONTEXT_KEY] = json(view)          ← Spawner axis source
 //!         │ inner.spawn(new_ctx)
@@ -58,9 +58,13 @@
 //!
 //! A field added to [`AgentContextView`] (either a named field, or an
 //! `extra` entry) reaches both axes automatically — no per-consumer wiring
-//! required. [`ContextPolicy`] is the (currently pass-all) receptacle for
-//! future Blueprint-driven field filtering; BP schema wiring for it is a
-//! future issue, out of scope here.
+//! required. [`ContextPolicy`] filters the materialized view before it is
+//! snapshotted / stashed; GH #21 Phase 1 wires it to Blueprint schema
+//! fields (`Blueprint.default_agent_ctx` / `default_context_policy`,
+//! `AgentMeta.ctx` / `context_policy`, resolved by
+//! `crate::service::task_launch::derive_agent_ctx` /
+//! `derive_context_policies` and consumed by
+//! `crate::middleware::agent_context::AgentContextMiddleware`).
 
 use crate::core::ctx::Ctx;
 use serde::{Deserialize, Serialize};
@@ -76,6 +80,19 @@ pub const AGENT_CONTEXT_KEY: &str = "agent_context";
 /// value. Canonical home as of GH #20 (previously a bare literal at
 /// `Engine::dispatch_attempt_with`).
 pub const RUN_ID_KEY: &str = "run_id";
+
+/// `ctx.meta.runtime` key that carries the GH #21 Phase 2 Step tier's
+/// resolved context bundle (`TaskSpec.step_ctx`, threaded through by
+/// `Engine::dispatch_attempt_with` on every attempt — same insertion
+/// site as [`RUN_ID_KEY`]). Consumed by
+/// `crate::middleware::agent_context::AgentContextMiddleware`, which
+/// unpacks the bundle's keys and applies them with the same
+/// only-if-absent mechanics as the Agent / BP-global tiers, ordered
+/// FIRST (Step outranks Agent and BP-global — see that middleware's
+/// module doc for the full precedence narrative). The bundle itself
+/// (this key's raw value) stays in the runtime bag verbatim — only its
+/// individual keys are folded into [`AgentContextView::extra`].
+pub const STEP_CTX_KEY: &str = "step_ctx";
 
 /// `ctx.meta.runtime` key that carries `Blueprint.metadata.project_name_alias`.
 /// Canonical home as of GH #20; re-exported from
@@ -233,65 +250,46 @@ impl AgentContextView {
         }
         out
     }
-}
 
-/// Receptacle for a future Blueprint-driven filter over
-/// [`AgentContextView`] fields. Today's default (`include: None, exclude:
-/// vec![]`) is pass-all — [`Self::apply`] is a no-op. Wiring a BP schema
-/// field (`AgentMeta.context_policy` or similar) to construct a non-default
-/// `ContextPolicy` is a future issue, out of scope for GH #20.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct ContextPolicy {
-    /// Field names to keep. `None` means "keep everything" (pass-all).
-    /// Matched against `"project_root"` / `"work_dir"` / `"task_metadata"`
-    /// / `"run_id"` / `"project_name_alias"`, and `extra` keys by their
-    /// own key string. `task_id` / `agent` / `attempt` are identity
-    /// fields and are never filtered regardless of `include`.
-    #[serde(default)]
-    pub include: Option<Vec<String>>,
-    /// Field names to drop, applied AFTER `include` (exclude wins when a
-    /// name appears in both). Same name-matching rule as `include`.
-    /// `task_id` / `agent` / `attempt` are never filtered.
-    #[serde(default)]
-    pub exclude: Vec<String>,
-}
-
-impl ContextPolicy {
-    /// Applies this policy to `view`, returning a filtered copy. Filtered
+    /// Applies `policy` to `self`, returning a filtered copy. Filtered
     /// `Option` fields become `None`; filtered `extra` keys are removed.
     /// Identity fields (`task_id` / `agent` / `attempt`) are never
-    /// filtered. Default policy (pass-all) returns `view` unchanged.
-    pub fn apply(&self, mut view: AgentContextView) -> AgentContextView {
-        let allowed = |name: &str| -> bool {
-            if self.exclude.iter().any(|excluded| excluded == name) {
-                return false;
-            }
-            match &self.include {
-                Some(list) => list.iter().any(|included| included == name),
-                None => true,
-            }
-        };
+    /// filtered. A pass-all policy (the `ContextPolicy` default) returns
+    /// `self` unchanged. Moved here from the former
+    /// `ContextPolicy::apply(&self, view)` (GH #21 Phase 1 — the filter
+    /// data shape now lives in `mlua_swarm_schema::ContextPolicy`; the
+    /// application logic stays on the view it filters).
+    pub fn apply_policy(mut self, policy: &ContextPolicy) -> Self {
+        if !policy.allows("project_root") {
+            self.project_root = None;
+        }
+        if !policy.allows("work_dir") {
+            self.work_dir = None;
+        }
+        if !policy.allows("task_metadata") {
+            self.task_metadata = None;
+        }
+        if !policy.allows("run_id") {
+            self.run_id = None;
+        }
+        if !policy.allows("project_name_alias") {
+            self.project_name_alias = None;
+        }
+        self.extra.retain(|key, _| policy.allows(key));
 
-        if !allowed("project_root") {
-            view.project_root = None;
-        }
-        if !allowed("work_dir") {
-            view.work_dir = None;
-        }
-        if !allowed("task_metadata") {
-            view.task_metadata = None;
-        }
-        if !allowed("run_id") {
-            view.run_id = None;
-        }
-        if !allowed("project_name_alias") {
-            view.project_name_alias = None;
-        }
-        view.extra.retain(|key, _| allowed(key));
-
-        view
+        self
     }
 }
+
+/// Filter over [`AgentContextView`] fields (GH #20/#21). Relocated to the
+/// schema crate in GH #21 Phase 1 so a Blueprint author can declare one via
+/// `Blueprint.default_context_policy` / `AgentMeta.context_policy` — this
+/// re-export keeps `mlua_swarm::core::agent_context::ContextPolicy`
+/// resolving unchanged for every existing caller (path-compat; see the
+/// `context_policy_path_compat_reexport` test below). The filter
+/// *application* logic lives on the view side, at
+/// [`AgentContextView::apply_policy`].
+pub use mlua_swarm_schema::ContextPolicy;
 
 #[cfg(test)]
 mod tests {
@@ -440,7 +438,7 @@ mod tests {
             (TASK_PROJECT_ROOT_KEY, Value::String("/repo".into())),
             (RUN_ID_KEY, Value::String("R-1".into())),
         ]));
-        let filtered = ContextPolicy::default().apply(view.clone());
+        let filtered = view.clone().apply_policy(&ContextPolicy::default());
         assert_eq!(filtered, view);
     }
 
@@ -455,7 +453,7 @@ mod tests {
             include: Some(vec!["project_root".to_string()]),
             exclude: Vec::new(),
         };
-        let filtered = policy.apply(view);
+        let filtered = view.apply_policy(&policy);
         assert_eq!(filtered.project_root.as_deref(), Some("/repo"));
         assert!(filtered.work_dir.is_none());
         assert!(filtered.run_id.is_none());
@@ -471,7 +469,7 @@ mod tests {
             include: None,
             exclude: vec!["work_dir".to_string()],
         };
-        let filtered = policy.apply(view);
+        let filtered = view.apply_policy(&policy);
         assert_eq!(filtered.project_root.as_deref(), Some("/repo"));
         assert!(filtered.work_dir.is_none());
     }
@@ -486,7 +484,7 @@ mod tests {
             include: Some(vec!["project_root".to_string()]),
             exclude: vec!["project_root".to_string()],
         };
-        let filtered = policy.apply(view);
+        let filtered = view.apply_policy(&policy);
         assert!(filtered.project_root.is_none());
     }
 
@@ -501,7 +499,7 @@ mod tests {
                 "attempt".to_string(),
             ],
         };
-        let filtered = policy.apply(view.clone());
+        let filtered = view.clone().apply_policy(&policy);
         assert_eq!(filtered.task_id, view.task_id);
         assert_eq!(filtered.agent, view.agent);
         assert_eq!(filtered.attempt, view.attempt);
@@ -517,7 +515,7 @@ mod tests {
             include: None,
             exclude: vec!["secret".to_string()],
         };
-        let filtered = policy.apply(view);
+        let filtered = view.apply_policy(&policy);
         assert!(!filtered.extra.contains_key("secret"));
         assert!(filtered.extra.contains_key("kept"));
     }
@@ -594,5 +592,16 @@ mod tests {
             json.get("extra").and_then(|e| e.get("step_meta")),
             Some(&serde_json::json!({"loop_idx": 2}))
         );
+    }
+
+    /// GH #21 Phase 1 path-compat guard: `ContextPolicy` moved to the
+    /// schema crate, but every caller importing it as
+    /// `crate::core::agent_context::ContextPolicy` (this module's `pub
+    /// use` re-export) must keep resolving unchanged.
+    #[test]
+    fn context_policy_path_compat_reexport() {
+        let policy: crate::core::agent_context::ContextPolicy =
+            crate::core::agent_context::ContextPolicy::default();
+        assert_eq!(policy, mlua_swarm_schema::ContextPolicy::default());
     }
 }
