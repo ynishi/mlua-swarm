@@ -17,6 +17,7 @@
 //! mse://blueprints/samples/<slug>
 //! mse://api/blueprint-schema
 //! mse://api/http-endpoints
+//! mse://api/mcp-tools
 //! ```
 //!
 //! ## Current resources
@@ -33,6 +34,7 @@
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
 //! | `mse://api/blueprint-schema`                 | Live Blueprint JSON Schema (generated per read).    |
 //! | `mse://api/http-endpoints`                   | Live HTTP wire-body JSON Schemas, keyed by endpoint (issue #19 ST5). |
+//! | `mse://api/mcp-tools`                        | Live schemars-generated MCP tool inputSchemas keyed by tool name (GH #24 sibling). |
 //!
 //! `mse://api/http-endpoints` is deliberately a separate resource from
 //! `mse://api/blueprint-schema` — the two schemas serve different
@@ -52,6 +54,9 @@ pub enum ResourceBody {
     /// Body is generated at `read_resource` time (the HTTP wire-body JSON
     /// Schemas, keyed by endpoint; see [`http_endpoints_schema_value`]).
     HttpEndpoints,
+    /// Body is generated at `read_resource` time (the MCP tool inputSchemas,
+    /// keyed by tool name; see [`mcp_tools_schema_value`]).
+    McpTools,
 }
 
 /// One MCP Resource entry exposed under the `mse://` scheme.
@@ -152,6 +157,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         mime_type: "application/json",
         body: ResourceBody::HttpEndpoints,
     },
+    ResourceEntry {
+        uri: "mse://api/mcp-tools",
+        title: "MCP tool inputSchemas",
+        description: "Live schemars-generated inputSchema for every tool `mse mcp` exposes, keyed by tool name. External callers get the same wire contract this MCP client validates against — makes schemars any-schema drops (see GH #24) inspectable ahead of time. Full-fat OpenAPI 3.1 for the HTTP surface is a companion follow-up.",
+        mime_type: "application/json",
+        body: ResourceBody::McpTools,
+    },
 ];
 
 /// Look up a resource entry by its full URI. Returns `None` for unknown URIs.
@@ -234,7 +246,38 @@ pub fn body_for(entry: &ResourceEntry) -> Result<String, String> {
                 http_endpoints_schema_value().map_err(|e| format!("schema serialize: {e}"))?;
             serde_json::to_string_pretty(&value).map_err(|e| format!("schema stringify: {e}"))
         }
+        ResourceBody::McpTools => {
+            let value = mcp_tools_schema_value().map_err(|e| format!("schema serialize: {e}"))?;
+            serde_json::to_string_pretty(&value).map_err(|e| format!("schema stringify: {e}"))
+        }
     }
+}
+
+/// Generate the MCP tool inputSchemas (schemars-derived from every
+/// `#[tool]` on `MseServer`) as a `serde_json::Value`, keyed by tool
+/// name. Shared by the `mse://api/mcp-tools` dynamic resource;
+/// regenerated on every call so it never drifts from the current
+/// `tool_router()` output.
+///
+/// Form (name-unit map, symmetric with [`http_endpoints_schema_value`]):
+/// `{"tools": {"<name>": {"description", "input_schema"}}}`. The
+/// `input_schema` value is the exact JSON Schema this MCP server
+/// validates arguments against — so any schemars any-schema regression
+/// (see GH #24) is inspectable to external readers ahead of time.
+pub fn mcp_tools_schema_value() -> Result<serde_json::Value, serde_json::Error> {
+    let tools = crate::mcp::MseServer::tool_router().list_all();
+    let mut entries = serde_json::Map::with_capacity(tools.len());
+    for tool in &tools {
+        let name = tool.name.to_string();
+        entries.insert(
+            name,
+            serde_json::json!({
+                "description": tool.description,
+                "input_schema": &tool.input_schema,
+            }),
+        );
+    }
+    Ok(serde_json::json!({ "tools": entries }))
 }
 
 #[cfg(test)]
@@ -326,6 +369,52 @@ mod tests {
             endpoints["POST /v1/blueprints/:id"]["request"]["schema_ref"],
             serde_json::json!("mse://api/blueprint-schema")
         );
+    }
+
+    #[test]
+    fn mcp_tools_resource_covers_every_registered_tool_with_a_typed_input_schema() {
+        let entry = find_by_uri("mse://api/mcp-tools").expect("resource must exist");
+        let body = body_for(entry).expect("mcp-tools resource body generation must succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("body must be valid JSON");
+        let tools = parsed
+            .get("tools")
+            .expect("body must expose a tools map")
+            .as_object()
+            .expect("tools must be a JSON object");
+
+        // Coverage: the resource must list exactly the tools the router
+        // exposes — no missing entries, no phantom entries. If a future
+        // change adds/removes a tool, this asserts the resource stays in
+        // sync (drift detector, symmetric with `mcp_tool_reference` guide).
+        let registered: std::collections::BTreeSet<String> = crate::mcp::MseServer::tool_router()
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let published: std::collections::BTreeSet<String> = tools.keys().cloned().collect();
+        assert_eq!(
+            registered, published,
+            "mse://api/mcp-tools must list exactly the tools the router exposes"
+        );
+
+        // GH #24 sibling: every tool entry must carry an `input_schema`
+        // whose top-level is a JSON object with a `type` key. The tightest
+        // signal that schemars any-schema drops (which render as bare
+        // booleans / missing types) are being kept out of the wire
+        // contract external readers see.
+        for (name, entry) in tools {
+            let input_schema = entry
+                .get("input_schema")
+                .unwrap_or_else(|| panic!("tool {name}: missing input_schema"));
+            let obj = input_schema
+                .as_object()
+                .unwrap_or_else(|| panic!("tool {name}: input_schema must be a JSON object"));
+            assert!(
+                obj.contains_key("type"),
+                "tool {name}: input_schema must declare a top-level `type` key (schemars any-schema regression): {input_schema}"
+            );
+        }
     }
 
     #[test]
