@@ -116,6 +116,49 @@ pub const TASK_WORK_DIR_KEY: &str = "work_dir";
 /// [`crate::middleware::task_input`] for API compatibility.
 pub const TASK_METADATA_KEY: &str = "task_metadata";
 
+/// A pointer to one preceding step's OUTPUT, embedded into
+/// [`AgentContextView::steps`] by `crates/mlua-swarm-server/src/worker.rs`'s
+/// `GET /v1/worker/prompt` handler (the `projection-adapter` ST5 Worker
+/// axis) — never the OUTPUT content itself (pointer-only invariant: no
+/// preview, no content bytes, matching the "worker payload never
+/// inline-embeds a projected value" contract `crate::core::projection`'s
+/// module doc establishes for the directive header).
+///
+/// A worker resolves the pointed-at content either by `Read`ing
+/// [`Self::file_path`] (when `Some`, the step's OUTPUT was materialized to
+/// disk — see `crate::core::projection::FileProjectionAdapter`) or by
+/// fetching [`Self::content_url`] (always present; the HTTP debug-plane
+/// route `GET /v1/tasks/:id/runs/:run/steps/:step/content` this URL
+/// addresses serves the same content regardless of whether a materialized
+/// file exists).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct StepPointer {
+    /// The producing step's name (the Blueprint `AgentDef.name` /
+    /// flow.ir `Step.ref` that emitted this OUTPUT).
+    pub name: String,
+    /// Byte length of the OUTPUT body as served by [`Self::content_url`]
+    /// (the exact bytes an HTTP `GET` of that URL returns).
+    pub size_bytes: u64,
+    /// Absolute filesystem path to the materialized projection file
+    /// (`crate::core::projection::FileProjectionAdapter`'s
+    /// `<root>/workspace/tasks/<step_id>/ctx/<name>.md` target), when the
+    /// step's submission was materialized to disk. `None` when the OUTPUT
+    /// is only resolvable via [`Self::content_url`] (in-memory Data-plane
+    /// record, or a `RunRecord.result_ref` fallback — see
+    /// `crates/mlua-swarm-server/src/projection.rs`'s module doc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// Fetch URL for the step's OUTPUT content — absolute
+    /// (`AppState.base_url`-prefixed) when the server has a configured
+    /// base URL, relative otherwise. Always present, regardless of
+    /// [`Self::file_path`].
+    pub content_url: String,
+    /// SHA-256 hex digest of the OUTPUT body — change detection, matching
+    /// the HTTP debug-plane route's `ETag` header value (`sha256:<hex>`,
+    /// minus the `sha256:` prefix).
+    pub sha256: String,
+}
+
 /// Contract C's view struct — the task-level context that must reach the
 /// LLM/Agent boundary, materialized once per spawn (see the module doc).
 ///
@@ -173,6 +216,15 @@ pub struct AgentContextView {
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     #[schemars(with = "serde_json::Value")]
     pub extra: serde_json::Map<String, Value>,
+    /// Pointers to preceding steps' OUTPUT, `ContextPolicy.steps`-filtered
+    /// (`projection-adapter` ST5 Worker axis). Empty in [`Self::from_ctx`]
+    /// / on every snapshot stashed into `EngineState.agent_contexts` —
+    /// this field is populated only on the `WorkerPayload` clone
+    /// `crates/mlua-swarm-server/src/worker.rs`'s `GET /v1/worker/prompt`
+    /// handler returns (assembled at fetch time, so in-flight submissions
+    /// after spawn are still visible — see that module's doc).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepPointer>,
 }
 
 impl AgentContextView {
@@ -205,6 +257,7 @@ impl AgentContextView {
                 .and_then(Value::as_str)
                 .map(String::from),
             extra: serde_json::Map::new(),
+            steps: Vec::new(),
         }
     }
 
@@ -427,6 +480,7 @@ mod tests {
             "run_id",
             "project_name_alias",
             "extra",
+            "steps",
         ] {
             assert!(props.contains_key(field), "schema missing field {field}");
         }
@@ -452,6 +506,7 @@ mod tests {
         let policy = ContextPolicy {
             include: Some(vec!["project_root".to_string()]),
             exclude: Vec::new(),
+            ..Default::default()
         };
         let filtered = view.apply_policy(&policy);
         assert_eq!(filtered.project_root.as_deref(), Some("/repo"));
@@ -468,6 +523,7 @@ mod tests {
         let policy = ContextPolicy {
             include: None,
             exclude: vec!["work_dir".to_string()],
+            ..Default::default()
         };
         let filtered = view.apply_policy(&policy);
         assert_eq!(filtered.project_root.as_deref(), Some("/repo"));
@@ -483,6 +539,7 @@ mod tests {
         let policy = ContextPolicy {
             include: Some(vec!["project_root".to_string()]),
             exclude: vec!["project_root".to_string()],
+            ..Default::default()
         };
         let filtered = view.apply_policy(&policy);
         assert!(filtered.project_root.is_none());
@@ -498,6 +555,7 @@ mod tests {
                 "agent".to_string(),
                 "attempt".to_string(),
             ],
+            ..Default::default()
         };
         let filtered = view.clone().apply_policy(&policy);
         assert_eq!(filtered.task_id, view.task_id);
@@ -514,6 +572,7 @@ mod tests {
         let policy = ContextPolicy {
             include: None,
             exclude: vec!["secret".to_string()],
+            ..Default::default()
         };
         let filtered = view.apply_policy(&policy);
         assert!(!filtered.extra.contains_key("secret"));
@@ -532,6 +591,7 @@ mod tests {
             run_id: None,
             project_name_alias: None,
             extra: serde_json::Map::new(),
+            steps: Vec::new(),
         };
         let header = view.to_directive_header();
         assert_eq!(
@@ -554,6 +614,7 @@ mod tests {
             run_id: None,
             project_name_alias: Some("alias-x".into()),
             extra: serde_json::Map::new(),
+            steps: Vec::new(),
         };
         let header = view.to_directive_header();
         assert_eq!(

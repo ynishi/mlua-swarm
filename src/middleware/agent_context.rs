@@ -281,13 +281,20 @@ impl SpawnerAdapter for AgentContextWrapped {
         // keyed the same way EngineState.prompts / .systems are — Ctx
         // itself is not stored, so the view has to be captured here to
         // still be servable when fetch_worker_payload{,_trusted} runs
-        // later.
+        // later. `context_policies` snapshots the SAME resolved `policy`
+        // alongside it (projection-adapter ST5) — `Engine::context_policy_for`
+        // reads it back so the Worker axis's `GET /v1/worker/prompt`
+        // handler can filter `context.steps` via `ContextPolicy::allows_step`
+        // without re-deriving the policy from the Blueprint at fetch time.
         let view_for_state = view.clone();
         let task_id_for_state = task_id.clone();
+        let policy_for_state = policy.cloned().unwrap_or_default();
         engine
             .with_state("agent_context.materialize", move |s| {
                 s.agent_contexts
-                    .insert((task_id_for_state, attempt), view_for_state);
+                    .insert((task_id_for_state.clone(), attempt), view_for_state);
+                s.context_policies
+                    .insert((task_id_for_state, attempt), policy_for_state);
             })
             .await
             .map_err(|e| SpawnError::Internal(format!("agent_context state insert: {e}")))?;
@@ -417,6 +424,7 @@ mod tests {
         let policy = ContextPolicy {
             include: None,
             exclude: vec!["work_dir".to_string()],
+            ..Default::default()
         };
         let (stack, seen) = probe_stack(AgentContextMiddleware::new(
             None,
@@ -649,6 +657,7 @@ mod tests {
         let default_policy = ContextPolicy {
             include: None,
             exclude: vec!["work_dir".to_string()],
+            ..Default::default()
         };
         let mut per_agent_policy = HashMap::new();
         per_agent_policy.insert(
@@ -656,6 +665,7 @@ mod tests {
             ContextPolicy {
                 include: None,
                 exclude: vec![],
+                ..Default::default()
             },
         );
 

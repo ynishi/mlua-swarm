@@ -502,6 +502,26 @@ pub struct EngineState {
     /// `systems` — `Ctx` itself is not stored, so the view has to be
     /// snapshotted here to still be servable at fetch time.
     pub agent_contexts: HashMap<(StepId, u32), crate::core::agent_context::AgentContextView>,
+    /// Per-attempt effective [`mlua_swarm_schema::ContextPolicy`] resolved
+    /// by `AgentContextMiddleware` (the same policy already applied to the
+    /// `agent_contexts` snapshot at this key) — the `projection-adapter`
+    /// ST5 Worker axis addition. `Engine::context_policy_for` reads it back
+    /// so `crates/mlua-swarm-server/src/worker.rs`'s `GET
+    /// /v1/worker/prompt` handler can filter the `WorkerPayload.context.steps`
+    /// pointer list via `ContextPolicy::allows_step` without re-deriving the
+    /// policy from the Blueprint at fetch time. An absent entry (pre-ST5
+    /// spawns, or a spawner stack that never layered
+    /// `AgentContextMiddleware`) means pass-all
+    /// (`mlua_swarm_schema::ContextPolicy::default()`).
+    ///
+    /// TODO(GH #23): (1) neither this map
+    /// nor `agent_contexts` (nor `prompts` / `systems`) has a removal path —
+    /// entries accumulate for the process lifetime; a long-running server
+    /// needs a task-completion sweep. (2) This map and `agent_contexts`
+    /// share a key and are only kept in sync by convention (single insert
+    /// site in `AgentContextMiddleware`); folding both values into one map
+    /// of a `(view, policy)` struct would make the pairing structural.
+    pub context_policies: HashMap<(StepId, u32), mlua_swarm_schema::ContextPolicy>,
     /// All minted `CapToken` records, keyed by token fingerprint
     /// (`CapToken::fingerprint` = SHA-256 of the nonce; issue #14 — the
     /// key is loggable, the nonce is not).
@@ -543,6 +563,7 @@ impl EngineState {
             prompts: HashMap::new(),
             systems: HashMap::new(),
             agent_contexts: HashMap::new(),
+            context_policies: HashMap::new(),
             tokens: HashMap::new(),
             worker_handles: HashMap::new(),
             pending_resumes: HashMap::new(),

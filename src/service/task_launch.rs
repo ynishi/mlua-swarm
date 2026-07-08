@@ -1299,6 +1299,7 @@ mod tests {
                         context_policy: Some(ContextPolicy {
                             include: None,
                             exclude: vec!["work_dir".to_string()],
+                            ..Default::default()
                         }),
                         ..Default::default()
                     },
@@ -1309,6 +1310,7 @@ mod tests {
         blueprint.default_context_policy = Some(ContextPolicy {
             include: Some(vec!["project_root".to_string()]),
             exclude: vec![],
+            ..Default::default()
         });
         let (default_policy, per_agent) = derive_context_policies(&blueprint);
         assert_eq!(
@@ -1316,6 +1318,7 @@ mod tests {
             Some(ContextPolicy {
                 include: Some(vec!["project_root".to_string()]),
                 exclude: vec![],
+                ..Default::default()
             })
         );
         assert_eq!(per_agent.len(), 1);
@@ -1324,6 +1327,7 @@ mod tests {
             Some(&ContextPolicy {
                 include: None,
                 exclude: vec!["work_dir".to_string()],
+                ..Default::default()
             })
         );
         assert!(!per_agent.contains_key("no-policy"));

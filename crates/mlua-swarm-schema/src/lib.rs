@@ -368,6 +368,20 @@ pub struct ContextPolicy {
     /// name appears in both). Same name-matching rule as `include`.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Which preceding steps' OUTPUT pointers a worker's fetch payload may
+    /// see (`WorkerPayload.context.steps`, ST5 of the `projection-adapter`
+    /// design). `None` = pass-all (every submitted step, the pre-ST5
+    /// `ctx_step_dir` behavior); `Some(list)` = only the named steps;
+    /// `Some(vec![])` = none. Evaluated by [`Self::allows_step`], a sibling
+    /// of [`Self::allows`] with the same include/exclude precedence rule
+    /// but a separate namespace (step names vs. `AgentContextView` field /
+    /// `extra` key names never collide).
+    #[serde(default)]
+    pub steps: Option<Vec<String>>,
+    /// Step names to drop, applied AFTER `steps` (exclude wins when a name
+    /// appears in both). Same name-matching rule as `steps`.
+    #[serde(default)]
+    pub steps_exclude: Vec<String>,
 }
 
 impl ContextPolicy {
@@ -381,6 +395,21 @@ impl ContextPolicy {
             return false;
         }
         match &self.include {
+            Some(list) => list.iter().any(|included| included == name),
+            None => true,
+        }
+    }
+
+    /// Whether the preceding step named `name` survives this policy for the
+    /// worker fetch payload's `context.steps` pointer list: `false` if
+    /// `steps_exclude` lists it; otherwise `true` when `steps` is `None`
+    /// (pass-all) or lists `name`. Same precedence rule as [`Self::allows`],
+    /// evaluated against the separate `steps` / `steps_exclude` fields.
+    pub fn allows_step(&self, name: &str) -> bool {
+        if self.steps_exclude.iter().any(|excluded| excluded == name) {
+            return false;
+        }
+        match &self.steps {
             Some(list) => list.iter().any(|included| included == name),
             None => true,
         }
@@ -931,6 +960,7 @@ mod tests {
         bp.default_context_policy = Some(ContextPolicy {
             include: Some(vec!["project_root".to_string()]),
             exclude: vec!["work_dir".to_string()],
+            ..Default::default()
         });
         let json = serde_json::to_string(&bp).expect("serializes");
         let back: Blueprint = serde_json::from_str(&json).expect("deserializes");
@@ -944,6 +974,7 @@ mod tests {
             Some(ContextPolicy {
                 include: Some(vec!["project_root".to_string()]),
                 exclude: vec!["work_dir".to_string()],
+                ..Default::default()
             })
         );
     }
@@ -988,6 +1019,7 @@ mod tests {
             context_policy: Some(ContextPolicy {
                 include: None,
                 exclude: vec!["run_id".to_string()],
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1118,6 +1150,7 @@ mod tests {
         let policy = ContextPolicy {
             include: Some(vec!["project_root".to_string()]),
             exclude: vec![],
+            ..Default::default()
         };
         assert!(policy.allows("project_root"));
         assert!(!policy.allows("work_dir"));
@@ -1128,6 +1161,7 @@ mod tests {
         let policy = ContextPolicy {
             include: Some(vec!["project_root".to_string()]),
             exclude: vec!["project_root".to_string()],
+            ..Default::default()
         };
         assert!(!policy.allows("project_root"));
     }
@@ -1137,6 +1171,7 @@ mod tests {
         let policy = ContextPolicy {
             include: Some(vec!["a".to_string(), "b".to_string()]),
             exclude: vec!["c".to_string()],
+            ..Default::default()
         };
         let json = serde_json::to_value(&policy).expect("serializes");
         let back: ContextPolicy = serde_json::from_value(json).expect("deserializes");
@@ -1147,7 +1182,67 @@ mod tests {
     fn context_policy_default_roundtrips_as_empty_object() {
         let policy = ContextPolicy::default();
         let json = serde_json::to_value(&policy).expect("serializes");
-        assert_eq!(json, serde_json::json!({ "include": null, "exclude": [] }));
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "include": null,
+                "exclude": [],
+                "steps": null,
+                "steps_exclude": [],
+            })
+        );
+        let back: ContextPolicy = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, policy);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // ST5 (`projection-adapter`): `ContextPolicy.steps` / `steps_exclude`
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn context_policy_steps_default_allows_every_step() {
+        let policy = ContextPolicy::default();
+        assert!(policy.allows_step("planner"));
+        assert!(policy.allows_step("anything"));
+    }
+
+    #[test]
+    fn context_policy_steps_include_only_allows_listed_names() {
+        let policy = ContextPolicy {
+            steps: Some(vec!["planner".to_string()]),
+            ..Default::default()
+        };
+        assert!(policy.allows_step("planner"));
+        assert!(!policy.allows_step("coder"));
+    }
+
+    #[test]
+    fn context_policy_steps_empty_list_allows_none() {
+        let policy = ContextPolicy {
+            steps: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(!policy.allows_step("planner"));
+    }
+
+    #[test]
+    fn context_policy_steps_exclude_wins_over_steps() {
+        let policy = ContextPolicy {
+            steps: Some(vec!["planner".to_string()]),
+            steps_exclude: vec!["planner".to_string()],
+            ..Default::default()
+        };
+        assert!(!policy.allows_step("planner"));
+    }
+
+    #[test]
+    fn context_policy_steps_roundtrips_through_json() {
+        let policy = ContextPolicy {
+            steps: Some(vec!["planner".to_string(), "coder".to_string()]),
+            steps_exclude: vec!["reviewer".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&policy).expect("serializes");
         let back: ContextPolicy = serde_json::from_value(json).expect("deserializes");
         assert_eq!(back, policy);
     }

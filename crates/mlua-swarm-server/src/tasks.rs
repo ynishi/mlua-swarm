@@ -338,7 +338,10 @@ pub async fn run_get(
     Ok(Json(run))
 }
 
-fn map_task_store_err(e: TaskStoreError) -> ApiError {
+/// `pub(crate)` so `crate::projection`'s `GET /v1/tasks/:id/ctx` handler can
+/// reuse this module's existing-Task-existence-check error mapping (same
+/// 404-vs-500 split `task_get` already applies).
+pub(crate) fn map_task_store_err(e: TaskStoreError) -> ApiError {
     match e {
         TaskStoreError::NotFound(id) => ApiError::not_found(format!("task not found: {id}")),
         other => ApiError::engine(other),

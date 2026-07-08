@@ -13,6 +13,14 @@
 //! - `GET /v1/tasks/:id` — a `TaskRecord` plus every `RunRecord` kicked from it.
 //! - `POST /v1/tasks/:id/runs` — re-kick an existing Task (new `RunId`, same
 //!   `blueprint_ref` / `input_ctx`).
+//! - `GET /v1/tasks/:id/runs/:run/steps` / `.../steps/:step` /
+//!   `.../steps/:step/content` — the metadata + content debug plane over a
+//!   Run's step OUTPUT (`:run` accepts `latest` or an explicit `R-<hex>`,
+//!   `projection::McpQueryAdapter`); see the `projection` module doc. This
+//!   is the operator / human-debug counterpart to the Worker axis's
+//!   `context.steps` pointer list on `GET /v1/worker/prompt`
+//!   (`projection-adapter` ST5 — replaces the ST2/ST4 single-value `GET
+//!   /v1/tasks/:id/ctx`).
 //! - `GET /v1/runs/:id` — a single `RunRecord` (its `step_entries` trace included).
 //! - `POST /v1/operators` / `GET /v1/operators/:sid` / `DELETE /v1/operators/:sid` /
 //!   `GET /v1/operators/:sid/ws` (WS upgrade) — REST-like Operator login flow,
@@ -58,6 +66,14 @@ pub mod enhance_settings;
 pub mod issues;
 /// WebSocket Operator Callback IF (`/v1/operators*`).
 pub mod operator_ws;
+/// `GET /v1/tasks/:id/runs/:run/steps*` (the metadata + content debug
+/// plane over a Run's step OUTPUT — `McpQueryAdapter`, a server-side
+/// `mlua_swarm::core::projection::ProjectionAdapter` impl reading through
+/// the Data-plane `OutputStore` with a persisted `RunRecord.result_ref`
+/// fallback). See the module doc for how this relates to
+/// `operator_ws::session`'s in-flight `FileProjectionAdapter` hook and
+/// `worker`'s Worker-axis `context.steps` pointer assembly.
+pub mod projection;
 /// HTTP surface for the Task/Run persistence axis (issue #13 ID hierarchy;
 /// `GET /v1/tasks`, `GET /v1/tasks/:id`, `POST /v1/tasks/:id/runs`,
 /// `GET /v1/runs/:id`). `POST /v1/tasks` itself stays in this module (it is
@@ -74,6 +90,7 @@ pub use operator_ws::{
     operators_create, operators_delete, operators_info, operators_ws_connect, ClientMsg,
     OperatorSessionEntry, ServerMsg, WSOperatorSession,
 };
+pub use projection::{McpQueryAdapter, ProjectionSource, StepList, StepPathQuery, StepSummary};
 pub use tasks::{RunKickRequest, RunKickResponse, TaskDetailResponse};
 pub use worker::{worker_prompt, worker_result, PromptQuery, WorkerResultReq};
 
@@ -280,6 +297,15 @@ pub fn build_router_full(
         Some(s) => s,
         None => Arc::new(mlua_swarm::store::output::InMemoryOutputStore::new()),
     };
+    // subtask-4 / ST2 rework: wire the SAME `data_store` instance into the
+    // engine's submit-time projection sink (`Engine::submit_output` /
+    // `submit_worker_result_trusted`), so an ordinary worker
+    // `/v1/worker/submit` — not just the explicit `POST /v1/data/emit` —
+    // lands in this store too. `projection::McpQueryAdapter` (`GET
+    // /v1/tasks/:id/runs/:run/steps*`) reads through this same `Arc`,
+    // which is what makes an in-flight run's already-submitted step
+    // OUTPUT queryable.
+    engine.set_output_store(data_store.clone());
     let task_store: Arc<dyn TaskStore> = match task_store {
         Some(s) => s,
         None => Arc::new(mlua_swarm::store::task::InMemoryTaskStore::new()),
@@ -311,6 +337,15 @@ pub fn build_router_full(
         .route("/v1/tasks", post(tasks_start).get(tasks::tasks_list))
         .route("/v1/tasks/:id", get(tasks::task_get))
         .route("/v1/tasks/:id/runs", post(tasks::task_rekick))
+        .route("/v1/tasks/:id/runs/:run/steps", get(projection::steps_list))
+        .route(
+            "/v1/tasks/:id/runs/:run/steps/:step",
+            get(projection::step_get),
+        )
+        .route(
+            "/v1/tasks/:id/runs/:run/steps/:step/content",
+            get(projection::step_content),
+        )
         .route("/v1/runs/:id", get(tasks::run_get))
         // REST-like Operator login flow (Bearer-mandatory, roles exclusivity).
         // Sole WS Operator session route; see `operator_ws::login` module doc.

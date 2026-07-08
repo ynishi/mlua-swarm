@@ -28,6 +28,7 @@ async-trait.workspace = true
 axum.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+sha2.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 uuid.workspace = true

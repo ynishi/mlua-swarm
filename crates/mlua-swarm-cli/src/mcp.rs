@@ -1702,6 +1702,25 @@ mod tests {
         assert!(msg.contains("expected 204"), "err: {msg}");
     }
 
+    /// ST5 (`projection-adapter`) removal confirmation: `mse_ctx_get` no
+    /// longer exists as an MCP tool — the Worker axis now gets prior
+    /// steps' OUTPUT pointers automatically via `context.steps` on `GET
+    /// /v1/worker/prompt` (see `mlua_swarm::core::agent_context`'s module
+    /// doc), so the tool's existence reason (a manual pull wrapper over
+    /// `GET /v1/tasks/:id/ctx`) is gone. `MseServer::tool_router()`'s tool
+    /// name list is the single source of truth for what this MCP server
+    /// exposes; asserting its absence here catches a regression re-adding
+    /// it under the same name.
+    #[test]
+    fn mse_ctx_get_tool_is_not_registered() {
+        let tools = MseServer::tool_router().list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            !names.contains(&"mse_ctx_get"),
+            "mse_ctx_get must be retired (ST5): {names:?}"
+        );
+    }
+
     // ─── S3 operator client tools: error paths (no network required) ───────
 
     #[tokio::test]

@@ -12,6 +12,9 @@
 
 use async_trait::async_trait;
 use mlua_swarm::core::agent_context::AgentContextView;
+use mlua_swarm::core::projection::{
+    FileProjectionAdapter, ProjectionAdapter, ProjectionKey, ProjectionRef,
+};
 use mlua_swarm::{
     CapToken, Ctx, Operator, SeniorBridge, SessionId, SpawnHook, StepId, WorkerBinding,
     WorkerError, WorkerResult,
@@ -268,6 +271,11 @@ impl Operator for WSOperatorSession {
             run_id,
             &prompt,
         );
+        // issue #21/ST2 in-flight projection hook: materializes `view`
+        // (already `apply_policy`-filtered — see `AgentContextMiddleware`)
+        // to file and appends a `ctx_projection:` pointer line. See
+        // `append_projection_pointer`'s doc for the fallback contract.
+        let directive = append_projection_pointer(directive, &ctx.task_id, &view, run_id);
         let msg = ServerMsg::Spawn {
             req_id: req_id.clone(),
             parent_req_id: current_parent_req_id(),
@@ -522,6 +530,84 @@ pub(super) fn default_spawn_directive_with_task_directive(
         other => format!("task_directive: {other}\n"),
     };
     format!("{base}{task_directive_line}")
+}
+
+/// issue #21/ST2 in-flight projection hook: projects `view` (the
+/// spawn-time, already `apply_policy`-filtered [`AgentContextView`] — see
+/// `AgentContextMiddleware`'s module doc) to file via a fresh
+/// [`FileProjectionAdapter`] rooted at `view.work_dir`, and appends a
+/// single `ctx_projection: {json}\n` line to `directive` — a
+/// `{key}: {value}\n` splice matching [`AgentContextView::to_directive_header`]'s
+/// own line convention (e.g. its `task_metadata: {compact-json}\n` line),
+/// never the projected value itself (pointer-only supply; see
+/// `mlua_swarm::core::projection`'s module doc for why).
+///
+/// `view.work_dir` absent, `view` failing to serialize, or the materialize
+/// write itself failing, all fall back to `directive` unchanged (no
+/// pointer line) rather than failing the spawn — subtask-2's Invariants
+/// require this hook to never turn a would-have-succeeded spawn into a
+/// failure.
+///
+/// # projection-adapter ST5: `ctx_step_dir` line retired
+///
+/// This spawn-time `ctx_projection:` line supplies *this spawning agent's
+/// own* `AgentContextView` (kept, unchanged, above). A companion
+/// `ctx_step_dir:` line — pointing the worker at
+/// `<root>/workspace/tasks/<task_id>/ctx/` plus the `mse_ctx_get` MCP tool
+/// as a way to pull a *prior* step's OUTPUT out of it — existed from
+/// subtask-4 through ST4; ST5 retires both (see
+/// `mlua_swarm::core::agent_context`'s module doc): the Worker axis now
+/// gets prior steps' OUTPUT pointers automatically, pre-filtered through
+/// `ContextPolicy.steps`, on `AgentContextView.steps` (assembled by
+/// `crates/mlua-swarm-server/src/worker.rs`'s `GET /v1/worker/prompt`
+/// handler) — no separate directory hint or MCP tool call needed.
+fn append_projection_pointer(
+    directive: String,
+    task_id: &StepId,
+    view: &AgentContextView,
+    run_id: Option<&str>,
+) -> String {
+    let Some(work_dir) = view.work_dir.as_deref() else {
+        return directive;
+    };
+    match serde_json::to_value(view) {
+        Ok(ctx_data) => {
+            let key = ProjectionKey {
+                task_id: task_id.to_string(),
+                run_id: run_id.map(str::to_string),
+                step: None,
+                path: None,
+            };
+            let adapter = FileProjectionAdapter::new(work_dir);
+            match adapter.project(&key, &ctx_data) {
+                Ok(reference) => {
+                    let pointer_value = match &reference {
+                        ProjectionRef::File { path } => serde_json::json!({ "file": path }),
+                        ProjectionRef::Query { endpoint, key } => {
+                            serde_json::json!({ "endpoint": endpoint, "key": key })
+                        }
+                    };
+                    format!("{directive}ctx_projection: {pointer_value}\n")
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %task_id,
+                        error = %err,
+                        "projection hook: materialize failed, spawning without a pointer"
+                    );
+                    directive
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                %task_id,
+                error = %err,
+                "projection hook: AgentContextView serialize failed, spawning without a pointer"
+            );
+            directive
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1472,5 +1558,145 @@ mod tests {
             )
             .await;
         handle.await.expect("join").expect("execute Ok");
+    }
+
+    // ─── issue #21/ST2: in-flight projection hook (`append_projection_pointer`) ───
+
+    /// `view.work_dir` present → the spawn directive carries a
+    /// `ctx_projection:` pointer line, and the pointed-at file actually
+    /// exists on disk (subtask-2 Tests #3).
+    #[tokio::test]
+    async fn execute_with_work_dir_appends_ctx_projection_pointer_and_materializes_file() {
+        use mlua_swarm::Operator;
+        use tokio::sync::mpsc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut ctx = test_ctx("ST-proj-1");
+        ctx.meta.runtime.insert(
+            TASK_WORK_DIR_KEY.to_string(),
+            Value::String(dir.path().to_string_lossy().into_owned()),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-proj-1").unwrap(),
+            tx,
+            None,
+        ));
+
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &ctx,
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        let sent = rx.recv().await.expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn {
+                req_id, directive, ..
+            } => {
+                assert!(
+                    directive.contains("ctx_projection:"),
+                    "directive missing ctx_projection pointer line: {directive}"
+                );
+                // ST5 (`projection-adapter`) removal confirmation: the
+                // pre-ST5 `ctx_step_dir:` companion line (pointing a
+                // worker at the raw materialize directory + the retired
+                // `mse_ctx_get` MCP tool) must never reappear — the
+                // Worker axis now gets prior steps' OUTPUT pointers
+                // automatically via `context.steps`.
+                assert!(
+                    !directive.contains("ctx_step_dir:"),
+                    "directive must not carry the retired ctx_step_dir line: {directive}"
+                );
+                req_id
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnAck {
+                    value: serde_json::json!({}),
+                    ok: true,
+                    error: None,
+                },
+            )
+            .await;
+        handle.await.expect("join").expect("execute Ok");
+
+        let expected_file = dir.path().join("workspace/tasks/ST-proj-1/ctx/_ctx.md");
+        assert!(
+            expected_file.exists(),
+            "materialized projection file missing at {expected_file:?}"
+        );
+    }
+
+    /// `view.work_dir` absent → the spawn directive carries no
+    /// `ctx_projection:` line, and the spawn still succeeds (non-fatal
+    /// fallback, subtask-2 Tests #4 + Invariant "must never turn a
+    /// would-have-succeeded spawn into a failure").
+    #[tokio::test]
+    async fn execute_without_work_dir_spawns_without_ctx_projection_pointer() {
+        use mlua_swarm::Operator;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-proj-2").unwrap(),
+            tx,
+            None,
+        ));
+
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &test_ctx("ST-proj-2"),
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        let sent = rx.recv().await.expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn {
+                req_id, directive, ..
+            } => {
+                assert!(
+                    !directive.contains("ctx_projection:"),
+                    "directive must not carry a pointer line when work_dir is absent \
+                     (fallback): {directive}"
+                );
+                req_id
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnAck {
+                    value: serde_json::json!({}),
+                    ok: true,
+                    error: None,
+                },
+            )
+            .await;
+        handle
+            .await
+            .expect("join")
+            .expect("execute Ok — a materialize skip must not fail the spawn");
     }
 }

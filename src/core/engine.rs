@@ -60,6 +60,20 @@ struct EngineInner {
     /// middleware implementations — it declares the capabilities it needs
     /// as hint keys".
     layer_registry: crate::middleware::LayerRegistry,
+    /// Optional Data-plane `OutputStore` backend (subtask-4 / ST2 rework —
+    /// see `submit_output`'s doc). `None` (the default) preserves
+    /// pre-subtask-4 behavior exactly: `submit_output` /
+    /// `submit_worker_result_trusted` only touch the Domain-plane
+    /// `EngineState.output_store` HashMap, same as before this was added.
+    /// `Some` additionally dual-writes every `Final` event into this store
+    /// via [`crate::store::output::OutputStore::append`], making it
+    /// queryable (e.g. by `mlua-swarm-server`'s `GET /v1/tasks/:id/ctx`)
+    /// even for an in-flight run. A plain `std::sync::RwLock` (not
+    /// `tokio::sync::RwLock`) — set once at boot via [`Engine::set_output_store`]
+    /// from a synchronous call site (`mlua-swarm-server`'s router builder),
+    /// then only ever briefly read (clone the `Option<Arc<..>>`, never held
+    /// across an `.await`) from the async submit path.
+    data_store: std::sync::RwLock<Option<Arc<dyn crate::store::output::OutputStore>>>,
 }
 
 /// Renders a `TaskSpec.initial_directive` / `EngineState.prompts`
@@ -112,6 +126,7 @@ impl Engine {
                 spawn_hooks: tokio::sync::RwLock::new(HashMap::new()),
                 operators: tokio::sync::RwLock::new(HashMap::new()),
                 layer_registry,
+                data_store: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -135,6 +150,7 @@ impl Engine {
             spawn_hooks: tokio::sync::RwLock::new(HashMap::new()),
             operators: tokio::sync::RwLock::new(HashMap::new()),
             layer_registry: self.inner.layer_registry.clone(),
+            data_store: std::sync::RwLock::new(None),
         });
         Self { inner }
     }
@@ -176,6 +192,39 @@ impl Engine {
     /// Subscribe to the engine's `Event` broadcast stream.
     pub fn subscribe(&self) -> EventStream {
         self.inner.event_tx.subscribe()
+    }
+
+    /// Wires the Data-plane [`crate::store::output::OutputStore`] backend
+    /// used by `submit_output` / `submit_worker_result_trusted`'s
+    /// submit-time projection sink (subtask-4 / ST2 rework — see
+    /// `submit_output`'s doc). Synchronous (a plain `std::sync::RwLock`
+    /// write) so a caller can wire it up at boot from a non-`async`
+    /// context (`mlua-swarm-server`'s router builder passes the same
+    /// `Arc` it hands to its `AppState.data_store`, so `POST
+    /// /v1/data/emit` and every worker's ordinary `/v1/worker/submit` land
+    /// in the one store). Calling this more than once replaces the
+    /// previous backend; not calling it at all (the default) preserves
+    /// pre-subtask-4 behavior exactly — `submit_output` only touches the
+    /// Domain-plane `EngineState.output_store` HashMap.
+    pub fn set_output_store(&self, store: Arc<dyn crate::store::output::OutputStore>) {
+        let mut guard = self
+            .inner
+            .data_store
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(store);
+    }
+
+    /// Clones the currently-wired Data-plane store handle, if any. Kept
+    /// private and side-effect-free (no lock held past this call) —
+    /// callers (`materialize_final_submission`) do their actual `.append`
+    /// work outside of any lock.
+    fn output_store_backend(&self) -> Option<Arc<dyn crate::store::output::OutputStore>> {
+        self.inner
+            .data_store
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -386,6 +435,15 @@ impl Engine {
             }
         })
         .await?;
+        // subtask-4 / ST2 rework: this path always submits a `Final` (there
+        // is no other event kind on `/v1/worker/submit`), so the
+        // submit-time projection sink always fires — see
+        // `materialize_final_submission`'s doc and `submit_output`'s
+        // Invariants (fail-open, never turns a would-have-succeeded submit
+        // into a failure).
+        let content = crate::worker::output::ContentRef::Inline { value };
+        self.materialize_final_submission(task_id, attempt, &content, ok)
+            .await;
         Ok(())
     }
 
@@ -1292,6 +1350,55 @@ impl Engine {
         .await?
     }
 
+    /// Returns the effective [`mlua_swarm_schema::ContextPolicy`]
+    /// `AgentContextMiddleware` resolved and snapshotted for `(task_id,
+    /// attempt)` at spawn time (the same policy already applied to that
+    /// key's `EngineState.agent_contexts` entry). Pass-all
+    /// (`ContextPolicy::default()`) when no entry exists — either a
+    /// pre-ST5 spawn, or a spawner stack that never layered
+    /// `AgentContextMiddleware` (fail-open, mirroring [`Self::output_tail`]'s
+    /// "no entry = empty default" convention).
+    ///
+    /// `crates/mlua-swarm-server/src/worker.rs`'s `GET /v1/worker/prompt`
+    /// handler reads this back to filter `WorkerPayload.context.steps` via
+    /// `ContextPolicy::allows_step`, without re-deriving the policy from
+    /// the Blueprint at fetch time (`projection-adapter` ST5).
+    pub async fn context_policy_for(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+    ) -> mlua_swarm_schema::ContextPolicy {
+        let key = (task_id.clone(), attempt);
+        self.with_state("context_policy_for", move |s| {
+            s.context_policies.get(&key).cloned().unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Returns the [`crate::core::agent_context::AgentContextView`]
+    /// snapshotted for `(task_id, attempt)`, if `AgentContextMiddleware`
+    /// stashed one — the same lookup [`Self::fetch_worker_payload`] /
+    /// [`Self::fetch_worker_payload_trusted`] perform inline, exposed
+    /// standalone for callers that only need the view (not a full
+    /// `WorkerPayload`) — e.g. the HTTP debug-plane `GET
+    /// /v1/tasks/:id/runs/:run/steps*` handlers resolving a
+    /// materialized-file root for a step *other than* the one currently
+    /// fetching its own prompt (`projection-adapter` ST5).
+    pub async fn agent_context_for(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+    ) -> Option<crate::core::agent_context::AgentContextView> {
+        let key = (task_id.clone(), attempt);
+        self.with_state("agent_context_for", move |s| {
+            s.agent_contexts.get(&key).cloned()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Read the current attempt number for a task (server-side lookup, no
     /// token verification). Used on `HTTP /v1/worker/result` when the
     /// worker omits `attempt` and the server has to fill it in.
@@ -1353,6 +1460,29 @@ impl Engine {
     /// not the Data-plane store in the `output_store` module. It also
     /// does not wake the dispatch path — that is done through the
     /// spawner's completion oneshot when the worker terminates.
+    ///
+    /// # Submit-time projection sink (subtask-4 / ST2 rework)
+    ///
+    /// A `Final` event additionally fans out to the submit-time projection
+    /// sink ([`Self::materialize_final_submission`]): (a) when
+    /// [`Self::set_output_store`] has wired a Data-plane
+    /// [`crate::store::output::OutputStore`], the event is dual-written
+    /// there (`producer_agent` = `TaskState.spec.agent`), and (b) when this
+    /// task's spawn ran through `AgentContextMiddleware` (so
+    /// `EngineState.agent_contexts` has a `work_dir` / `project_root` for
+    /// it), the value is additionally materialized to
+    /// `<root>/workspace/tasks/<task_id>/ctx/<producer_agent>.md` — see
+    /// `crate::core::projection`'s module doc.
+    ///
+    /// **Invariants** (Subtask 4): (1) this sink is fail-open — an
+    /// unresolved root, an unconfigured `OutputStore`, or either one
+    /// erroring, only logs a `tracing::warn!` and never turns this
+    /// `Ok(())` into an `Err`; (2) the wired `OutputStore` stays the single
+    /// source of truth for cross-step queries — the materialized file is a
+    /// projection of it, not a second store; (3) core does not depend on
+    /// `mlua-swarm-server` — everything this sink touches
+    /// (`crate::store::output` / `crate::core::projection`) already lives
+    /// in this crate.
     pub async fn submit_output(
         &self,
         token: &crate::types::CapToken,
@@ -1376,7 +1506,125 @@ impl Engine {
             });
         })
         .await?;
+        if let crate::worker::output::OutputEvent::Final { content, ok } = &event {
+            self.materialize_final_submission(task_id, attempt, content, *ok)
+                .await;
+        }
         Ok(())
+    }
+
+    /// Submit-time projection sink (subtask-4 / ST2 rework) shared by
+    /// [`Self::submit_output`] and [`Self::submit_worker_result_trusted`].
+    /// Best-effort / fail-open throughout (see `submit_output`'s doc
+    /// Invariants): every failure path only `tracing::warn!`s and returns.
+    ///
+    /// Reads `(producer_agent, root)` via one read-only [`Self::with_state`]
+    /// call — `producer_agent` off `TaskState.spec.agent`, `root` off
+    /// `EngineState.agent_contexts[(task_id, attempt)].work_dir` (falling
+    /// back to `.project_root`), the same snapshot
+    /// `crate::middleware::agent_context::AgentContextMiddleware` writes at
+    /// spawn time — then does its actual (dual-write / file-write) work
+    /// *outside* that lock, so a slow disk write or Data-plane store call
+    /// never holds up unrelated `Engine::with_state` callers.
+    async fn materialize_final_submission(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+        content: &crate::worker::output::ContentRef,
+        ok: bool,
+    ) {
+        let task_id_for_lookup = task_id.clone();
+        let lookup = self
+            .with_state("materialize_final_submission.lookup", move |s| {
+                let producer_agent = s
+                    .tasks
+                    .get(&task_id_for_lookup)
+                    .map(|t| t.spec.agent.clone());
+                let root = s
+                    .agent_contexts
+                    .get(&(task_id_for_lookup.clone(), attempt))
+                    .and_then(|view| view.work_dir.clone().or_else(|| view.project_root.clone()));
+                (producer_agent, root)
+            })
+            .await;
+        let (producer_agent, root) = match lookup {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::warn!(
+                    %task_id,
+                    error = %err,
+                    "submit-time projection sink: state lookup failed; skipping (fail-open)"
+                );
+                return;
+            }
+        };
+        let Some(producer_agent) = producer_agent else {
+            // Defensive only: `task_id` is always a just-looked-up task at
+            // every real call site. No task, no addressable producer name
+            // — nothing to project.
+            return;
+        };
+
+        // (a) Data-plane dual-write, when an OutputStore backend is wired.
+        if let Some(store) = self.output_store_backend() {
+            if let Err(err) = store
+                .append(
+                    task_id.as_str(),
+                    attempt,
+                    &producer_agent,
+                    crate::worker::output::OutputEvent::Final {
+                        content: content.clone(),
+                        ok,
+                    },
+                    Vec::new(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    %task_id,
+                    agent = %producer_agent,
+                    error = %err,
+                    "submit-time projection sink: OutputStore dual-write failed (fail-open)"
+                );
+            }
+        }
+
+        // (b) File materialize, when a root resolved.
+        let Some(root) = root else {
+            tracing::warn!(
+                %task_id,
+                agent = %producer_agent,
+                "submit-time projection sink: no work_dir/project_root resolved; skipping file materialize (fail-open)"
+            );
+            return;
+        };
+        let value = match content {
+            crate::worker::output::ContentRef::Inline { value } => value.clone(),
+            crate::worker::output::ContentRef::FileRef {
+                path,
+                mime,
+                size_hint,
+            } => serde_json::json!({
+                "file_ref": path.to_string_lossy(),
+                "mime": mime,
+                "size_hint": size_hint,
+            }),
+        };
+        let key = crate::core::projection::ProjectionKey {
+            task_id: task_id.to_string(),
+            run_id: None,
+            step: Some(producer_agent.clone()),
+            path: None,
+        };
+        let adapter = crate::core::projection::FileProjectionAdapter::new(root);
+        if let Err(err) = adapter.materialize_submission(&key, &value, attempt, ok) {
+            tracing::warn!(
+                %task_id,
+                agent = %producer_agent,
+                error = %err,
+                "submit-time projection sink: file materialize failed (fail-open)"
+            );
+        }
     }
 
     /// Snapshot the entire output tail for a given `(task_id, attempt)`.
@@ -2199,5 +2447,250 @@ mod initial_directive_value_passthrough_tests {
             .await
             .expect("fetch_prompt");
         assert_eq!(prompt, serde_json::json!("do the thing"));
+    }
+}
+
+/// subtask-4 / ST2 rework: `submit_output` / `submit_worker_result_trusted`'s
+/// submit-time projection sink (`Engine::materialize_final_submission`) —
+/// the Data-plane `OutputStore` dual-write plus the
+/// `FileProjectionAdapter`-backed file materialize, both fail-open. See
+/// the subtask-4 Tests this module covers inline on each test.
+#[cfg(test)]
+mod submit_time_projection_sink_tests {
+    use super::*;
+    use crate::core::agent_context::AgentContextView;
+    use crate::store::output::{ContentRef, InMemoryOutputStore, OutputEvent};
+
+    /// Starts a task under `agent`, returning `(engine, op_token, task_id,
+    /// worker_token)` — same helper shape as the sibling test modules
+    /// above (`initial_directive_value_passthrough_tests::seeded_engine` /
+    /// `mint_worker_token`), duplicated locally per this file's
+    /// established per-module convention.
+    async fn seeded_task(agent: &str) -> (Engine, CapToken, StepId, CapToken) {
+        let engine = Engine::new(EngineCfg::default());
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let task_id = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: agent.to_string(),
+                    initial_directive: Value::String("go".into()),
+                    step_ctx: None,
+                },
+            )
+            .await
+            .expect("start_task");
+        let worker_token = engine.signer().session(
+            format!("worker-of-{task_id}"),
+            Role::Worker,
+            vec!["*".into()],
+            Duration::from_secs(600),
+        );
+        let fp = worker_token.fingerprint();
+        let record = CapTokenRecord::from_worker_token(worker_token.clone(), task_id.clone());
+        engine
+            .with_state("test.mint_worker", move |s| {
+                s.tokens.insert(fp, record);
+            })
+            .await
+            .expect("mint worker token");
+        (engine, op_token, task_id, worker_token)
+    }
+
+    /// Seeds `EngineState.agent_contexts[(task_id, attempt)]` directly —
+    /// the same snapshot `AgentContextMiddleware` writes at spawn time
+    /// (see its module doc), stood up here without the full spawner
+    /// stack so these tests can exercise `submit_output` in isolation.
+    async fn seed_agent_context(engine: &Engine, task_id: &StepId, attempt: u32, work_dir: &str) {
+        let task_id = task_id.clone();
+        let work_dir = work_dir.to_string();
+        engine
+            .with_state("test.seed_agent_context", move |s| {
+                s.agent_contexts.insert(
+                    (task_id, attempt),
+                    AgentContextView {
+                        work_dir: Some(work_dir),
+                        ..Default::default()
+                    },
+                );
+            })
+            .await
+            .expect("seed agent_contexts");
+    }
+
+    fn final_event(value: Value, ok: bool) -> crate::worker::output::OutputEvent {
+        crate::worker::output::OutputEvent::Final {
+            content: crate::worker::output::ContentRef::Inline { value },
+            ok,
+        }
+    }
+
+    /// Subtask 4 Test #2: `submit_output`'s `Final` writes
+    /// `<root>/workspace/tasks/<task_id>/ctx/<agent>.md`, content matching
+    /// the submitted value.
+    #[tokio::test]
+    async fn submit_output_final_materializes_file_when_work_dir_resolved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (engine, _op, task_id, worker_token) = seeded_task("planner").await;
+        seed_agent_context(&engine, &task_id, 1, &dir.path().to_string_lossy()).await;
+
+        engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!({"plan": "do it"}), true),
+            )
+            .await
+            .expect("submit_output");
+
+        let expected_file = dir
+            .path()
+            .join("workspace/tasks")
+            .join(task_id.as_str())
+            .join("ctx/planner.md");
+        assert!(
+            expected_file.exists(),
+            "materialized submission file missing at {expected_file:?}"
+        );
+        let body = std::fs::read_to_string(expected_file).unwrap();
+        assert!(body.contains(r#""plan": "do it""#), "body: {body}");
+    }
+
+    /// Subtask 4 Test #3: `work_dir` unresolved (no `agent_contexts`
+    /// snapshot for this `(task_id, attempt)`) — submit still succeeds,
+    /// fail-open, no file.
+    #[tokio::test]
+    async fn submit_output_final_skips_file_when_root_unresolved() {
+        let (engine, _op, task_id, worker_token) = seeded_task("planner").await;
+        // No seed_agent_context call — root is unresolved.
+
+        let result = engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!("hi"), true),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "submit must succeed even with no resolvable root (fail-open, Invariant 1)"
+        );
+    }
+
+    /// Subtask 4 Test #4 (file half): re-submitting under the same
+    /// `(task_id, agent)` overwrites the materialized file with the
+    /// latest value.
+    #[tokio::test]
+    async fn resubmit_overwrites_materialized_file_with_latest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (engine, _op, task_id, worker_token) = seeded_task("planner").await;
+        seed_agent_context(&engine, &task_id, 1, &dir.path().to_string_lossy()).await;
+
+        engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!("first"), true),
+            )
+            .await
+            .expect("first submit");
+        engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!("second"), true),
+            )
+            .await
+            .expect("second submit");
+
+        let expected_file = dir
+            .path()
+            .join("workspace/tasks")
+            .join(task_id.as_str())
+            .join("ctx/planner.md");
+        let body = std::fs::read_to_string(expected_file).unwrap();
+        assert!(body.contains("second"), "body must reflect latest: {body}");
+        assert!(
+            !body.contains("first"),
+            "body must not carry the stale value: {body}"
+        );
+    }
+
+    /// Subtask 4 Invariant 3 / crux requirement #3: when
+    /// [`Engine::set_output_store`] wires a Data-plane [`crate::store::output::OutputStore`],
+    /// `submit_output`'s `Final` dual-writes into it under
+    /// `producer_agent = TaskState.spec.agent` — the store becomes
+    /// queryable via `get_latest_by_name`, independent of whether a root
+    /// resolved for the file half.
+    #[tokio::test]
+    async fn submit_output_final_dual_writes_into_configured_output_store() {
+        let (engine, _op, task_id, worker_token) = seeded_task("reviewer").await;
+        let data_store: Arc<dyn crate::store::output::OutputStore> =
+            Arc::new(InMemoryOutputStore::new());
+        engine.set_output_store(data_store.clone());
+
+        engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!({"verdict": "pass"}), true),
+            )
+            .await
+            .expect("submit_output");
+
+        let record = data_store
+            .get_latest_by_name("reviewer")
+            .await
+            .expect("dual-written record");
+        match record.event {
+            OutputEvent::Final { content, ok } => {
+                assert!(ok);
+                match content {
+                    ContentRef::Inline { value } => {
+                        assert_eq!(value, serde_json::json!({"verdict": "pass"}));
+                    }
+                    other => panic!("expected Inline content, got {other:?}"),
+                }
+            }
+            other => panic!("expected Final event, got {other:?}"),
+        }
+    }
+
+    /// `submit_worker_result_trusted` (the `/v1/worker/submit` short-handle
+    /// path) triggers the exact same sink as `submit_output` — parity
+    /// across both worker-submit entry points.
+    #[tokio::test]
+    async fn submit_worker_result_trusted_also_triggers_projection_sink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (engine, _op, task_id, _worker_token) = seeded_task("planner").await;
+        seed_agent_context(&engine, &task_id, 1, &dir.path().to_string_lossy()).await;
+        let data_store: Arc<dyn crate::store::output::OutputStore> =
+            Arc::new(InMemoryOutputStore::new());
+        engine.set_output_store(data_store.clone());
+
+        engine
+            .submit_worker_result_trusted(&task_id, 1, serde_json::json!("trusted-value"), true)
+            .await
+            .expect("submit_worker_result_trusted");
+
+        let expected_file = dir
+            .path()
+            .join("workspace/tasks")
+            .join(task_id.as_str())
+            .join("ctx/planner.md");
+        assert!(expected_file.exists());
+        let record = data_store
+            .get_latest_by_name("planner")
+            .await
+            .expect("dual-written record");
+        assert!(matches!(record.event, OutputEvent::Final { ok: true, .. }));
     }
 }

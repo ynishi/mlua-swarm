@@ -16,7 +16,13 @@
 //! ## Routes
 //!
 //! - `GET /v1/worker/prompt?task_id=<tid>` — via `engine.fetch_worker_payload`,
-//!   returns `{task_id, attempt, agent, system?, prompt}`.
+//!   returns `{task_id, attempt, agent, system?, prompt, context?}`.
+//!   `context.steps` (`projection-adapter` ST5, [`assemble_step_pointers`])
+//!   is assembled fresh on every fetch: a `ContextPolicy.steps`-filtered
+//!   pointer list to preceding steps' OUTPUT, resolved through
+//!   `crate::projection::McpQueryAdapter`'s Data-plane + `result_ref`
+//!   enumeration — no separate MCP tool call needed to discover a prior
+//!   step's OUTPUT.
 //! - `POST /v1/worker/result` with body `{task_id, value, ok}` — appends one `Final`
 //!   to the output tail via `engine.submit_output(Final)` (= the canonical path
 //!   through which the dispatch layer decides Pass/Blocked) and updates
@@ -40,10 +46,12 @@ use axum::{
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     Json,
 };
-use mlua_swarm::{CapToken, ContentRef, OutputEvent, StepId, WorkerPayload};
+use mlua_swarm::core::agent_context::StepPointer;
+use mlua_swarm::{CapToken, ContentRef, OutputEvent, RunId, StepId, WorkerPayload};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::projection::McpQueryAdapter;
 use crate::{ApiError, AppState};
 
 /// Query params for `GET /v1/worker/prompt`.
@@ -67,7 +75,7 @@ pub async fn worker_prompt(
 ) -> Result<Json<WorkerPayload>, ApiError> {
     let task_id = q.task_id;
     let bearer = extract_bearer_raw(&headers)?;
-    let payload = if let Some(handle) = parse_worker_handle(&bearer) {
+    let mut payload = if let Some(handle) = parse_worker_handle(&bearer) {
         // Short-handle path: verify handle → task_id (security: confirm the handle is bound to this task).
         let resolved = state
             .engine
@@ -94,7 +102,64 @@ pub async fn worker_prompt(
             .await
             .map_err(|e| ApiError::engine(format!("fetch_worker_payload: {e}")))?
     };
+    assemble_step_pointers(&state, &mut payload).await;
     Ok(Json(payload))
+}
+
+/// Assembles `payload.context.steps` — the `ContextPolicy.steps`-filtered
+/// pointer list to preceding steps' OUTPUT (`projection-adapter` ST5's
+/// Worker axis; see `mlua_swarm::core::agent_context`'s module doc).
+/// Resolved fresh on every fetch (not baked at spawn time), so a step
+/// submitted after this agent spawned — but before it fetches its prompt
+/// — is still visible.
+///
+/// No-op (`context.steps` stays empty) when: the payload carries no
+/// `context` at all; the context has no `run_id` (a spawn that never
+/// threaded one through — pre-run-tracking callers, or a spawner stack
+/// without the Run-tracking layer); or the addressed Run cannot be
+/// resolved. All three are fail-open, matching this crate's other
+/// best-effort projection hooks (a missing pointer list must never turn a
+/// would-have-succeeded fetch into a failure).
+async fn assemble_step_pointers(state: &AppState, payload: &mut WorkerPayload) {
+    let Some(context) = payload.context.as_mut() else {
+        return;
+    };
+    let Some(run_id_str) = context.run_id.clone() else {
+        return;
+    };
+    let Ok(run_id) = RunId::parse(run_id_str) else {
+        return;
+    };
+
+    let adapter = McpQueryAdapter::new(state.data_store.clone(), state.run_store.clone());
+    let Ok((run, resolved_steps)) = adapter.list_steps_by_run_id(&run_id).await else {
+        return;
+    };
+
+    let policy = state
+        .engine
+        .context_policy_for(&payload.task_id, payload.attempt)
+        .await;
+    let self_name = payload.agent.clone();
+
+    let mut pointers = Vec::new();
+    for step in &resolved_steps {
+        if step.name == self_name || !policy.allows_step(&step.name) {
+            continue;
+        }
+        if let Some((size_bytes, file_path, content_url, sha256)) =
+            crate::projection::resolve_step_pointer_fields(state, &run, step).await
+        {
+            pointers.push(StepPointer {
+                name: step.name.clone(),
+                size_bytes,
+                file_path,
+                content_url,
+                sha256,
+            });
+        }
+    }
+    context.steps = pointers;
 }
 
 /// Body for `POST /v1/worker/result`.
@@ -288,4 +353,451 @@ fn decode_worker_bearer(headers: &HeaderMap) -> Result<CapToken, ApiError> {
         return Err(ApiError::bad_request("Bearer token is empty".into()));
     }
     CapToken::decode(encoded).map_err(|e| ApiError::bad_request(format!("invalid token: {e}")))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// UT — `assemble_step_pointers` (`projection-adapter` ST5 Worker axis)
+// ──────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlua_swarm::core::agent_context::AgentContextView;
+    use mlua_swarm::core::config::EngineCfg;
+    use mlua_swarm::core::engine::Engine;
+    use mlua_swarm::store::output::{InMemoryOutputStore, OutputStore};
+    use mlua_swarm::store::run::{InMemoryRunStore, RunRecord, RunStatus, RunStore, StepEntry};
+    use mlua_swarm::store::task::InMemoryTaskStore;
+    use mlua_swarm::{RunId, StepId, TaskId};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// Per-module test-helper convention (this crate's established
+    /// pattern — see e.g. `projection::tests::test_state`): a minimal
+    /// `AppState` wired with the caller-supplied `data_store` / `run_store`
+    /// so a test can seed both directly rather than driving a real
+    /// dispatch through them.
+    fn test_state(data_store: Arc<dyn OutputStore>, run_store: Arc<dyn RunStore>) -> AppState {
+        let engine = Engine::new(EngineCfg::default());
+        let compiler = mlua_swarm::Compiler::new(crate::default_registry());
+        let launch = Arc::new(mlua_swarm::TaskLaunchService::new(engine.clone(), compiler));
+        AppState {
+            engine,
+            sessions: Arc::new(Mutex::new(crate::SessionStore::default())),
+            task_app: Arc::new(mlua_swarm::TaskApplication::new_inline_only(launch)),
+            ws_operator_factory: None,
+            data_store,
+            operator_sessions: Arc::new(Mutex::new(HashMap::new())),
+            roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
+            task_store: Arc::new(InMemoryTaskStore::new()),
+            run_store,
+            base_url: None,
+        }
+    }
+
+    async fn append_final(
+        data_store: &Arc<dyn OutputStore>,
+        task_id: &str,
+        producer: &str,
+        value: Value,
+    ) {
+        data_store
+            .append(
+                task_id,
+                1,
+                producer,
+                OutputEvent::Final {
+                    content: ContentRef::Inline { value },
+                    ok: true,
+                },
+                vec![],
+            )
+            .await
+            .expect("append final");
+    }
+
+    fn step_entry(step_id: &StepId, step_ref: &str) -> StepEntry {
+        StepEntry {
+            step_id: step_id.clone(),
+            step_ref: Some(step_ref.to_string()),
+            status: Some("passed".to_string()),
+            at: 0,
+        }
+    }
+
+    fn run_record(task_id: &TaskId, run_id: &RunId, step_entries: Vec<StepEntry>) -> RunRecord {
+        RunRecord {
+            id: run_id.clone(),
+            task_id: task_id.clone(),
+            status: RunStatus::Running,
+            step_entries,
+            operator_sid: None,
+            result_ref: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn consumer_payload(consumer_step_id: &StepId, run_id: &RunId) -> WorkerPayload {
+        WorkerPayload {
+            task_id: consumer_step_id.clone(),
+            attempt: 1,
+            agent: "consumer".to_string(),
+            system: None,
+            prompt: String::new(),
+            context: Some(AgentContextView {
+                task_id: consumer_step_id.to_string(),
+                agent: "consumer".to_string(),
+                attempt: 1,
+                run_id: Some(run_id.to_string()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Test 1: `ContextPolicy.steps` unspecified (no policy seeded at all
+    /// — `Engine::context_policy_for`'s "no entry" default is `None` /
+    /// pass-all) → the fetch payload carries every submitted step's
+    /// `StepPointer`.
+    #[tokio::test]
+    async fn context_policy_unspecified_yields_every_submitted_step() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        let planner_id = StepId::new();
+        let coder_id = StepId::new();
+
+        append_final(
+            &data_store,
+            planner_id.as_str(),
+            "planner",
+            json!({"plan": "x"}),
+        )
+        .await;
+        append_final(
+            &data_store,
+            coder_id.as_str(),
+            "coder",
+            json!({"code": "y"}),
+        )
+        .await;
+        run_store
+            .create(run_record(
+                &task_id,
+                &run_id,
+                vec![
+                    step_entry(&planner_id, "planner"),
+                    step_entry(&coder_id, "coder"),
+                ],
+            ))
+            .await
+            .expect("create run");
+
+        let state = test_state(data_store, run_store);
+        let consumer_id = StepId::new();
+        let mut payload = consumer_payload(&consumer_id, &run_id);
+        assemble_step_pointers(&state, &mut payload).await;
+
+        let names: Vec<&str> = payload
+            .context
+            .as_ref()
+            .expect("context")
+            .steps
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(names.contains(&"planner"), "names: {names:?}");
+        assert!(names.contains(&"coder"), "names: {names:?}");
+    }
+
+    /// Test 2: `steps: ["planner"]` → only `planner`'s pointer is present.
+    #[tokio::test]
+    async fn context_policy_steps_include_list_filters_to_named_steps() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        let planner_id = StepId::new();
+        let coder_id = StepId::new();
+        append_final(&data_store, planner_id.as_str(), "planner", json!("x")).await;
+        append_final(&data_store, coder_id.as_str(), "coder", json!("y")).await;
+        run_store
+            .create(run_record(
+                &task_id,
+                &run_id,
+                vec![
+                    step_entry(&planner_id, "planner"),
+                    step_entry(&coder_id, "coder"),
+                ],
+            ))
+            .await
+            .expect("create run");
+
+        let state = test_state(data_store, run_store);
+        let consumer_id = StepId::new();
+        state
+            .engine
+            .with_state("test.seed_policy", {
+                let consumer_id = consumer_id.clone();
+                move |s| {
+                    s.context_policies.insert(
+                        (consumer_id, 1),
+                        mlua_swarm_schema::ContextPolicy {
+                            steps: Some(vec!["planner".to_string()]),
+                            ..Default::default()
+                        },
+                    );
+                }
+            })
+            .await
+            .expect("seed policy");
+
+        let mut payload = consumer_payload(&consumer_id, &run_id);
+        assemble_step_pointers(&state, &mut payload).await;
+
+        let names: Vec<&str> = payload
+            .context
+            .as_ref()
+            .expect("context")
+            .steps
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["planner"], "names: {names:?}");
+    }
+
+    /// Test 3: `steps: []` → the pointer list is empty.
+    #[tokio::test]
+    async fn context_policy_steps_empty_list_yields_no_pointers() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        let planner_id = StepId::new();
+        append_final(&data_store, planner_id.as_str(), "planner", json!("x")).await;
+        run_store
+            .create(run_record(
+                &task_id,
+                &run_id,
+                vec![step_entry(&planner_id, "planner")],
+            ))
+            .await
+            .expect("create run");
+
+        let state = test_state(data_store, run_store);
+        let consumer_id = StepId::new();
+        state
+            .engine
+            .with_state("test.seed_policy", {
+                let consumer_id = consumer_id.clone();
+                move |s| {
+                    s.context_policies.insert(
+                        (consumer_id, 1),
+                        mlua_swarm_schema::ContextPolicy {
+                            steps: Some(vec![]),
+                            ..Default::default()
+                        },
+                    );
+                }
+            })
+            .await
+            .expect("seed policy");
+
+        let mut payload = consumer_payload(&consumer_id, &run_id);
+        assemble_step_pointers(&state, &mut payload).await;
+
+        assert!(payload.context.expect("context").steps.is_empty());
+    }
+
+    /// Test 4: `steps_exclude` wins over `steps` for a name in both.
+    #[tokio::test]
+    async fn context_policy_steps_exclude_wins_over_steps() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        let planner_id = StepId::new();
+        let coder_id = StepId::new();
+        append_final(&data_store, planner_id.as_str(), "planner", json!("x")).await;
+        append_final(&data_store, coder_id.as_str(), "coder", json!("y")).await;
+        run_store
+            .create(run_record(
+                &task_id,
+                &run_id,
+                vec![
+                    step_entry(&planner_id, "planner"),
+                    step_entry(&coder_id, "coder"),
+                ],
+            ))
+            .await
+            .expect("create run");
+
+        let state = test_state(data_store, run_store);
+        let consumer_id = StepId::new();
+        state
+            .engine
+            .with_state("test.seed_policy", {
+                let consumer_id = consumer_id.clone();
+                move |s| {
+                    s.context_policies.insert(
+                        (consumer_id, 1),
+                        mlua_swarm_schema::ContextPolicy {
+                            steps: Some(vec!["planner".to_string(), "coder".to_string()]),
+                            steps_exclude: vec!["planner".to_string()],
+                            ..Default::default()
+                        },
+                    );
+                }
+            })
+            .await
+            .expect("seed policy");
+
+        let mut payload = consumer_payload(&consumer_id, &run_id);
+        assemble_step_pointers(&state, &mut payload).await;
+
+        let names: Vec<&str> = payload
+            .context
+            .as_ref()
+            .expect("context")
+            .steps
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["coder"], "names: {names:?}");
+    }
+
+    /// Test 5 (in-flight window, subtask-4-style invariant): the Run has
+    /// NOT finalized (`result_ref: None`, mirroring a Run still `Running`)
+    /// yet the fetch payload still carries a `StepPointer` for a step
+    /// already visible through the Data-plane store — the same mechanism
+    /// `crates/mlua-swarm-server/src/projection.rs`'s
+    /// `steps_list_returns_in_flight_step_output_before_run_completes`
+    /// proves end-to-end through a real gated 2-step dispatch; this test
+    /// isolates the same invariant at the `assemble_step_pointers` level.
+    #[tokio::test]
+    async fn in_flight_step_output_is_visible_before_run_finalizes() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        let step1_id = StepId::new();
+        append_final(
+            &data_store,
+            step1_id.as_str(),
+            "step1",
+            json!({"step1_out": "hi"}),
+        )
+        .await;
+        let mut run = run_record(&task_id, &run_id, vec![step_entry(&step1_id, "step1")]);
+        run.status = RunStatus::Running;
+        run.result_ref = None; // the in-flight window: not yet finalized.
+        run_store.create(run).await.expect("create run");
+
+        let state = test_state(data_store, run_store);
+        let consumer_id = StepId::new();
+        let mut payload = consumer_payload(&consumer_id, &run_id);
+        assemble_step_pointers(&state, &mut payload).await;
+
+        let steps = &payload.context.expect("context").steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].name, "step1");
+    }
+
+    /// Test 6: the fetching agent's own name is always excluded, even if
+    /// (e.g. a loop re-dispatching the same agent) it also appears in
+    /// `run.step_entries` with a resolvable Data-plane record.
+    #[tokio::test]
+    async fn self_agent_name_is_always_excluded() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        let planner_id = StepId::new();
+        let consumer_prior_id = StepId::new();
+        append_final(&data_store, planner_id.as_str(), "planner", json!("x")).await;
+        append_final(
+            &data_store,
+            consumer_prior_id.as_str(),
+            "consumer",
+            json!("self"),
+        )
+        .await;
+        run_store
+            .create(run_record(
+                &task_id,
+                &run_id,
+                vec![
+                    step_entry(&planner_id, "planner"),
+                    step_entry(&consumer_prior_id, "consumer"),
+                ],
+            ))
+            .await
+            .expect("create run");
+
+        let state = test_state(data_store, run_store);
+        let consumer_id = StepId::new();
+        let mut payload = consumer_payload(&consumer_id, &run_id);
+        assemble_step_pointers(&state, &mut payload).await;
+
+        let names: Vec<&str> = payload
+            .context
+            .as_ref()
+            .expect("context")
+            .steps
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(!names.contains(&"consumer"), "names: {names:?}");
+        assert!(names.contains(&"planner"), "names: {names:?}");
+    }
+
+    /// Test 7 (pointer-only invariant): a `StepPointer`'s serialized JSON
+    /// carries no preview / content-bytes field — only `name` /
+    /// `size_bytes` / `file_path?` / `content_url` / `sha256`.
+    #[tokio::test]
+    async fn step_pointer_serializes_with_no_preview_or_content_bytes() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        let planner_id = StepId::new();
+        append_final(
+            &data_store,
+            planner_id.as_str(),
+            "planner",
+            json!({"plan": "do the thing, at length".repeat(50)}),
+        )
+        .await;
+        run_store
+            .create(run_record(
+                &task_id,
+                &run_id,
+                vec![step_entry(&planner_id, "planner")],
+            ))
+            .await
+            .expect("create run");
+
+        let state = test_state(data_store, run_store);
+        let consumer_id = StepId::new();
+        let mut payload = consumer_payload(&consumer_id, &run_id);
+        assemble_step_pointers(&state, &mut payload).await;
+
+        let steps = &payload.context.expect("context").steps;
+        assert_eq!(steps.len(), 1);
+        let json_value = serde_json::to_value(&steps[0]).expect("serialize StepPointer");
+        let obj = json_value.as_object().expect("object");
+        for forbidden in ["preview", "content", "value", "bytes"] {
+            assert!(
+                !obj.contains_key(forbidden),
+                "StepPointer must not carry a {forbidden:?} field: {obj:?}"
+            );
+        }
+        assert!(obj.contains_key("name"));
+        assert!(obj.contains_key("size_bytes"));
+        assert!(obj.contains_key("content_url"));
+        assert!(obj.contains_key("sha256"));
+    }
 }

@@ -5,4 +5,5 @@ pub mod config;
 pub mod ctx;
 pub mod engine;
 pub mod errors;
+pub mod projection;
 pub mod state;
