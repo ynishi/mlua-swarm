@@ -45,6 +45,19 @@
 //! table-driven path (their canonical name is simply their own `Step.ref`,
 //! byte-identical to the pre-GH-#23 name).
 //!
+//! ## GH #34 subtask-3: `Artifact` findings surfaced alongside a step's own
+//! canonical entry
+//!
+//! [`Self::enumerate_steps_via_table`]'s per-`step_entries`-row loop, after
+//! resolving that row's own canonical name, ALSO lists every
+//! `OutputEvent::Artifact` dual-written under the SAME `StepId`
+//! (`OutputStore::list_for_attempt`) and inserts each under its OWN
+//! `name` — e.g. `AfterRunAuditMiddleware`'s `"audit:<step_ref>"` finding
+//! (`Engine::submit_output`'s `Artifact` dual-write, see that method's
+//! doc). Purely additive: an artifact's name is never a step's canonical
+//! producer name, so it can't collide with / override the entry the
+//! canonical-name lookup above just inserted.
+//!
 //! # Architecture (subtask-4 rework, carried into ST5, table-driven since
 //! subtask-3)
 //!
@@ -569,6 +582,39 @@ impl McpQueryAdapter {
                             source: ProjectionSource::DataPlane,
                         },
                     );
+                }
+            }
+
+            // GH #34 subtask-3 gap fix: also surface any `Artifact` events
+            // dual-written under THIS row's own `StepId` — e.g.
+            // `AfterRunAuditMiddleware`'s `"audit:<step_ref>"` finding,
+            // submitted against the AUDITED step's own `(task_id, attempt)`
+            // (see `src/middleware.rs`'s `run_one_audit`, and
+            // `Engine::submit_output`'s doc, "`Artifact` dual-write"
+            // section). Purely additive to the canonical-name lookup
+            // above: an artifact's `name` is never a step's own canonical
+            // producer name (`"audit:"`-prefixed by convention, but this
+            // loop does not special-case the prefix — any `Artifact`
+            // dual-written under this `StepId` surfaces under its own
+            // `name`), so it can never collide with / override the entry
+            // just inserted. `list_for_attempt` returning `Err` (backend
+            // hiccup) is treated the same as "no artifacts" — fail-open,
+            // matching this whole adapter's read-path discipline.
+            if let Ok(records) = self
+                .data_store
+                .list_for_attempt(entry.step_id.as_str(), 1)
+                .await
+            {
+                for record in records {
+                    if let OutputEvent::Artifact { name, content } = &record.event {
+                        resolved
+                            .entry(name.clone())
+                            .or_insert_with(|| ResolvedStep {
+                                name: name.clone(),
+                                value: content_to_value(content),
+                                source: ProjectionSource::DataPlane,
+                            });
+                    }
                 }
             }
         }
@@ -1168,6 +1214,7 @@ mod tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement: None,
+            audits: vec![],
         }
     }
 
@@ -1253,6 +1300,7 @@ mod tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement: None,
+            audits: vec![],
         }
     }
 
@@ -1653,6 +1701,7 @@ mod tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement: None,
+            audits: vec![],
         };
 
         let req = TaskLaunchRequest {
@@ -2269,6 +2318,7 @@ mod tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement: None,
+            audits: vec![],
         };
 
         let req = TaskLaunchRequest {

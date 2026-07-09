@@ -76,7 +76,7 @@ these tools are thin wrappers, not a second process-management layer.
 
 | tool | purpose | side effect |
 |---|---|---|
-| `mse_doctor` | Combined snapshot: `mse mcp`'s own in-process state (in-memory Blueprint store, in-flight run count) + the server-side config/BP list fetched from `GET /v1/doctor`. Params: `bind?`. | Read-only; degrades gracefully if the server is down. |
+| `mse_doctor` | Combined snapshot: `mse mcp`'s own in-process state (in-memory Blueprint store, in-flight run count) + the server-side config/BP list fetched from `GET /v1/doctor` + an `audit_findings` section (GH #34): for every run this process is tracking with a known `task_id`, fetches `GET /v1/tasks/:id/runs/:run/steps` and flags entries whose `name` starts with `audit:`, reporting `{task_id, run_id, step, artifact_name}` per hit plus a `count`. Zero hits is an empty section, not an error; a steps-fetch failure for one run becomes a `notes` entry and never fails the whole call. Params: `bind?`. | Read-only; degrades gracefully if the server is down. |
 | `mlua_swarm_server_start` | `launchctl kickstart gui/<uid>/com.mse.server`, then healthz-polls up to 30s. No-op if already running. Errors with install instructions if the launchd job isn't bootstrapped. Params: `bind?`. | Mutating — starts a system service. |
 | `mlua_swarm_server_status` | healthz + a `launchctl print` summary (state/pid/last exit code). Params: `bind?`. | Read-only. |
 | `mlua_swarm_server_shutdown` | `launchctl bootout gui/<uid>/com.mse.server` (unloads the job; won't restart until the next start/restart). Params: `bind?`. | Mutating — stops a system service. |

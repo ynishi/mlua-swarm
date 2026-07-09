@@ -65,6 +65,7 @@
 //!     default_agent_ctx: None,
 //!     default_context_policy: None,
 //!     projection_placement: None,
+//!     audits: vec![],
 //! };
 //!
 //! assert_eq!(bp.id.as_str(), "hello");
@@ -101,6 +102,7 @@
 //!     default_agent_ctx: None,
 //!     default_context_policy: None,
 //!     projection_placement: None,
+//!     audits: vec![],
 //! };
 //!
 //! let json = serde_json::to_string(&bp).unwrap();
@@ -354,6 +356,62 @@ pub struct Blueprint {
     /// unaffected. See [`ProjectionPlacementSpec`]'s doc for field detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection_placement: Option<ProjectionPlacementSpec>,
+    /// GH #34 — Blueprint-declared after-run audit hooks: the engine
+    /// auto-kicks each listed [`AuditDef`]'s agent once a matching Step
+    /// settles, and persists its findings as an `OutputEvent::Artifact`
+    /// named `"audit:<step_ref>"` on the AUDITED step's own output tail
+    /// (see `mlua-swarm` core's `AfterRunAuditMiddleware` for the
+    /// dispatch mechanics). `audits[].agent` is validated at
+    /// `Compiler::compile` time against `Blueprint.agents[].name`
+    /// (mirrors the `operator_ref` validation). `[]` (the default) = no
+    /// audit hooks declared — every pre-#34 Blueprint is unaffected,
+    /// byte-for-byte.
+    ///
+    /// **Binding invariant**: an audit's verdict, findings, or even its
+    /// own failure NEVER change the audited step's outcome or gate the
+    /// flow — audits are purely observational.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audits: Vec<AuditDef>,
+}
+
+/// GH #34 — one Blueprint-declared after-run audit hook. See
+/// [`Blueprint::audits`] for the persistence / invariant contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditDef {
+    /// Name of the audit agent (must match a [`Blueprint::agents`] entry's
+    /// `name`) the engine dispatches after a matched step settles.
+    /// Validated at `Compiler::compile` time (mirrors
+    /// `AgentDef.spec.operator_ref`'s `operator_ref` validation) — an
+    /// unresolved name rejects compilation.
+    pub agent: String,
+    /// Step names this audit applies to, matched against the step's agent
+    /// ref name. `None`, or a list containing the literal `"*"`, means
+    /// "every step". `Some(vec![])` (an explicit empty list) audits no
+    /// step. `None` is the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<String>>,
+    /// Dispatch timing for this audit's agent (see [`AuditMode`]).
+    /// Defaults to [`AuditMode::Async`].
+    #[serde(default)]
+    pub mode: AuditMode,
+}
+
+/// GH #34 — dispatch timing for an [`AuditDef`]'s audit agent. Neither
+/// variant ever changes the audited step's outcome (see
+/// [`Blueprint::audits`]'s binding invariant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditMode {
+    /// Fire-and-forget: the audit runs in the background after the
+    /// audited step settles; the audited step's own spawn signal returns
+    /// immediately, without waiting for the audit to finish.
+    #[default]
+    Async,
+    /// Awaited before the audited step's spawn signal is returned to the
+    /// engine — still never alters that signal or the step's recorded
+    /// outcome.
+    Sync,
 }
 
 /// Receptacle for a Blueprint-driven filter over the materialized
@@ -899,6 +957,7 @@ mod tests {
             "default_agent_ctx",
             "default_context_policy",
             "projection_placement",
+            "audits",
         ] {
             assert!(props.contains_key(key), "missing property: {key}");
         }
@@ -959,6 +1018,7 @@ mod tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement: None,
+            audits: vec![],
         }
     }
 
@@ -1395,5 +1455,81 @@ mod tests {
         let json = serde_json::to_value(&policy).expect("serializes");
         let back: ContextPolicy = serde_json::from_value(json).expect("deserializes");
         assert_eq!(back, policy);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GH #34: `AuditDef`, `AuditMode`, `Blueprint.audits`
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn blueprint_audits_omitted_when_empty() {
+        let bp = minimal_bp(None);
+        let json = serde_json::to_value(&bp).expect("serializes");
+        assert!(
+            json.as_object().unwrap().get("audits").is_none(),
+            "audits key must be absent when empty: {json}"
+        );
+        let back: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert!(back.audits.is_empty());
+        assert_eq!(bp, back);
+    }
+
+    #[test]
+    fn blueprint_audits_roundtrips_when_non_empty() {
+        let mut bp = minimal_bp(None);
+        bp.audits = vec![AuditDef {
+            agent: "auditor".to_string(),
+            steps: Some(vec!["worker".to_string()]),
+            mode: AuditMode::Sync,
+        }];
+        let json = serde_json::to_string(&bp).expect("serializes");
+        let back: Blueprint = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(bp, back);
+        assert_eq!(back.audits.len(), 1);
+        assert_eq!(back.audits[0].agent, "auditor");
+        assert_eq!(back.audits[0].mode, AuditMode::Sync);
+    }
+
+    #[test]
+    fn audit_def_steps_none_and_mode_default_when_omitted() {
+        let json = serde_json::json!({ "agent": "auditor" });
+        let def: AuditDef = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(def.steps, None);
+        assert_eq!(def.mode, AuditMode::Async);
+    }
+
+    #[test]
+    fn audit_def_rejects_unknown_field() {
+        let json = serde_json::json!({ "agent": "auditor", "not_a_real_field": true });
+        let err = serde_json::from_value::<AuditDef>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("not_a_real_field")
+                || err.to_string().contains("unknown field"),
+            "expected an unknown-field rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn audit_mode_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(AuditMode::Async).unwrap(),
+            serde_json::json!("async")
+        );
+        assert_eq!(
+            serde_json::to_value(AuditMode::Sync).unwrap(),
+            serde_json::json!("sync")
+        );
+    }
+
+    #[test]
+    fn blueprint_json_schema_exports_audits_and_audit_def() {
+        let schema = schemars::schema_for!(Blueprint);
+        let v = serde_json::to_value(&schema).expect("schema serializes");
+        assert!(
+            v["properties"]["audits"].is_object(),
+            "audits must appear in the exported schema: {v}"
+        );
+        let dump = v.to_string();
+        assert!(dump.contains("AuditDef"), "AuditDef definition in schema");
     }
 }

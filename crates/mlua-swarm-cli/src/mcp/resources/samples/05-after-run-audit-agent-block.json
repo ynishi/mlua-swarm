@@ -1,0 +1,48 @@
+{
+  "id": "sample-after-run-audit-agent-block",
+  "flow": {
+    "kind": "step",
+    "ref": "worker",
+    "in": {
+      "op": "lit",
+      "value": "do the thing"
+    },
+    "out": {
+      "op": "path",
+      "at": "$.result"
+    }
+  },
+  "agents": [
+    {
+      "name": "worker",
+      "kind": "rust_fn",
+      "spec": {
+        "fn_id": "identity"
+      }
+    },
+    {
+      "name": "auditor",
+      "kind": "agent_block",
+      "spec": {},
+      "profile": {
+        "system_prompt": "You are an after-run auditor running in-process via agent-block. The prompt names the step you must audit. Inspect that step's output and report findings as structured JSON: {\"verdict\": \"clean\"|\"degraded\", \"notes\": \"...\"}. Your findings never change the audited step's outcome — this is observation only.",
+        "model": "claude-haiku-4-5-20251001"
+      }
+    }
+  ],
+  "operators": [],
+  "audits": [
+    {
+      "agent": "auditor",
+      "steps": ["worker"],
+      "mode": "async"
+    }
+  ],
+  "strategy": {
+    "strict_refs": true,
+    "strict_kind": true
+  },
+  "metadata": {
+    "description": "GH #34 reference sample — agent-block-backed after-run audit. `worker` (kind: rust_fn, the baseline `identity` fn) runs the flow's only step; `auditor` (kind: agent_block, PromptBasedAgent mode — spec.script_path absent) is auto-kicked in-process after `worker` settles, no operator round-trip involved. Findings persist as an `audit:worker` artifact on the worker step's own output tail — observational only, never gates the flow."
+  }
+}

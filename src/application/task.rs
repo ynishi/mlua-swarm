@@ -357,6 +357,7 @@ mod tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement: None,
+            audits: vec![],
         }
     }
 
@@ -385,6 +386,7 @@ mod tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement: None,
+            audits: vec![],
         }
     }
 

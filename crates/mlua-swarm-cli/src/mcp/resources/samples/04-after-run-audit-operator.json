@@ -1,0 +1,58 @@
+{
+  "id": "sample-after-run-audit-operator",
+  "flow": {
+    "kind": "step",
+    "ref": "worker",
+    "in": {
+      "op": "lit",
+      "value": "do the thing"
+    },
+    "out": {
+      "op": "path",
+      "at": "$.result"
+    }
+  },
+  "agents": [
+    {
+      "name": "worker",
+      "kind": "operator",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "profile": {
+        "system_prompt": "Perform the requested task and report the result.",
+        "tools": []
+      }
+    },
+    {
+      "name": "auditor",
+      "kind": "operator",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "profile": {
+        "system_prompt": "You are an after-run auditor. The directive names the step you must audit. Inspect that step's transcript/output (via agent-inspect, or by reading the worker's own submitted result), and report findings as structured JSON: {\"verdict\": \"clean\"|\"degraded\", \"notes\": \"...\"}. Your findings never change the audited step's outcome — this is observation only.",
+        "tools": []
+      }
+    }
+  ],
+  "operators": [
+    {
+      "name": "main-ai"
+    }
+  ],
+  "audits": [
+    {
+      "agent": "auditor",
+      "steps": ["worker"],
+      "mode": "async"
+    }
+  ],
+  "strategy": {
+    "strict_refs": true,
+    "strict_kind": true
+  },
+  "metadata": {
+    "description": "GH #34 reference sample — operator-backed after-run audit. `worker` runs the flow's only step; `auditor` (declared in `audits`) is auto-kicked after `worker` settles, receiving an ordinary Spawn frame whose directive asks it to audit that step instead of doing the step's own work. Findings persist as an `audit:worker` artifact on the worker step's own output tail — observational only, never gates the flow. Both agents point at the \"main-ai\" logical operator role; join with mse_operator_join(roles=[\"main-ai\"]) before dispatch."
+  }
+}

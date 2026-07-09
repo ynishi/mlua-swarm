@@ -366,6 +366,62 @@ the MainAI's launch prompt (hop 3) or from files inside `work_dir`
 (the classic `issue.md` pattern). The SubAgent never talks to the WS
 session and never sees the `Spawn.directive` text.
 
+## After-run audits (GH #34)
+
+`Blueprint.audits: Vec<AuditDef>` declares agents the engine auto-kicks
+**after** a matching step settles, purely for observation — see
+`mse://api/blueprint-schema`'s `AuditDef` for the field shape (`agent` /
+`steps` / `mode`), and `mse://blueprints/samples/*after-run-audit*` for
+worked samples.
+
+**From the operator's point of view.** When `AuditDef.agent` names an
+`AgentDef` whose `kind` is `operator`, the audit's dispatch reuses hops
+1-4 above unmodified — the operator receives an ordinary `ServerMsg::Spawn`
+frame via `mse_pending_wait`, exactly like any other Operator-kind step.
+There is no new frame kind and no special-casing required on the WS thin
+path. The only two differences from a normal step spawn:
+
+- **Timing**: the Spawn fires *after* another step's own spawn has
+  already settled — it is not part of the flow's own step sequence.
+- **Directive content**: instead of asking the operator to do the
+  audited step's own work, the rendered `Spawn.directive` instructs it to
+  **audit** that step — inspect the step's transcript/output (via
+  `agent-inspect`, or by reading the worker's own submitted result through
+  the normal read paths), then report findings as structured JSON.
+
+Launch the audit exactly as hop 3 launches any worker (a SubAgent whose
+prompt is the rendered directive text), and submit its findings through
+the normal worker path (`POST /v1/worker/submit`, hop 4) — no dedicated
+audit endpoint exists or is needed.
+
+**Observational only — binding invariant.** An audit's verdict, findings,
+or even its own failure or crash NEVER change the audited step's or run's
+outcome, and never gate the flow (`Blueprint.audits`'s binding invariant,
+enforced by `mlua-swarm` core's `AfterRunAuditMiddleware`). A worker that
+warned-and-fell-back on its own step still completes normally; the audit
+trail exists so degradations are visible **after the fact**, not so they
+can be blocked in the moment. `mode: async` (the default) fires the audit
+in the background without the audited step waiting on it; `mode: sync`
+awaits the audit before the step settles, but still never alters the
+outcome either way.
+
+**Finding the results.** The audit agent's own submitted output is
+persisted as an `OutputEvent::Artifact` named `audit:<step_ref>` on the
+AUDITED step's own output tail — no new endpoint or schema change: it
+shows up alongside that step's other output in
+`GET /v1/tasks/:id/runs/:run/steps` (an entry whose `name` starts with
+`audit:`), and `mse_doctor`'s `audit_findings` section (see
+`mse://guides/mcp-tool-reference`) flags it across every run the `mse mcp`
+process is tracking.
+
+**agent-block-backed audits.** When `AuditDef.agent` names a `kind:
+agent_block` `AgentDef` instead, the audit runs entirely in-process via
+the existing AgentBlock factory — no operator round-trip, so hops 2-4
+above do not apply. The audit agent runs and submits its finding the same
+way any other in-process AgentBlock worker does; the observational
+invariant and the `audit:<step_ref>` artifact naming are identical either
+way.
+
 ---
 
 ## Responsibility summary

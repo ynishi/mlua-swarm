@@ -33,6 +33,8 @@
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
+//! | `mse://blueprints/samples/04-after-run-audit-operator` | GH #34 operator-backed after-run audit sample. |
+//! | `mse://blueprints/samples/05-after-run-audit-agent-block` | GH #34 agent-block-backed after-run audit sample. |
 //! | `mse://api/blueprint-schema`                 | Live Blueprint JSON Schema (generated per read).    |
 //! | `mse://api/http-endpoints`                   | Live HTTP wire-body JSON Schemas, keyed by endpoint (issue #19 ST5). |
 //! | `mse://api/mcp-tools`                        | Live schemars-generated MCP tool inputSchemas keyed by tool name (GH #24 sibling). |
@@ -86,6 +88,10 @@ const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
 const SAMPLE_02_VERDICT_LOOP_BODY: &str = include_str!("./resources/samples/02-verdict-loop.json");
 const SAMPLE_03_FN_OVERRIDE_BODY: &str = include_str!("./resources/samples/03-fn-override.json");
+const SAMPLE_04_AFTER_RUN_AUDIT_OPERATOR_BODY: &str =
+    include_str!("./resources/samples/04-after-run-audit-operator.json");
+const SAMPLE_05_AFTER_RUN_AUDIT_AGENT_BLOCK_BODY: &str =
+    include_str!("./resources/samples/05-after-run-audit-agent-block.json");
 
 /// Static resource catalogue. Order is the order `list_resources` reports.
 pub const RESOURCES: &[ResourceEntry] = &[
@@ -151,6 +157,20 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "A BLOCKED verdict overridden to ALLOW by an approver step, gating a commit branch.",
         mime_type: "application/json",
         body: ResourceBody::Static(SAMPLE_03_FN_OVERRIDE_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://blueprints/samples/04-after-run-audit-operator",
+        title: "Sample Blueprint — after-run audit (operator)",
+        description: "GH #34: an operator-kind `auditor` declared in `audits` is auto-kicked after the `worker` step settles, receiving an ordinary Spawn frame whose directive asks it to audit that step.",
+        mime_type: "application/json",
+        body: ResourceBody::Static(SAMPLE_04_AFTER_RUN_AUDIT_OPERATOR_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://blueprints/samples/05-after-run-audit-agent-block",
+        title: "Sample Blueprint — after-run audit (agent_block)",
+        description: "GH #34: an agent_block-kind `auditor` declared in `audits` runs in-process after the `worker` step settles, with no operator round-trip.",
+        mime_type: "application/json",
+        body: ResourceBody::Static(SAMPLE_05_AFTER_RUN_AUDIT_AGENT_BLOCK_BODY),
     },
     ResourceEntry {
         uri: "mse://api/blueprint-schema",
@@ -434,6 +454,8 @@ mod tests {
             "mse://blueprints/samples/01-pure-ctx-eval",
             "mse://blueprints/samples/02-verdict-loop",
             "mse://blueprints/samples/03-fn-override",
+            "mse://blueprints/samples/04-after-run-audit-operator",
+            "mse://blueprints/samples/05-after-run-audit-agent-block",
         ] {
             let entry = find_by_uri(uri).unwrap_or_else(|| panic!("sample must exist: {uri}"));
             let body = body_for(entry).expect("sample body must generate");
@@ -443,6 +465,53 @@ mod tests {
                 !bp.id.as_str().is_empty(),
                 "{uri}: sample Blueprint must carry a non-empty id"
             );
+        }
+    }
+
+    /// GH #34: the two reference auditor samples must actually declare
+    /// `audits`, and each declared `agent` must resolve to an `AgentDef` of
+    /// the backend the sample's title promises — guards the guide/sample
+    /// pairing against silent drift (e.g. someone flattening `audits` back
+    /// to `[]` while editing the flow).
+    #[test]
+    fn after_run_audit_samples_declare_audits_on_the_expected_backend() {
+        use mlua_swarm::blueprint::AgentKind;
+
+        let cases: &[(&str, AgentKind)] = &[
+            (
+                "mse://blueprints/samples/04-after-run-audit-operator",
+                AgentKind::Operator,
+            ),
+            (
+                "mse://blueprints/samples/05-after-run-audit-agent-block",
+                AgentKind::AgentBlock,
+            ),
+        ];
+        for case in cases {
+            let uri: &str = case.0;
+            let expected_auditor_kind: &AgentKind = &case.1;
+            let entry = find_by_uri(uri).unwrap_or_else(|| panic!("sample must exist: {uri}"));
+            let body = body_for(entry).expect("sample body must generate");
+            let bp: Blueprint = serde_json::from_str(&body)
+                .unwrap_or_else(|e| panic!("{uri}: not a valid Blueprint: {e}"));
+            assert!(!bp.audits.is_empty(), "{uri}: must declare audits");
+            for audit in &bp.audits {
+                let auditor = bp
+                    .agents
+                    .iter()
+                    .find(|a| a.name == audit.agent)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{uri}: audits[].agent {:?} has no matching AgentDef",
+                            audit.agent
+                        )
+                    });
+                assert_eq!(
+                    &auditor.kind, expected_auditor_kind,
+                    "{uri}: auditor agent {:?} kind mismatch",
+                    audit.agent
+                );
+            }
         }
     }
 

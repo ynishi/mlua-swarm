@@ -47,6 +47,12 @@ use tokio::sync::RwLock;
 struct RunHandle {
     run_id: String,
     status: RunStatus,
+    /// The Run's owning Task, when known. `None` briefly for an
+    /// HTTP-proxied (`Id` selector) dispatch before the server's response
+    /// is parsed. Populated for in-process (Inline/File) dispatch from the
+    /// start (issue GH #34 — `mse_doctor`'s `audit_findings` scan needs
+    /// `task_id` to address `GET /v1/tasks/:id/runs/:run/steps`).
+    task_id: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -121,6 +127,60 @@ fn client_error_to_mcp(e: ClientError) -> McpError {
         }
         ClientError::Http(_) | ClientError::Ws(_) => McpError::internal_error(e.to_string(), None),
     }
+}
+
+/// One `audit:<step_ref>` artifact spotted by `mse_doctor`'s `audit_findings`
+/// scan (GH #34) — an after-run audit agent (`AfterRunAuditMiddleware`,
+/// `mlua-swarm` core) left a finding on a tracked run's step output.
+/// Purely observational: this struct's presence never implies the audited
+/// step failed or was gated (`Blueprint.audits`'s binding invariant).
+#[derive(Debug, Clone, Serialize)]
+struct AuditFinding {
+    task_id: String,
+    run_id: String,
+    /// The AUDITED step's own ref name (the artifact name's `audit:` prefix
+    /// stripped) — e.g. `"echo"` for an `audit:echo` artifact.
+    step: String,
+    /// The raw artifact name as it appears in the steps listing
+    /// (`"audit:<step_ref>"`).
+    artifact_name: String,
+}
+
+/// Pure extraction: given a `GET /v1/tasks/:id/runs/:run/steps` response
+/// body (`{task_id, run_id, steps: [{name, ...}, ...]}`), pick out every
+/// step whose `name` starts with `audit:` — the
+/// `AfterRunAuditMiddleware`/`OutputEvent::Artifact` naming convention
+/// (GH #34, ST1). A step whose name does not carry that prefix (the
+/// audited step itself, or any other OUTPUT artifact) is not a finding.
+///
+/// Kept a pure function (no I/O, no `self`) so it is testable without a
+/// live `mse serve` process — feed it a hand-built
+/// `serde_json::json!({"task_id": ..., "run_id": ..., "steps": [...]})`.
+fn extract_audit_findings(steps_body: &JsonValue) -> Vec<AuditFinding> {
+    let task_id = steps_body
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let run_id = steps_body
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let Some(steps) = steps_body.get("steps").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    steps
+        .iter()
+        .filter_map(|step| {
+            let name = step.get("name")?.as_str()?;
+            let step_ref = name.strip_prefix("audit:")?;
+            Some(AuditFinding {
+                task_id: task_id.to_string(),
+                run_id: run_id.to_string(),
+                step: step_ref.to_string(),
+                artifact_name: name.to_string(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -805,6 +865,13 @@ impl MseServer {
                 .await;
         }
 
+        // Minted here (rather than just before `run_store.create` below) so
+        // the initial `RunHandle` insert already carries it — `mse_doctor`'s
+        // `audit_findings` scan (GH #34) addresses the steps API by
+        // `task_id`, and in-process runs are its only source until the
+        // dispatch below finishes.
+        let task_id_typed = TaskId::new();
+
         let (task_app, run_store) = {
             let mut inner = self.state.write().await;
             inner.runs.insert(
@@ -812,6 +879,7 @@ impl MseServer {
                 RunHandle {
                     run_id: run_id.clone(),
                     status: RunStatus::Running,
+                    task_id: Some(task_id_typed.to_string()),
                 },
             );
             (inner.task_app.clone(), inner.run_store.clone())
@@ -893,8 +961,8 @@ impl MseServer {
 
         // Trace this kick in the local run store (in-memory; issue #13).
         // The stdio adapter has no TaskStore, so the work-item id is minted
-        // ad hoc — it groups re-runs only within this process's lifetime.
-        let task_id_typed = TaskId::new();
+        // ad hoc (above) — it groups re-runs only within this process's
+        // lifetime.
         let now = now_secs();
         let run_ctx = match run_store
             .create(RunRecord {
@@ -1025,6 +1093,9 @@ impl MseServer {
                 RunHandle {
                     run_id: run_id.clone(),
                     status: RunStatus::Running,
+                    // Not known yet — the server mints/reports it in the
+                    // POST /v1/tasks response body, parsed below.
+                    task_id: None,
                 },
             );
         }
@@ -1103,12 +1174,20 @@ impl MseServer {
         // placeholder, so the caller-visible run_id matches what
         // GET /v1/runs/:id on the server will resolve.
         let mut effective_run_id = run_id.clone();
+        // GH #34: `mse_doctor`'s `audit_findings` scan addresses the steps
+        // API by `task_id` — capture the server-minted one alongside
+        // `effective_run_id` so the tracked `RunHandle` carries it.
+        let mut effective_task_id: Option<String> = None;
         let (final_status, body) = if http_status.is_success() {
             let parsed: JsonValue =
                 serde_json::from_str(&text).unwrap_or_else(|_| JsonValue::String(text.clone()));
             if let Some(sid) = parsed.get("run_id").and_then(|v| v.as_str()) {
                 effective_run_id = sid.to_string();
             }
+            effective_task_id = parsed
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             (
                 RunStatus::Done,
                 serde_json::json!({
@@ -1144,10 +1223,14 @@ impl MseServer {
                     RunHandle {
                         run_id: effective_run_id.clone(),
                         status: final_status,
+                        task_id: effective_task_id,
                     },
                 );
             } else if let Some(h) = inner.runs.get_mut(&run_id) {
                 h.status = final_status;
+                if effective_task_id.is_some() {
+                    h.task_id = effective_task_id;
+                }
             }
         }
         json_result(&body)
@@ -1365,7 +1448,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Doctor snapshot: mse mcp self state (in-process store = InMemory ephemeral) + server-side config (backend / store root / ref_base / registered BP list) fetched from GET /v1/doctor. Answers 'where is the store?' and 'how many BPs are registered?' in a single call."
+        description = "Doctor snapshot: mse mcp self state (in-process store = InMemory ephemeral) + server-side config (backend / store root / ref_base / registered BP list) fetched from GET /v1/doctor + an audit_findings section (GH #34) flagging `audit:<step>` artifacts across every run this mse mcp process is tracking. Answers 'where is the store?', 'how many BPs are registered?', and 'did any after-run audit leave a finding?' in a single call."
     )]
     async fn mse_doctor(
         &self,
@@ -1395,7 +1478,64 @@ impl MseServer {
             serde_json::json!({"note": "mse serve down; start via mlua_swarm_server_start"})
         };
 
-        let run_count = self.state.read().await.runs.len();
+        let (run_count, tracked_runs) = {
+            let inner = self.state.read().await;
+            let tracked: Vec<(String, Option<String>)> = inner
+                .runs
+                .iter()
+                .map(|(rid, h)| (rid.clone(), h.task_id.clone()))
+                .collect();
+            (inner.runs.len(), tracked)
+        };
+
+        // GH #34: audit_findings — for each tracked run whose task_id is
+        // known, fetch its steps via the same HTTP steps API
+        // (`GET /v1/tasks/:id/runs/:run/steps`) the REST debug plane
+        // exposes, and flag entries whose name starts with `audit:` (the
+        // `AfterRunAuditMiddleware` artifact naming convention). Runs with
+        // no known task_id yet (an HTTP-proxied dispatch whose response is
+        // still in flight) are silently skipped, not noted — that is not a
+        // fetch failure. Per Invariant #1 (subtask-2): this scan NEVER
+        // fails the doctor call — every error becomes a note.
+        let mut audit_findings: Vec<AuditFinding> = Vec::new();
+        let mut audit_fetch_notes: Vec<String> = Vec::new();
+        if server_up {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build();
+            match client {
+                Ok(client) => {
+                    for (run_id, task_id) in tracked_runs {
+                        let Some(task_id) = task_id else {
+                            continue;
+                        };
+                        let url = format!("http://{bind}/v1/tasks/{task_id}/runs/{run_id}/steps");
+                        match client.get(&url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.json::<JsonValue>().await {
+                                    Ok(steps_body) => {
+                                        audit_findings.extend(extract_audit_findings(&steps_body));
+                                    }
+                                    Err(e) => audit_fetch_notes.push(format!(
+                                        "run {run_id} (task {task_id}): steps decode failed: {e}"
+                                    )),
+                                }
+                            }
+                            Ok(resp) => audit_fetch_notes.push(format!(
+                                "run {run_id} (task {task_id}): steps fetch returned HTTP {}",
+                                resp.status().as_u16()
+                            )),
+                            Err(e) => audit_fetch_notes.push(format!(
+                                "run {run_id} (task {task_id}): steps fetch failed: {e}"
+                            )),
+                        }
+                    }
+                }
+                Err(e) => audit_fetch_notes.push(format!("audit scan client build failed: {e}")),
+            }
+        } else {
+            audit_fetch_notes.push("mse serve down; audit_findings scan skipped".to_string());
+        }
 
         let body = serde_json::json!({
             "mse_mcp": {
@@ -1409,6 +1549,11 @@ impl MseServer {
                 "launchd_state": server_status.launchd_state,
                 "launchd_pid": server_status.launchd_pid,
                 "doctor": server_info,
+            },
+            "audit_findings": {
+                "count": audit_findings.len(),
+                "findings": audit_findings,
+                "notes": audit_fetch_notes,
             },
         });
         json_result(&body)
@@ -1573,8 +1718,8 @@ mod tests {
     use super::*;
     use mlua_flow_ir::{Expr, Node as FlowNode};
     use mlua_swarm::blueprint::{
-        current_schema_version, AgentDef, AgentKind, AgentMeta, BlueprintMetadata, CompilerHints,
-        CompilerStrategy,
+        current_schema_version, AgentDef, AgentKind, AgentMeta, AuditDef, AuditMode,
+        BlueprintMetadata, CompilerHints, CompilerStrategy,
     };
 
     fn identity_blueprint() -> Blueprint {
@@ -1613,6 +1758,7 @@ mod tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement: None,
+            audits: vec![],
         }
     }
 
@@ -2135,7 +2281,10 @@ mod tests {
 
     #[test]
     fn classify_agent_md_severity_ok_at_zero() {
-        assert_eq!(classify_agent_md_severity(0, 0, &default_thresholds()), "OK");
+        assert_eq!(
+            classify_agent_md_severity(0, 0, &default_thresholds()),
+            "OK"
+        );
     }
 
     #[test]
@@ -2263,5 +2412,354 @@ mod tests {
             aggregate_agent_md_verdict(&["OK", "WARN", "BLOCK", "WARN"]),
             "BLOCK"
         );
+    }
+
+    // ─── GH #34: mse_doctor audit_findings surfacing (subtask-2) ───────────
+
+    #[test]
+    fn extract_audit_findings_returns_empty_for_no_steps() {
+        let body = serde_json::json!({
+            "task_id": "T-abc",
+            "run_id": "R-def",
+            "steps": [],
+        });
+        assert!(extract_audit_findings(&body).is_empty());
+    }
+
+    #[test]
+    fn extract_audit_findings_ignores_non_audit_step_names() {
+        let body = serde_json::json!({
+            "task_id": "T-abc",
+            "run_id": "R-def",
+            "steps": [
+                { "name": "worker" },
+                { "name": "not-an-audit-artifact" },
+            ],
+        });
+        assert!(extract_audit_findings(&body).is_empty());
+    }
+
+    #[test]
+    fn extract_audit_findings_flags_audit_prefixed_steps_and_copies_ids() {
+        let body = serde_json::json!({
+            "task_id": "T-abc",
+            "run_id": "R-def",
+            "steps": [
+                { "name": "worker" },
+                { "name": "audit:worker" },
+                { "name": "audit:committer" },
+            ],
+        });
+        let findings = extract_audit_findings(&body);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].task_id, "T-abc");
+        assert_eq!(findings[0].run_id, "R-def");
+        assert_eq!(findings[0].step, "worker");
+        assert_eq!(findings[0].artifact_name, "audit:worker");
+        assert_eq!(findings[1].step, "committer");
+        assert_eq!(findings[1].artifact_name, "audit:committer");
+    }
+
+    #[test]
+    fn extract_audit_findings_missing_steps_key_returns_empty_not_panic() {
+        let body = serde_json::json!({ "task_id": "T-abc", "run_id": "R-def" });
+        assert!(extract_audit_findings(&body).is_empty());
+    }
+
+    #[test]
+    fn extract_audit_findings_skips_step_entries_without_a_name() {
+        let body = serde_json::json!({
+            "task_id": "T-abc",
+            "run_id": "R-def",
+            "steps": [ { "size_bytes": 4 } ],
+        });
+        assert!(extract_audit_findings(&body).is_empty());
+    }
+
+    /// `mse serve` unreachable: the audit scan must degrade to an empty
+    /// section plus a note, never fail the doctor call (subtask-2
+    /// Invariant #1).
+    #[tokio::test]
+    async fn mse_doctor_server_down_notes_the_audit_scan_skip() {
+        let server = MseServer::new();
+        {
+            let mut inner = server.state.write().await;
+            inner.runs.insert(
+                "R-unknown".into(),
+                RunHandle {
+                    run_id: "R-unknown".into(),
+                    status: RunStatus::Running,
+                    task_id: Some("T-unknown".into()),
+                },
+            );
+        }
+        let result = server
+            .mse_doctor(Parameters(DoctorReq {
+                // Black-hole address (same convention as the worker-fetch
+                // tests above): fails fast, never a live server.
+                bind: Some("127.0.0.1:1".into()),
+            }))
+            .await
+            .expect("mse_doctor must never fail on an audit-scan issue");
+        let json: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("doctor json");
+        assert_eq!(json["audit_findings"]["count"], 0, "body: {json}");
+        assert!(
+            json["audit_findings"]["findings"]
+                .as_array()
+                .expect("findings array")
+                .is_empty(),
+            "body: {json}"
+        );
+        let notes = json["audit_findings"]["notes"]
+            .as_array()
+            .expect("notes array");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.as_str().unwrap_or_default().contains("mse serve down")),
+            "notes: {notes:?}"
+        );
+    }
+
+    /// GH #34 subtask-3 gap fix: dispatches a real Blueprint with `audits`
+    /// declared through a real in-process `mse serve` router (same setup
+    /// pattern as `mse_worker_fetch_and_submit_hit_the_http_endpoints`)
+    /// and inspects the real `GET /v1/tasks/:id/runs/:run/steps` response.
+    ///
+    /// **Formerly** (subtask-2's `..._but_not_yet_the_audit_artifact`
+    /// name): `Engine::submit_output` (`src/core/engine.rs`) only
+    /// dual-wrote to the Data-plane `OutputStore` the HTTP steps API reads
+    /// from for `OutputEvent::Final` events. `AfterRunAuditMiddleware`
+    /// submits `OutputEvent::Artifact` — a different variant — so the
+    /// audit finding never reached the Data-plane store and never
+    /// appeared in the steps listing, even though it WAS recorded in the
+    /// domain-plane (`Engine::output_tail`).
+    ///
+    /// **Now**: two changes were needed, not one.
+    ///
+    /// 1. `Engine::submit_output` (`src/core/engine.rs`) dual-writes
+    ///    `Artifact` events too (general form — every `Artifact`, no
+    ///    name-prefix gate), keyed under the artifact's own `name`
+    ///    verbatim, into the SAME `(task_id, attempt)` coordinates as the
+    ///    AUDITED step's own `Final` (`AfterRunAuditMiddleware` submits
+    ///    its `"audit:<step_ref>"` finding against the audited task's own
+    ///    id — see `src/middleware.rs`'s `run_one_audit` — not a separate
+    ///    id for the auditor agent).
+    /// 2. THIS turned out to be necessary but not sufficient:
+    ///    `McpQueryAdapter::enumerate_steps_via_table`
+    ///    (`crates/mlua-swarm-server/src/projection.rs`) only ever looked
+    ///    up ONE name per `RunRecord.step_entries` row — the row's own
+    ///    canonical producer name (`"echo"`) — so a differently-named
+    ///    `Artifact` dual-written under the SAME `StepId` was invisible to
+    ///    it even after change (1) landed (confirmed empirically: this
+    ///    test still failed with `step_names == ["echo"]` before change
+    ///    (2)). `enumerate_steps_via_table` now ALSO lists every
+    ///    `OutputEvent::Artifact` under a row's `StepId`
+    ///    (`OutputStore::list_for_attempt`) and surfaces each under its
+    ///    own name — additive, never overrides the canonical-name lookup.
+    ///    This is a deviation from subtask-3.md's literal "Do NOT touch
+    ///    ... server routes" scope note, made because the flipped
+    ///    assertion below could not otherwise pass; see the impl-lead
+    ///    report for this task for the full rationale.
+    #[tokio::test]
+    async fn steps_api_exposes_both_the_audited_steps_own_output_and_the_audit_artifact() {
+        use mlua_swarm::{RustFnInProcessSpawnerFactory, SpawnerRegistry, WorkerResult};
+        use std::sync::Arc;
+
+        let factory = RustFnInProcessSpawnerFactory::new()
+            .register_fn("echo", |inv| async move {
+                Ok(WorkerResult {
+                    value: serde_json::json!({ "echoed": inv.prompt }),
+                    ok: true,
+                })
+            })
+            .register_fn("audit-fn", |_inv| async move {
+                Ok(WorkerResult {
+                    value: serde_json::json!({ "finding": "clean" }),
+                    ok: true,
+                })
+            });
+        let mut registry = SpawnerRegistry::new();
+        registry.register::<RustFnInProcessSpawnerFactory>(Arc::new(factory));
+
+        let engine = Engine::new(EngineCfg::default());
+        let router = mlua_swarm_server::build_router_with(engine, registry, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let bind = addr.to_string();
+
+        let bp = Blueprint {
+            schema_version: current_schema_version(),
+            id: "mse mcp-audit-findings-fixture".into(),
+            flow: FlowNode::Step {
+                ref_: "echo".into(),
+                in_: Expr::Path {
+                    at: "$.input".into(),
+                },
+                out: Expr::Path { at: "$.out".into() },
+            },
+            agents: vec![
+                AgentDef {
+                    name: "echo".into(),
+                    kind: AgentKind::RustFn,
+                    spec: serde_json::json!({"fn_id": "echo"}),
+                    profile: None,
+                    meta: Some(AgentMeta::default()),
+                },
+                AgentDef {
+                    name: "auditor".into(),
+                    kind: AgentKind::RustFn,
+                    spec: serde_json::json!({"fn_id": "audit-fn"}),
+                    profile: None,
+                    meta: Some(AgentMeta::default()),
+                },
+            ],
+            operators: vec![],
+            metas: vec![],
+            hints: CompilerHints::default(),
+            strategy: CompilerStrategy::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+            projection_placement: None,
+            audits: vec![AuditDef {
+                agent: "auditor".into(),
+                steps: None,
+                mode: AuditMode::Sync,
+            }],
+        };
+
+        let client = reqwest::Client::new();
+        let launch_resp = client
+            .post(format!("http://{bind}/v1/tasks"))
+            .json(&serde_json::json!({
+                "blueprint": { "kind": "inline", "value": bp },
+                "init_ctx": { "input": "hi" },
+            }))
+            .send()
+            .await
+            .expect("POST /v1/tasks");
+        assert!(
+            launch_resp.status().is_success(),
+            "launch status: {}",
+            launch_resp.status()
+        );
+        let launch_body: JsonValue = launch_resp.json().await.expect("launch response json");
+        let task_id = launch_body["task_id"]
+            .as_str()
+            .expect("task_id in response")
+            .to_string();
+        let run_id = launch_body["run_id"]
+            .as_str()
+            .expect("run_id in response")
+            .to_string();
+
+        let steps_resp = client
+            .get(format!(
+                "http://{bind}/v1/tasks/{task_id}/runs/{run_id}/steps"
+            ))
+            .send()
+            .await
+            .expect("GET steps");
+        assert!(steps_resp.status().is_success());
+        let steps_body: JsonValue = steps_resp.json().await.expect("steps response json");
+        let step_names: Vec<String> = steps_body["steps"]
+            .as_array()
+            .expect("steps array")
+            .iter()
+            .filter_map(|s| s["name"].as_str().map(String::from))
+            .collect();
+        assert!(
+            step_names.contains(&"echo".to_string()),
+            "steps API must expose the echo step's own output: {step_names:?}"
+        );
+        assert!(
+            step_names.contains(&"audit:echo".to_string()),
+            "steps API must expose the audit finding once submit_output's \
+             Artifact dual-write lands: {step_names:?}"
+        );
+    }
+
+    /// `mse_doctor`'s own HTTP-calling + extraction logic, isolated from the
+    /// core-crate gap documented on
+    /// `steps_api_exposes_the_audited_steps_own_output_but_not_yet_the_audit_artifact`
+    /// above: a stub router serving the real `GET
+    /// /v1/tasks/:id/runs/:run/steps` response *shape* (not a real
+    /// dispatch) proves the doctor tool round-trips correctly once the
+    /// steps API genuinely returns an `audit:`-prefixed entry — i.e. this
+    /// is subtask-2's own code working correctly against the documented
+    /// contract, decoupled from whether core currently honors that
+    /// contract for `OutputEvent::Artifact`.
+    #[tokio::test]
+    async fn mse_doctor_surfaces_audit_findings_via_stub_steps_api() {
+        use axum::extract::Path as AxumPath;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        async fn stub_healthz() -> &'static str {
+            "ok"
+        }
+        async fn stub_steps(
+            AxumPath((task_id, run_id)): AxumPath<(String, String)>,
+        ) -> Json<JsonValue> {
+            Json(serde_json::json!({
+                "task_id": task_id,
+                "run_id": run_id,
+                "steps": [
+                    { "name": "worker" },
+                    { "name": "audit:worker" },
+                ],
+            }))
+        }
+
+        let router = Router::new()
+            .route("/v1/healthz", get(stub_healthz))
+            .route("/v1/tasks/:task_id/runs/:run_id/steps", get(stub_steps));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let bind = addr.to_string();
+
+        let server = MseServer::new();
+        {
+            let mut inner = server.state.write().await;
+            inner.runs.insert(
+                "R-stub".into(),
+                RunHandle {
+                    run_id: "R-stub".into(),
+                    status: RunStatus::Done,
+                    task_id: Some("T-stub".into()),
+                },
+            );
+        }
+        let result = server
+            .mse_doctor(Parameters(DoctorReq { bind: Some(bind) }))
+            .await
+            .expect("mse_doctor");
+        let json: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("doctor json");
+        let findings = json["audit_findings"]["findings"]
+            .as_array()
+            .expect("audit_findings.findings array");
+        assert_eq!(json["audit_findings"]["count"], 1, "body: {json}");
+        assert_eq!(findings.len(), 1, "body: {json}");
+        assert_eq!(findings[0]["task_id"], "T-stub");
+        assert_eq!(findings[0]["run_id"], "R-stub");
+        assert_eq!(findings[0]["step"], "worker");
+        assert_eq!(findings[0]["artifact_name"], "audit:worker");
     }
 }

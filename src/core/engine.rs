@@ -1544,6 +1544,23 @@ impl Engine {
     /// `mlua-swarm-server` — everything this sink touches
     /// (`crate::store::output` / `crate::core::projection`) already lives
     /// in this crate.
+    ///
+    /// # `Artifact` dual-write (GH #34 subtask-3 gap fix)
+    ///
+    /// An `Artifact` event ALSO fans out to the Data-plane, via
+    /// [`Self::materialize_artifact_submission`] — general-form: every
+    /// `Artifact` submitted through this API dual-writes, no name-prefix
+    /// gate. Unlike `Final`, the dual-write key is the artifact's own
+    /// `name` field, verbatim — NOT resolved through the GH #23 canonical
+    /// `StepNaming` table. An artifact's `name` IS its identity (mirrors
+    /// [`crate::store::output::OutputStore::get_latest_by_name`]'s doc),
+    /// so no canonicalization applies. Same fail-open discipline as
+    /// `Final` (Invariant 1 above), but `Artifact` does NOT drive the
+    /// file-materialize half (b) — artifact findings (e.g.
+    /// `AfterRunAuditMiddleware`'s `"audit:<step_ref>"`) are observational
+    /// sidecar data, not a step's own submission a work_dir/project_root
+    /// projection needs to track. `Progress` / `Partial` events are
+    /// unaffected — no behavior change.
     pub async fn submit_output(
         &self,
         token: &crate::types::CapToken,
@@ -1567,9 +1584,16 @@ impl Engine {
             });
         })
         .await?;
-        if let crate::worker::output::OutputEvent::Final { content, ok } = &event {
-            self.materialize_final_submission(task_id, attempt, content, *ok)
-                .await;
+        match &event {
+            crate::worker::output::OutputEvent::Final { content, ok } => {
+                self.materialize_final_submission(task_id, attempt, content, *ok)
+                    .await;
+            }
+            crate::worker::output::OutputEvent::Artifact { name, content } => {
+                self.materialize_artifact_submission(task_id, attempt, name, content)
+                    .await;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1723,6 +1747,56 @@ impl Engine {
                 canonical = %canonical_agent,
                 error = %err,
                 "submit-time projection sink: file materialize failed (fail-open)"
+            );
+        }
+    }
+
+    /// Submit-time projection sink for `OutputEvent::Artifact` (GH #34
+    /// subtask-3 gap fix). Data-plane-only sibling of
+    /// [`Self::materialize_final_submission`]: when [`Self::set_output_store`]
+    /// has wired a Data-plane [`crate::store::output::OutputStore`], the
+    /// artifact dual-writes there under its own `name`, verbatim — general
+    /// form, every `Artifact` submitted via [`Self::submit_output`]
+    /// materializes this way, no name-prefix gate (see `submit_output`'s
+    /// doc, "`Artifact` dual-write" section, for the full rationale).
+    ///
+    /// Deliberately does NOT resolve `producer_agent` / `StepNaming` /
+    /// `AgentContextView` / a `root` the way `materialize_final_submission`
+    /// does — an artifact's `name` already IS the Data-plane key (no
+    /// canonicalization needed), and this sink does not drive the
+    /// file-materialize half, so none of that lookup is needed here. Same
+    /// fail-open discipline: an unconfigured `OutputStore`, or the write
+    /// erroring, only logs a `tracing::warn!` and never surfaces to the
+    /// caller (`submit_output` already committed the domain-plane append
+    /// before calling this sink).
+    async fn materialize_artifact_submission(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+        name: &str,
+        content: &crate::worker::output::ContentRef,
+    ) {
+        let Some(store) = self.output_store_backend() else {
+            return;
+        };
+        if let Err(err) = store
+            .append(
+                task_id.as_str(),
+                attempt,
+                name,
+                crate::worker::output::OutputEvent::Artifact {
+                    name: name.to_string(),
+                    content: content.clone(),
+                },
+                Vec::new(),
+            )
+            .await
+        {
+            tracing::warn!(
+                %task_id,
+                artifact = %name,
+                error = %err,
+                "submit-time projection sink: OutputStore dual-write failed for Artifact (fail-open)"
             );
         }
     }
@@ -2728,6 +2802,7 @@ mod submit_time_projection_sink_tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement: None,
+            audits: vec![],
         };
         let (naming, warnings) = StepNaming::from_blueprint(&bp).expect("no collision");
         assert!(warnings.is_empty(), "single-step fixture has no collisions");
@@ -2982,6 +3057,84 @@ mod submit_time_projection_sink_tests {
             }
             other => panic!("expected Final event, got {other:?}"),
         }
+    }
+
+    /// GH #34 subtask-3 gap fix: an `Artifact` event submitted via
+    /// `submit_output` dual-writes into a wired Data-plane `OutputStore`
+    /// under its OWN `name`, verbatim — mirrors
+    /// `submit_output_final_dual_writes_into_configured_output_store`
+    /// above, but for the `Artifact` variant.
+    #[tokio::test]
+    async fn submit_output_artifact_dual_writes_into_configured_output_store() {
+        let (engine, _op, task_id, worker_token) = seeded_task("echo").await;
+        let data_store: Arc<dyn crate::store::output::OutputStore> =
+            Arc::new(InMemoryOutputStore::new());
+        engine.set_output_store(data_store.clone());
+
+        engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                OutputEvent::Artifact {
+                    name: "audit:echo".to_string(),
+                    content: ContentRef::Inline {
+                        value: serde_json::json!({"finding": "clean"}),
+                    },
+                },
+            )
+            .await
+            .expect("submit_output");
+
+        let record = data_store
+            .get_latest_by_name("audit:echo")
+            .await
+            .expect("dual-written artifact record");
+        match record.event {
+            OutputEvent::Artifact { name, content } => {
+                assert_eq!(name, "audit:echo");
+                match content {
+                    ContentRef::Inline { value } => {
+                        assert_eq!(value, serde_json::json!({"finding": "clean"}));
+                    }
+                    other => panic!("expected Inline content, got {other:?}"),
+                }
+            }
+            other => panic!("expected Artifact event, got {other:?}"),
+        }
+        // The `Artifact` dual-write must never collide with / overwrite
+        // the producing step's own `Final` name — `submit_output` never
+        // materialized a `Final` here, so `"echo"` must stay unresolved.
+        assert!(
+            data_store.get_latest_by_name("echo").await.is_err(),
+            "artifact write must not fabricate a record under the raw producer_agent name"
+        );
+    }
+
+    /// Invariant 1 (fail-open) for `Artifact`, mirroring
+    /// `submit_output_final_skips_file_when_root_unresolved`'s Final-side
+    /// coverage: no `OutputStore` wired at all — submit still succeeds.
+    #[tokio::test]
+    async fn submit_output_artifact_is_fail_open_when_no_output_store_configured() {
+        let (engine, _op, task_id, worker_token) = seeded_task("echo").await;
+
+        let result = engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                OutputEvent::Artifact {
+                    name: "audit:echo".to_string(),
+                    content: ContentRef::Inline {
+                        value: serde_json::json!("finding"),
+                    },
+                },
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "submit must succeed even with no OutputStore wired (fail-open, Invariant 1)"
+        );
     }
 
     /// `submit_worker_result_trusted` (the `/v1/worker/submit` short-handle

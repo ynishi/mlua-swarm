@@ -20,7 +20,7 @@
 //! shape.
 
 use crate::blueprint::compiler::{CompileError, Compiler};
-use crate::blueprint::{Blueprint, EngineDispatcher};
+use crate::blueprint::{AuditDef, Blueprint, EngineDispatcher};
 use crate::core::agent_context::ContextPolicy;
 use crate::core::ctx::OperatorKind;
 use crate::core::engine::Engine;
@@ -29,7 +29,7 @@ use crate::middleware::agent_context::AgentContextMiddleware;
 use crate::middleware::project_name_alias::ProjectNameAliasMiddleware;
 use crate::middleware::task_input::TaskInputMiddleware;
 use crate::middleware::worker_binding::WorkerBindingMiddleware;
-use crate::middleware::SpawnerStack;
+use crate::middleware::{AfterRunAuditMiddleware, SpawnerStack};
 use crate::operator::WorkerBinding;
 use crate::service::linker;
 use crate::store::run::RunContext;
@@ -84,6 +84,18 @@ fn derive_worker_bindings(blueprint: &Blueprint) -> HashMap<String, WorkerBindin
             ))
         })
         .collect()
+}
+
+/// GH #34 — extract the Blueprint-declared after-run audit hooks
+/// (`Blueprint.audits`), the launch-time input to `AfterRunAuditMiddleware`.
+/// Trivial extraction (unlike [`derive_worker_bindings`] / the agent-context
+/// derivers below, no per-agent lookup is needed — `AuditDef.agent` is a
+/// plain agent-name string already validated against `Blueprint.agents` at
+/// `Compiler::compile` time). `[]` (every pre-#34 Blueprint) means "no
+/// audit layer at all" — see the conditional `.layer(...)` wiring in
+/// [`TaskLaunchService::launch`] (invariant #4: byte-identical behavior).
+fn derive_audits(blueprint: &Blueprint) -> Vec<AuditDef> {
+    blueprint.audits.clone()
 }
 
 /// Issue #21 Phase 1: build the agent-context supply axis's "BP Global" +
@@ -553,6 +565,26 @@ impl TaskLaunchService {
                 .layer(WorkerBindingMiddleware::new(worker_bindings))
                 .build()
         };
+        // GH #34: Blueprint-declared after-run audit hooks — same
+        // conditional-layering shape as the alias / worker-binding blocks
+        // above. Empty `Blueprint.audits` (every pre-#34 Blueprint) means
+        // no layer at all (invariant #4: byte-identical behavior). The
+        // router handle handed to `AfterRunAuditMiddleware` is
+        // `compiled.router` — the raw name→adapter table `Compiler::compile`
+        // built (NOT this progressively-wrapped `spawner`) — so an audit
+        // agent's own dispatch never re-enters this same layer (see
+        // `AfterRunAuditMiddleware`'s module doc, Recursion guard section).
+        let audit_defs = derive_audits(&input.blueprint);
+        let spawner = if audit_defs.is_empty() {
+            spawner
+        } else {
+            SpawnerStack::new(spawner)
+                .layer(AfterRunAuditMiddleware::new(
+                    audit_defs,
+                    compiled.router.clone(),
+                ))
+                .build()
+        };
 
         // Task-level execution context (`project_root` / `work_dir` /
         // `task_metadata`) — same conditional-layering shape as the alias /
@@ -704,6 +736,7 @@ mod tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement: None,
+            audits: vec![],
         }
     }
 
@@ -715,6 +748,96 @@ mod tests {
             Duration::from_secs(30),
             init_ctx,
         )
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GH #34: `derive_audits` + the conditional `AfterRunAuditMiddleware`
+    // `.layer(...)` wiring in `TaskLaunchService::launch`
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn derive_audits_empty_by_default() {
+        let blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        assert!(
+            derive_audits(&blueprint).is_empty(),
+            "audits_absent_no_layer: an undeclared audits Vec must stay empty"
+        );
+    }
+
+    #[test]
+    fn derive_audits_returns_blueprint_audits_verbatim() {
+        let mut blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        blueprint.audits = vec![crate::blueprint::AuditDef {
+            agent: "auditor".to_string(),
+            steps: None,
+            mode: crate::blueprint::AuditMode::Async,
+        }];
+        let got = derive_audits(&blueprint);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].agent, "auditor");
+    }
+
+    #[tokio::test]
+    async fn launch_appends_audit_artifact_when_audits_declared() {
+        use crate::blueprint::{AuditDef, AuditMode};
+
+        let factory = RustFnInProcessSpawnerFactory::new()
+            .register_fn("echo", |inv| async move {
+                Ok(WorkerResult {
+                    value: json!({ "echoed": inv.prompt }),
+                    ok: true,
+                })
+            })
+            .register_fn("audit-fn", |_inv| async move {
+                Ok(WorkerResult {
+                    value: json!({ "finding": "clean" }),
+                    ok: true,
+                })
+            });
+        let svc = build_service(factory);
+        let mut blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo"), agent("auditor", "audit-fn")],
+        );
+        blueprint.audits = vec![AuditDef {
+            agent: "auditor".to_string(),
+            steps: None,
+            mode: AuditMode::Sync,
+        }];
+        let out = svc
+            .launch(launch_input(blueprint, json!({ "input": "hi" })))
+            .await
+            .expect("launch ok — audits must never alter the audited step's outcome");
+        assert_eq!(out.final_ctx["out"]["echoed"], "hi");
+
+        let audited_task_id = svc
+            .engine()
+            .with_state("test.find_audited_task", |s| {
+                s.tasks
+                    .iter()
+                    .find(|(_, t)| t.spec.agent == "echo")
+                    .map(|(id, _)| id.clone())
+            })
+            .await
+            .expect("with_state")
+            .expect("the echo task must exist");
+        let tail = svc.engine().output_tail(&audited_task_id, 1).await;
+        let found = tail.iter().any(|ev| {
+            matches!(
+                ev,
+                crate::worker::output::OutputEvent::Artifact { name, .. } if name == "audit:echo"
+            )
+        });
+        assert!(
+            found,
+            "launch() must wire AfterRunAuditMiddleware end-to-end when Blueprint.audits is declared"
+        );
     }
 
     #[tokio::test]

@@ -50,8 +50,9 @@ use std::sync::Arc;
 pub use mlua_swarm_schema::OperatorKind as SchemaOperatorKind;
 pub use mlua_swarm_schema::{
     current_schema_version, default_global_agent_kind, AgentDef, AgentKind, AgentMeta,
-    AgentProfile, Blueprint, BlueprintMetadata, BlueprintOrigin, CompilerHints, CompilerStrategy,
-    MetaDef, OperatorDef, ProjectionPlacementSpec, SpawnerHints, CURRENT_SCHEMA_VERSION,
+    AgentProfile, AuditDef, AuditMode, Blueprint, BlueprintMetadata, BlueprintOrigin,
+    CompilerHints, CompilerStrategy, MetaDef, OperatorDef, ProjectionPlacementSpec, SpawnerHints,
+    CURRENT_SCHEMA_VERSION,
 };
 
 /// Bridges `mlua_flow_ir::AsyncDispatcher` to the engine's

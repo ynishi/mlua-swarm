@@ -112,6 +112,18 @@ pub enum CompileError {
     /// `root` not `"work_dir"`/`"project_root"`).
     #[error("invalid projection_placement: {0}")]
     InvalidProjectionPlacement(#[from] ProjectionPlacementError),
+    /// GH #34: an `audits[].agent` name does not match any `AgentDef.name`
+    /// declared in `Blueprint.agents` — mirrors the `operator_ref`
+    /// validation above (same "design-time reference must resolve"
+    /// discipline).
+    #[error("audits[].agent '{agent}' does not match any AgentDef.name in Blueprint.agents (defined: {defined:?})")]
+    UnresolvedAuditAgent {
+        /// The `audits[].agent` value that was looked up.
+        agent: String,
+        /// The `AgentDef.name`s that *are* declared, for the error
+        /// message.
+        defined: Vec<String>,
+    },
 }
 
 // ─── SpawnerFactory + Registry ───────────────────────────────────────────
@@ -311,6 +323,20 @@ impl Compiler {
                     where_,
                     meta_ref,
                     defined: metas_defined.clone(),
+                });
+            }
+        }
+
+        // GH #34: `audits[].agent` must name an entry in `Blueprint.agents`
+        // — mirrors the `operator_ref` validation above (design-time
+        // reference must resolve at compile time, before any spawner is
+        // built).
+        let agents_defined: Vec<String> = bp.agents.iter().map(|a| a.name.clone()).collect();
+        for audit in &bp.audits {
+            if !agents_defined.iter().any(|n| n == &audit.agent) {
+                return Err(CompileError::UnresolvedAuditAgent {
+                    agent: audit.agent.clone(),
+                    defined: agents_defined.clone(),
                 });
             }
         }
@@ -1512,6 +1538,7 @@ mod meta_ref_validation_tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement: None,
+            audits: vec![],
         }
     }
 
@@ -1626,6 +1653,106 @@ mod meta_ref_validation_tests {
     }
 }
 
+// ─── GH #34: `Blueprint.audits[].agent` compile-time validation ────────────
+#[cfg(test)]
+mod audit_agent_validation_tests {
+    use super::*;
+    use crate::worker::adapter::WorkerResult;
+    use mlua_swarm_schema::{AuditDef, AuditMode};
+
+    fn registry_with_echo() -> SpawnerRegistry {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: Value::String(inv.prompt),
+                ok: true,
+            })
+        });
+        let mut reg = SpawnerRegistry::new();
+        reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(factory));
+        reg
+    }
+
+    fn rustfn_agent(name: &str) -> AgentDef {
+        AgentDef {
+            name: name.to_string(),
+            kind: AgentKind::RustFn,
+            spec: serde_json::json!({ "fn_id": "echo" }),
+            profile: None,
+            meta: None,
+        }
+    }
+
+    fn minimal_bp(agents: Vec<AgentDef>, audits: Vec<AuditDef>) -> Blueprint {
+        Blueprint {
+            schema_version: crate::blueprint::current_schema_version(),
+            id: "audit-ref-ut".into(),
+            flow: FlowNode::Step {
+                ref_: "worker".to_string(),
+                in_: Expr::Path {
+                    at: "$.input".into(),
+                },
+                out: Expr::Path {
+                    at: "$.output".into(),
+                },
+            },
+            agents,
+            operators: vec![],
+            metas: vec![],
+            hints: Default::default(),
+            strategy: Default::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+            projection_placement: None,
+            audits,
+        }
+    }
+
+    #[test]
+    fn unresolved_audit_agent_is_a_loud_compile_error() {
+        let bp = minimal_bp(
+            vec![rustfn_agent("worker")],
+            vec![AuditDef {
+                agent: "missing-auditor".to_string(),
+                steps: None,
+                mode: AuditMode::default(),
+            }],
+        );
+        let compiler = Compiler::new(registry_with_echo());
+        match compiler.compile(&bp) {
+            Err(CompileError::UnresolvedAuditAgent { agent, defined }) => {
+                assert_eq!(agent, "missing-auditor");
+                assert_eq!(defined, vec!["worker".to_string()]);
+            }
+            Err(other) => {
+                panic!("expected UnresolvedAuditAgent, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!("expected compile-time failure, got Ok"),
+        }
+    }
+
+    #[test]
+    fn resolved_audit_agent_compiles_fine() {
+        let bp = minimal_bp(
+            vec![rustfn_agent("worker"), rustfn_agent("auditor")],
+            vec![AuditDef {
+                agent: "auditor".to_string(),
+                steps: None,
+                mode: AuditMode::default(),
+            }],
+        );
+        let compiler = Compiler::new(registry_with_echo());
+        assert!(
+            compiler.compile(&bp).is_ok(),
+            "an audits[].agent that names a declared AgentDef must compile"
+        );
+    }
+}
+
 // ─── GH #27 (follow-up to #23): `Blueprint.projection_placement` compile-time
 // validation + `CompiledBlueprint.projection_placement` construction ────────
 #[cfg(test)]
@@ -1679,6 +1806,7 @@ mod projection_placement_compile_tests {
             default_agent_ctx: None,
             default_context_policy: None,
             projection_placement,
+            audits: vec![],
         }
     }
 
