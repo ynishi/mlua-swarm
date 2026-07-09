@@ -122,6 +122,12 @@ pub struct Args {
     /// Overrides the config file's `default_agent_kind`.
     #[arg(long)]
     default_agent_kind: Option<String>,
+    /// Ceiling (seconds) for the `POST /v1/tasks` synchronous launch await
+    /// (GH #33 Guard 2). Per-request `timeout_secs` in the request body
+    /// takes priority; this is the server-wide fallback. Overrides the
+    /// config file's `sync_timeout_secs`; built-in default is 300s.
+    #[arg(long)]
+    sync_timeout_secs: Option<u64>,
 }
 
 fn parse_agent_kind_cli(s: &str) -> Result<mlua_swarm::blueprint::AgentKind, String> {
@@ -154,6 +160,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         seed_blueprint_id: args.seed_blueprint_id.clone(),
         default_agent_kind: args.default_agent_kind.clone(),
         token_secret: args.token_secret.clone(),
+        sync_timeout_secs: args.sync_timeout_secs,
     };
     let cfg = mlua_swarm_server::config::resolve(cli_overrides, file_config)
         .unwrap_or_else(|e| panic!("mse serve: config resolve failed: {e}"));
@@ -350,6 +357,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(base_url),
         Some(task_store),
         Some(run_store),
+        cfg.sync_timeout_secs,
     );
 
     let compiler = Compiler::new(make_registry());

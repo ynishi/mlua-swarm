@@ -1194,6 +1194,7 @@ mod tests {
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
             base_url: None,
+            sync_timeout_secs: 300,
         }
     }
 
@@ -1209,6 +1210,7 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            timeout_secs: None,
             goal: Some("projection test goal".to_string()),
         }
     }
@@ -1266,6 +1268,7 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            timeout_secs: None,
             goal: Some("projection test goal (declared name)".to_string()),
         }
     }
@@ -1493,6 +1496,7 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            timeout_secs: None,
             goal: Some("projection placement test goal".to_string()),
         };
         let posted = crate::tasks_start(State(state.clone()), Json(req))
@@ -1587,6 +1591,7 @@ mod tests {
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
             base_url: None,
+            sync_timeout_secs: 300,
         };
 
         let flow = FlowNode::Seq {
@@ -1661,6 +1666,7 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            timeout_secs: None,
             goal: None,
         };
 
@@ -2206,6 +2212,7 @@ mod tests {
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
             base_url: None,
+            sync_timeout_secs: 300,
         };
 
         let flow = FlowNode::Seq {
@@ -2275,6 +2282,7 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            timeout_secs: None,
             goal: None,
         };
 

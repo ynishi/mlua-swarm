@@ -8,7 +8,11 @@
 //! - `POST /v1/tasks` (= unified Flow-form entry, Operator inject supported;
 //!   `operator_sid` explicitly pins the task to a registered Operator session, S2).
 //!   Also creates a `TaskRecord` + `RunRecord` (issue #13 ID-hierarchy persistence)
-//!   and echoes their ids in the response; see the `tasks` module doc.
+//!   and echoes their ids in the response; see the `tasks` module doc. Always
+//!   synchronous, guarded against hanging (GH #33) by a readiness precheck
+//!   (`503` when the launch resolves to an operator-delegate path with zero
+//!   attached operators) and a `tokio::time::timeout` ceiling around the
+//!   dispatch await (`504` on expiry) — see `run_flow_form`'s doc comment.
 //! - `GET /v1/tasks` — list every persisted `TaskRecord` (newest first).
 //! - `GET /v1/tasks/:id` — a `TaskRecord` plus every `RunRecord` kicked from it.
 //! - `POST /v1/tasks/:id/runs` — re-kick an existing Task (new `RunId`, same
@@ -182,6 +186,12 @@ pub struct AppState {
     /// detour (issue #8). `None` preserves the historical fallback
     /// (a placeholder that points at `mse_doctor`).
     pub base_url: Option<Arc<str>>,
+    /// Server-wide fallback ceiling (seconds) for the `POST /v1/tasks`
+    /// synchronous launch await (GH #33 Guard 2; see `run_flow_form`'s doc
+    /// comment). Sourced from `config::ResolvedConfig::sync_timeout_secs`.
+    /// A per-request `TaskLaunchRequest.timeout_secs` override, when
+    /// present, takes priority over this value.
+    pub sync_timeout_secs: u64,
 }
 
 /// Minimal entry point: builds a router with [`default_registry`] and no
@@ -258,6 +268,7 @@ pub fn build_router_with_ws_factory_and_output(
         None,
         None,
         None,
+        crate::config::default_sync_timeout_secs(),
     )
 }
 
@@ -271,6 +282,9 @@ pub fn build_router_with_ws_factory_and_output(
 /// `InMemoryRunStore` (issue #13 ID-hierarchy persistence) for a
 /// caller-supplied backend (`SqliteTaskStore` / `SqliteRunStore`, for
 /// instance); `None` preserves the process-volatile default.
+/// `sync_timeout_secs` is the server-wide fallback ceiling for the `POST
+/// /v1/tasks` synchronous launch await (GH #33 Guard 2) — see
+/// `AppState::sync_timeout_secs` / `run_flow_form`'s doc comment.
 // This is the terminal builder in the `build_router*` delegation chain
 // (each variant adds one more caller-overridable store/factory); the
 // argument count grows with the number of pluggable backends, not with
@@ -286,6 +300,7 @@ pub fn build_router_full(
     base_url: Option<Arc<str>>,
     task_store: Option<Arc<dyn TaskStore>>,
     run_store: Option<Arc<dyn RunStore>>,
+    sync_timeout_secs: u64,
 ) -> Router {
     let compiler = Compiler::new(registry);
     let launch = Arc::new(TaskLaunchService::new(engine.clone(), compiler));
@@ -325,6 +340,7 @@ pub fn build_router_full(
         task_store,
         run_store,
         base_url,
+        sync_timeout_secs,
     };
     Router::new()
         .route("/v1/healthz", get(healthz))
@@ -569,6 +585,15 @@ pub struct TaskLaunchRequest {
     /// resolution already does still applies.
     #[serde(default)]
     operator_sid: Option<String>,
+    /// Per-request override for the sync launch's timeout ceiling (GH #33
+    /// Guard 2, see `run_flow_form`'s doc comment). `None` (the default;
+    /// existing clients are unaffected) falls back to
+    /// `AppState::sync_timeout_secs` (server config), then the built-in
+    /// default (300s). `Some(0)` is rejected with `400` — omit the field
+    /// to defer to the server default rather than sending an explicit
+    /// zero.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
     /// Human-facing description of the work item (e.g. "resolve issue #10"),
     /// stashed verbatim into the minted `TaskRecord.goal`. Omitted / `None`
     /// stores an empty string — the flow-eval path itself never reads it.
@@ -697,6 +722,29 @@ async fn tasks_start(
 /// `senior_bridge_id` / `operator_backend_id`) is registered on
 /// `state.engine.register_*` at WS connect time — the engine is the SoT.
 /// See the `operator_ws` module doc for details.
+///
+/// # GH #33 — sync-hang guards
+///
+/// This handler is always synchronous end-to-end (no sync/async branch);
+/// two fail-loud guards keep a bad launch from hanging the HTTP request
+/// forever:
+///
+/// - **Guard 1 (readiness precheck, `503`)**: when the request/BP
+///   references an operator backend (`operator.operator_backend_id`, set
+///   directly or via `operator_sid`) and `state.engine.list_operator_ids()`
+///   is empty, the request fails immediately rather than dispatching into
+///   a session with nothing attached to serve it. Coarse by design — a
+///   launch that cannot be cheaply determined to route through an operator
+///   is never rejected here (Guard 2 still covers the hang in that case).
+/// - **Guard 2 (sync timeout, `504`)**: the single
+///   `state.task_app.handle_with_run` await is wrapped in
+///   `tokio::time::timeout`. Ceiling cascade, highest priority first:
+///   request `timeout_secs` (rejecting `Some(0)` with `400`), then
+///   `AppState::sync_timeout_secs` (server config), then the built-in
+///   default (300s). On expiry the timed-out future is dropped — this
+///   cancels the in-process flow eval (the flow is abandoned, not
+///   resumed; intended v1 semantics) — and the Task/Run records are
+///   best-effort marked `Failed` so they do not stay `Running` forever.
 async fn run_flow_form(
     state: &AppState,
     req: TaskLaunchRequest,
@@ -749,6 +797,43 @@ async fn run_flow_form(
             )));
         }
         op_req.operator_backend_id = Some(sid.clone());
+    }
+
+    // GH #33 Guard 2 ceiling resolution: request field > server config >
+    // built-in default (300s, `config::default_sync_timeout_secs`).
+    // Validated up front — before any TaskRecord/RunRecord side effects —
+    // so a caller-supplied `Some(0)` fails fast with `400` rather than
+    // minting records for a launch that was never going to dispatch.
+    let sync_timeout_secs = match req.timeout_secs {
+        Some(0) => {
+            return Err(ApiError::bad_request(
+                "timeout_secs: 0 is invalid; omit the field to use the server default".into(),
+            ));
+        }
+        Some(v) => v,
+        None => state.sync_timeout_secs,
+    };
+
+    // GH #33 Guard 1: operator readiness precheck. Coarse signal — this
+    // handler can cheaply see whether the request/BP references an
+    // operator backend (`operator.operator_backend_id`, set directly or
+    // resolved above from `operator_sid`), but not the full
+    // `OperatorDelegateMiddleware` routing decision (that also considers
+    // BP-level `kind` tiers, resolved only at dispatch time). When a
+    // backend is referenced and *zero* operators are attached at all,
+    // fail fast rather than dispatching into a session nothing can serve.
+    // A launch this coarse check cannot positively identify as
+    // operator-delegate is never rejected here — Guard 2 (the timeout
+    // wrap below) still covers the hang in that case.
+    if let Some(backend_id) = op_req.operator_backend_id.as_deref() {
+        let attached = state.engine.list_operator_ids().await;
+        if attached.is_empty() {
+            return Err(ApiError::unavailable(format!(
+                "no operator attached to serve this launch (operator backend '{backend_id}' \
+                 requested): attach an operator via POST /v1/operators + WS, or use the \
+                 poll-style flow (GET /v1/worker/prompt + POST /v1/worker/submit)"
+            )));
+        }
     }
 
     // "Runtime Global" tier: `Some(_)` — including `Some(Automate)` — is
@@ -831,9 +916,14 @@ async fn run_flow_form(
         run_id: run_id.clone(),
         run_store: state.run_store.clone(),
     };
-    let outcome = state
-        .task_app
-        .handle_with_run(
+    // GH #33 Guard 2: the single await point this handler blocks on. On
+    // expiry the timed-out future is dropped, cancelling the in-process
+    // flow eval — the flow is abandoned, not resumed (intended v1
+    // semantics; stage-granularity resume is a coarser guarantee than
+    // this handler makes, out of scope here).
+    let outcome = match tokio::time::timeout(
+        Duration::from_secs(sync_timeout_secs),
+        state.task_app.handle_with_run(
             TaskApplicationInput {
                 blueprint,
                 operator_id: operator_id.clone(),
@@ -848,8 +938,46 @@ async fn run_flow_form(
                 task_input: task_input_spec,
             },
             Some(run_ctx),
-        )
-        .await;
+        ),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => {
+            // Best effort: mark the Task/Run so they do not stay `Running`
+            // forever. Reuses the existing `Failed` variant (no new
+            // schema-crate enum additions) and stashes a reason string
+            // into `RunRecord.result_ref` — the only free-form field the
+            // Run schema carries; secondary persistence failures here are
+            // logged and swallowed, mirroring `tasks::finalize_run`'s
+            // error-path convention.
+            let reason = json!({
+                "error": format!("sync launch exceeded {sync_timeout_secs}s timeout ceiling"),
+            });
+            if let Err(e) = state.run_store.set_result(&run_id, reason).await {
+                tracing::warn!(%run_id, error = %e, "run_flow_form: timeout run set_result failed");
+            }
+            if let Err(e) = state
+                .run_store
+                .update_status(&run_id, RunStatus::Failed)
+                .await
+            {
+                tracing::warn!(%run_id, error = %e, "run_flow_form: timeout run update_status(Failed) failed");
+            }
+            if let Err(e) = state
+                .task_store
+                .update_status(&task_id, TaskRecordStatus::Failed)
+                .await
+            {
+                tracing::warn!(%task_id, error = %e, "run_flow_form: timeout task update_status(Failed) failed");
+            }
+            return Err(ApiError::timeout(format!(
+                "sync launch exceeded {sync_timeout_secs}s timeout ceiling: the in-process flow \
+                 eval was abandoned (dropping the future cancels it); attach an operator that \
+                 acks promptly (POST /v1/operators + WS), or raise timeout_secs / sync_timeout_secs"
+            )));
+        }
+    };
 
     let out = tasks::finalize_run(state, &task_id, &run_id, outcome)
         .await
@@ -987,6 +1115,22 @@ impl ApiError {
             message: m,
         }
     }
+    /// Builds a `503 Service Unavailable` with the given message (GH #33
+    /// Guard 1 — operator readiness precheck).
+    pub fn unavailable(m: String) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: m,
+        }
+    }
+    /// Builds a `504 Gateway Timeout` with the given message (GH #33
+    /// Guard 2 — sync launch timeout ceiling).
+    pub fn timeout(m: String) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: m,
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -1105,6 +1249,7 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            timeout_secs: None,
             goal: None,
         }
     }

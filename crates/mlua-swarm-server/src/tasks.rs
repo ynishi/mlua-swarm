@@ -433,6 +433,7 @@ mod tests {
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
             base_url: None,
+            sync_timeout_secs: 300,
         }
     }
 
@@ -448,6 +449,7 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            timeout_secs: None,
             goal: Some(goal.to_string()),
         }
     }
@@ -518,6 +520,182 @@ mod tests {
             Some(mlua_swarm::worker::baseline::AG_IDENTITY.to_string())
         );
         assert_eq!(run.step_entries[0].status, Some("passed".to_string()));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #33 — sync-hang guards (readiness precheck / timeout ceiling)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Same 1-step identity flow as [`identity_blueprint`], but opts into
+    /// the Blueprint-global Operator delegate axis
+    /// (`spawner_hints.layers = ["operator_delegate"]`) so a registered
+    /// `Operator` backend can be exercised end-to-end through the real
+    /// `tasks_start` dispatch path (`OperatorDelegateMiddleware` bypasses
+    /// `inner.spawn` and calls `operator.execute` instead — see
+    /// `mlua_swarm::middleware::OperatorDelegateMiddleware` doc).
+    fn identity_blueprint_with_operator_delegate() -> Blueprint {
+        Blueprint {
+            spawner_hints: mlua_swarm::SpawnerHints {
+                layers: vec!["operator_delegate".to_string()],
+            },
+            ..identity_blueprint()
+        }
+    }
+
+    /// `Operator` stub whose `execute` never resolves — the GH #33 Guard 2
+    /// fixture ("a registered-but-never-acking operator").
+    struct StallingOperator;
+
+    #[async_trait::async_trait]
+    impl mlua_swarm::Operator for StallingOperator {
+        async fn execute(
+            &self,
+            _ctx: &mlua_swarm::Ctx,
+            _system: Option<String>,
+            _prompt: Value,
+            _worker: Option<mlua_swarm::WorkerBinding>,
+            _worker_token: mlua_swarm::CapToken,
+        ) -> Result<mlua_swarm::WorkerResult, mlua_swarm::WorkerError> {
+            std::future::pending::<()>().await;
+            unreachable!("StallingOperator.execute must never resolve")
+        }
+    }
+
+    /// A launch request that references an operator backend by id (via
+    /// `operator.operator_backend_id`, the coarse Guard 1 signal) against
+    /// [`identity_blueprint_with_operator_delegate`].
+    fn operator_launch_req(
+        backend_id: &str,
+        timeout_secs: Option<u64>,
+    ) -> crate::TaskLaunchRequest {
+        crate::TaskLaunchRequest {
+            blueprint: BlueprintRef::Inline {
+                value: Box::new(identity_blueprint_with_operator_delegate()),
+            },
+            init_ctx: serde_json::json!({"in": "hello"}),
+            project_root: None,
+            work_dir: None,
+            task_metadata: None,
+            ttl_secs: None,
+            operator: Some(crate::OperatorReq {
+                operator_backend_id: Some(backend_id.to_string()),
+                ..Default::default()
+            }),
+            operator_sid: None,
+            timeout_secs,
+            goal: Some("operator delegate test goal".to_string()),
+        }
+    }
+
+    /// Guard 1: an operator-requiring launch with zero attached operators
+    /// must fail immediately with a structured `503`, not hang waiting on
+    /// a session nothing can serve.
+    #[tokio::test]
+    async fn sync_launch_zero_operators_fails_fast() {
+        let state = test_state();
+        // No `state.engine.register_operator(...)` call — zero operators
+        // attached, matching `list_operator_ids()` being empty.
+        let req = operator_launch_req("nonexistent-op", None);
+
+        let started = std::time::Instant::now();
+        let result = crate::tasks_start(State(state), Json(req)).await;
+        let elapsed = started.elapsed();
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("zero attached operators must fail the operator-delegate launch"),
+        };
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.message.contains("no operator attached"),
+            "error message must mention the missing operator: {}",
+            err.message
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "guard 1 must fail fast (no dispatch, no timeout wait): took {elapsed:?}"
+        );
+    }
+
+    /// Guard 2: a launch that resolves to a registered-but-stalled
+    /// operator session must return a structured `504` within the
+    /// requested `timeout_secs` ceiling, not hang the request forever.
+    #[tokio::test]
+    async fn sync_launch_stalled_times_out() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("stall-op", Arc::new(StallingOperator))
+            .await;
+        let req = operator_launch_req("stall-op", Some(1));
+
+        let started = std::time::Instant::now();
+        // Outer safety-net timeout: if guard 2 itself regressed into an
+        // infinite hang, fail this test loudly instead of stalling `cargo
+        // test` indefinitely.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::tasks_start(State(state), Json(req)),
+        )
+        .await
+        .expect("tasks_start must resolve well within 5s when guard 2's ceiling is 1s");
+        let elapsed = started.elapsed();
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a stalled operator session must time out, not succeed"),
+        };
+        assert_eq!(err.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            err.message.contains('1'),
+            "error message must mention the configured 1s ceiling: {}",
+            err.message
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "guard 2 must fire close to the requested 1s ceiling: took {elapsed:?}"
+        );
+    }
+
+    /// Invariant 2: a launch that never references an operator backend
+    /// must never be rejected by guard 1 — the simplest existing passing
+    /// fixture (`post_tasks_req`) still succeeds unaffected.
+    #[tokio::test]
+    async fn sync_launch_without_operator_path_unaffected() {
+        let state = test_state();
+        let result = crate::tasks_start(
+            State(state),
+            Json(post_tasks_req("non-operator launch goal")),
+        )
+        .await;
+        if let Err(e) = &result {
+            panic!(
+                "non-operator launch must succeed unaffected by guard 1: {}",
+                e.message
+            );
+        }
+    }
+
+    /// Guard 2 ceiling resolution: `timeout_secs: Some(0)` is invalid
+    /// (design doc: "0 = reject with 400 or treat as invalid — pick one
+    /// and test it") — rejected fast, before any Task/Run side effects.
+    #[tokio::test]
+    async fn sync_launch_zero_timeout_secs_rejected() {
+        let state = test_state();
+        let mut req = post_tasks_req("zero timeout goal");
+        req.timeout_secs = Some(0);
+
+        let result = crate::tasks_start(State(state), Json(req)).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("timeout_secs: Some(0) must be rejected, not treated as a no-op"),
+        };
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("timeout_secs"),
+            "error message must reference timeout_secs: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -664,6 +842,7 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            timeout_secs: None,
             goal: Some("st4 rekick goal".to_string()),
         }
     }

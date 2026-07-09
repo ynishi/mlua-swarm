@@ -74,6 +74,12 @@ pub struct FileConfig {
     pub default_agent_kind: Option<String>,
     /// Shared secret used to verify/sign `CapToken` HMAC signatures.
     pub token_secret: Option<String>,
+    /// Ceiling (seconds) for the `POST /v1/tasks` synchronous launch await
+    /// (GH #33 Guard 2). Overridable per-request via `TaskLaunchRequest
+    /// .timeout_secs`; this is the server-wide fallback when the request
+    /// omits it. `None` = fall back to the built-in default (300s, see
+    /// [`ResolvedConfig`]'s `Default` impl).
+    pub sync_timeout_secs: Option<u64>,
 }
 
 /// CLI-side overrides. Mirrors [`FileConfig`] field-for-field. Kept as a
@@ -107,6 +113,8 @@ pub struct CliOverrides {
     pub default_agent_kind: Option<String>,
     /// `--token-secret` value.
     pub token_secret: Option<String>,
+    /// `--sync-timeout-secs` value (mirrors [`FileConfig::sync_timeout_secs`]).
+    pub sync_timeout_secs: Option<u64>,
 }
 
 /// Fully resolved config — every field has the built-in default applied.
@@ -147,6 +155,12 @@ pub struct ResolvedConfig {
     pub default_agent_kind: Option<String>,
     /// Shared secret used to verify/sign `CapToken` HMAC signatures.
     pub token_secret: Option<String>,
+    /// Ceiling (seconds) for the `POST /v1/tasks` synchronous launch await
+    /// (GH #33 Guard 2). Always set — defaults to 300s (see
+    /// [`default_sync_timeout_secs`]) when neither CLI nor config file
+    /// provides one. A per-request `TaskLaunchRequest.timeout_secs`
+    /// override, when present, takes priority over this server-wide value.
+    pub sync_timeout_secs: u64,
 }
 
 impl Default for ResolvedConfig {
@@ -165,8 +179,14 @@ impl Default for ResolvedConfig {
             seed_blueprint_id: "main".into(),
             default_agent_kind: None,
             token_secret: None,
+            sync_timeout_secs: default_sync_timeout_secs(),
         }
     }
+}
+
+/// Built-in default sync-launch timeout ceiling (GH #33 Guard 2), seconds.
+pub fn default_sync_timeout_secs() -> u64 {
+    300
 }
 
 fn default_bind() -> SocketAddr {
@@ -225,6 +245,10 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .unwrap_or(default.seed_blueprint_id),
         default_agent_kind: cli.default_agent_kind.or(file.default_agent_kind),
         token_secret: cli.token_secret.or(file.token_secret),
+        sync_timeout_secs: cli
+            .sync_timeout_secs
+            .or(file.sync_timeout_secs)
+            .unwrap_or_else(default_sync_timeout_secs),
     })
 }
 
@@ -354,5 +378,43 @@ mod tests {
         let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
         assert_eq!(resolved.task_store_path, None);
         assert_eq!(resolved.run_store_path, None);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #33 Guard 2: `sync_timeout_secs` resolution cascade
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_sync_timeout_secs_default_300_when_cli_and_file_absent() {
+        let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
+        assert_eq!(resolved.sync_timeout_secs, 300);
+        assert_eq!(resolved.sync_timeout_secs, default_sync_timeout_secs());
+    }
+
+    #[test]
+    fn resolve_sync_timeout_secs_file_wins_over_default() {
+        let file = FileConfig {
+            sync_timeout_secs: Some(120),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file).expect("resolve");
+        assert_eq!(resolved.sync_timeout_secs, 120);
+    }
+
+    #[test]
+    fn resolve_sync_timeout_secs_cli_wins_over_file() {
+        let cli = CliOverrides {
+            sync_timeout_secs: Some(45),
+            ..Default::default()
+        };
+        let file = FileConfig {
+            sync_timeout_secs: Some(120),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).expect("resolve");
+        assert_eq!(
+            resolved.sync_timeout_secs, 45,
+            "cli sync_timeout_secs must win over file"
+        );
     }
 }

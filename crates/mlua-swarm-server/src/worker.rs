@@ -461,6 +461,7 @@ mod tests {
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store,
             base_url: None,
+            sync_timeout_secs: 300,
         }
     }
 
