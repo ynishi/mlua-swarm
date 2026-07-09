@@ -558,6 +558,23 @@ pub struct EngineState {
     /// `with_step_naming`) — callers fall back to the pre-GH-#23 runtime
     /// union rule in that case.
     pub step_namings: HashMap<StepId, Arc<crate::core::step_naming::StepNaming>>,
+    /// GH #27 (follow-up to #23): per-dispatch snapshot of the
+    /// Blueprint-wide [`crate::core::projection_placement::ProjectionPlacement`]
+    /// resolver — built once by `blueprint::compiler::Compiler::compile`
+    /// and stashed here, per `StepId`, by
+    /// `crate::blueprint::EngineDispatcher::dispatch` (the same insert
+    /// site, and the same "construct once, read many" contract, as
+    /// [`Self::step_namings`]). `Engine::projection_placement_for` reads
+    /// it back so every one of the 3 materialize call sites (submit-time
+    /// sink, server read-back, spawn-time pointer) resolves the SAME root
+    /// preference / directory template. An absent entry means the
+    /// dispatcher was never given a `ProjectionPlacement` (e.g. a direct
+    /// `EngineDispatcher::with_spawner` caller that skipped
+    /// `with_projection_placement`) — callers fall back to
+    /// `ProjectionPlacement::default()` (byte-compat with the pre-#27
+    /// hardcoded layout) in that case.
+    pub projection_placements:
+        HashMap<StepId, Arc<crate::core::projection_placement::ProjectionPlacement>>,
     /// All minted `CapToken` records, keyed by token fingerprint
     /// (`CapToken::fingerprint` = SHA-256 of the nonce; issue #14 — the
     /// key is loggable, the nonce is not).
@@ -600,6 +617,7 @@ impl EngineState {
             systems: HashMap::new(),
             agent_ctx: HashMap::new(),
             step_namings: HashMap::new(),
+            projection_placements: HashMap::new(),
             tokens: HashMap::new(),
             worker_handles: HashMap::new(),
             pending_resumes: HashMap::new(),

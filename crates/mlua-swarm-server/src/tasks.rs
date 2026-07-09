@@ -410,6 +410,7 @@ mod tests {
             default_init_ctx: None,
             default_agent_ctx: None,
             default_context_policy: None,
+            projection_placement: None,
         }
     }
 
@@ -644,6 +645,7 @@ mod tests {
             default_init_ctx: None,
             default_agent_ctx: None,
             default_context_policy: None,
+            projection_placement: None,
         }
     }
 

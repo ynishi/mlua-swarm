@@ -612,6 +612,14 @@ impl TaskLaunchService {
         // Unconditional — every compile produces one, undeclared Blueprints
         // included (canonical falls back to `Step.ref` byte-for-byte).
         let dispatcher = dispatcher.with_step_naming(compiled.step_naming.clone());
+        // GH #27 (follow-up to #23): attach the `ProjectionPlacement`
+        // resolver `Compiler::compile` already built once for this
+        // Blueprint (the sole construction site — see
+        // `core::projection_placement::ProjectionPlacement::from_spec`'s
+        // doc). Unconditional — every compile produces one, undeclared
+        // Blueprints included (resolves to `ProjectionPlacement::default()`).
+        let dispatcher =
+            dispatcher.with_projection_placement(compiled.projection_placement.clone());
         // Issue #19 ST3: BP default + Task init_ctx → merged init_ctx (the
         // 2-layer slice of the eventual 4-layer cascade; Run override is
         // ST4 carry). `input.blueprint.default_init_ctx` is `None` for
@@ -695,6 +703,7 @@ mod tests {
             default_init_ctx: None,
             default_agent_ctx: None,
             default_context_policy: None,
+            projection_placement: None,
         }
     }
 

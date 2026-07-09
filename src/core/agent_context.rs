@@ -76,6 +76,18 @@ use serde_json::Value;
 /// Spawner axis's read-back source (see the module doc).
 pub const AGENT_CONTEXT_KEY: &str = "agent_context";
 
+/// `ctx.meta.runtime` key under which the Blueprint-wide
+/// [`crate::core::projection_placement::ProjectionPlacement`] resolver
+/// (JSON-serialized, GH #27 follow-up to #23) is stashed by
+/// `crate::middleware::agent_context::AgentContextMiddleware` — the read-back
+/// source for the spawn-time in-flight projection pointer
+/// (`crates/mlua-swarm-server/src/operator_ws/session.rs`'s
+/// `append_projection_pointer`), which has no direct `Engine` handle to
+/// call `Engine::projection_placement_for` with. Absent (or
+/// undeserializable) falls back to
+/// `ProjectionPlacement::default()` (byte-compat).
+pub const PROJECTION_PLACEMENT_KEY: &str = "__projection_placement";
+
 /// `ctx.meta.runtime` key that carries the issue #13 run-id propagation
 /// value. Canonical home as of GH #20 (previously a bare literal at
 /// `Engine::dispatch_attempt_with`).
@@ -141,7 +153,9 @@ pub struct StepPointer {
     pub size_bytes: u64,
     /// Absolute filesystem path to the materialized projection file
     /// (`crate::core::projection::FileProjectionAdapter`'s
-    /// `<root>/workspace/tasks/<step_id>/ctx/<name>.md` target), when the
+    /// [`crate::core::projection_placement::ProjectionPlacement`]
+    /// resolver's target — byte-compat default layout
+    /// `<root>/workspace/tasks/<step_id>/ctx/<name>.md`), when the
     /// step's submission was materialized to disk. `None` when the OUTPUT
     /// is only resolvable via [`Self::content_url`] (in-memory Data-plane
     /// record, or a `RunRecord.result_ref` fallback — see

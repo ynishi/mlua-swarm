@@ -6,5 +6,6 @@ pub mod ctx;
 pub mod engine;
 pub mod errors;
 pub mod projection;
+pub mod projection_placement;
 pub mod state;
 pub mod step_naming;

@@ -93,6 +93,9 @@ pub use core::ctx::{
 };
 pub use core::engine::Engine;
 pub use core::errors::EngineError;
+pub use core::projection_placement::{
+    ProjectionPlacement, ProjectionPlacementError, RootPreference,
+};
 pub use core::state::{
     CapTokenConsumeError, CapTokenRecord, DispatchOutcome, Event, EventStream, OperatorSession,
     ResumeKey, ResumePending, TaskSpec, TaskState, TaskStatus,

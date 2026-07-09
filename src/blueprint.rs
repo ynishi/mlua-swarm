@@ -25,6 +25,7 @@
 //! versioning, and external consumers.
 
 use crate::core::engine::Engine;
+use crate::core::projection_placement::ProjectionPlacement;
 use crate::core::state::{DispatchOutcome, TaskSpec};
 use crate::core::step_naming::StepNaming;
 use crate::store::run::{RunContext, StepEntry};
@@ -50,7 +51,7 @@ pub use mlua_swarm_schema::OperatorKind as SchemaOperatorKind;
 pub use mlua_swarm_schema::{
     current_schema_version, default_global_agent_kind, AgentDef, AgentKind, AgentMeta,
     AgentProfile, Blueprint, BlueprintMetadata, BlueprintOrigin, CompilerHints, CompilerStrategy,
-    MetaDef, OperatorDef, SpawnerHints, CURRENT_SCHEMA_VERSION,
+    MetaDef, OperatorDef, ProjectionPlacementSpec, SpawnerHints, CURRENT_SCHEMA_VERSION,
 };
 
 /// Bridges `mlua_flow_ir::AsyncDispatcher` to the engine's
@@ -85,6 +86,12 @@ pub use mlua_swarm_schema::{
 /// half of the "construct once, read many" contract; `Engine::step_naming_for`
 /// is the read-back accessor later consumers (GH #23 subtask-2/3) pull
 /// from.
+///
+/// GH #27 (follow-up to #23): optionally also carries the Blueprint's
+/// [`ProjectionPlacement`] resolver (via [`Self::with_projection_placement`],
+/// built once by `Compiler::compile`) — the SAME snapshot-then-read-back
+/// contract as [`StepNaming`] above, this time read back via
+/// `Engine::projection_placement_for`.
 pub struct EngineDispatcher {
     engine: Engine,
     op_token: CapToken,
@@ -92,6 +99,7 @@ pub struct EngineDispatcher {
     run_ctx: Option<RunContext>,
     step_metas: HashMap<String, Value>,
     step_naming: Option<Arc<StepNaming>>,
+    projection_placement: Option<Arc<ProjectionPlacement>>,
 }
 
 impl EngineDispatcher {
@@ -112,6 +120,7 @@ impl EngineDispatcher {
             run_ctx: None,
             step_metas: HashMap::new(),
             step_naming: None,
+            projection_placement: None,
         }
     }
 
@@ -143,6 +152,21 @@ impl EngineDispatcher {
     /// `service::task_launch::TaskLaunchService::launch`).
     pub fn with_step_naming(mut self, step_naming: Arc<StepNaming>) -> Self {
         self.step_naming = Some(step_naming);
+        self
+    }
+
+    /// GH #27 (follow-up to #23): attach the Blueprint's
+    /// [`ProjectionPlacement`] resolver (built once by
+    /// `blueprint::compiler::Compiler::compile`). `None` (the default via
+    /// [`Self::with_spawner`]) preserves pre-GH-#27 behavior byte-for-byte
+    /// — [`Self::dispatch`] simply skips the
+    /// `EngineState.projection_placements` snapshot for every caller that
+    /// never opts in, mirroring [`Self::with_step_naming`]'s contract.
+    pub fn with_projection_placement(
+        mut self,
+        projection_placement: Arc<ProjectionPlacement>,
+    ) -> Self {
+        self.projection_placement = Some(projection_placement);
         self
     }
 }
@@ -332,6 +356,34 @@ impl AsyncDispatcher for EngineDispatcher {
                     task_id = %tid,
                     error = %e,
                     "EngineDispatcher::dispatch: failed to snapshot StepNaming into EngineState"
+                );
+            }
+        }
+
+        // GH #27 (follow-up to #23): same snapshot pattern as StepNaming
+        // above — stash the (already-built, Blueprint-wide)
+        // ProjectionPlacement resolver into `EngineState.projection_placements`
+        // keyed by this dispatch's `tid`. `None` (no
+        // `with_projection_placement` call) is a no-op, same fail-open
+        // convention as the `step_naming` snapshot: a secondary-persistence
+        // failure here must never mask the primary dispatch outcome.
+        if let Some(projection_placement) = self.projection_placement.clone() {
+            let tid_for_placement = tid.clone();
+            if let Err(e) = self
+                .engine
+                .with_state(
+                    "EngineDispatcher::dispatch.projection_placement",
+                    move |s| {
+                        s.projection_placements
+                            .insert(tid_for_placement, projection_placement);
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    task_id = %tid,
+                    error = %e,
+                    "EngineDispatcher::dispatch: failed to snapshot ProjectionPlacement into EngineState"
                 );
             }
         }

@@ -116,6 +116,7 @@ use mlua_swarm::core::engine::Engine;
 use mlua_swarm::core::projection::{
     ProjectionAdapter, ProjectionError, ProjectionKey, ProjectionRef,
 };
+use mlua_swarm::core::projection_placement::ProjectionPlacement;
 use mlua_swarm::core::step_naming::StepNaming;
 use mlua_swarm::store::output::{ContentRef, OutputEvent, OutputStore, OutputStoreError};
 use mlua_swarm::store::run::{RunRecord, RunStore};
@@ -750,7 +751,8 @@ pub struct StepSummary {
     pub source: ProjectionSource,
     /// Absolute filesystem path to the materialized projection file
     /// (`crate::core::projection::FileProjectionAdapter`'s
-    /// `<root>/workspace/tasks/<step_id>/ctx/<name>.md` target), when one
+    /// [`ProjectionPlacement`] resolver's target — byte-compat default
+    /// layout `<root>/workspace/tasks/<step_id>/ctx/<name>.md`), when one
     /// exists AND this entry addresses the whole step (no `?path=`
     /// narrowing — a narrowed fragment is never file-backed). `None`
     /// otherwise.
@@ -801,18 +803,18 @@ fn narrow_step_value(value: &Value, path: Option<&str>) -> Option<Value> {
 }
 
 /// The materialize target [`mlua_swarm::core::projection::FileProjectionAdapter`]
-/// writes to for a submission (`<root>/workspace/tasks/<step_id>/ctx/<name>.md`
-/// — same convention as that adapter's own `target_path`, reconstructed
-/// here because this module resolves `root` for a step *other than* the
-/// one materializing it, so it cannot construct the adapter itself
-/// key-first).
-fn materialized_file_path(root: &str, step_id: &StepId, name: &str) -> std::path::PathBuf {
-    std::path::Path::new(root)
-        .join("workspace")
-        .join("tasks")
-        .join(step_id.to_string())
-        .join("ctx")
-        .join(format!("{name}.md"))
+/// writes to for a submission, resolved via the SAME
+/// [`ProjectionPlacement`] (GH #27, follow-up to #23) the writer
+/// consulted — reconstructed here (rather than constructed through the
+/// adapter itself) because this module resolves the target for a step
+/// *other than* the one materializing it, key-first.
+fn materialized_file_path(
+    placement: &ProjectionPlacement,
+    root: &str,
+    step_id: &StepId,
+    name: &str,
+) -> std::path::PathBuf {
+    placement.target_path(root, step_id.as_ref(), name)
 }
 
 /// Resolves the materialized file body for `name` (a CANONICAL name — the
@@ -822,10 +824,12 @@ fn materialized_file_path(root: &str, step_id: &StepId, name: &str) -> std::path
 /// finds `name`'s most recent [`mlua_swarm::store::run::StepEntry`]
 /// (giving its own dispatch `StepId`) via
 /// [`find_step_id_for_canonical`], resolves that step's own
-/// `AgentContextView` root (`work_dir`, falling back to `project_root` —
-/// the same fallback order `Engine::submit_output`'s materialize sink
-/// uses) via [`mlua_swarm::core::engine::Engine::agent_context_for`], and
-/// reads the file at the resulting path back.
+/// `AgentContextView` root via the SAME [`ProjectionPlacement`]
+/// [`Engine::submit_output`]'s materialize sink snapshotted at dispatch
+/// time (GH #27, follow-up to #23 — see
+/// `mlua_swarm::core::projection_placement`'s module doc for the "3 path"
+/// convergence), via [`mlua_swarm::core::engine::Engine::agent_context_for`],
+/// and reads the file at the resulting path back.
 ///
 /// Only tries `attempt = 1` (the common case — a single dispatch per
 /// flow.ir Step) — a step retried under the same `StepId` at a later
@@ -840,8 +844,13 @@ async fn resolve_materialized_file(
     let naming = resolve_step_naming_for_run(&state.engine, run).await;
     let step_id = find_step_id_for_canonical(run, naming.as_deref(), name)?;
     let view = state.engine.agent_context_for(&step_id, 1).await?;
-    let root = view.work_dir.clone().or(view.project_root.clone())?;
-    let path = materialized_file_path(&root, &step_id, name);
+    let placement = state
+        .engine
+        .projection_placement_for(&step_id)
+        .await
+        .unwrap_or_default();
+    let root = placement.resolve_root(&view)?;
+    let path = materialized_file_path(&placement, &root, &step_id, name);
     let bytes = std::fs::read(&path).ok()?;
     Some((path, bytes))
 }
@@ -1111,7 +1120,7 @@ mod tests {
     use mlua_swarm::application::BlueprintRef;
     use mlua_swarm::blueprint::{
         current_schema_version, AgentDef, AgentKind, AgentMeta, Blueprint, BlueprintMetadata,
-        CompilerHints, CompilerStrategy,
+        CompilerHints, CompilerStrategy, ProjectionPlacementSpec,
     };
     use mlua_swarm::core::config::EngineCfg;
     use mlua_swarm::core::engine::Engine;
@@ -1158,6 +1167,7 @@ mod tests {
             default_init_ctx: None,
             default_agent_ctx: None,
             default_context_policy: None,
+            projection_placement: None,
         }
     }
 
@@ -1240,6 +1250,7 @@ mod tests {
             default_init_ctx: None,
             default_agent_ctx: None,
             default_context_policy: None,
+            projection_placement: None,
         }
     }
 
@@ -1451,6 +1462,85 @@ mod tests {
         );
     }
 
+    /// GH #27 (follow-up to #23), 3-path consistency E2E: a Blueprint
+    /// declaring `projection_placement` (`root = "project_root"`, a
+    /// custom `dir_template`) drives BOTH the submit-time write (`Engine`'s
+    /// `materialize_final_submission`, dispatched off the `Compiler`-built
+    /// resolver) AND the server read-back
+    /// (`resolve_materialized_file`, which re-fetches the SAME resolver via
+    /// `Engine::projection_placement_for`) to the identical custom
+    /// location — proof the "3 path" convergence
+    /// `crate::core::projection_placement`'s module doc describes holds
+    /// end-to-end, and that `work_dir` (absent here) is correctly NOT
+    /// preferred when `root = "project_root"` is declared.
+    #[tokio::test]
+    async fn declared_projection_placement_e2e_write_and_read_back_converge() {
+        let project_root_dir = tempfile::TempDir::new().unwrap();
+        let state = test_state();
+        let mut bp = declared_projection_name_blueprint("plan-out");
+        bp.projection_placement = Some(ProjectionPlacementSpec {
+            root: Some("project_root".to_string()),
+            dir_template: Some("custom/{task_id}/out".to_string()),
+        });
+        let req = TaskLaunchRequest {
+            blueprint: BlueprintRef::Inline {
+                value: Box::new(bp),
+            },
+            init_ctx: json!({ "greeting": "materialized-custom-placement" }),
+            project_root: Some(project_root_dir.path().to_string_lossy().into_owned()),
+            work_dir: None,
+            task_metadata: None,
+            ttl_secs: None,
+            operator: None,
+            operator_sid: None,
+            goal: Some("projection placement test goal".to_string()),
+        };
+        let posted = crate::tasks_start(State(state.clone()), Json(req))
+            .await
+            .expect("tasks_start")
+            .0;
+
+        let summary = step_get(
+            State(state.clone()),
+            Path((
+                posted.task_id.to_string(),
+                "latest".to_string(),
+                "plan-out".to_string(),
+            )),
+            Query(StepPathQuery::default()),
+        )
+        .await
+        .expect("step_get")
+        .0;
+
+        // NOTE: the `{task_id}` the placement resolver substitutes is the
+        // dispatched Step's own `StepId` (`ProjectionKey.task_id`), which is
+        // NOT the same value as `posted.task_id` (the outer `TaskId` this
+        // flow-of-one-Step was launched under) — so the expected path is
+        // built from the ACTUAL observed `file_path` shape (prefix / infix
+        // / suffix), not a predicted exact id, mirroring
+        // `declared_projection_name_materialized_file_stem_is_canonical`'s
+        // own suffix-only assertion style.
+        let file_path = summary.file_path.expect("materialized file_path present");
+        let path = std::path::Path::new(&file_path);
+        assert!(
+            path.starts_with(project_root_dir.path()),
+            "file must be rooted at project_root (root_preference=ProjectRoot): {file_path}"
+        );
+        assert!(
+            file_path.ends_with("out/plan-out.md"),
+            "file must follow the custom dir_template's tail: {file_path}"
+        );
+        assert!(
+            file_path.contains("/custom/"),
+            "file must follow the custom dir_template's prefix segment: {file_path}"
+        );
+        assert!(
+            path.exists(),
+            "the write side must have materialized the file the read-back reports: {file_path}"
+        );
+    }
+
     /// GH #23 subtask-3 (collision): a declared `projection_name` that
     /// collides with another Step's own `ref` is rejected at
     /// register/compile time — `StepNaming::from_blueprint`'s hard-error
@@ -1557,6 +1647,7 @@ mod tests {
             default_init_ctx: None,
             default_agent_ctx: None,
             default_context_policy: None,
+            projection_placement: None,
         };
 
         let req = TaskLaunchRequest {
@@ -2170,6 +2261,7 @@ mod tests {
             default_init_ctx: None,
             default_agent_ctx: None,
             default_context_policy: None,
+            projection_placement: None,
         };
 
         let req = TaskLaunchRequest {

@@ -174,6 +174,52 @@ collapse that union into one name declared up front, on the Agent tier:
 See `crate::core::step_naming`'s module doc for the full addressing-space
 design this table backs.
 
+### Projection placement (GH #27, follow-up to #23): `Blueprint.projection_placement`
+
+A Step's materialized OUTPUT file — the file the submit-time projection
+sink writes, the REST metadata/content routes' `file_path` reconstructs,
+and the spawn-time `ctx_projection` pointer addresses (the "3 path"
+convergence a single
+`mlua_swarm::core::projection_placement::ProjectionPlacement` resolver now
+owns) — lives at a location resolved from two independent choices:
+
+- **Root preference**: which of the spawn-time `work_dir` / `project_root`
+  to prefer as the materialize root, falling back to the other when the
+  preferred one is absent. `work_dir` is the per-task working directory
+  supplied on the task — typically a git worktree cut from the main
+  checkout; `project_root` is that main checkout itself. Default (and
+  every pre-GH-#27 Blueprint's behavior): prefer `work_dir`, falling back
+  to `project_root`.
+- **Directory template**: a `{task_id}`-templated path, relative to the
+  resolved root, under which the file is written (the file name itself is
+  unchanged — the canonical agent / projection name, `.md`-suffixed).
+  Default: `"workspace/tasks/{task_id}/ctx"`.
+
+Declare either or both on `Blueprint.projection_placement`:
+
+```jsonc
+{
+  "projection_placement": {
+    "root": "project_root",
+    "dir_template": "artifacts/{task_id}/projections"
+  }
+}
+```
+
+- **Undeclared** (`projection_placement` absent, the default): both
+  choices resolve to their defaults above — byte-identical to every
+  pre-GH-#27 Blueprint's materialize location.
+- **Partially declared**: an omitted field (`root` or `dir_template`)
+  resolves to its own default independently — declaring only `root`
+  leaves `dir_template` at `"workspace/tasks/{task_id}/ctx"`.
+- **Invalid `dir_template`**: empty, missing the `{task_id}` placeholder,
+  absolute, or containing a `..` path segment is rejected at
+  `Compiler::compile` time (fails fast, same class as the Step-naming
+  collision above).
+
+See `crate::core::projection_placement`'s module doc for the resolver's
+full API and the "3 path" convergence this collapses.
+
 ### Per-Step meta: `$step_meta` envelope, and the dedicated-agent pattern
 
 Besides the `$step_meta` envelope (the Step tier row above, detailed

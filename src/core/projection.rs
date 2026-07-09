@@ -54,19 +54,22 @@
 //! worker's `Final` output lands in [`crate::core::engine::Engine::submit_output`]
 //! / `submit_worker_result_trusted` (the canonical worker-submit path, `POST
 //! /v1/worker/submit` and `/v1/worker/result`), the engine materializes that
-//! step's OUTPUT to `<root>/workspace/tasks/<task_id>/ctx/<canonical_agent>.md`
-//! via [`FileProjectionAdapter::materialize_submission`] — this is the file
-//! a Worker-axis `StepPointer.file_path` (when `Some`) and the HTTP debug
+//! step's OUTPUT to the [`crate::core::projection_placement::ProjectionPlacement`]
+//! resolver's target (`<root>/<dir_template>/<canonical_agent>.md`; the
+//! byte-compat default layout is `workspace/tasks/<task_id>/ctx/`) via
+//! [`FileProjectionAdapter::materialize_submission`] — this is the file a
+//! Worker-axis `StepPointer.file_path` (when `Some`) and the HTTP debug
 //! plane's `StepSummary.file_path` both address, so a *later* Agent step
 //! (or an operator, over HTTP) can read a *prior* step's OUTPUT while the
 //! overall run is still in flight, without waiting for
 //! `RunRecord.result_ref` to be set at finalization. `<root>` is resolved
 //! from the [`crate::core::agent_context::AgentContextView`]
-//! `AgentContextMiddleware` snapshotted at spawn time (`work_dir`, falling
-//! back to `project_root`); this sink is best-effort (fail-open — see the
-//! Invariants on `Engine::submit_output`'s doc): an unresolved root, or a
-//! `Final` from a spawn that never ran through that middleware, is a silent
-//! no-op, never a submit failure.
+//! `AgentContextMiddleware` snapshotted at spawn time, via
+//! [`ProjectionPlacement::resolve_root`] (`work_dir` falling back to
+//! `project_root` for the byte-compat default preference); this sink is
+//! best-effort (fail-open — see the Invariants on `Engine::submit_output`'s
+//! doc): an unresolved root, or a `Final` from a spawn that never ran
+//! through that middleware, is a silent no-op, never a submit failure.
 //!
 //! `<canonical_agent>` (GH #23) is `producer_agent` (`TaskState.spec.agent`)
 //! resolved through `Engine::step_naming_for(task_id)`'s
@@ -85,6 +88,7 @@
 //! same type. [`ProjectionKey::resolve`] is the pure, adapter-independent
 //! implementation of that narrowing, shared by every adapter.
 
+use crate::core::projection_placement::ProjectionPlacement;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -212,36 +216,57 @@ pub trait ProjectionAdapter: Send + Sync {
     fn pointer_line(&self, r: &ProjectionRef) -> String;
 }
 
-/// File-backed [`ProjectionAdapter`]: materializes the projected value to
-/// `<root>/workspace/tasks/<task_id>/ctx/<step-or-_ctx>.md` and reads it
-/// back on [`Self::fetch`].
+/// File-backed [`ProjectionAdapter`]: materializes the projected value
+/// under `root`, at the target [`ProjectionPlacement::target_path`]
+/// resolves for `key`, and reads it back on [`Self::fetch`]. [`Self::new`]
+/// resolves through [`ProjectionPlacement::default`] (the pre-GH-#27
+/// hardcoded `<root>/workspace/tasks/<task_id>/ctx/<step-or-_ctx>.md`
+/// layout, unchanged); [`Self::with_placement`] resolves through a
+/// caller-supplied resolver instead — see
+/// `crate::core::projection_placement`'s module doc for the "3 path"
+/// convergence this collapses.
 pub struct FileProjectionAdapter {
     root: PathBuf,
+    placement: ProjectionPlacement,
 }
 
 impl FileProjectionAdapter {
-    /// Builds an adapter rooted at `root` (the project root — materialize
-    /// targets are resolved under `<root>/workspace/tasks/...`).
+    /// Builds an adapter rooted at `root` (typically the resolved
+    /// `work_dir` / `project_root`) using the byte-compat
+    /// [`ProjectionPlacement::default`] resolver.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            placement: ProjectionPlacement::default(),
+        }
     }
 
-    /// The materialize target for `key`: `<root>/workspace/tasks/<task_id>/ctx/<step-or-_ctx>.md`.
+    /// Builds an adapter rooted at `root`, resolving materialize targets
+    /// through the given `placement` instead of the byte-compat default —
+    /// the constructor every one of the "3 path" call sites
+    /// (`crate::core::projection_placement`'s module doc) uses once they
+    /// hold a Blueprint-resolved [`ProjectionPlacement`].
+    pub fn with_placement(root: impl Into<PathBuf>, placement: ProjectionPlacement) -> Self {
+        Self {
+            root: root.into(),
+            placement,
+        }
+    }
+
+    /// The materialize target for `key`, resolved via
+    /// [`ProjectionPlacement::target_path`].
     fn target_path(&self, key: &ProjectionKey) -> PathBuf {
-        self.root
-            .join("workspace")
-            .join("tasks")
-            .join(&key.task_id)
-            .join("ctx")
-            .join(format!("{}.md", key.step_slug()))
+        self.placement
+            .target_path(&self.root, &key.task_id, key.step_slug())
     }
 
     /// Submit-path materialize (subtask-4 / ST2 rework — see the module
     /// doc's "Submit-path projection" section). Unlike [`Self::project`],
     /// `value` is not narrowed out of a larger `ctx_data` via
     /// [`ProjectionKey::resolve`] — it is the exact submitted content, so
-    /// this writes it directly. Reuses [`Self::target_path`] (same
-    /// `<root>/workspace/tasks/<task_id>/ctx/<step>.md` convention as
+    /// this writes it directly. Reuses [`Self::target_path`] (the same
+    /// [`ProjectionPlacement`]-resolved target — byte-compat default
+    /// `<root>/workspace/tasks/<task_id>/ctx/<step>.md` — as
     /// [`Self::project`]), so a later [`Self::fetch`] against the same
     /// `key` reads it back unchanged (`fetch` only parses the fenced
     /// ```` ```json ```` block, so the extra `attempt` / `ok` front-matter
@@ -396,6 +421,7 @@ fn parse_projection_file(text: &str) -> Result<Value, ProjectionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::projection_placement::RootPreference;
     use serde_json::json;
     use std::path::Path;
     use tempfile::TempDir;
@@ -464,6 +490,38 @@ mod tests {
             ProjectionRef::File { path } => path.clone(),
             other => panic!("expected File ref, got {other:?}"),
         };
+        assert!(Path::new(&path).exists());
+
+        let fetched = adapter.fetch(&k).unwrap();
+        assert_eq!(&fetched, k.resolve(&ctx_data).unwrap());
+    }
+
+    /// GH #27 (follow-up to #23): `with_placement` resolves the target
+    /// through the given `ProjectionPlacement` instead of the byte-compat
+    /// default — the file lands at the custom `dir_template`, and a
+    /// `fetch` against the SAME key/adapter still round-trips (write and
+    /// read agree by construction, since both go through the same
+    /// resolver instance).
+    #[test]
+    fn file_adapter_with_placement_uses_custom_dir_template() {
+        let dir = TempDir::new().unwrap();
+        let placement = ProjectionPlacement {
+            root_preference: RootPreference::WorkDir,
+            dir_template: "custom/{task_id}/out".to_string(),
+        };
+        let adapter = FileProjectionAdapter::with_placement(dir.path(), placement);
+        let k = key(Some("planner"), None);
+        let ctx_data = sample_ctx_data();
+
+        let reference = adapter.project(&k, &ctx_data).unwrap();
+        let path = match &reference {
+            ProjectionRef::File { path } => path.clone(),
+            other => panic!("expected File ref, got {other:?}"),
+        };
+        assert!(
+            path.ends_with("custom/T-1/out/planner.md"),
+            "path must follow the custom dir_template: {path}"
+        );
         assert!(Path::new(&path).exists());
 
         let fetched = adapter.fetch(&k).unwrap();

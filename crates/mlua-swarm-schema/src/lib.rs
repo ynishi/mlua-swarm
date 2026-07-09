@@ -64,6 +64,7 @@
 //!     default_init_ctx: None,
 //!     default_agent_ctx: None,
 //!     default_context_policy: None,
+//!     projection_placement: None,
 //! };
 //!
 //! assert_eq!(bp.id.as_str(), "hello");
@@ -99,6 +100,7 @@
 //!     default_init_ctx: None,
 //!     default_agent_ctx: None,
 //!     default_context_policy: None,
+//!     projection_placement: None,
 //! };
 //!
 //! let json = serde_json::to_string(&bp).unwrap();
@@ -343,6 +345,15 @@ pub struct Blueprint {
     /// its own. `None` = pass-all (the pre-#21 behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_context_policy: Option<ContextPolicy>,
+    /// GH #27 (follow-up to #23) — Blueprint-declared override of the
+    /// `mlua-swarm` core crate's projection placement resolver (root
+    /// preference + target directory template for materialized step
+    /// OUTPUT files). `None` = the resolver's byte-compat default (root =
+    /// `work_dir` falling back to `project_root`; dir_template =
+    /// `"workspace/tasks/{task_id}/ctx"`) — every pre-#27 Blueprint is
+    /// unaffected. See [`ProjectionPlacementSpec`]'s doc for field detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_placement: Option<ProjectionPlacementSpec>,
 }
 
 /// Receptacle for a Blueprint-driven filter over the materialized
@@ -671,6 +682,35 @@ pub struct MetaDef {
     pub ctx: Value,
 }
 
+/// GH #27 (follow-up to #23) — Blueprint-declared override of the
+/// `mlua-swarm` core crate's placement resolver
+/// (`mlua_swarm::core::projection_placement::ProjectionPlacement`), which
+/// decides where a Step's materialized OUTPUT file (submit-time sink,
+/// server read-back, and spawn-time `ctx_projection` pointer — the "3
+/// path" convergence point) is written on disk. Both fields are
+/// independently optional and validated (`dir_template`) at
+/// `Compiler::compile` time — see that resolver's `from_spec` doc for the
+/// full rejection rules.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionPlacementSpec {
+    /// Which of the spawn-time `work_dir` / `project_root` to prefer as
+    /// the materialize root, falling back to the other when the
+    /// preferred one is absent. `"work_dir"` (default, current
+    /// byte-compat behavior) | `"project_root"`. `None` = the default
+    /// (`"work_dir"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    /// Target directory template, relative to the resolved root, with a
+    /// `{task_id}` placeholder substituted at materialize time. `None` =
+    /// the default (`"workspace/tasks/{task_id}/ctx"`, current byte-compat
+    /// behavior). Must be non-empty, contain the `{task_id}` placeholder,
+    /// stay relative, and not contain any `..` path segment — rejected at
+    /// `Compiler::compile` time otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir_template: Option<String>,
+}
+
 /// Agent / Operator level metadata (description / version / tags).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -858,6 +898,7 @@ mod tests {
             "default_init_ctx",
             "default_agent_ctx",
             "default_context_policy",
+            "projection_placement",
         ] {
             assert!(props.contains_key(key), "missing property: {key}");
         }
@@ -917,6 +958,7 @@ mod tests {
             default_init_ctx,
             default_agent_ctx: None,
             default_context_policy: None,
+            projection_placement: None,
         }
     }
 
@@ -1019,6 +1061,56 @@ mod tests {
         assert!(
             v["properties"]["default_context_policy"].is_object(),
             "default_context_policy must appear in the exported schema: {v}"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GH #27 (follow-up to #23): `Blueprint.projection_placement` /
+    // `ProjectionPlacementSpec`
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn blueprint_projection_placement_roundtrips_when_some() {
+        let mut bp = minimal_bp(None);
+        bp.projection_placement = Some(ProjectionPlacementSpec {
+            root: Some("project_root".to_string()),
+            dir_template: Some("custom/{task_id}/out".to_string()),
+        });
+        let json = serde_json::to_string(&bp).expect("serializes");
+        let back: Blueprint = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(bp, back);
+        assert_eq!(
+            back.projection_placement,
+            Some(ProjectionPlacementSpec {
+                root: Some("project_root".to_string()),
+                dir_template: Some("custom/{task_id}/out".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn blueprint_projection_placement_omitted_when_none() {
+        let bp = minimal_bp(None);
+        let json = serde_json::to_value(&bp).expect("serializes");
+        assert!(
+            json.as_object()
+                .unwrap()
+                .get("projection_placement")
+                .is_none(),
+            "projection_placement key must be absent when None: {json}"
+        );
+        let back: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.projection_placement, None);
+        assert_eq!(bp, back);
+    }
+
+    #[test]
+    fn blueprint_json_schema_exports_projection_placement() {
+        let schema = schemars::schema_for!(Blueprint);
+        let v = serde_json::to_value(&schema).expect("schema serializes");
+        assert!(
+            v["properties"]["projection_placement"].is_object(),
+            "projection_placement must appear in the exported schema: {v}"
         );
     }
 

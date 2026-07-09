@@ -1402,6 +1402,30 @@ impl Engine {
         .flatten()
     }
 
+    /// GH #27 (follow-up to #23): returns the Blueprint-wide
+    /// [`crate::core::projection_placement::ProjectionPlacement`] resolver
+    /// snapshotted for `task_id` (the same `Arc`
+    /// `crate::blueprint::EngineDispatcher::dispatch` stashed into
+    /// `EngineState.projection_placements` at dispatch time — mirroring
+    /// [`Self::step_naming_for`]'s contract exactly). `None` when no entry
+    /// exists — either the dispatcher was never given a
+    /// `ProjectionPlacement` (`EngineDispatcher::with_projection_placement`
+    /// not called) or the lock could not be acquired; callers are expected
+    /// to fall back to `ProjectionPlacement::default()` (byte-compat with
+    /// the pre-#27 hardcoded layout) in that case.
+    pub async fn projection_placement_for(
+        &self,
+        task_id: &StepId,
+    ) -> Option<Arc<crate::core::projection_placement::ProjectionPlacement>> {
+        let key = task_id.clone();
+        self.with_state("projection_placement_for", move |s| {
+            s.projection_placements.get(&key).cloned()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Returns the [`crate::core::agent_context::AgentContextView`]
     /// snapshotted for `(task_id, attempt)`, if `AgentContextMiddleware`
     /// stashed one — the same lookup [`Self::fetch_worker_payload`] /
@@ -1497,8 +1521,10 @@ impl Engine {
     /// GH #23 canonical projection name — see below), and (b) when this
     /// task's spawn ran through `AgentContextMiddleware` (so
     /// `EngineState.agent_ctx` has a `.view.work_dir` / `.view.project_root`
-    /// for it), the value is additionally materialized to
-    /// `<root>/workspace/tasks/<task_id>/ctx/<canonical_agent>.md` — see
+    /// for it), the value is additionally materialized to the
+    /// [`crate::core::projection_placement::ProjectionPlacement`]
+    /// resolver's target (byte-compat default layout
+    /// `<root>/workspace/tasks/<task_id>/ctx/<canonical_agent>.md`) — see
     /// `crate::core::projection`'s module doc.
     ///
     /// **GH #23 subtask-2 (canonical sink):** both writes above key off the
@@ -1553,14 +1579,21 @@ impl Engine {
     /// Best-effort / fail-open throughout (see `submit_output`'s doc
     /// Invariants): every failure path only `tracing::warn!`s and returns.
     ///
-    /// Reads `(producer_agent, root)` via one read-only [`Self::with_state`]
-    /// call — `producer_agent` off `TaskState.spec.agent`, `root` off
-    /// `EngineState.agent_ctx[(task_id, attempt)].view.work_dir` (falling
-    /// back to `.view.project_root`), the same snapshot
+    /// Reads `(producer_agent, view)` via one read-only [`Self::with_state`]
+    /// call — `producer_agent` off `TaskState.spec.agent`, `view` (the
+    /// full [`crate::core::agent_context::AgentContextView`]) off
+    /// `EngineState.agent_ctx[(task_id, attempt)]`, the same snapshot
     /// `crate::middleware::agent_context::AgentContextMiddleware` writes at
     /// spawn time — then does its actual (dual-write / file-write) work
     /// *outside* that lock, so a slow disk write or Data-plane store call
-    /// never holds up unrelated `Engine::with_state` callers.
+    /// never holds up unrelated `Engine::with_state` callers. `root` itself
+    /// is resolved from `view` AFTER the lock via
+    /// [`crate::core::projection_placement::ProjectionPlacement::resolve_root`]
+    /// (GH #27, follow-up to #23) — the SAME resolver
+    /// [`Self::step_naming_for`]'s sibling accessor
+    /// [`Self::projection_placement_for`] snapshotted at dispatch time, so
+    /// this sink's root-preference / fallback order is identical to the
+    /// server read-back and the spawn-time pointer.
     async fn materialize_final_submission(
         &self,
         task_id: &StepId,
@@ -1575,19 +1608,14 @@ impl Engine {
                     .tasks
                     .get(&task_id_for_lookup)
                     .map(|t| t.spec.agent.clone());
-                let root = s
+                let view = s
                     .agent_ctx
                     .get(&(task_id_for_lookup.clone(), attempt))
-                    .and_then(|e| {
-                        e.view
-                            .work_dir
-                            .clone()
-                            .or_else(|| e.view.project_root.clone())
-                    });
-                (producer_agent, root)
+                    .map(|e| e.view.clone());
+                (producer_agent, view)
             })
             .await;
-        let (producer_agent, root) = match lookup {
+        let (producer_agent, view) = match lookup {
             Ok(pair) => pair,
             Err(err) => {
                 tracing::warn!(
@@ -1604,6 +1632,11 @@ impl Engine {
             // — nothing to project.
             return;
         };
+        let placement = self
+            .projection_placement_for(task_id)
+            .await
+            .unwrap_or_default();
+        let root = view.and_then(|v| placement.resolve_root(&v));
 
         // GH #23 subtask-2: resolve `producer_agent` to its canonical
         // projection name via the Blueprint-wide `StepNaming` table
@@ -1679,7 +1712,10 @@ impl Engine {
             step: Some(canonical_agent.clone()),
             path: None,
         };
-        let adapter = crate::core::projection::FileProjectionAdapter::new(root);
+        let adapter = crate::core::projection::FileProjectionAdapter::with_placement(
+            root,
+            (*placement).clone(),
+        );
         if let Err(err) = adapter.materialize_submission(&key, &value, attempt, ok) {
             tracing::warn!(
                 %task_id,
@@ -2588,6 +2624,59 @@ mod submit_time_projection_sink_tests {
             .expect("seed agent_ctx");
     }
 
+    /// GH #27 (follow-up to #23): seeds `EngineState.agent_ctx` with an
+    /// arbitrary `work_dir` / `project_root` pair (either may be `None`),
+    /// unlike [`seed_agent_context`] (which only ever sets `work_dir`) —
+    /// lets these tests exercise `ProjectionPlacement::resolve_root`'s
+    /// fallback in both directions.
+    async fn seed_agent_context_roots(
+        engine: &Engine,
+        task_id: &StepId,
+        attempt: u32,
+        work_dir: Option<&str>,
+        project_root: Option<&str>,
+    ) {
+        let task_id = task_id.clone();
+        let work_dir = work_dir.map(str::to_string);
+        let project_root = project_root.map(str::to_string);
+        engine
+            .with_state("test.seed_agent_context_roots", move |s| {
+                s.agent_ctx.insert(
+                    (task_id, attempt),
+                    crate::core::state::AgentCtxEntry {
+                        view: AgentContextView {
+                            work_dir,
+                            project_root,
+                            ..Default::default()
+                        },
+                        policy: Default::default(),
+                    },
+                );
+            })
+            .await
+            .expect("seed agent_ctx");
+    }
+
+    /// GH #27 (follow-up to #23): seeds `EngineState.projection_placements`
+    /// directly — the same snapshot `EngineDispatcher::dispatch` stashes
+    /// at dispatch time (mirroring [`seed_step_naming`]'s contract) — so
+    /// these tests can exercise a declared `ProjectionPlacement` without
+    /// driving a real `Compiler::compile`.
+    async fn seed_projection_placement(
+        engine: &Engine,
+        task_id: &StepId,
+        placement: crate::core::projection_placement::ProjectionPlacement,
+    ) {
+        let task_id = task_id.clone();
+        let placement = Arc::new(placement);
+        engine
+            .with_state("test.seed_projection_placement", move |s| {
+                s.projection_placements.insert(task_id, placement);
+            })
+            .await
+            .expect("seed projection_placements");
+    }
+
     /// GH #23 subtask-2: builds a fixture
     /// [`crate::core::step_naming::StepNaming`] table declaring `producer`
     /// → `canonical` (`AgentMeta.projection_name`), then seeds it into
@@ -2638,6 +2727,7 @@ mod submit_time_projection_sink_tests {
             default_init_ctx: None,
             default_agent_ctx: None,
             default_context_policy: None,
+            projection_placement: None,
         };
         let (naming, warnings) = StepNaming::from_blueprint(&bp).expect("no collision");
         assert!(warnings.is_empty(), "single-step fixture has no collisions");
@@ -2750,6 +2840,106 @@ mod submit_time_projection_sink_tests {
         assert!(
             !body.contains("first"),
             "body must not carry the stale value: {body}"
+        );
+    }
+
+    /// GH #27 (follow-up to #23): the byte-compat default
+    /// `ProjectionPlacement` (`root_preference = WorkDir`) falls back to
+    /// `project_root` when `work_dir` is absent — the same fallback
+    /// [`crate::core::projection_placement::ProjectionPlacement::resolve_root`]
+    /// now performs for every one of the "3 path" call sites, this one
+    /// exercised at the submit-sink layer.
+    #[tokio::test]
+    async fn submit_output_final_falls_back_to_project_root_when_work_dir_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (engine, _op, task_id, worker_token) = seeded_task("planner").await;
+        seed_agent_context_roots(
+            &engine,
+            &task_id,
+            1,
+            None,
+            Some(&dir.path().to_string_lossy()),
+        )
+        .await;
+
+        engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!({"plan": "via project_root"}), true),
+            )
+            .await
+            .expect("submit_output");
+
+        let expected_file = dir
+            .path()
+            .join("workspace/tasks")
+            .join(task_id.as_str())
+            .join("ctx/planner.md");
+        assert!(
+            expected_file.exists(),
+            "materialized submission file missing at {expected_file:?} \
+             (work_dir absent must fall back to project_root)"
+        );
+    }
+
+    /// GH #27 (follow-up to #23): a declared `ProjectionPlacement`
+    /// (`root_preference = ProjectRoot`, custom `dir_template`) changes
+    /// BOTH which root is preferred (project_root wins even though
+    /// work_dir is also present) AND the target directory layout — proof
+    /// the submit sink consults the snapshotted resolver rather than a
+    /// hardcoded layout.
+    #[tokio::test]
+    async fn submit_output_final_uses_declared_projection_placement() {
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let project_root = tempfile::TempDir::new().unwrap();
+        let (engine, _op, task_id, worker_token) = seeded_task("planner").await;
+        seed_agent_context_roots(
+            &engine,
+            &task_id,
+            1,
+            Some(&work_dir.path().to_string_lossy()),
+            Some(&project_root.path().to_string_lossy()),
+        )
+        .await;
+        seed_projection_placement(
+            &engine,
+            &task_id,
+            crate::core::projection_placement::ProjectionPlacement {
+                root_preference: crate::core::projection_placement::RootPreference::ProjectRoot,
+                dir_template: "custom/{task_id}/out".to_string(),
+            },
+        )
+        .await;
+
+        engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!({"plan": "via custom placement"}), true),
+            )
+            .await
+            .expect("submit_output");
+
+        let expected_file = project_root
+            .path()
+            .join("custom")
+            .join(task_id.as_str())
+            .join("out/planner.md");
+        assert!(
+            expected_file.exists(),
+            "materialized submission file missing at custom placement target {expected_file:?}"
+        );
+        let unexpected_file = work_dir
+            .path()
+            .join("workspace/tasks")
+            .join(task_id.as_str())
+            .join("ctx/planner.md");
+        assert!(
+            !unexpected_file.exists(),
+            "declared root_preference=ProjectRoot must not fall back to work_dir: {unexpected_file:?}"
         );
     }
 

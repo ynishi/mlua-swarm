@@ -66,8 +66,9 @@
 //! only its individual keys are.
 
 use crate::core::agent_context::{
-    AgentContextView, ContextPolicy, AGENT_CONTEXT_KEY, PROJECT_NAME_ALIAS_KEY, RUN_ID_KEY,
-    STEP_CTX_KEY, TASK_METADATA_KEY, TASK_PROJECT_ROOT_KEY, TASK_WORK_DIR_KEY,
+    AgentContextView, ContextPolicy, AGENT_CONTEXT_KEY, PROJECTION_PLACEMENT_KEY,
+    PROJECT_NAME_ALIAS_KEY, RUN_ID_KEY, STEP_CTX_KEY, TASK_METADATA_KEY, TASK_PROJECT_ROOT_KEY,
+    TASK_WORK_DIR_KEY,
 };
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
@@ -327,6 +328,37 @@ impl SpawnerAdapter for AgentContextWrapped {
             }
         }
 
+        // GH #27 (follow-up to #23): resolve the Blueprint-wide
+        // ProjectionPlacement resolver `EngineDispatcher::dispatch`
+        // snapshotted for this task (falling back to
+        // `ProjectionPlacement::default()` — byte-compat — when none was
+        // snapshotted, e.g. a direct `EngineDispatcher::with_spawner`
+        // caller that skipped `with_projection_placement`) and stash it
+        // (serialized) the SAME way as `AGENT_CONTEXT_KEY` above — this is
+        // the resolve point for the spawn-time in-flight pointer
+        // (`crates/mlua-swarm-server/src/operator_ws/session.rs`'s
+        // `append_projection_pointer`), which has no direct `Engine`
+        // handle of its own.
+        let projection_placement = engine
+            .projection_placement_for(&task_id)
+            .await
+            .unwrap_or_default();
+        match serde_json::to_value(&*projection_placement) {
+            Ok(value) => {
+                new_ctx
+                    .meta
+                    .runtime
+                    .insert(PROJECTION_PLACEMENT_KEY.to_string(), value);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    task_id = %task_id,
+                    "ProjectionPlacement failed to serialize; proceeding without it in ctx.meta.runtime"
+                );
+            }
+        }
+
         self.inner
             .spawn(engine, &new_ctx, task_id, attempt, token)
             .await
@@ -398,6 +430,82 @@ mod tests {
             .expect("agent_ctx entry present")
             .view;
         assert_eq!(snapshotted.project_root.as_deref(), Some("/repo"));
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GH #27 (follow-up to #23): ProjectionPlacement resolve + stash into
+    // ctx.meta.runtime[PROJECTION_PLACEMENT_KEY]
+    // ──────────────────────────────────────────────────────────────
+
+    /// No `ProjectionPlacement` snapshotted for this `task_id` (no
+    /// `EngineDispatcher::with_projection_placement` caller) — the
+    /// byte-compat default is stashed instead of the key being omitted.
+    #[tokio::test]
+    async fn no_snapshotted_projection_placement_stashes_the_default() {
+        let (stack, seen) = probe_stack(AgentContextMiddleware::default());
+        let engine = Engine::new(EngineCfg::default());
+        let task_id = StepId::parse("ST-14").unwrap();
+        let ctx = Ctx::new(task_id.clone(), 1, "planner");
+        let token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let _ = stack.spawn(&engine, &ctx, task_id, 1, token).await;
+
+        let observed = seen.lock().unwrap().clone().expect("inner ctx captured");
+        let raw = observed
+            .meta
+            .runtime
+            .get(PROJECTION_PLACEMENT_KEY)
+            .expect("projection_placement key present");
+        let placement: crate::core::projection_placement::ProjectionPlacement =
+            serde_json::from_value(raw.clone()).expect("round-trip");
+        assert_eq!(
+            placement,
+            crate::core::projection_placement::ProjectionPlacement::default()
+        );
+    }
+
+    /// A `ProjectionPlacement` snapshotted into `EngineState.projection_placements`
+    /// for this `task_id` (mirroring `EngineDispatcher::dispatch`'s insert
+    /// site) is read back and stashed unchanged.
+    #[tokio::test]
+    async fn snapshotted_projection_placement_is_stashed_into_ctx() {
+        use crate::core::projection_placement::{ProjectionPlacement, RootPreference};
+
+        let (stack, seen) = probe_stack(AgentContextMiddleware::default());
+        let engine = Engine::new(EngineCfg::default());
+        let task_id = StepId::parse("ST-15").unwrap();
+        let custom = ProjectionPlacement {
+            root_preference: RootPreference::ProjectRoot,
+            dir_template: "custom/{task_id}/out".to_string(),
+        };
+        let task_id_for_seed = task_id.clone();
+        let custom_for_seed = std::sync::Arc::new(custom.clone());
+        engine
+            .with_state("test.seed_projection_placement", move |s| {
+                s.projection_placements
+                    .insert(task_id_for_seed, custom_for_seed);
+            })
+            .await
+            .expect("seed projection_placements");
+
+        let ctx = Ctx::new(task_id.clone(), 1, "planner");
+        let token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let _ = stack.spawn(&engine, &ctx, task_id, 1, token).await;
+
+        let observed = seen.lock().unwrap().clone().expect("inner ctx captured");
+        let raw = observed
+            .meta
+            .runtime
+            .get(PROJECTION_PLACEMENT_KEY)
+            .expect("projection_placement key present");
+        let placement: ProjectionPlacement =
+            serde_json::from_value(raw.clone()).expect("round-trip");
+        assert_eq!(placement, custom);
     }
 
     #[tokio::test]

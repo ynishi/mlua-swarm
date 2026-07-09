@@ -30,6 +30,7 @@
 use crate::blueprint::{AgentDef, AgentKind, Blueprint, BlueprintMetadata};
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
+use crate::core::projection_placement::{ProjectionPlacement, ProjectionPlacementError};
 use crate::core::step_naming::{StepNaming, StepNamingError};
 use crate::operator::{Operator, OperatorSpawner, WorkerBinding};
 use crate::types::{CapToken, StepId};
@@ -103,6 +104,14 @@ pub enum CompileError {
     /// warning instead, logged but not rejected).
     #[error("StepNaming collision: {0}")]
     StepNamingCollision(#[from] StepNamingError),
+    /// GH #27 (follow-up to #23): `Blueprint.projection_placement` failed
+    /// validation — see
+    /// [`crate::core::projection_placement::ProjectionPlacement::from_spec`]'s
+    /// doc for the rejection rules (`dir_template` empty / missing the
+    /// `{task_id}` placeholder / absolute / containing a `..` segment, or
+    /// `root` not `"work_dir"`/`"project_root"`).
+    #[error("invalid projection_placement: {0}")]
+    InvalidProjectionPlacement(#[from] ProjectionPlacementError),
 }
 
 // ─── SpawnerFactory + Registry ───────────────────────────────────────────
@@ -215,6 +224,12 @@ pub struct CompiledBlueprint {
     /// [`StepNaming::from_blueprint`]'s doc) and threaded through
     /// `EngineDispatcher::with_step_naming` for `EngineState` storage.
     pub step_naming: Arc<StepNaming>,
+    /// GH #27 (follow-up to #23): the Blueprint's [`ProjectionPlacement`]
+    /// resolver, built once here (the sole construction site — see
+    /// [`ProjectionPlacement::from_spec`]'s doc) and threaded through
+    /// `EngineDispatcher::with_projection_placement` for `EngineState`
+    /// storage.
+    pub projection_placement: Arc<ProjectionPlacement>,
 }
 
 impl Compiler {
@@ -349,6 +364,16 @@ impl Compiler {
             );
         }
 
+        // GH #27 (follow-up to #23): build the ProjectionPlacement resolver
+        // once, here (the sole construction site) — an invalid
+        // `dir_template` / `root` literal rejects the compile via `?`
+        // (`ProjectionPlacementError` → `CompileError::InvalidProjectionPlacement`,
+        // same family as the other Blueprint validation checks above). No
+        // declared `projection_placement` (the pre-#27 default) resolves
+        // to `ProjectionPlacement::default()` unchanged.
+        let projection_placement =
+            ProjectionPlacement::from_spec(bp.projection_placement.as_ref())?;
+
         let router = Arc::new(CompiledAgentTable {
             routes,
             default: self.default_spawner.clone(),
@@ -358,6 +383,7 @@ impl Compiler {
             flow: bp.flow.clone(),
             metadata: bp.metadata.clone(),
             step_naming: Arc::new(step_naming),
+            projection_placement: Arc::new(projection_placement),
         })
     }
 }
@@ -1485,6 +1511,7 @@ mod meta_ref_validation_tests {
             default_init_ctx: None,
             default_agent_ctx: None,
             default_context_policy: None,
+            projection_placement: None,
         }
     }
 
@@ -1596,5 +1623,125 @@ mod meta_ref_validation_tests {
             compiler.compile(&bp).is_ok(),
             "a non-Lit Step.in must not trigger the best-effort static $step_meta check"
         );
+    }
+}
+
+// ─── GH #27 (follow-up to #23): `Blueprint.projection_placement` compile-time
+// validation + `CompiledBlueprint.projection_placement` construction ────────
+#[cfg(test)]
+mod projection_placement_compile_tests {
+    use super::*;
+    use crate::core::projection_placement::{ProjectionPlacement, RootPreference};
+    use crate::worker::adapter::WorkerResult;
+    use mlua_swarm_schema::ProjectionPlacementSpec;
+
+    fn registry_with_echo() -> SpawnerRegistry {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: Value::String(inv.prompt),
+                ok: true,
+            })
+        });
+        let mut reg = SpawnerRegistry::new();
+        reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(factory));
+        reg
+    }
+
+    fn minimal_bp(projection_placement: Option<ProjectionPlacementSpec>) -> Blueprint {
+        Blueprint {
+            schema_version: crate::blueprint::current_schema_version(),
+            id: "projection-placement-ut".into(),
+            flow: FlowNode::Step {
+                ref_: "worker".to_string(),
+                in_: Expr::Path {
+                    at: "$.input".into(),
+                },
+                out: Expr::Path {
+                    at: "$.output".into(),
+                },
+            },
+            agents: vec![AgentDef {
+                name: "worker".to_string(),
+                kind: AgentKind::RustFn,
+                spec: serde_json::json!({ "fn_id": "echo" }),
+                profile: None,
+                meta: None,
+            }],
+            operators: vec![],
+            metas: vec![],
+            hints: Default::default(),
+            strategy: Default::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+            projection_placement,
+        }
+    }
+
+    #[test]
+    fn undeclared_projection_placement_compiles_to_byte_compat_default() {
+        let bp = minimal_bp(None);
+        let compiled = Compiler::new(registry_with_echo())
+            .compile(&bp)
+            .expect("undeclared projection_placement compiles");
+        assert_eq!(
+            *compiled.projection_placement,
+            ProjectionPlacement::default()
+        );
+    }
+
+    #[test]
+    fn declared_valid_projection_placement_compiles_to_matching_resolver() {
+        let bp = minimal_bp(Some(ProjectionPlacementSpec {
+            root: Some("project_root".to_string()),
+            dir_template: Some("custom/{task_id}/out".to_string()),
+        }));
+        let compiled = Compiler::new(registry_with_echo())
+            .compile(&bp)
+            .expect("valid projection_placement compiles");
+        assert_eq!(
+            compiled.projection_placement.root_preference,
+            RootPreference::ProjectRoot
+        );
+        assert_eq!(
+            compiled.projection_placement.dir_template,
+            "custom/{task_id}/out"
+        );
+    }
+
+    #[test]
+    fn declared_invalid_dir_template_rejects_compile() {
+        let bp = minimal_bp(Some(ProjectionPlacementSpec {
+            root: None,
+            dir_template: Some("workspace/tasks/ctx".to_string()), // missing {task_id}
+        }));
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::InvalidProjectionPlacement(_)) => {}
+            Err(other) => {
+                panic!("expected InvalidProjectionPlacement, got a different CompileError: {other}")
+            }
+            Ok(_) => {
+                panic!("expected compile-time rejection for a missing {{task_id}} placeholder")
+            }
+        }
+    }
+
+    #[test]
+    fn declared_invalid_root_literal_rejects_compile() {
+        let bp = minimal_bp(Some(ProjectionPlacementSpec {
+            root: Some("nope".to_string()),
+            dir_template: None,
+        }));
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::InvalidProjectionPlacement(_)) => {}
+            Err(other) => {
+                panic!("expected InvalidProjectionPlacement, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!("expected compile-time rejection for an invalid root literal"),
+        }
     }
 }

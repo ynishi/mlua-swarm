@@ -11,10 +11,11 @@
 //! For the detailed S↔C message flow, see the overview figure in `mod.rs`.
 
 use async_trait::async_trait;
-use mlua_swarm::core::agent_context::AgentContextView;
+use mlua_swarm::core::agent_context::{AgentContextView, PROJECTION_PLACEMENT_KEY};
 use mlua_swarm::core::projection::{
     FileProjectionAdapter, ProjectionAdapter, ProjectionKey, ProjectionRef,
 };
+use mlua_swarm::core::projection_placement::ProjectionPlacement;
 use mlua_swarm::{
     CapToken, Ctx, Operator, SeniorBridge, SessionId, SpawnHook, StepId, WorkerBinding,
     WorkerError, WorkerResult,
@@ -271,11 +272,30 @@ impl Operator for WSOperatorSession {
             run_id,
             &prompt,
         );
+        // GH #27 (follow-up to #23): the ProjectionPlacement resolver
+        // `AgentContextMiddleware` resolved (via `Engine::projection_placement_for`,
+        // which this WS session has no direct handle to call itself) and
+        // stashed into `ctx.meta.runtime[PROJECTION_PLACEMENT_KEY]` — falls
+        // back to the byte-compat default when absent or undeserializable
+        // (middleware never layered onto this spawner stack, e.g. tests
+        // driving `execute` directly against a bare `Ctx`).
+        let projection_placement = ctx
+            .meta
+            .runtime
+            .get(PROJECTION_PLACEMENT_KEY)
+            .and_then(|v| serde_json::from_value::<ProjectionPlacement>(v.clone()).ok())
+            .unwrap_or_default();
         // issue #21/ST2 in-flight projection hook: materializes `view`
         // (already `apply_policy`-filtered — see `AgentContextMiddleware`)
         // to file and appends a `ctx_projection:` pointer line. See
         // `append_projection_pointer`'s doc for the fallback contract.
-        let directive = append_projection_pointer(directive, &ctx.task_id, &view, run_id);
+        let directive = append_projection_pointer(
+            directive,
+            &ctx.task_id,
+            &view,
+            run_id,
+            &projection_placement,
+        );
         let msg = ServerMsg::Spawn {
             req_id: req_id.clone(),
             parent_req_id: current_parent_req_id(),
@@ -535,14 +555,19 @@ pub(super) fn default_spawn_directive_with_task_directive(
 /// issue #21/ST2 in-flight projection hook: projects `view` (the
 /// spawn-time, already `apply_policy`-filtered [`AgentContextView`] — see
 /// `AgentContextMiddleware`'s module doc) to file via a fresh
-/// [`FileProjectionAdapter`] rooted at `view.work_dir`, and appends a
-/// single `ctx_projection: {json}\n` line to `directive` — a
+/// [`FileProjectionAdapter`] rooted at the materialize root
+/// `placement.resolve_root(view)` resolves (GH #27, follow-up to #23 —
+/// see `mlua_swarm::core::projection_placement`'s module doc for the "3
+/// path" convergence this closes: this hook used to check `view.work_dir`
+/// ONLY, with no fallback to `view.project_root`, an asymmetry against
+/// the other two call sites the shared resolver now removes), and appends
+/// a single `ctx_projection: {json}\n` line to `directive` — a
 /// `{key}: {value}\n` splice matching [`AgentContextView::to_directive_header`]'s
 /// own line convention (e.g. its `task_metadata: {compact-json}\n` line),
 /// never the projected value itself (pointer-only supply; see
 /// `mlua_swarm::core::projection`'s module doc for why).
 ///
-/// `view.work_dir` absent, `view` failing to serialize, or the materialize
+/// An unresolved root, `view` failing to serialize, or the materialize
 /// write itself failing, all fall back to `directive` unchanged (no
 /// pointer line) rather than failing the spawn — subtask-2's Invariants
 /// require this hook to never turn a would-have-succeeded spawn into a
@@ -566,8 +591,9 @@ fn append_projection_pointer(
     task_id: &StepId,
     view: &AgentContextView,
     run_id: Option<&str>,
+    placement: &ProjectionPlacement,
 ) -> String {
-    let Some(work_dir) = view.work_dir.as_deref() else {
+    let Some(root) = placement.resolve_root(view) else {
         return directive;
     };
     match serde_json::to_value(view) {
@@ -578,7 +604,7 @@ fn append_projection_pointer(
                 step: None,
                 path: None,
             };
-            let adapter = FileProjectionAdapter::new(work_dir);
+            let adapter = FileProjectionAdapter::with_placement(root, placement.clone());
             match adapter.project(&key, &ctx_data) {
                 Ok(reference) => {
                     let pointer_value = match &reference {
@@ -1698,5 +1724,173 @@ mod tests {
             .await
             .expect("join")
             .expect("execute Ok — a materialize skip must not fail the spawn");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GH #27 (follow-up to #23): ProjectionPlacement resolver wiring
+    // ──────────────────────────────────────────────────────────────
+
+    /// `view.work_dir` ABSENT but `view.project_root` present, with the
+    /// byte-compat default `ProjectionPlacement` (`root_preference =
+    /// WorkDir`, falling back to `project_root`) — the asymmetry fix: a
+    /// pre-GH-#27 build would have skipped the pointer entirely here
+    /// (`view.work_dir` ONLY, no fallback); this build now falls back the
+    /// SAME way the submit-time sink and server read-back always did.
+    #[tokio::test]
+    async fn execute_with_project_root_only_appends_ctx_projection_pointer_default_placement() {
+        use mlua_swarm::Operator;
+        use tokio::sync::mpsc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut ctx = test_ctx("ST-proj-3");
+        ctx.meta.runtime.insert(
+            TASK_PROJECT_ROOT_KEY.to_string(),
+            Value::String(dir.path().to_string_lossy().into_owned()),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-proj-3").unwrap(),
+            tx,
+            None,
+        ));
+
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &ctx,
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        let sent = rx.recv().await.expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn {
+                req_id, directive, ..
+            } => {
+                assert!(
+                    directive.contains("ctx_projection:"),
+                    "work_dir absent must still fall back to project_root: {directive}"
+                );
+                req_id
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnAck {
+                    value: serde_json::json!({}),
+                    ok: true,
+                    error: None,
+                },
+            )
+            .await;
+        handle.await.expect("join").expect("execute Ok");
+
+        let expected_file = dir.path().join("workspace/tasks/ST-proj-3/ctx/_ctx.md");
+        assert!(
+            expected_file.exists(),
+            "materialized projection file missing at {expected_file:?}"
+        );
+    }
+
+    /// A `ProjectionPlacement` stashed into
+    /// `ctx.meta.runtime[PROJECTION_PLACEMENT_KEY]` (the same channel
+    /// `AgentContextMiddleware` populates at spawn time) with
+    /// `root_preference = ProjectRoot` and a custom `dir_template` changes
+    /// BOTH which root is preferred (even though `work_dir` is ALSO
+    /// present) AND the target directory layout the in-flight pointer
+    /// materializes to.
+    #[tokio::test]
+    async fn execute_with_custom_projection_placement_uses_declared_root_and_template() {
+        use mlua_swarm::core::projection_placement::{ProjectionPlacement, RootPreference};
+        use mlua_swarm::Operator;
+        use tokio::sync::mpsc;
+
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let project_root = tempfile::TempDir::new().unwrap();
+        let mut ctx = test_ctx("ST-proj-4");
+        ctx.meta.runtime.insert(
+            TASK_WORK_DIR_KEY.to_string(),
+            Value::String(work_dir.path().to_string_lossy().into_owned()),
+        );
+        ctx.meta.runtime.insert(
+            TASK_PROJECT_ROOT_KEY.to_string(),
+            Value::String(project_root.path().to_string_lossy().into_owned()),
+        );
+        let placement = ProjectionPlacement {
+            root_preference: RootPreference::ProjectRoot,
+            dir_template: "custom/{task_id}/out".to_string(),
+        };
+        ctx.meta.runtime.insert(
+            PROJECTION_PLACEMENT_KEY.to_string(),
+            serde_json::to_value(&placement).expect("placement serializes"),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-proj-4").unwrap(),
+            tx,
+            None,
+        ));
+
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &ctx,
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        let sent = rx.recv().await.expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn {
+                req_id, directive, ..
+            } => {
+                assert!(
+                    directive.contains("ctx_projection:"),
+                    "directive missing ctx_projection pointer line: {directive}"
+                );
+                req_id
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnAck {
+                    value: serde_json::json!({}),
+                    ok: true,
+                    error: None,
+                },
+            )
+            .await;
+        handle.await.expect("join").expect("execute Ok");
+
+        let expected_file = project_root.path().join("custom/ST-proj-4/out/_ctx.md");
+        assert!(
+            expected_file.exists(),
+            "materialized projection file missing at custom placement target {expected_file:?}"
+        );
+        let unexpected_file = work_dir
+            .path()
+            .join("workspace/tasks/ST-proj-4/ctx/_ctx.md");
+        assert!(
+            !unexpected_file.exists(),
+            "declared root_preference=ProjectRoot must not fall back to work_dir: {unexpected_file:?}"
+        );
     }
 }
