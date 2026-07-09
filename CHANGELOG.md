@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/ynishi/mlua-swarm/compare/v0.6.0...v0.7.0) - 2026-07-09
+
+### Added
+
+- *(schema,core,server,cli)* ContextPolicy-driven step OUTPUT projection supply
+- *(mcp)* expose MCP tool inputSchemas as `mse://api/mcp-tools`
+
+### Fixed
+
+- *(mcp)* pin schemars type on init_ctx / mse_ack.value (GH #24)
+
 ## [0.6.0](https://github.com/ynishi/mlua-swarm/compare/v0.5.0...v0.6.0) - 2026-07-08
 
 ### Added
