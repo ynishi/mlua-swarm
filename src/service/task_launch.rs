@@ -606,6 +606,12 @@ impl TaskLaunchService {
         // Unconditional — an empty map (every pre-#21-Phase-2 Blueprint)
         // is a no-op, matching `EngineDispatcher::with_spawner`'s default.
         let dispatcher = dispatcher.with_step_metas(derive_step_metas(&input.blueprint));
+        // GH #23: attach the `StepNaming` table `Compiler::compile` already
+        // built once for this Blueprint (the sole construction site — see
+        // `core::step_naming::StepNaming::from_blueprint`'s doc).
+        // Unconditional — every compile produces one, undeclared Blueprints
+        // included (canonical falls back to `Step.ref` byte-for-byte).
+        let dispatcher = dispatcher.with_step_naming(compiled.step_naming.clone());
         // Issue #19 ST3: BP default + Task init_ctx → merged init_ctx (the
         // 2-layer slice of the eventual 4-layer cascade; Run override is
         // ST4 carry). `input.blueprint.default_init_ctx` is `None` for

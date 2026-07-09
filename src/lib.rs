@@ -97,6 +97,7 @@ pub use core::state::{
     CapTokenConsumeError, CapTokenRecord, DispatchOutcome, Event, EventStream, OperatorSession,
     ResumeKey, ResumePending, TaskSpec, TaskState, TaskStatus,
 };
+pub use core::step_naming::{StepNameEntry, StepNaming, StepNamingError, StepNamingWarning};
 pub use lua::bridge::{parse_lua_blueprint, parse_lua_blueprint_with_ctx};
 pub use middleware::lua_layer::LuaMiddleware;
 pub use middleware::project_name_alias::{ProjectNameAliasMiddleware, PROJECT_NAME_ALIAS_KEY};

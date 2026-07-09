@@ -39,7 +39,7 @@
 //!         ▼
 //!  AgentContextMiddleware (innermost layer)
 //!    view = AgentContextView::from_ctx(ctx).apply_policy(&policy)
-//!    (a) EngineState.agent_contexts[(task_id, attempt)] = view     ← Worker axis source
+//!    (a) EngineState.agent_ctx[(task_id, attempt)].view = view     ← Worker axis source
 //!    (b) ctx.meta.runtime[AGENT_CONTEXT_KEY] = json(view)          ← Spawner axis source
 //!         │ inner.spawn(new_ctx)
 //!         ▼
@@ -218,7 +218,7 @@ pub struct AgentContextView {
     pub extra: serde_json::Map<String, Value>,
     /// Pointers to preceding steps' OUTPUT, `ContextPolicy.steps`-filtered
     /// (`projection-adapter` ST5 Worker axis). Empty in [`Self::from_ctx`]
-    /// / on every snapshot stashed into `EngineState.agent_contexts` —
+    /// / on every snapshot stashed into `EngineState.agent_ctx` —
     /// this field is populated only on the `WorkerPayload` clone
     /// `crates/mlua-swarm-server/src/worker.rs`'s `GET /v1/worker/prompt`
     /// handler returns (assembled at fetch time, so in-flight submissions

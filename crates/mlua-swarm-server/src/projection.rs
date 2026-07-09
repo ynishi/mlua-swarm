@@ -15,36 +15,61 @@
 //!   pointers' `content_url` addresses, plus an unfiltered metadata/content
 //!   view for operators / humans debugging a run.
 //!
-//! Both consumers share [`McpQueryAdapter::list_steps`]'s enumeration:
-//! every distinct `step_ref` name in `RunRecord.step_entries`, resolved
-//! through the Data-plane `OutputStore` (in-flight-safe — see below),
-//! **union** `RunRecord.result_ref`'s top-level object keys (the
-//! finalized-Run fallback) — a name present in both wins on the Data-plane
-//! side (same rule [`McpQueryAdapter::resolve_run`]'s single-key sibling,
-//! [`McpQueryAdapter::resolve_async`], already applies). Name-namespace
-//! unification (Data-plane producer names vs. flow.ir ctx-path segments)
-//! is tracked separately (see the KNOWN LIMITATION note below); this module
-//! does not resolve it.
+//! # GH #23 subtask-3: table-driven addressing (replaces the runtime union
+//! rule)
 //!
-//! # Architecture (subtask-4 rework, carried into ST5)
+//! Both consumers share [`McpQueryAdapter::list_steps`]'s enumeration.
+//! Previously every distinct `step_ref` name in `RunRecord.step_entries`
+//! was resolved through the Data-plane `OutputStore`, **unioned** with
+//! `RunRecord.result_ref`'s top-level object keys (the finalized-Run
+//! fallback), Data-plane winning a name collision — the pre-GH-#23 runtime
+//! union rule. That rule is now statically replaced: every real
+//! `Compiler::compile` output carries a
+//! [`mlua_swarm::core::step_naming::StepNaming`] table (built once, at
+//! compile time — see that module's doc), and this module's enumeration /
+//! single-key resolution ([`Self::enumerate_steps`] /
+//! [`Self::resolve_async`]) look the table up via
+//! `Engine::step_naming_for` and report every step under its ONE canonical
+//! name, addressable by that name OR any alias (`Step.ref` / the `out`
+//! ctx-path's top-level segment). The runtime union / collision-priority
+//! logic itself no longer runs per-request; it is baked into the table
+//! once, at register time (`StepNaming::from_blueprint`).
 //!
-//! [`McpQueryAdapter`] reads through **two** backings, tried in order:
+//! [`Self::enumerate_steps_legacy_union`] keeps the OLD runtime-union body
+//! verbatim as a **defensive-only** fallback for the rare case no table
+//! resolves (a spawn stack the dispatcher never wired
+//! `EngineDispatcher::with_step_naming` for — certain test harnesses that
+//! seed `OutputStore`/`RunStore` fixtures directly without driving a real
+//! dispatch); it is not a "declared Blueprints get the new path, undeclared
+//! ones keep the old one" branch — undeclared Blueprints get the SAME
+//! table-driven path (their canonical name is simply their own `Step.ref`,
+//! byte-identical to the pre-GH-#23 name).
 //!
-//! 1. **Data-plane, in-flight-safe** (subtask-4's whole reason for being):
-//!    when `key.step` is `Some(producer_agent)` and no explicit `run_id`
-//!    pins an older Run, [`McpQueryAdapter::resolve_async`] first tries
-//!    `OutputStore::get_latest_by_name(producer_agent)` — the same store
-//!    `Engine::submit_output`'s submit-time projection sink dual-writes
-//!    into (see `mlua_swarm::core::engine::Engine::submit_output`'s doc).
-//!    A hit here can be a **not-yet-finalized** Run's already-submitted
-//!    step — the in-flight case this rework exists for.
-//! 2. **Persisted `RunRecord.result_ref` fallback** (the pre-rework path,
-//!    unchanged): used whenever (1) is skipped (`key.step` is `None`, or
-//!    an explicit `run_id` was given) or comes back empty (no Data-plane
-//!    record under that producer name yet — e.g. a Run that predates the
-//!    engine having an `OutputStore` wired, or `key.step` names a flow.ir
-//!    ctx-path segment rather than an agent ref — see the KNOWN
-//!    LIMITATION note below).
+//! # Architecture (subtask-4 rework, carried into ST5, table-driven since
+//! subtask-3)
+//!
+//! [`McpQueryAdapter`] reads through **two** backings, tried in order, for
+//! every step's OWN dispatch (`RunRecord.step_entries` row → its own
+//! `StepId`):
+//!
+//! 1. **Data-plane, in-flight-safe AND Run-scoped** (subtask-4's original
+//!    reason for being; Run-scoped since subtask-3 — see the former KNOWN
+//!    LIMITATION below): [`McpQueryAdapter::resolve_async`] /
+//!    [`Self::enumerate_steps_via_table`] look up
+//!    `OutputStore::get_latest_by_name_in_run(step_entry.step_id, 1,
+//!    canonical_name)` — the same store `Engine::submit_output`'s
+//!    submit-time projection sink dual-writes into (see
+//!    `mlua_swarm::core::engine::Engine::submit_output`'s doc), keyed
+//!    Run-scoped by construction (a `StepId` is globally unique per
+//!    dispatch, so two concurrent Runs sharing a producer name never
+//!    cross-resolve — no narrowing-by-guard needed any more). A hit here
+//!    can be a **not-yet-finalized** Run's already-submitted step — the
+//!    in-flight case subtask-4 exists for.
+//! 2. **Persisted `RunRecord.result_ref` fallback** (unchanged in kind,
+//!    now tried under the canonical name AND every alias): used whenever
+//!    (1) comes back empty (no Data-plane record for that step's own
+//!    dispatch yet — e.g. a Run that predates the engine having an
+//!    `OutputStore` wired).
 //!
 //! Unlike `crate::operator_ws::session`'s spawn-time
 //! [`mlua_swarm::core::projection::FileProjectionAdapter`] hook (which
@@ -52,19 +77,22 @@
 //! adapter's Data-plane path serves **prior steps'** submitted OUTPUT —
 //! the pull-supply counterpart to `Engine`'s submit-time file sink.
 //!
-//! ## KNOWN LIMITATION
+//! ## Former KNOWN LIMITATION (closed by GH #23 subtask-3)
 //!
 //! `OutputStore::get_latest_by_name` is producer-name-scoped, not
 //! Run-scoped (see `mlua_swarm::store::output`'s module doc) — it returns
 //! the single newest `Final` submitted anywhere under that producer name,
-//! across every Run / Task. This adapter narrows the blast radius by only
-//! taking this path when an explicit `run_id` did NOT pin an older Run
-//! (an explicit pin always uses the Run-scoped `result_ref` fallback
-//! instead), but two *concurrent* Runs whose flow.ir happens to dispatch
-//! an agent of the identical name can still race each other on this path.
-//! This is an accepted, pre-existing characteristic of the Data-plane
-//! store (not a new race introduced here) — see
-//! `mlua_swarm::store::output::OutputStore::get_latest_by_name`'s doc.
+//! across every Run / Task, so two *concurrent* Runs whose flow.ir happens
+//! to dispatch an agent of the identical name could race each other. This
+//! module no longer calls that method: every lookup here goes through
+//! `OutputStore::get_latest_by_name_in_run`, scoped to the dispatching
+//! step's own (globally unique) `StepId`, closing the race by
+//! construction, independent of whether the Blueprint declared a
+//! `projection_name` (see
+//! `mlua_swarm::store::output::OutputStore::get_latest_by_name_in_run`'s
+//! doc). `get_latest_by_name` itself is untouched (still used by
+//! `Engine::submit_output`'s own fail-open cross-Run compatibility path)
+//! — only this module's consumption of it changed.
 //!
 //! [`ProjectionAdapter::fetch`] is a synchronous trait method, but this
 //! adapter's backing stores are async. [`McpQueryAdapter::resolve_async`]
@@ -84,9 +112,11 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use mlua_swarm::core::engine::Engine;
 use mlua_swarm::core::projection::{
     ProjectionAdapter, ProjectionError, ProjectionKey, ProjectionRef,
 };
+use mlua_swarm::core::step_naming::StepNaming;
 use mlua_swarm::store::output::{ContentRef, OutputEvent, OutputStore, OutputStoreError};
 use mlua_swarm::store::run::{RunRecord, RunStore};
 use mlua_swarm::{RunId, StepId, TaskId};
@@ -99,11 +129,16 @@ use crate::tasks::map_task_store_err;
 use crate::{ApiError, AppState};
 
 /// Server-side [`ProjectionAdapter`] backed by an [`OutputStore`]
-/// (in-flight-safe, subtask-4) with a [`RunStore`]-backed `result_ref`
-/// fallback (see the module doc for the full narrative).
+/// (in-flight-safe, subtask-4, Run-scoped since GH #23 subtask-3) with a
+/// [`RunStore`]-backed `result_ref` fallback (see the module doc for the
+/// full narrative). Holds an [`Engine`] handle (GH #23 subtask-3) so
+/// [`Self::step_naming_for_run`] can pull the Blueprint-wide
+/// [`StepNaming`] table `Engine::step_naming_for` snapshotted at dispatch
+/// time.
 pub struct McpQueryAdapter {
     data_store: Arc<dyn OutputStore>,
     run_store: Arc<dyn RunStore>,
+    engine: Engine,
 }
 
 /// Which backing produced a [`StepSummary`] / a Worker-axis `StepPointer`
@@ -167,13 +202,108 @@ fn content_to_value(content: &ContentRef) -> Value {
     }
 }
 
+/// GH #23 subtask-3: finds the [`StepId`] of the `run.step_entries` row
+/// whose canonical name (via `naming.canonical_of_producer`, or the raw
+/// `step_ref` unchanged when `naming` is `None`) equals `canonical`. Tried
+/// most-recent-first (`.rev()`) so a step re-dispatched under the same ref
+/// (e.g. inside a Loop) resolves to its LATEST occurrence within this
+/// Run — matching [`resolve_materialized_file`]'s own "only tries `attempt
+/// = 1`" convention, this helper does not attempt to disambiguate
+/// multiple attempts of the SAME occurrence, only multiple occurrences.
+fn find_step_id_for_canonical(
+    run: &RunRecord,
+    naming: Option<&StepNaming>,
+    canonical: &str,
+) -> Option<StepId> {
+    run.step_entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            let Some(step_ref) = entry.step_ref.as_deref() else {
+                return false;
+            };
+            match naming {
+                Some(n) => n.canonical_of_producer(step_ref) == Some(canonical),
+                None => step_ref == canonical,
+            }
+        })
+        .map(|entry| entry.step_id.clone())
+}
+
+/// GH #23 subtask-3: every name worth trying against `RunRecord.result_ref`
+/// for `canonical` — the canonical name itself, every alias `naming`
+/// records for it (when `naming` resolves an entry), and `raw_step` (the
+/// original, un-canonicalized query) as a final fail-open fallback for
+/// when `naming` is `None` entirely or does not carry an entry for
+/// `canonical` (defensive-only — see [`McpQueryAdapter::step_naming_for_run`]'s
+/// doc). Order matters only for determinism (canonical first); a
+/// `result_ref` object has at most one of these keys present.
+fn candidate_names<'a>(
+    naming: Option<&'a StepNaming>,
+    canonical: &'a str,
+    raw_step: &'a str,
+) -> Vec<&'a str> {
+    let mut names = vec![canonical];
+    if let Some(entry) = naming.and_then(|n| n.entries().find(|e| e.canonical == canonical)) {
+        for alias in &entry.aliases {
+            if alias != canonical {
+                names.push(alias.as_str());
+            }
+        }
+    }
+    if !names.contains(&raw_step) {
+        names.push(raw_step);
+    }
+    names
+}
+
 impl McpQueryAdapter {
     /// Builds an adapter reading through `data_store` (in-flight-safe,
-    /// tried first) with `run_store`-backed `result_ref` fallback.
-    pub fn new(data_store: Arc<dyn OutputStore>, run_store: Arc<dyn RunStore>) -> Self {
+    /// Run-scoped, tried first) with `run_store`-backed `result_ref`
+    /// fallback, and `engine` for the GH #23 subtask-3 `StepNaming` table
+    /// lookup.
+    pub fn new(
+        data_store: Arc<dyn OutputStore>,
+        run_store: Arc<dyn RunStore>,
+        engine: Engine,
+    ) -> Self {
         Self {
             data_store,
             run_store,
+            engine,
+        }
+    }
+
+    /// GH #23 subtask-3: resolves the Blueprint-wide [`StepNaming`] table
+    /// for `run` by trying each of its `step_entries`' own `StepId` via
+    /// `Engine::step_naming_for` until one resolves — every dispatched
+    /// step of one Blueprint launch shares the SAME `Arc`, snapshotted
+    /// under every one of their own ids at dispatch time (see
+    /// [`StepNaming`]'s module doc), so any entry's id suffices. `None`
+    /// when the Run has no `step_entries` yet, or none of them resolve
+    /// (a spawn stack that never called
+    /// `EngineDispatcher::with_step_naming` — pre-GH-#23 callers / test
+    /// harnesses that seed `OutputStore`/`RunStore` fixtures directly) —
+    /// callers fall back to [`Self::enumerate_steps_legacy_union`] in
+    /// that case (defensive-only; see the module doc). Delegates to the
+    /// free-function sibling [`resolve_step_naming_for_run`] (shared with
+    /// [`resolve_materialized_file`], which has no `McpQueryAdapter`
+    /// handle).
+    async fn step_naming_for_run(&self, run: &RunRecord) -> Option<Arc<StepNaming>> {
+        resolve_step_naming_for_run(&self.engine, run).await
+    }
+
+    /// GH #23 subtask-3: canonicalizes `raw` (a REST `:step` path segment
+    /// — the canonical name itself, or any alias) against `run`'s
+    /// [`StepNaming`] table, so `step_get` / `step_content` can find the
+    /// matching [`ResolvedStep`] by its (always-canonical) `name` — see
+    /// [`Self::enumerate_steps`]. Returns `raw` unchanged when no table
+    /// resolves for this Run (fail-open, matching
+    /// [`Self::step_naming_for_run`]'s own defensive fallback).
+    pub(crate) async fn resolve_step_name(&self, run: &RunRecord, raw: &str) -> String {
+        match self.step_naming_for_run(run).await {
+            Some(naming) => naming.resolve(raw).unwrap_or(raw).to_string(),
+            None => raw.to_string(),
         }
     }
 
@@ -234,11 +364,23 @@ impl McpQueryAdapter {
 
     /// The real, native-async single-key resolve: selects the Run `key`
     /// addresses via [`Self::resolve_run`], then resolves the value —
-    /// Data-plane first (in-flight-safe), falling back to the selected
-    /// Run's persisted `result_ref` — see the module doc's Architecture
-    /// section. Returns the selected [`RunRecord`] alongside the resolved
-    /// value so a caller can report which Run actually served the
-    /// projection, even when the caller only supplied `task_id`.
+    /// Data-plane first (in-flight-safe, Run-scoped since GH #23
+    /// subtask-3), falling back to the selected Run's persisted
+    /// `result_ref` — see the module doc's Architecture section. Returns
+    /// the selected [`RunRecord`] alongside the resolved value so a
+    /// caller can report which Run actually served the projection, even
+    /// when the caller only supplied `task_id`.
+    ///
+    /// GH #23 subtask-3: `key.step` (canonical name OR any alias) is
+    /// canonicalized against `run`'s [`StepNaming`] table BEFORE either
+    /// lookup — the pre-subtask-3 `key.run_id.is_none()` guard (which
+    /// narrowed the Data-plane path to only in-flight fetches, hedging
+    /// against the cross-Run race the former KNOWN LIMITATION described)
+    /// is gone: the Data-plane lookup is now `get_latest_by_name_in_run`,
+    /// scoped to the resolving step's own globally-unique `StepId`, so an
+    /// explicit `run_id` pin is exactly as race-free as the in-flight
+    /// case — narrowing which calls attempt it bought nothing once the
+    /// lookup itself is Run-scoped.
     async fn resolve_async(
         &self,
         key: &ProjectionKey,
@@ -247,56 +389,84 @@ impl McpQueryAdapter {
             .map_err(|e| ProjectionError::InvalidKey(format!("task_id: {e}")))?;
         let run = self.resolve_run(&task_id, key.run_id.as_deref()).await?;
 
-        // Data-plane, in-flight-safe path: only when `step` names a
-        // producer agent AND no explicit `run_id` pinned an older Run (see
-        // the module doc's KNOWN LIMITATION).
-        if key.run_id.is_none() {
-            if let Some(step) = &key.step {
-                match self.data_store.get_latest_by_name(step).await {
-                    Ok(record) => {
-                        if let Some(value) = final_value(&record.event) {
-                            let narrowed = match &key.path {
-                                None => Some(value),
-                                Some(_) => {
-                                    // Reuse `ProjectionKey::resolve`'s path-walk
-                                    // only (the step lookup is already done —
-                                    // this value IS the step's own content, not
-                                    // a `{step: value}` map to look `step` up
-                                    // in again).
-                                    let path_only = ProjectionKey {
-                                        task_id: key.task_id.clone(),
-                                        run_id: key.run_id.clone(),
-                                        step: None,
-                                        path: key.path.clone(),
-                                    };
-                                    path_only.resolve(&value).cloned()
-                                }
-                            };
-                            if let Some(value) = narrowed {
-                                return Ok((run, value));
+        let Some(raw_step) = &key.step else {
+            // `key.step` is `None` — whole-ctx addressing, no step name to
+            // canonicalize.
+            let ctx_data = run.result_ref.clone().unwrap_or(Value::Null);
+            let value = key
+                .resolve(&ctx_data)
+                .cloned()
+                .ok_or_else(|| ProjectionError::NotFound(key.clone()))?;
+            return Ok((run, value));
+        };
+
+        let naming = self.step_naming_for_run(&run).await;
+        let canonical = naming
+            .as_deref()
+            .and_then(|n| n.resolve(raw_step))
+            .unwrap_or(raw_step.as_str())
+            .to_string();
+
+        // Data-plane, in-flight-safe, Run-scoped path.
+        if let Some(step_id) = find_step_id_for_canonical(&run, naming.as_deref(), &canonical) {
+            match self
+                .data_store
+                .get_latest_by_name_in_run(step_id.as_str(), 1, &canonical)
+                .await
+            {
+                Ok(record) => {
+                    if let Some(value) = final_value(&record.event) {
+                        let narrowed = match &key.path {
+                            None => Some(value),
+                            Some(_) => {
+                                // Reuse `ProjectionKey::resolve`'s path-walk
+                                // only (the step lookup is already done —
+                                // this value IS the step's own content, not
+                                // a `{step: value}` map to look `step` up
+                                // in again).
+                                let path_only = ProjectionKey {
+                                    task_id: key.task_id.clone(),
+                                    run_id: key.run_id.clone(),
+                                    step: None,
+                                    path: key.path.clone(),
+                                };
+                                path_only.resolve(&value).cloned()
                             }
+                        };
+                        if let Some(value) = narrowed {
+                            return Ok((run, value));
                         }
                     }
-                    Err(OutputStoreError::NotFound(_)) => {
-                        // No Data-plane record under this producer name —
-                        // fall through to the result_ref fallback below.
-                    }
-                    Err(other) => {
-                        return Err(ProjectionError::Io(std::io::Error::other(format!(
-                            "OutputStore::get_latest_by_name: {other}"
-                        ))));
-                    }
+                }
+                Err(OutputStoreError::NotFound(_)) => {
+                    // No Data-plane record for this step's own dispatch —
+                    // fall through to the result_ref fallback below.
+                }
+                Err(other) => {
+                    return Err(ProjectionError::Io(std::io::Error::other(format!(
+                        "OutputStore::get_latest_by_name_in_run: {other}"
+                    ))));
                 }
             }
         }
 
-        // Fallback: the pre-rework, Run-scoped `result_ref` path.
+        // Fallback: the persisted `result_ref`, tried under the canonical
+        // name AND every alias (`result_ref` keys are still the raw
+        // flow.ir ctx-path segment — an alias, not necessarily the
+        // canonical name).
         let ctx_data = run.result_ref.clone().unwrap_or(Value::Null);
-        let value = key
-            .resolve(&ctx_data)
-            .cloned()
-            .ok_or_else(|| ProjectionError::NotFound(key.clone()))?;
-        Ok((run, value))
+        for candidate in candidate_names(naming.as_deref(), &canonical, raw_step) {
+            let candidate_key = ProjectionKey {
+                task_id: key.task_id.clone(),
+                run_id: key.run_id.clone(),
+                step: Some(candidate.to_string()),
+                path: key.path.clone(),
+            };
+            if let Some(value) = candidate_key.resolve(&ctx_data) {
+                return Ok((run, value.clone()));
+            }
+        }
+        Err(ProjectionError::NotFound(key.clone()))
     }
 
     /// Enumerates every step visible for the Run addressed by `task_id` +
@@ -337,12 +507,108 @@ impl McpQueryAdapter {
         Ok((run, steps))
     }
 
-    /// Data-plane `run.step_entries`' distinct `step_ref` names, resolved
-    /// through `OutputStore::get_latest_by_name` — **union**
-    /// `run.result_ref`'s top-level object keys not already resolved on
-    /// the Data-plane side (Data-plane wins a name collision, matching
-    /// [`Self::resolve_async`]'s single-key rule).
+    /// GH #23 subtask-3: dispatches to the table-driven enumeration
+    /// ([`Self::enumerate_steps_via_table`]) when a [`StepNaming`] table
+    /// resolves for `run`, else the defensive-only
+    /// [`Self::enumerate_steps_legacy_union`] fallback — see the module
+    /// doc's "table-driven addressing" section and
+    /// [`Self::step_naming_for_run`]'s doc for when the fallback fires.
     async fn enumerate_steps(&self, run: &RunRecord) -> Vec<ResolvedStep> {
+        match self.step_naming_for_run(run).await {
+            Some(naming) => self.enumerate_steps_via_table(run, &naming).await,
+            None => self.enumerate_steps_legacy_union(run).await,
+        }
+    }
+
+    /// GH #23 subtask-3: the table-driven replacement for the runtime
+    /// union rule. For every `run.step_entries` row, resolves that row's
+    /// own `Step.ref` to its canonical name via
+    /// `naming.canonical_of_producer` (falling back to the raw ref when
+    /// the table has no entry for it — defensive-only, mirrors this
+    /// module's other best-effort hooks), then queries the Run-scoped
+    /// `OutputStore::get_latest_by_name_in_run` keyed by THIS row's own
+    /// `StepId` — globally unique, so no cross-Run bleed by construction,
+    /// closing the former KNOWN LIMITATION race regardless of whether the
+    /// Blueprint declared a `projection_name`. A canonical name spanning
+    /// multiple `step_entries` rows (a step re-dispatched under the same
+    /// ref, e.g. inside a Loop) keeps the LATEST successfully-resolved
+    /// occurrence (later rows overwrite earlier ones in `resolved`; a row
+    /// whose own lookup comes up empty never blanks an earlier
+    /// occurrence's already-resolved value). Names still unresolved after
+    /// every occurrence is tried fall back to `run.result_ref`, matched
+    /// against every alias (or the canonical name itself) — `result_ref`
+    /// keys are still the raw flow.ir ctx-path segment.
+    async fn enumerate_steps_via_table(
+        &self,
+        run: &RunRecord,
+        naming: &StepNaming,
+    ) -> Vec<ResolvedStep> {
+        let mut resolved: std::collections::BTreeMap<String, ResolvedStep> =
+            std::collections::BTreeMap::new();
+
+        for entry in &run.step_entries {
+            let Some(step_ref) = entry.step_ref.as_deref() else {
+                continue;
+            };
+            let canonical = naming
+                .canonical_of_producer(step_ref)
+                .unwrap_or(step_ref)
+                .to_string();
+            if let Ok(record) = self
+                .data_store
+                .get_latest_by_name_in_run(entry.step_id.as_str(), 1, &canonical)
+                .await
+            {
+                if let Some(value) = final_value(&record.event) {
+                    resolved.insert(
+                        canonical.clone(),
+                        ResolvedStep {
+                            name: canonical,
+                            value,
+                            source: ProjectionSource::DataPlane,
+                        },
+                    );
+                }
+            }
+        }
+
+        if let Some(Value::Object(map)) = &run.result_ref {
+            for entry in naming.entries() {
+                if resolved.contains_key(&entry.canonical) {
+                    continue;
+                }
+                let hit = entry
+                    .aliases
+                    .iter()
+                    .find_map(|alias| map.get(alias))
+                    .or_else(|| map.get(&entry.canonical));
+                if let Some(value) = hit {
+                    resolved.insert(
+                        entry.canonical.clone(),
+                        ResolvedStep {
+                            name: entry.canonical.clone(),
+                            value: value.clone(),
+                            source: ProjectionSource::ResultRef,
+                        },
+                    );
+                }
+            }
+        }
+
+        resolved.into_values().collect()
+    }
+
+    /// Pre-GH-#23 defensive-only fallback: the ORIGINAL runtime union rule
+    /// (raw `Step.ref` name ∪ `result_ref` top-level keys, Data-plane wins
+    /// a collision), used ONLY when [`Self::step_naming_for_run`] resolves
+    /// no [`StepNaming`] table for this Run. NOT a "keep the old path
+    /// around for undeclared Blueprints" hedge — every real
+    /// `Compiler::compile` output always carries a table (see
+    /// [`StepNaming`]'s module doc), so this branch is reached by
+    /// defensive-only callers (test harnesses that seed
+    /// `OutputStore`/`RunStore` fixtures directly, bypassing a real
+    /// dispatch), not by any Blueprint-driven Run.
+    async fn enumerate_steps_legacy_union(&self, run: &RunRecord) -> Vec<ResolvedStep> {
         let mut out = Vec::new();
         let mut attempted = std::collections::HashSet::new();
         let mut resolved_names = std::collections::HashSet::new();
@@ -549,9 +815,13 @@ fn materialized_file_path(root: &str, step_id: &StepId, name: &str) -> std::path
         .join(format!("{name}.md"))
 }
 
-/// Resolves the materialized file body for `name` in `run`, when one
-/// exists: finds `name`'s most recent [`mlua_swarm::store::run::StepEntry`]
-/// (giving its own dispatch `StepId`), resolves that step's own
+/// Resolves the materialized file body for `name` (a CANONICAL name — the
+/// GH #23 subtask-2 sink writes the materialize target under the
+/// canonical name, so this lookup canonicalizes `run.step_entries`' raw
+/// `step_ref`s the same way before matching) in `run`, when one exists:
+/// finds `name`'s most recent [`mlua_swarm::store::run::StepEntry`]
+/// (giving its own dispatch `StepId`) via
+/// [`find_step_id_for_canonical`], resolves that step's own
 /// `AgentContextView` root (`work_dir`, falling back to `project_root` —
 /// the same fallback order `Engine::submit_output`'s materialize sink
 /// uses) via [`mlua_swarm::core::engine::Engine::agent_context_for`], and
@@ -567,17 +837,26 @@ async fn resolve_materialized_file(
     run: &RunRecord,
     name: &str,
 ) -> Option<(std::path::PathBuf, Vec<u8>)> {
-    let step_id = run
-        .step_entries
-        .iter()
-        .rev()
-        .find(|e| e.step_ref.as_deref() == Some(name))
-        .map(|e| e.step_id.clone())?;
+    let naming = resolve_step_naming_for_run(&state.engine, run).await;
+    let step_id = find_step_id_for_canonical(run, naming.as_deref(), name)?;
     let view = state.engine.agent_context_for(&step_id, 1).await?;
     let root = view.work_dir.clone().or(view.project_root.clone())?;
     let path = materialized_file_path(&root, &step_id, name);
     let bytes = std::fs::read(&path).ok()?;
     Some((path, bytes))
+}
+
+/// Free-function sibling of [`McpQueryAdapter::step_naming_for_run`] for
+/// [`resolve_materialized_file`], which has no `McpQueryAdapter` handle
+/// (it resolves a step OTHER than the one materializing it, from a bare
+/// `&AppState`) — same lookup, same fail-open contract.
+async fn resolve_step_naming_for_run(engine: &Engine, run: &RunRecord) -> Option<Arc<StepNaming>> {
+    for entry in &run.step_entries {
+        if let Some(naming) = engine.step_naming_for(&entry.step_id).await {
+            return Some(naming);
+        }
+    }
+    None
 }
 
 /// Renders the body [`Self`]'s content endpoint serves for `step`,
@@ -704,13 +983,16 @@ pub(crate) async fn resolve_step_pointer_fields(
 /// Shared resolve: `:id` → `TaskId` (existence-checked against
 /// `state.task_store` first, so an unknown Task returns its own 404
 /// distinct from an unknown Run) + `:run` (`"latest"` or an explicit
-/// `R-<hex>`) → the addressed [`RunRecord`] and its enumerated
-/// [`ResolvedStep`]s.
+/// `R-<hex>`) → the [`McpQueryAdapter`] that resolved it (returned
+/// alongside so `step_get` / `step_content` can canonicalize their `:step`
+/// path segment through the SAME adapter, via
+/// [`McpQueryAdapter::resolve_step_name`] — GH #23 subtask-3), the
+/// addressed [`RunRecord`], and its enumerated [`ResolvedStep`]s.
 async fn resolve_run_and_steps(
     state: &AppState,
     id: &str,
     run: &str,
-) -> Result<(RunRecord, Vec<ResolvedStep>), ApiError> {
+) -> Result<(McpQueryAdapter, RunRecord, Vec<ResolvedStep>), ApiError> {
     let task_id = TaskId::parse(id.to_string())
         .map_err(|e| ApiError::bad_request(format!("invalid task id: {e}")))?;
     state
@@ -718,12 +1000,17 @@ async fn resolve_run_and_steps(
         .get(&task_id)
         .await
         .map_err(map_task_store_err)?;
-    let adapter = McpQueryAdapter::new(state.data_store.clone(), state.run_store.clone());
+    let adapter = McpQueryAdapter::new(
+        state.data_store.clone(),
+        state.run_store.clone(),
+        state.engine.clone(),
+    );
     let run_sel = if run == "latest" { None } else { Some(run) };
-    adapter
+    let (run_record, steps) = adapter
         .list_steps(&task_id, run_sel)
         .await
-        .map_err(map_projection_err)
+        .map_err(map_projection_err)?;
+    Ok((adapter, run_record, steps))
 }
 
 /// `GET /v1/tasks/:id/runs/:run/steps` — every step visible for the
@@ -732,7 +1019,7 @@ pub async fn steps_list(
     State(state): State<AppState>,
     Path((id, run)): Path<(String, String)>,
 ) -> Result<Json<StepList>, ApiError> {
-    let (run_record, steps) = resolve_run_and_steps(&state, &id, &run).await?;
+    let (_adapter, run_record, steps) = resolve_run_and_steps(&state, &id, &run).await?;
     let mut summaries = Vec::with_capacity(steps.len());
     for step in &steps {
         if let Some(summary) = build_step_summary(&state, &run_record, step, None).await {
@@ -747,16 +1034,20 @@ pub async fn steps_list(
 }
 
 /// `GET /v1/tasks/:id/runs/:run/steps/:step?path=$.a.b` — one step's
-/// metadata, optionally narrowed.
+/// metadata, optionally narrowed. GH #23 subtask-3: `:step` is
+/// canonicalized (`adapter.resolve_step_name`) before the lookup, so
+/// either the canonical name or any alias 200s — the reported
+/// [`StepSummary::name`] is always the canonical form.
 pub async fn step_get(
     State(state): State<AppState>,
     Path((id, run, step)): Path<(String, String, String)>,
     Query(q): Query<StepPathQuery>,
 ) -> Result<Json<StepSummary>, ApiError> {
-    let (run_record, steps) = resolve_run_and_steps(&state, &id, &run).await?;
+    let (adapter, run_record, steps) = resolve_run_and_steps(&state, &id, &run).await?;
+    let canonical = adapter.resolve_step_name(&run_record, &step).await;
     let resolved = steps
         .into_iter()
-        .find(|s| s.name == step)
+        .find(|s| s.name == canonical)
         .ok_or_else(|| ApiError::not_found(format!("step not found: {step}")))?;
     let summary = build_step_summary(&state, &run_record, &resolved, q.path.as_deref())
         .await
@@ -767,16 +1058,18 @@ pub async fn step_get(
 /// `GET /v1/tasks/:id/runs/:run/steps/:step/content?path=$.a.b` — the raw
 /// body: full bytes, no envelope, no Range support. `Content-Type` and
 /// `ETag` follow [`StepSummary::content_type`] / [`StepSummary::sha256`]'s
-/// same rules (module doc).
+/// same rules (module doc). GH #23 subtask-3: `:step` is canonicalized
+/// the same way [`step_get`] does.
 pub async fn step_content(
     State(state): State<AppState>,
     Path((id, run, step)): Path<(String, String, String)>,
     Query(q): Query<StepPathQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (run_record, steps) = resolve_run_and_steps(&state, &id, &run).await?;
+    let (adapter, run_record, steps) = resolve_run_and_steps(&state, &id, &run).await?;
+    let canonical = adapter.resolve_step_name(&run_record, &step).await;
     let resolved = steps
         .into_iter()
-        .find(|s| s.name == step)
+        .find(|s| s.name == canonical)
         .ok_or_else(|| ApiError::not_found(format!("step not found: {step}")))?;
     let (body, content_type, _file_path) =
         render_step_body(&state, &run_record, &resolved, q.path.as_deref())
@@ -817,8 +1110,8 @@ mod tests {
     use axum::http::StatusCode;
     use mlua_swarm::application::BlueprintRef;
     use mlua_swarm::blueprint::{
-        current_schema_version, AgentDef, AgentKind, Blueprint, BlueprintMetadata, CompilerHints,
-        CompilerStrategy,
+        current_schema_version, AgentDef, AgentKind, AgentMeta, Blueprint, BlueprintMetadata,
+        CompilerHints, CompilerStrategy,
     };
     use mlua_swarm::core::config::EngineCfg;
     use mlua_swarm::core::engine::Engine;
@@ -910,10 +1203,73 @@ mod tests {
         }
     }
 
-    // ─── Test 8: steps collection, data-plane ∪ result_ref union ───────────
+    /// GH #23 subtask-3: a single-step Blueprint whose sole agent
+    /// (`AG_IDENTITY`) declares `AgentMeta.projection_name`, distinct from
+    /// its own `Step.ref` — the declared-name E2E fixture. Same shape as
+    /// [`greeting_blueprint`] otherwise (echoes `$.greeting` into
+    /// `$.out`).
+    fn declared_projection_name_blueprint(projection_name: &str) -> Blueprint {
+        Blueprint {
+            schema_version: current_schema_version(),
+            id: "projection-test-declared-name-bp".into(),
+            flow: serde_json::from_value(json!({
+                "kind": "step",
+                "ref": mlua_swarm::worker::baseline::AG_IDENTITY,
+                "in": {"op": "path", "at": "$.greeting"},
+                "out": {"op": "path", "at": "$.out"},
+            }))
+            .expect("flow parse"),
+            agents: vec![AgentDef {
+                name: mlua_swarm::worker::baseline::AG_IDENTITY.into(),
+                kind: AgentKind::RustFn,
+                spec: json!({"fn_id": mlua_swarm::worker::baseline::AG_IDENTITY}),
+                profile: None,
+                meta: Some(AgentMeta {
+                    projection_name: Some(projection_name.to_string()),
+                    ..Default::default()
+                }),
+            }],
+            operators: vec![],
+            metas: vec![],
+            hints: CompilerHints::default(),
+            strategy: CompilerStrategy::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+        }
+    }
 
+    fn declared_task_req(greeting: &str, projection_name: &str) -> TaskLaunchRequest {
+        TaskLaunchRequest {
+            blueprint: BlueprintRef::Inline {
+                value: Box::new(declared_projection_name_blueprint(projection_name)),
+            },
+            init_ctx: json!({ "greeting": greeting }),
+            project_root: None,
+            work_dir: None,
+            task_metadata: None,
+            ttl_secs: None,
+            operator: None,
+            operator_sid: None,
+            goal: Some("projection test goal (declared name)".to_string()),
+        }
+    }
+
+    // ─── Test 8: steps collection, GH #23 subtask-3 table-driven addressing ───
+
+    /// GH #23 subtask-3 (backward-compat): an undeclared step's `Step.ref`
+    /// (its own name) and its `out` ctx-path top-level segment are now ONE
+    /// canonical addressing space — `enumerate_steps` reports exactly ONE
+    /// entry (the canonical name = the ref itself), not the pre-GH-#23
+    /// runtime union rule's two separate Data-plane/ResultRef entries.
+    /// `step_get_resolves_alias_name_to_canonical_entry` below covers that
+    /// "out" still 200s via alias resolution.
     #[tokio::test]
-    async fn steps_list_returns_data_plane_and_result_ref_union() {
+    async fn steps_list_undeclared_step_resolves_to_single_canonical_entry() {
         let state = test_state();
         let posted = crate::tasks_start(State(state.clone()), Json(greeting_task_req("hello")))
             .await
@@ -930,22 +1286,359 @@ mod tests {
 
         assert_eq!(resp.task_id, posted.task_id.to_string());
         assert_eq!(resp.run_id, posted.run_id.to_string());
-        // AG_IDENTITY's own producer name resolves via the Data-plane
-        // dual-write; "out" (the flow.ir ctx-path segment) only exists in
-        // `result_ref` — both must appear, with the correct `source`.
         let identity_name = mlua_swarm::worker::baseline::AG_IDENTITY;
-        let identity_entry = resp
+        assert_eq!(resp.steps.len(), 1, "steps: {:?}", resp.steps);
+        let entry = &resp.steps[0];
+        assert_eq!(entry.name, identity_name);
+        assert_eq!(entry.source, ProjectionSource::DataPlane);
+    }
+
+    /// GH #23 subtask-3 (backward-compat): `step_get`'s `:step` segment
+    /// resolves through the `StepNaming` table — the raw `Step.ref` name
+    /// and the `out` ctx-path alias both 200, to the SAME content, and
+    /// both report the canonical name.
+    #[tokio::test]
+    async fn step_get_resolves_alias_name_to_canonical_entry() {
+        let state = test_state();
+        let posted = crate::tasks_start(State(state.clone()), Json(greeting_task_req("hi")))
+            .await
+            .expect("tasks_start")
+            .0;
+
+        let identity_name = mlua_swarm::worker::baseline::AG_IDENTITY;
+        let via_ref = step_get(
+            State(state.clone()),
+            Path((
+                posted.task_id.to_string(),
+                "latest".to_string(),
+                identity_name.to_string(),
+            )),
+            Query(StepPathQuery::default()),
+        )
+        .await
+        .expect("step_get via own ref name")
+        .0;
+        let via_alias = step_get(
+            State(state.clone()),
+            Path((
+                posted.task_id.to_string(),
+                "latest".to_string(),
+                "out".to_string(),
+            )),
+            Query(StepPathQuery::default()),
+        )
+        .await
+        .expect("step_get via out-top alias")
+        .0;
+
+        assert_eq!(via_ref.name, identity_name);
+        assert_eq!(
+            via_alias.name, identity_name,
+            "alias lookup must report the canonical name"
+        );
+        assert_eq!(
+            via_ref.sha256, via_alias.sha256,
+            "same OUTPUT regardless of which name was queried"
+        );
+    }
+
+    /// GH #23 subtask-3 (declared-name E2E): a Blueprint-declared
+    /// `projection_name` drives `steps_list` (single canonical entry) AND
+    /// `step_get`'s `:step` resolution (canonical name, the raw `Step.ref`
+    /// alias, AND the `out`-top alias all 200 to the SAME content).
+    #[tokio::test]
+    async fn declared_projection_name_e2e_resolves_via_canonical_and_alias() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(declared_task_req("hi", "plan-out")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        let list = steps_list(
+            State(state.clone()),
+            Path((posted.task_id.to_string(), "latest".to_string())),
+        )
+        .await
+        .expect("steps_list")
+        .0;
+        assert_eq!(list.steps.len(), 1, "steps: {:?}", list.steps);
+        assert_eq!(list.steps[0].name, "plan-out");
+        assert_eq!(list.steps[0].source, ProjectionSource::DataPlane);
+
+        let by_canonical = step_get(
+            State(state.clone()),
+            Path((
+                posted.task_id.to_string(),
+                "latest".to_string(),
+                "plan-out".to_string(),
+            )),
+            Query(StepPathQuery::default()),
+        )
+        .await
+        .expect("step_get canonical")
+        .0;
+        assert_eq!(by_canonical.name, "plan-out");
+
+        let identity_name = mlua_swarm::worker::baseline::AG_IDENTITY;
+        let by_ref_alias = step_get(
+            State(state.clone()),
+            Path((
+                posted.task_id.to_string(),
+                "latest".to_string(),
+                identity_name.to_string(),
+            )),
+            Query(StepPathQuery::default()),
+        )
+        .await
+        .expect("step_get ref alias")
+        .0;
+        assert_eq!(by_ref_alias.name, "plan-out");
+        assert_eq!(by_ref_alias.sha256, by_canonical.sha256);
+
+        let by_out_alias = step_get(
+            State(state.clone()),
+            Path((
+                posted.task_id.to_string(),
+                "latest".to_string(),
+                "out".to_string(),
+            )),
+            Query(StepPathQuery::default()),
+        )
+        .await
+        .expect("step_get out-top alias")
+        .0;
+        assert_eq!(by_out_alias.name, "plan-out");
+        assert_eq!(by_out_alias.sha256, by_canonical.sha256);
+    }
+
+    /// GH #23 subtask-3 (declared-name E2E, materialized file half): the
+    /// GH #23 subtask-2 sink writes the materialize target under the
+    /// CANONICAL name — `resolve_materialized_file`'s lookup must
+    /// canonicalize `run.step_entries`' raw `step_ref` the same way to
+    /// find it, so the stem the server reports is `plan-out.md`, not
+    /// `identity.md`.
+    #[tokio::test]
+    async fn declared_projection_name_materialized_file_stem_is_canonical() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_state();
+        let mut req = declared_task_req("materialized-declared", "plan-out");
+        req.work_dir = Some(dir.path().to_string_lossy().into_owned());
+        let posted = crate::tasks_start(State(state.clone()), Json(req))
+            .await
+            .expect("tasks_start")
+            .0;
+
+        let summary = step_get(
+            State(state.clone()),
+            Path((
+                posted.task_id.to_string(),
+                "latest".to_string(),
+                "plan-out".to_string(),
+            )),
+            Query(StepPathQuery::default()),
+        )
+        .await
+        .expect("step_get")
+        .0;
+
+        let file_path = summary.file_path.expect("materialized file_path present");
+        assert!(
+            file_path.ends_with("plan-out.md"),
+            "materialized file stem must be the canonical name: {file_path}"
+        );
+    }
+
+    /// GH #23 subtask-3 (collision): a declared `projection_name` that
+    /// collides with another Step's own `ref` is rejected at
+    /// register/compile time — `StepNaming::from_blueprint`'s hard-error
+    /// validation (subtask-1) surfaces end-to-end through the real
+    /// `tasks_start` dispatch path, not just the unit-level `StepNaming`
+    /// tests.
+    #[tokio::test]
+    async fn declared_projection_name_colliding_with_another_steps_ref_is_rejected_at_register_time(
+    ) {
+        use mlua_flow_ir::{Expr, Node as FlowNode};
+        use mlua_swarm::worker::adapter::WorkerResult;
+        use mlua_swarm::{RustFnInProcessSpawnerFactory, SpawnerRegistry};
+
+        let factory = RustFnInProcessSpawnerFactory::new()
+            .register_fn("step-a", |inv| async move {
+                Ok(WorkerResult {
+                    value: json!(inv.prompt),
+                    ok: true,
+                })
+            })
+            .register_fn("step-b", |inv| async move {
+                Ok(WorkerResult {
+                    value: json!(inv.prompt),
+                    ok: true,
+                })
+            });
+        let mut reg = SpawnerRegistry::new();
+        reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(factory));
+
+        let engine = Engine::new_with_layers(EngineCfg::default(), crate::default_layer_registry());
+        let data_store: Arc<dyn mlua_swarm::store::output::OutputStore> =
+            Arc::new(InMemoryOutputStore::new());
+        engine.set_output_store(data_store.clone());
+        let compiler = mlua_swarm::Compiler::new(reg);
+        let launch = Arc::new(mlua_swarm::TaskLaunchService::new(engine.clone(), compiler));
+        let state = AppState {
+            engine,
+            sessions: Arc::new(Mutex::new(crate::SessionStore::default())),
+            task_app: Arc::new(mlua_swarm::TaskApplication::new_inline_only(launch)),
+            ws_operator_factory: None,
+            data_store,
+            operator_sessions: Arc::new(Mutex::new(HashMap::new())),
+            roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
+            task_store: Arc::new(InMemoryTaskStore::new()),
+            run_store: Arc::new(InMemoryRunStore::new()),
+            base_url: None,
+        };
+
+        let flow = FlowNode::Seq {
+            children: vec![
+                FlowNode::Step {
+                    ref_: "step-a".to_string(),
+                    in_: Expr::Path {
+                        at: "$.greeting".to_string(),
+                    },
+                    out: Expr::Path {
+                        at: "$.a_out".to_string(),
+                    },
+                },
+                FlowNode::Step {
+                    ref_: "step-b".to_string(),
+                    in_: Expr::Path {
+                        at: "$.greeting".to_string(),
+                    },
+                    out: Expr::Path {
+                        at: "$.b_out".to_string(),
+                    },
+                },
+            ],
+        };
+        let blueprint = Blueprint {
+            schema_version: current_schema_version(),
+            id: "projection-test-collision-bp".into(),
+            flow,
+            agents: vec![
+                AgentDef {
+                    name: "step-a".into(),
+                    kind: AgentKind::RustFn,
+                    spec: json!({"fn_id": "step-a"}),
+                    profile: None,
+                    // Declares a projection_name colliding with "step-b"'s
+                    // own (undeclared) ref — hard collision.
+                    meta: Some(AgentMeta {
+                        projection_name: Some("step-b".to_string()),
+                        ..Default::default()
+                    }),
+                },
+                AgentDef {
+                    name: "step-b".into(),
+                    kind: AgentKind::RustFn,
+                    spec: json!({"fn_id": "step-b"}),
+                    profile: None,
+                    meta: None,
+                },
+            ],
+            operators: vec![],
+            metas: vec![],
+            hints: CompilerHints::default(),
+            strategy: CompilerStrategy::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+        };
+
+        let req = TaskLaunchRequest {
+            blueprint: BlueprintRef::Inline {
+                value: Box::new(blueprint),
+            },
+            init_ctx: json!({ "greeting": "hi" }),
+            project_root: None,
+            work_dir: None,
+            task_metadata: None,
+            ttl_secs: None,
+            operator: None,
+            operator_sid: None,
+            goal: None,
+        };
+
+        // `TaskLaunchResponse` (the `Ok` side) does not implement `Debug`,
+        // so `.expect_err` (which requires `T: Debug`) is not usable here —
+        // match instead.
+        let result = crate::tasks_start(State(state), Json(req)).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("declared projection_name colliding with another step's own ref must reject")
+            }
+        };
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// GH #23 subtask-3 (race close): two separate Tasks whose flow.ir
+    /// each dispatch the SAME producer name (`AG_IDENTITY`) — pre-GH-#23,
+    /// `OutputStore::get_latest_by_name` would resolve whichever Task
+    /// submitted LAST, globally, regardless of which Run's steps were
+    /// being enumerated (the former KNOWN LIMITATION race). The
+    /// Run-scoped `get_latest_by_name_in_run` lookup this subtask wires
+    /// (keyed by each step's own globally-unique `StepId`) must keep each
+    /// Task's own value distinct even though both share a producer name.
+    #[tokio::test]
+    async fn steps_list_run_scoped_lookup_does_not_bleed_across_tasks_sharing_a_producer_name() {
+        let state = test_state();
+        let first = crate::tasks_start(State(state.clone()), Json(greeting_task_req("first-task")))
+            .await
+            .expect("first tasks_start")
+            .0;
+        let second =
+            crate::tasks_start(State(state.clone()), Json(greeting_task_req("second-task")))
+                .await
+                .expect("second tasks_start")
+                .0;
+
+        let first_steps = steps_list(
+            State(state.clone()),
+            Path((first.task_id.to_string(), "latest".to_string())),
+        )
+        .await
+        .expect("first steps_list")
+        .0;
+        let second_steps = steps_list(
+            State(state.clone()),
+            Path((second.task_id.to_string(), "latest".to_string())),
+        )
+        .await
+        .expect("second steps_list")
+        .0;
+
+        let identity_name = mlua_swarm::worker::baseline::AG_IDENTITY;
+        let first_entry = first_steps
             .steps
             .iter()
             .find(|s| s.name == identity_name)
-            .unwrap_or_else(|| panic!("missing {identity_name} in {:?}", resp.steps));
-        assert_eq!(identity_entry.source, ProjectionSource::DataPlane);
-        let out_entry = resp
+            .expect("first entry present");
+        let second_entry = second_steps
             .steps
             .iter()
-            .find(|s| s.name == "out")
-            .unwrap_or_else(|| panic!("missing \"out\" in {:?}", resp.steps));
-        assert_eq!(out_entry.source, ProjectionSource::ResultRef);
+            .find(|s| s.name == identity_name)
+            .expect("second entry present");
+        assert_eq!(first_entry.source, ProjectionSource::DataPlane);
+        assert_eq!(second_entry.source, ProjectionSource::DataPlane);
+        assert_ne!(
+            first_entry.sha256, second_entry.sha256,
+            "each Task's own greeting must resolve, not the globally-latest submission"
+        );
     }
 
     // ─── Test 9: `:run = latest` resolves to newest Run; explicit pin still works ───
@@ -1259,6 +1952,7 @@ mod tests {
         let adapter = McpQueryAdapter::new(
             Arc::new(InMemoryOutputStore::new()),
             Arc::new(InMemoryRunStore::new()),
+            Engine::new(EngineCfg::default()),
         );
         let key = ProjectionKey {
             task_id: "T-abc".to_string(),
@@ -1284,6 +1978,7 @@ mod tests {
         let adapter = McpQueryAdapter::new(
             Arc::new(InMemoryOutputStore::new()),
             Arc::new(InMemoryRunStore::new()),
+            Engine::new(EngineCfg::default()),
         );
         let key = ProjectionKey {
             task_id: "T-abc".to_string(),
@@ -1303,7 +1998,11 @@ mod tests {
             .expect("tasks_start")
             .0;
 
-        let adapter = McpQueryAdapter::new(state.data_store.clone(), state.run_store.clone());
+        let adapter = McpQueryAdapter::new(
+            state.data_store.clone(),
+            state.run_store.clone(),
+            state.engine.clone(),
+        );
         let key = ProjectionKey {
             task_id: posted.task_id.to_string(),
             run_id: None,
@@ -1325,12 +2024,14 @@ mod tests {
 
     /// Subtask 4 Test #5: path narrowing works against the Data-plane
     /// `Final` content — `AG_IDENTITY`'s own name (the producer_agent
-    /// `Engine::submit_output`'s dual-write submits under; distinct from
-    /// `greeting_blueprint`'s flow.ir ctx-path segment `"out"`, which is
-    /// what `mcp_query_adapter_fetch_bridges_to_resolve_async` and its
-    /// siblings above still exercise via the `result_ref` fallback) is
-    /// queryable directly against the Data-plane store, narrowed by
-    /// `path`.
+    /// `Engine::submit_output`'s dual-write submits under) is queryable
+    /// directly against the Run-scoped Data-plane store, narrowed by
+    /// `path`. GH #23 subtask-3: `greeting_blueprint`'s flow.ir ctx-path
+    /// segment `"out"` is now an ALIAS of this same canonical entry (not
+    /// a separate `result_ref`-only name) — `mcp_query_adapter_fetch_bridges_to_resolve_async`
+    /// above queries `"out"` and, since the table unifies it with
+    /// `AG_IDENTITY`'s canonical entry, now resolves via this SAME
+    /// Data-plane path too, not the `result_ref` fallback.
     #[tokio::test]
     async fn resolve_async_path_narrows_within_data_plane_final_content() {
         let state = test_state();
@@ -1339,7 +2040,11 @@ mod tests {
             .expect("tasks_start")
             .0;
 
-        let adapter = McpQueryAdapter::new(state.data_store.clone(), state.run_store.clone());
+        let adapter = McpQueryAdapter::new(
+            state.data_store.clone(),
+            state.run_store.clone(),
+            state.engine.clone(),
+        );
         let key = ProjectionKey {
             task_id: posted.task_id.to_string(),
             run_id: None,

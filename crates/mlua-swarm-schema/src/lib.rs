@@ -706,6 +706,16 @@ pub struct AgentMeta {
     /// `MetaDef` reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta_ref: Option<String>,
+    /// GH #23 — the step-projection canonical name this agent's dispatched
+    /// Steps should be addressed by (data-plane submit / `ContextPolicy`
+    /// filter / `StepPointer`/`StepSummary` `name` / REST `:step` path /
+    /// materialized file stem — see `mlua-swarm` core's
+    /// `core::step_naming::StepNaming` for the table this field feeds).
+    /// `None` = this agent declares no projection name; the canonical
+    /// name falls back to the Step's `ref` (the flow.ir data-plane
+    /// producer name), matching pre-GH-#23 behavior byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_name: Option<String>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1055,6 +1065,7 @@ mod tests {
             "ctx",
             "context_policy",
             "meta_ref",
+            "projection_name",
         ] {
             assert!(props.contains_key(key), "missing property: {key}");
         }
@@ -1136,6 +1147,53 @@ mod tests {
         );
         let back: AgentMeta = serde_json::from_value(json).expect("deserializes");
         assert_eq!(back.meta_ref, None);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GH #23: `AgentMeta.projection_name`
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn agent_meta_projection_name_roundtrips_when_some() {
+        let meta = AgentMeta {
+            projection_name: Some("plan".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&meta).expect("serializes");
+        assert_eq!(json["projection_name"], "plan");
+        let back: AgentMeta = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn agent_meta_projection_name_omitted_when_none() {
+        let meta = AgentMeta::default();
+        let json = serde_json::to_value(&meta).expect("serializes");
+        assert!(
+            json.as_object().unwrap().get("projection_name").is_none(),
+            "projection_name key must be absent when None: {json}"
+        );
+        let back: AgentMeta = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.projection_name, None);
+        assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn agent_meta_rejects_unknown_field_with_projection_name_present() {
+        // `deny_unknown_fields` must still reject an unrelated stray key
+        // even when `projection_name` is present alongside it (regression
+        // guard: adding the field must not accidentally loosen the
+        // contract for the rest of the struct).
+        let json = serde_json::json!({
+            "projection_name": "plan",
+            "not_a_real_field": true
+        });
+        let err = serde_json::from_value::<AgentMeta>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("not_a_real_field")
+                || err.to_string().contains("unknown field"),
+            "expected an unknown-field rejection, got: {err}"
+        );
     }
 
     #[test]

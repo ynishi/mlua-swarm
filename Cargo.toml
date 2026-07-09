@@ -14,6 +14,7 @@ authors = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
 repository = "https://github.com/ynishi/mlua-swarm"
 homepage = "https://github.com/ynishi/mlua-swarm"
 documentation = "https://docs.rs/mlua-swarm"
+description = "Swarm engine host built on mlua — long-running stateful runtime with Role/Verb gate, CapToken, 3-stage pipeline, and Middleware overlay."
 readme = "README.md"
 
 [profile.release]

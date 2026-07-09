@@ -70,7 +70,7 @@ source is now one materialized view, not individual `Ctx.meta.runtime`
 reads. `AgentContextMiddleware` (`src/middleware/agent_context.rs`, the
 innermost spawner layer) builds an `AgentContextView`
 (`src/core/agent_context.rs`) from `Ctx` exactly once per spawn and fans
-it out on two rails: (a) `EngineState.agent_contexts[(task_id, attempt)]`
+it out on two rails: (a) `EngineState.agent_ctx[(task_id, attempt)].view`
 — the Worker axis source (hop 4 below), and (b)
 `ctx.meta.runtime[AGENT_CONTEXT_KEY]` (JSON-serialized) — the Spawner
 axis source this hop reads back via `AgentContextView::materialized_or_from_ctx`.
@@ -132,6 +132,47 @@ seeds the flow-ir eval `ctx` exactly once at flow start (a pure eval seed
 is consumed per-spawn by `AgentContextMiddleware` and lands in the
 Agent/LLM-boundary runtime bag (`ctx.meta.runtime` / `AgentContextView`) —
 it never touches flow-ir eval at all.
+
+### Step projection naming (GH #23): `AgentMeta.projection_name`
+
+A dispatched Step's OUTPUT used to be addressable under two independent
+names — the flow.ir data-plane producer name (`Step.ref`) and the
+`result_ref` ctx-path key (`Step.out`'s top-level path segment) — with
+consumers (the `ContextPolicy.steps` filter, `StepPointer.name`, the REST
+`:step` resolver, and the materialized-file stem) resolving the union of
+both, data-plane winning on a name collision.
+`AgentMeta.projection_name: Option<String>` lets a Blueprint author
+collapse that union into one name declared up front, on the Agent tier:
+
+```jsonc
+{
+  "agents": [
+    { "name": "planner", "kind": "operator", "spec": { /* ... */ },
+      "meta": { "projection_name": "plan" } }
+  ]
+}
+```
+
+- **Declared** (`meta.projection_name = "plan"`): every consumer converges
+  on `"plan"` as the ONE canonical name for that step's OUTPUT — the
+  `ContextPolicy.steps` filter, `StepPointer.name`, the REST `:step` path,
+  and the materialized `<name>.md` file stem all use it. The step stays
+  reachable under its `Step.ref` (`"planner"`) and its `out` ctx-path's
+  top-level segment too — both become aliases — so a filter written
+  against either of those names keeps matching.
+- **Undeclared** (`meta.projection_name` absent, the default): the step's
+  canonical name stays its `Step.ref`, and its aliases are `{Step.ref,
+  out-top-segment}` — byte-identical to the pre-GH-#23 union behavior. No
+  Blueprint change is required for this to keep working.
+- **Collision at register time**: a declared name (or alias) that clashes
+  with another step's DECLARED name is rejected — `Compiler::compile`
+  fails fast with a `StepNamingError` naming both contending steps. A
+  clash between two UNDECLARED steps still registers (the pre-GH-#23
+  collision case) with a `tracing::warn!`, resolving data-plane-first —
+  unchanged from before.
+
+See `crate::core::step_naming`'s module doc for the full addressing-space
+design this table backs.
 
 ### Per-Step meta: `$step_meta` envelope, and the dedicated-agent pattern
 
@@ -264,7 +305,7 @@ own contract is documented in `mse-worker.md`:
    spawner stack) carries the same materialized `AgentContextView` hop 2
    splices into the directive text, as structured JSON instead of
    header lines — the Worker axis's read-back source, keyed by
-   `(task_id, attempt)` in `EngineState.agent_contexts`. In practice
+   `(task_id, attempt)` in `EngineState.agent_ctx`. In practice
    the SubAgent has already been handed whatever it needs as prompt
    text via hop 3, so consuming `context` here is optional; it exists
    as a structured fallback for a SubAgent that wants

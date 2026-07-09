@@ -465,6 +465,24 @@ impl Default for ResumePending {
 
 // ─── EngineState (= the locked thing) ──────────────────────────────────────
 
+/// One `(task_id, attempt)` entry of [`EngineState::agent_ctx`] — the
+/// materialized [`crate::core::agent_context::AgentContextView`] (Contract
+/// C, GH #20) and the effective [`mlua_swarm_schema::ContextPolicy`]
+/// `AgentContextMiddleware` already applied to it (`projection-adapter`
+/// ST5), folded into one struct (GH #23) so the two values — written
+/// together at the same single insert site — can no longer drift apart.
+#[derive(Debug, Clone, Default)]
+pub struct AgentCtxEntry {
+    /// The materialized view; the Worker axis's read-back source
+    /// (`Engine::fetch_worker_payload{,_trusted}` / `Engine::agent_context_for`).
+    pub view: crate::core::agent_context::AgentContextView,
+    /// The resolved policy already applied to `view`; read back by
+    /// `Engine::context_policy_for` so a consumer can filter a *different*
+    /// step's pointer list against this key's policy without re-deriving it
+    /// from the Blueprint.
+    pub policy: mlua_swarm_schema::ContextPolicy,
+}
+
 /// The single `Mutex`-guarded blob of engine flow state, accessed only
 /// through `Engine::with_state` (see the R1-R4 discipline documented
 /// there).
@@ -494,34 +512,52 @@ pub struct EngineState {
     /// while `Some(None)` means "baked and profile is explicitly absent".
     pub systems: HashMap<(StepId, u32), Option<String>>,
     /// Per-attempt materialized [`crate::core::agent_context::AgentContextView`]
-    /// (Contract C, GH #20) — the Worker axis's read-back source. Written
-    /// by `crate::middleware::agent_context::AgentContextMiddleware`
-    /// (innermost spawner layer) at dispatch time; read by
-    /// `Engine::fetch_worker_payload{,_trusted}` and threaded into
-    /// `WorkerPayload.context`. Keyed the same way as `prompts` /
-    /// `systems` — `Ctx` itself is not stored, so the view has to be
-    /// snapshotted here to still be servable at fetch time.
-    pub agent_contexts: HashMap<(StepId, u32), crate::core::agent_context::AgentContextView>,
-    /// Per-attempt effective [`mlua_swarm_schema::ContextPolicy`] resolved
-    /// by `AgentContextMiddleware` (the same policy already applied to the
-    /// `agent_contexts` snapshot at this key) — the `projection-adapter`
-    /// ST5 Worker axis addition. `Engine::context_policy_for` reads it back
-    /// so `crates/mlua-swarm-server/src/worker.rs`'s `GET
-    /// /v1/worker/prompt` handler can filter the `WorkerPayload.context.steps`
-    /// pointer list via `ContextPolicy::allows_step` without re-deriving the
-    /// policy from the Blueprint at fetch time. An absent entry (pre-ST5
-    /// spawns, or a spawner stack that never layered
-    /// `AgentContextMiddleware`) means pass-all
-    /// (`mlua_swarm_schema::ContextPolicy::default()`).
+    /// (Contract C, GH #20) paired with the effective
+    /// [`mlua_swarm_schema::ContextPolicy`] `AgentContextMiddleware` already
+    /// applied to that same view — the Worker axis's read-back source.
+    /// Written by `crate::middleware::agent_context::AgentContextMiddleware`
+    /// (innermost spawner layer) at dispatch time via one insert (GH #23:
+    /// folded from two separately-keyed maps — see below); read by
+    /// `Engine::fetch_worker_payload{,_trusted}` / `Engine::agent_context_for`
+    /// (the [`AgentCtxEntry::view`] half, threaded into `WorkerPayload.context`)
+    /// and `Engine::context_policy_for` (the [`AgentCtxEntry::policy`] half,
+    /// read by `crates/mlua-swarm-server/src/worker.rs`'s `GET
+    /// /v1/worker/prompt` handler to filter `WorkerPayload.context.steps` via
+    /// `ContextPolicy::allows_step` without re-deriving the policy from the
+    /// Blueprint at fetch time). Keyed the same way as `prompts` / `systems`
+    /// — `Ctx` itself is not stored, so the entry has to be snapshotted here
+    /// to still be servable at fetch time. An absent entry (pre-ST5 spawns,
+    /// or a spawner stack that never layered `AgentContextMiddleware`) means
+    /// no materialized view and a pass-all policy
+    /// (`mlua_swarm_schema::ContextPolicy::default()`) for that key.
     ///
-    /// TODO(GH #23): (1) neither this map
-    /// nor `agent_contexts` (nor `prompts` / `systems`) has a removal path —
-    /// entries accumulate for the process lifetime; a long-running server
-    /// needs a task-completion sweep. (2) This map and `agent_contexts`
-    /// share a key and are only kept in sync by convention (single insert
-    /// site in `AgentContextMiddleware`); folding both values into one map
-    /// of a `(view, policy)` struct would make the pairing structural.
-    pub context_policies: HashMap<(StepId, u32), mlua_swarm_schema::ContextPolicy>,
+    /// GH #23: this map used to be two separately-keyed maps
+    /// (`agent_contexts: HashMap<_, AgentContextView>` /
+    /// `context_policies: HashMap<_, ContextPolicy>`) sharing a key and kept
+    /// in sync only by convention (the single insert site in
+    /// `AgentContextMiddleware` writing both in the same `with_state` call).
+    /// Folding both values into one map of an [`AgentCtxEntry`] struct makes
+    /// that pairing structural — the two values can no longer drift apart
+    /// key-by-key. TODO(GH #23): this map (nor `prompts` / `systems`) still
+    /// has no removal path — entries accumulate for the process lifetime; a
+    /// long-running server needs a task-completion sweep (tracked
+    /// separately from this fold).
+    pub agent_ctx: HashMap<(StepId, u32), AgentCtxEntry>,
+    /// GH #23: per-dispatch snapshot of the Blueprint-wide
+    /// [`crate::core::step_naming::StepNaming`] addressing-space table —
+    /// built once by `blueprint::compiler::Compiler::compile` and stashed
+    /// here, per `StepId`, by `crate::blueprint::EngineDispatcher::dispatch`
+    /// (its single insert site; the same `Arc` is shared across every
+    /// Step dispatched from the same Blueprint launch). `Engine::step_naming_for`
+    /// reads it back so later consumers (GH #23 subtask-2/3 —
+    /// `ContextPolicy.allows_step`, `StepPointer`/`StepSummary` assembly,
+    /// the REST `:step` resolver, `FileProjectionAdapter`) do not have to
+    /// re-derive the table from the Blueprint at read time. An absent
+    /// entry means the dispatcher was never given a `StepNaming` (e.g. a
+    /// direct `EngineDispatcher::with_spawner` caller that skipped
+    /// `with_step_naming`) — callers fall back to the pre-GH-#23 runtime
+    /// union rule in that case.
+    pub step_namings: HashMap<StepId, Arc<crate::core::step_naming::StepNaming>>,
     /// All minted `CapToken` records, keyed by token fingerprint
     /// (`CapToken::fingerprint` = SHA-256 of the nonce; issue #14 — the
     /// key is loggable, the nonce is not).
@@ -562,8 +598,8 @@ impl EngineState {
             sessions: HashMap::new(),
             prompts: HashMap::new(),
             systems: HashMap::new(),
-            agent_contexts: HashMap::new(),
-            context_policies: HashMap::new(),
+            agent_ctx: HashMap::new(),
+            step_namings: HashMap::new(),
             tokens: HashMap::new(),
             worker_handles: HashMap::new(),
             pending_resumes: HashMap::new(),

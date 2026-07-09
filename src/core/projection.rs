@@ -54,7 +54,7 @@
 //! worker's `Final` output lands in [`crate::core::engine::Engine::submit_output`]
 //! / `submit_worker_result_trusted` (the canonical worker-submit path, `POST
 //! /v1/worker/submit` and `/v1/worker/result`), the engine materializes that
-//! step's OUTPUT to `<root>/workspace/tasks/<task_id>/ctx/<producer_agent>.md`
+//! step's OUTPUT to `<root>/workspace/tasks/<task_id>/ctx/<canonical_agent>.md`
 //! via [`FileProjectionAdapter::materialize_submission`] — this is the file
 //! a Worker-axis `StepPointer.file_path` (when `Some`) and the HTTP debug
 //! plane's `StepSummary.file_path` both address, so a *later* Agent step
@@ -67,6 +67,14 @@
 //! Invariants on `Engine::submit_output`'s doc): an unresolved root, or a
 //! `Final` from a spawn that never ran through that middleware, is a silent
 //! no-op, never a submit failure.
+//!
+//! `<canonical_agent>` (GH #23) is `producer_agent` (`TaskState.spec.agent`)
+//! resolved through `Engine::step_naming_for(task_id)`'s
+//! `crate::core::step_naming::StepNaming::canonical_of_producer` when a
+//! table was snapshotted for this task's dispatch — `producer_agent`
+//! unchanged (byte-identical file stem to pre-GH-#23 behavior) for any
+//! step whose `AgentMeta.projection_name` is undeclared, or when no table
+//! exists for this `task_id` at all.
 //!
 //! # Design: addressing
 //!

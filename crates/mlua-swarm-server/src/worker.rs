@@ -47,7 +47,9 @@ use axum::{
     Json,
 };
 use mlua_swarm::core::agent_context::StepPointer;
+use mlua_swarm::core::step_naming::StepNaming;
 use mlua_swarm::{CapToken, ContentRef, OutputEvent, RunId, StepId, WorkerPayload};
+use mlua_swarm_schema::ContextPolicy;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -113,6 +115,19 @@ pub async fn worker_prompt(
 /// submitted after this agent spawned — but before it fetches its prompt
 /// — is still visible.
 ///
+/// GH #23 subtask-3: `resolved_steps` (from
+/// `McpQueryAdapter::list_steps_by_run_id`) always reports the CANONICAL
+/// name (see `crate::projection`'s module doc), so both the self-exclusion
+/// check and the `ContextPolicy` match are done against canonical names —
+/// `payload.agent` (the raw `Step.ref` this fetching agent was dispatched
+/// under) is canonicalized via `Engine::step_naming_for(&payload.task_id)`
+/// (the FETCHING agent's own dispatch id — the same `StepNaming` `Arc`
+/// every step of this Blueprint launch shares, see [`StepNaming`]'s module
+/// doc), and `policy.allows_step` itself is left untouched (schema crate
+/// stays name-agnostic) — [`allows_step_canonical`] is the caller-side seam
+/// that resolves each policy-declared name through the table before
+/// comparing.
+///
 /// No-op (`context.steps` stays empty) when: the payload carries no
 /// `context` at all; the context has no `run_id` (a spawn that never
 /// threaded one through — pre-run-tracking callers, or a spawner stack
@@ -131,20 +146,31 @@ async fn assemble_step_pointers(state: &AppState, payload: &mut WorkerPayload) {
         return;
     };
 
-    let adapter = McpQueryAdapter::new(state.data_store.clone(), state.run_store.clone());
+    let adapter = McpQueryAdapter::new(
+        state.data_store.clone(),
+        state.run_store.clone(),
+        state.engine.clone(),
+    );
     let Ok((run, resolved_steps)) = adapter.list_steps_by_run_id(&run_id).await else {
         return;
     };
 
+    let naming = state.engine.step_naming_for(&payload.task_id).await;
     let policy = state
         .engine
         .context_policy_for(&payload.task_id, payload.attempt)
         .await;
-    let self_name = payload.agent.clone();
+    let self_canonical = naming
+        .as_deref()
+        .and_then(|n| n.canonical_of_producer(&payload.agent))
+        .map(str::to_string)
+        .unwrap_or_else(|| payload.agent.clone());
 
     let mut pointers = Vec::new();
     for step in &resolved_steps {
-        if step.name == self_name || !policy.allows_step(&step.name) {
+        if step.name == self_canonical
+            || !allows_step_canonical(&policy, naming.as_deref(), &step.name)
+        {
             continue;
         }
         if let Some((size_bytes, file_path, content_url, sha256)) =
@@ -160,6 +186,47 @@ async fn assemble_step_pointers(state: &AppState, payload: &mut WorkerPayload) {
         }
     }
     context.steps = pointers;
+}
+
+/// GH #23 subtask-3: caller-side canonical/alias expansion for
+/// `ContextPolicy.allows_step` — same precedence as
+/// `ContextPolicy::allows_step` itself (`steps_exclude` wins; `steps:
+/// None` = pass-all, `Some(list)` = named-only), but each
+/// policy-declared name is resolved through the Blueprint's `StepNaming`
+/// table before comparison, so a Blueprint author's `steps: [...]` entry
+/// naming either the canonical projection name OR any alias (`Step.ref` /
+/// the `out` ctx-path's top-level segment) matches the same step.
+/// `ContextPolicy::allows_step` (schema crate) is untouched — this is the
+/// GH #23 seam, kept out of the name-agnostic schema type. `naming: None`
+/// degrades to a literal string comparison, byte-identical to
+/// `ContextPolicy::allows_step` itself (defensive-only fallback, matching
+/// `crate::projection::McpQueryAdapter::step_naming_for_run`'s own
+/// contract).
+fn allows_step_canonical(
+    policy: &ContextPolicy,
+    naming: Option<&StepNaming>,
+    canonical_name: &str,
+) -> bool {
+    let resolves_to = |raw: &str| -> bool {
+        match naming {
+            Some(n) => n
+                .resolve(raw)
+                .map(|c| c == canonical_name)
+                .unwrap_or(raw == canonical_name),
+            None => raw == canonical_name,
+        }
+    };
+    if policy
+        .steps_exclude
+        .iter()
+        .any(|excluded| resolves_to(excluded))
+    {
+        return false;
+    }
+    match &policy.steps {
+        None => true,
+        Some(list) => list.iter().any(|included| resolves_to(included)),
+    }
 }
 
 /// Body for `POST /v1/worker/result`.
@@ -543,10 +610,13 @@ mod tests {
             .with_state("test.seed_policy", {
                 let consumer_id = consumer_id.clone();
                 move |s| {
-                    s.context_policies.insert(
+                    s.agent_ctx.insert(
                         (consumer_id, 1),
-                        mlua_swarm_schema::ContextPolicy {
-                            steps: Some(vec!["planner".to_string()]),
+                        mlua_swarm::core::state::AgentCtxEntry {
+                            policy: mlua_swarm_schema::ContextPolicy {
+                                steps: Some(vec!["planner".to_string()]),
+                                ..Default::default()
+                            },
                             ..Default::default()
                         },
                     );
@@ -594,10 +664,13 @@ mod tests {
             .with_state("test.seed_policy", {
                 let consumer_id = consumer_id.clone();
                 move |s| {
-                    s.context_policies.insert(
+                    s.agent_ctx.insert(
                         (consumer_id, 1),
-                        mlua_swarm_schema::ContextPolicy {
-                            steps: Some(vec![]),
+                        mlua_swarm::core::state::AgentCtxEntry {
+                            policy: mlua_swarm_schema::ContextPolicy {
+                                steps: Some(vec![]),
+                                ..Default::default()
+                            },
                             ..Default::default()
                         },
                     );
@@ -642,11 +715,14 @@ mod tests {
             .with_state("test.seed_policy", {
                 let consumer_id = consumer_id.clone();
                 move |s| {
-                    s.context_policies.insert(
+                    s.agent_ctx.insert(
                         (consumer_id, 1),
-                        mlua_swarm_schema::ContextPolicy {
-                            steps: Some(vec!["planner".to_string(), "coder".to_string()]),
-                            steps_exclude: vec!["planner".to_string()],
+                        mlua_swarm::core::state::AgentCtxEntry {
+                            policy: mlua_swarm_schema::ContextPolicy {
+                                steps: Some(vec!["planner".to_string(), "coder".to_string()]),
+                                steps_exclude: vec!["planner".to_string()],
+                                ..Default::default()
+                            },
                             ..Default::default()
                         },
                     );
@@ -799,5 +875,141 @@ mod tests {
         assert!(obj.contains_key("size_bytes"));
         assert!(obj.contains_key("content_url"));
         assert!(obj.contains_key("sha256"));
+    }
+
+    /// A single-step Blueprint whose `planner` agent declares
+    /// `AgentMeta.projection_name = "plan-out"` — the `StepNaming` fixture
+    /// for [`declared_projection_name_pointer_name_is_canonical_and_policy_matches_it`],
+    /// mirroring `crate::projection::tests`' own
+    /// `declared_projection_name_blueprint` helper (duplicated here rather
+    /// than shared — this crate's established per-module test-helper
+    /// convention).
+    fn declared_name_bp() -> mlua_swarm::blueprint::Blueprint {
+        use mlua_flow_ir::{Expr, Node};
+        use mlua_swarm::blueprint::{
+            current_schema_version, AgentDef, AgentKind, AgentMeta, Blueprint, BlueprintMetadata,
+            CompilerHints, CompilerStrategy,
+        };
+        Blueprint {
+            schema_version: current_schema_version(),
+            id: "worker-test-declared-name-bp".into(),
+            flow: Node::Step {
+                ref_: "planner".to_string(),
+                in_: Expr::Path {
+                    at: "$.in".to_string(),
+                },
+                out: Expr::Path {
+                    at: "$.plan".to_string(),
+                },
+            },
+            agents: vec![AgentDef {
+                name: "planner".to_string(),
+                kind: AgentKind::RustFn,
+                spec: json!({"fn_id": "planner"}),
+                profile: None,
+                meta: Some(AgentMeta {
+                    projection_name: Some("plan-out".to_string()),
+                    ..Default::default()
+                }),
+            }],
+            operators: vec![],
+            metas: vec![],
+            hints: CompilerHints::default(),
+            strategy: CompilerStrategy::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+        }
+    }
+
+    /// Test 8 (GH #23 subtask-3, declared-name E2E — Worker axis half): a
+    /// declared `projection_name` makes `StepPointer.name` the CANONICAL
+    /// name (not the raw `Step.ref` the Data-plane / `step_entries` still
+    /// index by), and `ContextPolicy.steps` naming the canonical name
+    /// matches it.
+    #[tokio::test]
+    async fn declared_projection_name_pointer_name_is_canonical_and_policy_matches_it() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        let planner_id = StepId::new();
+
+        // The Data-plane store is keyed by the CANONICAL name — GH #23
+        // subtask-2's sink already writes it that way.
+        append_final(
+            &data_store,
+            planner_id.as_str(),
+            "plan-out",
+            json!({"plan": "x"}),
+        )
+        .await;
+        run_store
+            .create(run_record(
+                &task_id,
+                &run_id,
+                vec![step_entry(&planner_id, "planner")],
+            ))
+            .await
+            .expect("create run");
+
+        let state = test_state(data_store, run_store);
+
+        // Seed the `StepNaming` table the way `Compiler::compile` +
+        // `EngineDispatcher::dispatch` would have — the same `Arc` stashed
+        // under every dispatched step's own id, including the FETCHING
+        // agent's (`consumer_id`), which `assemble_step_pointers` looks up
+        // via `Engine::step_naming_for(&payload.task_id)`.
+        let (naming, _warnings) =
+            mlua_swarm::core::step_naming::StepNaming::from_blueprint(&declared_name_bp())
+                .expect("no collision");
+        let naming = Arc::new(naming);
+        let consumer_id = StepId::new();
+        state
+            .engine
+            .with_state("test.seed_step_naming", {
+                let naming = naming.clone();
+                let planner_id = planner_id.clone();
+                let consumer_id = consumer_id.clone();
+                move |s| {
+                    s.step_namings.insert(planner_id, naming.clone());
+                    s.step_namings.insert(consumer_id, naming);
+                }
+            })
+            .await
+            .expect("seed step naming");
+        state
+            .engine
+            .with_state("test.seed_policy", {
+                let consumer_id = consumer_id.clone();
+                move |s| {
+                    s.agent_ctx.insert(
+                        (consumer_id, 1),
+                        mlua_swarm::core::state::AgentCtxEntry {
+                            policy: mlua_swarm_schema::ContextPolicy {
+                                steps: Some(vec!["plan-out".to_string()]),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    );
+                }
+            })
+            .await
+            .expect("seed policy");
+
+        let mut payload = consumer_payload(&consumer_id, &run_id);
+        assemble_step_pointers(&state, &mut payload).await;
+
+        let steps = &payload.context.expect("context").steps;
+        assert_eq!(steps.len(), 1, "steps: {steps:?}");
+        assert_eq!(
+            steps[0].name, "plan-out",
+            "StepPointer.name must be the canonical name"
+        );
     }
 }

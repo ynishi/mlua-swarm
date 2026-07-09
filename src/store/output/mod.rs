@@ -254,6 +254,23 @@ pub trait OutputStore: Send + Sync {
     /// Names are producer-scoped, not task-scoped: the newest emit wins.
     async fn get_latest_by_name(&self, name: &str) -> Result<OutputRecord, OutputStoreError>;
 
+    /// GH #23 Layer 2 — the Run-scoped sibling of [`Self::get_latest_by_name`].
+    /// Looks up the **latest** record emitted under `name`, restricted to
+    /// one `(task_id, attempt)` run. [`Self::get_latest_by_name`] resolves
+    /// across every Run the store has ever seen, so two concurrently
+    /// dispatched Runs that happen to share a producer name race each
+    /// other (documented as a `KNOWN LIMITATION` in
+    /// `crates/mlua-swarm-server/src/projection.rs`); this method closes
+    /// that race by construction — the newest emit for `name` *inside*
+    /// `(task_id, attempt)` wins, other Runs' emits under the same name
+    /// are invisible to it.
+    async fn get_latest_by_name_in_run(
+        &self,
+        task_id: &str,
+        attempt: u32,
+        name: &str,
+    ) -> Result<OutputRecord, OutputStoreError>;
+
     /// List every record for a given `(task_id, attempt)` pair. Used where
     /// the dispatch path pulls the verdict view.
     async fn list_for_attempt(
@@ -277,6 +294,13 @@ struct InMemoryInner {
     by_attempt: HashMap<(String, u32), Vec<OutputRef>>,
     /// producer_agent → emitted refs in insertion order (last = latest).
     by_name: HashMap<String, Vec<OutputRef>>,
+    /// `(task_id, attempt, producer_agent)` → emitted refs in insertion
+    /// order (last = latest) — the Run-scoped sibling of `by_name` (GH #23
+    /// Layer 2, backs [`OutputStore::get_latest_by_name_in_run`]). Same
+    /// shape as `by_attempt` plus the name dimension, so a producer name
+    /// shared by two concurrent `(task_id, attempt)` Runs never
+    /// cross-resolves.
+    by_name_run: HashMap<(String, u32, String), Vec<OutputRef>>,
 }
 
 impl InMemoryOutputStore {
@@ -317,6 +341,11 @@ impl OutputStore for InMemoryOutputStore {
             .entry(producer_agent.to_string())
             .or_default()
             .push(id.clone());
+        guard
+            .by_name_run
+            .entry((task_id.to_string(), attempt, producer_agent.to_string()))
+            .or_default()
+            .push(id.clone());
         Ok(id)
     }
 
@@ -341,6 +370,26 @@ impl OutputStore for InMemoryOutputStore {
             .get(latest)
             .cloned()
             .ok_or_else(|| OutputStoreError::Internal(format!("name index dangling: {name}")))
+    }
+
+    async fn get_latest_by_name_in_run(
+        &self,
+        task_id: &str,
+        attempt: u32,
+        name: &str,
+    ) -> Result<OutputRecord, OutputStoreError> {
+        let guard = self.inner.lock().await;
+        let key = (task_id.to_string(), attempt, name.to_string());
+        let latest = guard
+            .by_name_run
+            .get(&key)
+            .and_then(|ids| ids.last())
+            .ok_or_else(|| OutputStoreError::NotFound(format!("{task_id}/{attempt}/{name}")))?;
+        guard.by_id.get(latest).cloned().ok_or_else(|| {
+            OutputStoreError::Internal(format!(
+                "name-in-run index dangling: {task_id}/{attempt}/{name}"
+            ))
+        })
     }
 
     async fn list_for_attempt(
@@ -449,6 +498,81 @@ mod tests {
     async fn get_latest_by_name_unknown_returns_not_found() {
         let store = InMemoryOutputStore::new();
         let err = store.get_latest_by_name("nobody").await.unwrap_err();
+        assert!(matches!(err, OutputStoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn get_latest_by_name_in_run_does_not_cross_resolve_between_runs() {
+        let store = InMemoryOutputStore::new();
+        let e = |s: &str| OutputEvent::Progress {
+            stage: s.into(),
+            note: None,
+        };
+        let id_t1 = store
+            .append("t1", 1, "same-producer", e("run-1"), vec![])
+            .await
+            .expect("append t1");
+        let id_t2 = store
+            .append("t2", 1, "same-producer", e("run-2"), vec![])
+            .await
+            .expect("append t2");
+
+        let got_t1 = store
+            .get_latest_by_name_in_run("t1", 1, "same-producer")
+            .await
+            .expect("run t1 lookup");
+        assert_eq!(got_t1.id, id_t1, "must not cross-resolve to t2's emit");
+
+        let got_t2 = store
+            .get_latest_by_name_in_run("t2", 1, "same-producer")
+            .await
+            .expect("run t2 lookup");
+        assert_eq!(got_t2.id, id_t2, "must not cross-resolve to t1's emit");
+    }
+
+    #[tokio::test]
+    async fn get_latest_by_name_in_run_returns_newest_within_run() {
+        let store = InMemoryOutputStore::new();
+        let e = |s: &str| OutputEvent::Progress {
+            stage: s.into(),
+            note: None,
+        };
+        store
+            .append("t", 1, "p", e("first"), vec![])
+            .await
+            .expect("append 1");
+        let id2 = store
+            .append("t", 1, "p", e("second"), vec![])
+            .await
+            .expect("append 2");
+        let got = store
+            .get_latest_by_name_in_run("t", 1, "p")
+            .await
+            .expect("lookup");
+        assert_eq!(got.id, id2, "latest emit within the run wins");
+    }
+
+    #[tokio::test]
+    async fn get_latest_by_name_in_run_wrong_run_returns_not_found() {
+        let store = InMemoryOutputStore::new();
+        store
+            .append(
+                "t",
+                1,
+                "same-producer",
+                OutputEvent::Progress {
+                    stage: "x".into(),
+                    note: None,
+                },
+                vec![],
+            )
+            .await
+            .expect("append");
+        // Right name, wrong attempt — must not fall back to a different run.
+        let err = store
+            .get_latest_by_name_in_run("t", 2, "same-producer")
+            .await
+            .unwrap_err();
         assert!(matches!(err, OutputStoreError::NotFound(_)));
     }
 

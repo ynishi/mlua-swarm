@@ -12,11 +12,12 @@
 //! the two-axis fan-out diagram.
 //!
 //! Unlike `TaskInputMiddleware` / `ProjectNameAliasMiddleware` (which only
-//! mutate `ctx`), this layer ALSO snapshots the view into
-//! `EngineState.agent_contexts`, keyed `(task_id, attempt)` — the Worker
-//! axis (`Engine::fetch_worker_payload{,_trusted}`) reads it back from
-//! there, mirroring how `EngineState.prompts` / `.systems` are populated
-//! and later fetched.
+//! mutate `ctx`), this layer ALSO snapshots the view (paired with the
+//! resolved policy, GH #23) into `EngineState.agent_ctx`, keyed
+//! `(task_id, attempt)` — the Worker axis
+//! (`Engine::fetch_worker_payload{,_trusted}`) reads the view half back
+//! from there, mirroring how `EngineState.prompts` / `.systems` are
+//! populated and later fetched.
 //!
 //! # GH #21 Phase 1: the supply tiers this layer merges
 //!
@@ -277,24 +278,29 @@ impl SpawnerAdapter for AgentContextWrapped {
             None => view,
         };
 
-        // Worker axis source: snapshot into EngineState.agent_contexts,
-        // keyed the same way EngineState.prompts / .systems are — Ctx
-        // itself is not stored, so the view has to be captured here to
-        // still be servable when fetch_worker_payload{,_trusted} runs
-        // later. `context_policies` snapshots the SAME resolved `policy`
-        // alongside it (projection-adapter ST5) — `Engine::context_policy_for`
-        // reads it back so the Worker axis's `GET /v1/worker/prompt`
-        // handler can filter `context.steps` via `ContextPolicy::allows_step`
-        // without re-deriving the policy from the Blueprint at fetch time.
+        // Worker axis source: snapshot into EngineState.agent_ctx, keyed the
+        // same way EngineState.prompts / .systems are — Ctx itself is not
+        // stored, so the entry has to be captured here to still be servable
+        // when fetch_worker_payload{,_trusted} runs later. `policy` is the
+        // SAME resolved value already applied to `view` (projection-adapter
+        // ST5), folded into the same `AgentCtxEntry` (GH #23) so the two
+        // halves are written by one insert instead of two maps kept in sync
+        // by convention — `Engine::context_policy_for` reads the `.policy`
+        // half back so the Worker axis's `GET /v1/worker/prompt` handler can
+        // filter `context.steps` via `ContextPolicy::allows_step` without
+        // re-deriving the policy from the Blueprint at fetch time.
         let view_for_state = view.clone();
         let task_id_for_state = task_id.clone();
         let policy_for_state = policy.cloned().unwrap_or_default();
         engine
             .with_state("agent_context.materialize", move |s| {
-                s.agent_contexts
-                    .insert((task_id_for_state.clone(), attempt), view_for_state);
-                s.context_policies
-                    .insert((task_id_for_state, attempt), policy_for_state);
+                s.agent_ctx.insert(
+                    (task_id_for_state, attempt),
+                    crate::core::state::AgentCtxEntry {
+                        view: view_for_state,
+                        policy: policy_for_state,
+                    },
+                );
             })
             .await
             .map_err(|e| SpawnError::Internal(format!("agent_context state insert: {e}")))?;
@@ -368,7 +374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshots_view_into_engine_state_agent_contexts() {
+    async fn snapshots_view_into_engine_state_agent_ctx() {
         let (stack, _seen) = probe_stack(AgentContextMiddleware::default());
         let engine = Engine::new(EngineCfg::default());
         let task_id = StepId::parse("ST-1").unwrap();
@@ -384,12 +390,13 @@ mod tests {
         let _ = stack.spawn(&engine, &ctx, task_id.clone(), 1, token).await;
 
         let snapshotted = engine
-            .with_state("test.read_agent_contexts", move |s| {
-                s.agent_contexts.get(&(task_id, 1)).cloned()
+            .with_state("test.read_agent_ctx", move |s| {
+                s.agent_ctx.get(&(task_id, 1)).cloned()
             })
             .await
             .expect("with_state")
-            .expect("agent_contexts entry present");
+            .expect("agent_ctx entry present")
+            .view;
         assert_eq!(snapshotted.project_root.as_deref(), Some("/repo"));
     }
 
@@ -450,12 +457,13 @@ mod tests {
         let _ = stack.spawn(&engine, &ctx, task_id.clone(), 1, token).await;
 
         let snapshotted = engine
-            .with_state("test.read_agent_contexts_excluded", move |s| {
-                s.agent_contexts.get(&(task_id, 1)).cloned()
+            .with_state("test.read_agent_ctx_excluded", move |s| {
+                s.agent_ctx.get(&(task_id, 1)).cloned()
             })
             .await
             .expect("with_state")
-            .expect("agent_contexts entry present");
+            .expect("agent_ctx entry present")
+            .view;
         assert_eq!(snapshotted.project_root.as_deref(), Some("/repo"));
         assert!(snapshotted.work_dir.is_none());
 

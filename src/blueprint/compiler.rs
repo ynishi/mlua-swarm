@@ -30,6 +30,7 @@
 use crate::blueprint::{AgentDef, AgentKind, Blueprint, BlueprintMetadata};
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
+use crate::core::step_naming::{StepNaming, StepNamingError};
 use crate::operator::{Operator, OperatorSpawner, WorkerBinding};
 use crate::types::{CapToken, StepId};
 use crate::worker::adapter::{InProcSpawner, SpawnError, SpawnerAdapter, WorkerFn};
@@ -95,6 +96,13 @@ pub enum CompileError {
         /// message.
         defined: Vec<String>,
     },
+    /// GH #23: two Steps' canonical/alias projection names collide and at
+    /// least one side declared `AgentMeta.projection_name` — see
+    /// [`crate::core::step_naming::StepNaming::from_blueprint`]'s doc for
+    /// the full resolution rule (an undeclared/undeclared clash is a soft
+    /// warning instead, logged but not rejected).
+    #[error("StepNaming collision: {0}")]
+    StepNamingCollision(#[from] StepNamingError),
 }
 
 // ─── SpawnerFactory + Registry ───────────────────────────────────────────
@@ -202,6 +210,11 @@ pub struct CompiledBlueprint {
     pub flow: FlowNode,
     /// Copied verbatim from `Blueprint.metadata`.
     pub metadata: BlueprintMetadata,
+    /// GH #23: the Blueprint's [`StepNaming`] addressing-space table,
+    /// built once here (the sole construction site — see
+    /// [`StepNaming::from_blueprint`]'s doc) and threaded through
+    /// `EngineDispatcher::with_step_naming` for `EngineState` storage.
+    pub step_naming: Arc<StepNaming>,
 }
 
 impl Compiler {
@@ -318,6 +331,24 @@ impl Compiler {
             verify_refs(&bp.flow, &routes, self.default_spawner.is_some())?;
         }
 
+        // GH #23: build the StepNaming addressing-space table once, here
+        // (the sole construction site). A hard collision (either side
+        // declares `AgentMeta.projection_name`) rejects the compile via
+        // `?` (`StepNamingError` → `CompileError::StepNamingCollision`,
+        // same family as the other Blueprint validation checks above); a
+        // soft undeclared/undeclared collision is logged and compilation
+        // proceeds (pre-GH-#23 union-rule behavior preserved).
+        let (step_naming, step_naming_warnings) = StepNaming::from_blueprint(bp)?;
+        for warning in &step_naming_warnings {
+            tracing::warn!(
+                name = %warning.name,
+                first_step_ref = %warning.first_step_ref,
+                second_step_ref = %warning.second_step_ref,
+                "StepNaming: undeclared steps' canonical/alias names collide; \
+                 the step whose own ref matches the name keeps it (data-plane priority)"
+            );
+        }
+
         let router = Arc::new(CompiledAgentTable {
             routes,
             default: self.default_spawner.clone(),
@@ -326,6 +357,7 @@ impl Compiler {
             router,
             flow: bp.flow.clone(),
             metadata: bp.metadata.clone(),
+            step_naming: Arc::new(step_naming),
         })
     }
 }

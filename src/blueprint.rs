@@ -26,6 +26,7 @@
 
 use crate::core::engine::Engine;
 use crate::core::state::{DispatchOutcome, TaskSpec};
+use crate::core::step_naming::StepNaming;
 use crate::store::run::{RunContext, StepEntry};
 use crate::types::{now_unix, CapToken};
 use crate::worker::adapter::SpawnerAdapter;
@@ -74,19 +75,31 @@ pub use mlua_swarm_schema::{
 /// Also carries the GH #21 Phase 2 named `MetaDef` pool (via
 /// [`Self::with_step_metas`]) — the Step tier's dispatch-time resolver;
 /// see [`Self::dispatch`]'s doc for the full envelope contract.
+///
+/// GH #23: optionally carries the Blueprint's [`StepNaming`] table (via
+/// [`Self::with_step_naming`], built once by
+/// `blueprint::compiler::Compiler::compile` — see that type's doc for the
+/// full addressing-space narrative). When present, [`Self::dispatch`]
+/// snapshots the same `Arc` into `EngineState.step_namings` for every
+/// dispatched task, keyed by its freshly-minted `StepId` — the storage
+/// half of the "construct once, read many" contract; `Engine::step_naming_for`
+/// is the read-back accessor later consumers (GH #23 subtask-2/3) pull
+/// from.
 pub struct EngineDispatcher {
     engine: Engine,
     op_token: CapToken,
     spawner: Arc<dyn SpawnerAdapter>,
     run_ctx: Option<RunContext>,
     step_metas: HashMap<String, Value>,
+    step_naming: Option<Arc<StepNaming>>,
 }
 
 impl EngineDispatcher {
-    /// Build a dispatcher with no run-level tracing (`run_ctx = None`) and
-    /// no named `MetaDef`s (`step_metas` empty) — the pre-existing
-    /// behavior. Use [`Self::with_run`] / [`Self::with_step_metas`] to
-    /// opt into either.
+    /// Build a dispatcher with no run-level tracing (`run_ctx = None`),
+    /// no named `MetaDef`s (`step_metas` empty), and no [`StepNaming`]
+    /// table — the pre-existing behavior. Use [`Self::with_run`] /
+    /// [`Self::with_step_metas`] / [`Self::with_step_naming`] to opt into
+    /// any of them.
     pub fn with_spawner(
         engine: Engine,
         op_token: CapToken,
@@ -98,6 +111,7 @@ impl EngineDispatcher {
             spawner,
             run_ctx: None,
             step_metas: HashMap::new(),
+            step_naming: None,
         }
     }
 
@@ -117,6 +131,18 @@ impl EngineDispatcher {
     /// loudly, same as a Blueprint that never declares `Blueprint.metas`.
     pub fn with_step_metas(mut self, step_metas: HashMap<String, Value>) -> Self {
         self.step_metas = step_metas;
+        self
+    }
+
+    /// GH #23: attach the Blueprint's [`StepNaming`] table (built once by
+    /// `blueprint::compiler::Compiler::compile`). `None` (the default via
+    /// [`Self::with_spawner`]) preserves pre-GH-#23 behavior byte-for-byte
+    /// — [`Self::dispatch`] simply skips the `EngineState.step_namings`
+    /// snapshot for every caller that never opts in (e.g. tests that build
+    /// an `EngineDispatcher` directly instead of going through
+    /// `service::task_launch::TaskLaunchService::launch`).
+    pub fn with_step_naming(mut self, step_naming: Arc<StepNaming>) -> Self {
+        self.step_naming = Some(step_naming);
         self
     }
 }
@@ -284,6 +310,31 @@ impl AsyncDispatcher for EngineDispatcher {
                 ref_: ref_.to_string(),
                 msg: format!("start_task: {e}"),
             })?;
+
+        // GH #23: snapshot the (already-built, Blueprint-wide) StepNaming
+        // table into `EngineState.step_namings` keyed by this dispatch's
+        // freshly-minted `tid` — the storage half of the "construct once
+        // (`Compiler::compile`), read many (`Engine::step_naming_for`)"
+        // contract. `None` (no `with_step_naming` call) is a no-op, same
+        // fail-open convention as the `run_ctx` step_entry append below:
+        // a secondary-persistence failure here must never mask the
+        // primary dispatch outcome.
+        if let Some(step_naming) = self.step_naming.clone() {
+            let tid_for_naming = tid.clone();
+            if let Err(e) = self
+                .engine
+                .with_state("EngineDispatcher::dispatch.step_naming", move |s| {
+                    s.step_namings.insert(tid_for_naming, step_naming);
+                })
+                .await
+            {
+                tracing::warn!(
+                    task_id = %tid,
+                    error = %e,
+                    "EngineDispatcher::dispatch: failed to snapshot StepNaming into EngineState"
+                );
+            }
+        }
 
         let run_id_for_ctx = self.run_ctx.as_ref().map(|rc| rc.run_id.clone());
         let outcome = self

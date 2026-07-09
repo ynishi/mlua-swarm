@@ -1286,9 +1286,9 @@ impl Engine {
                 .unwrap_or(None);
             let agent = task.spec.agent.clone();
             let context = s
-                .agent_contexts
+                .agent_ctx
                 .get(&(task_id_clone.clone(), attempt))
-                .cloned();
+                .map(|e| e.view.clone());
             Ok::<_, EngineError>(crate::types::WorkerPayload {
                 task_id: task_id_clone.clone(),
                 attempt,
@@ -1335,9 +1335,9 @@ impl Engine {
                 .unwrap_or(None);
             let agent = task.spec.agent.clone();
             let context = s
-                .agent_contexts
+                .agent_ctx
                 .get(&(task_id_clone.clone(), attempt))
-                .cloned();
+                .map(|e| e.view.clone());
             Ok::<_, EngineError>(crate::types::WorkerPayload {
                 task_id: task_id_clone.clone(),
                 attempt,
@@ -1353,9 +1353,9 @@ impl Engine {
     /// Returns the effective [`mlua_swarm_schema::ContextPolicy`]
     /// `AgentContextMiddleware` resolved and snapshotted for `(task_id,
     /// attempt)` at spawn time (the same policy already applied to that
-    /// key's `EngineState.agent_contexts` entry). Pass-all
-    /// (`ContextPolicy::default()`) when no entry exists — either a
-    /// pre-ST5 spawn, or a spawner stack that never layered
+    /// key's `EngineState.agent_ctx` entry's `.view`, GH #23 fold).
+    /// Pass-all (`ContextPolicy::default()`) when no entry exists — either
+    /// a pre-ST5 spawn, or a spawner stack that never layered
     /// `AgentContextMiddleware` (fail-open, mirroring [`Self::output_tail`]'s
     /// "no entry = empty default" convention).
     ///
@@ -1370,10 +1370,36 @@ impl Engine {
     ) -> mlua_swarm_schema::ContextPolicy {
         let key = (task_id.clone(), attempt);
         self.with_state("context_policy_for", move |s| {
-            s.context_policies.get(&key).cloned().unwrap_or_default()
+            s.agent_ctx
+                .get(&key)
+                .map(|e| e.policy.clone())
+                .unwrap_or_default()
         })
         .await
         .unwrap_or_default()
+    }
+
+    /// GH #23: returns the Blueprint-wide
+    /// [`crate::core::step_naming::StepNaming`] table snapshotted for
+    /// `task_id` (the same `Arc` `crate::blueprint::EngineDispatcher::dispatch`
+    /// stashed into `EngineState.step_namings` at dispatch time —
+    /// `Self::start_task`'s `StepId`, not the `TaskId` work item). `None`
+    /// when no entry exists — either the dispatcher was never given a
+    /// `StepNaming` (`EngineDispatcher::with_step_naming` not called) or
+    /// the lock could not be acquired; callers are expected to fall back
+    /// to the pre-GH-#23 runtime union rule in that case (subtask-2/3
+    /// consumers).
+    pub async fn step_naming_for(
+        &self,
+        task_id: &StepId,
+    ) -> Option<Arc<crate::core::step_naming::StepNaming>> {
+        let key = task_id.clone();
+        self.with_state("step_naming_for", move |s| {
+            s.step_namings.get(&key).cloned()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Returns the [`crate::core::agent_context::AgentContextView`]
@@ -1392,7 +1418,7 @@ impl Engine {
     ) -> Option<crate::core::agent_context::AgentContextView> {
         let key = (task_id.clone(), attempt);
         self.with_state("agent_context_for", move |s| {
-            s.agent_contexts.get(&key).cloned()
+            s.agent_ctx.get(&key).map(|e| e.view.clone())
         })
         .await
         .ok()
@@ -1467,12 +1493,21 @@ impl Engine {
     /// sink ([`Self::materialize_final_submission`]): (a) when
     /// [`Self::set_output_store`] has wired a Data-plane
     /// [`crate::store::output::OutputStore`], the event is dual-written
-    /// there (`producer_agent` = `TaskState.spec.agent`), and (b) when this
+    /// there (`producer_agent` = `TaskState.spec.agent`, resolved to its
+    /// GH #23 canonical projection name — see below), and (b) when this
     /// task's spawn ran through `AgentContextMiddleware` (so
-    /// `EngineState.agent_contexts` has a `work_dir` / `project_root` for
-    /// it), the value is additionally materialized to
-    /// `<root>/workspace/tasks/<task_id>/ctx/<producer_agent>.md` — see
+    /// `EngineState.agent_ctx` has a `.view.work_dir` / `.view.project_root`
+    /// for it), the value is additionally materialized to
+    /// `<root>/workspace/tasks/<task_id>/ctx/<canonical_agent>.md` — see
     /// `crate::core::projection`'s module doc.
+    ///
+    /// **GH #23 subtask-2 (canonical sink):** both writes above key off the
+    /// canonical name — `Engine::step_naming_for(task_id)`'s
+    /// `StepNaming::canonical_of_producer(producer_agent)` when a table was
+    /// snapshotted for this task (`EngineDispatcher::with_step_naming`),
+    /// else `producer_agent` unchanged (fail-open, byte-identical to
+    /// pre-GH-#23 behavior — see [`crate::core::step_naming`]'s module
+    /// doc).
     ///
     /// **Invariants** (Subtask 4): (1) this sink is fail-open — an
     /// unresolved root, an unconfigured `OutputStore`, or either one
@@ -1520,8 +1555,8 @@ impl Engine {
     ///
     /// Reads `(producer_agent, root)` via one read-only [`Self::with_state`]
     /// call — `producer_agent` off `TaskState.spec.agent`, `root` off
-    /// `EngineState.agent_contexts[(task_id, attempt)].work_dir` (falling
-    /// back to `.project_root`), the same snapshot
+    /// `EngineState.agent_ctx[(task_id, attempt)].view.work_dir` (falling
+    /// back to `.view.project_root`), the same snapshot
     /// `crate::middleware::agent_context::AgentContextMiddleware` writes at
     /// spawn time — then does its actual (dual-write / file-write) work
     /// *outside* that lock, so a slow disk write or Data-plane store call
@@ -1541,9 +1576,14 @@ impl Engine {
                     .get(&task_id_for_lookup)
                     .map(|t| t.spec.agent.clone());
                 let root = s
-                    .agent_contexts
+                    .agent_ctx
                     .get(&(task_id_for_lookup.clone(), attempt))
-                    .and_then(|view| view.work_dir.clone().or_else(|| view.project_root.clone()));
+                    .and_then(|e| {
+                        e.view
+                            .work_dir
+                            .clone()
+                            .or_else(|| e.view.project_root.clone())
+                    });
                 (producer_agent, root)
             })
             .await;
@@ -1565,13 +1605,34 @@ impl Engine {
             return;
         };
 
+        // GH #23 subtask-2: resolve `producer_agent` to its canonical
+        // projection name via the Blueprint-wide `StepNaming` table
+        // snapshotted at dispatch time (`Engine::step_naming_for`). Both
+        // write paths below ((a) data-plane, (b) file stem) use the
+        // *canonical* name — `StepNaming::canonical_of_producer` returns
+        // `producer_agent` unchanged for undeclared steps (byte-identical
+        // to pre-GH-#23 behavior), and `None` (no table for this
+        // `task_id`, e.g. a spawn that never went through
+        // `EngineDispatcher::with_step_naming`) is a defensive fail-open
+        // to the raw `producer_agent`, same discipline as the rest of this
+        // sink.
+        let canonical_agent = self
+            .step_naming_for(task_id)
+            .await
+            .and_then(|naming| {
+                naming
+                    .canonical_of_producer(&producer_agent)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| producer_agent.clone());
+
         // (a) Data-plane dual-write, when an OutputStore backend is wired.
         if let Some(store) = self.output_store_backend() {
             if let Err(err) = store
                 .append(
                     task_id.as_str(),
                     attempt,
-                    &producer_agent,
+                    &canonical_agent,
                     crate::worker::output::OutputEvent::Final {
                         content: content.clone(),
                         ok,
@@ -1583,6 +1644,7 @@ impl Engine {
                 tracing::warn!(
                     %task_id,
                     agent = %producer_agent,
+                    canonical = %canonical_agent,
                     error = %err,
                     "submit-time projection sink: OutputStore dual-write failed (fail-open)"
                 );
@@ -1594,6 +1656,7 @@ impl Engine {
             tracing::warn!(
                 %task_id,
                 agent = %producer_agent,
+                canonical = %canonical_agent,
                 "submit-time projection sink: no work_dir/project_root resolved; skipping file materialize (fail-open)"
             );
             return;
@@ -1613,7 +1676,7 @@ impl Engine {
         let key = crate::core::projection::ProjectionKey {
             task_id: task_id.to_string(),
             run_id: None,
-            step: Some(producer_agent.clone()),
+            step: Some(canonical_agent.clone()),
             path: None,
         };
         let adapter = crate::core::projection::FileProjectionAdapter::new(root);
@@ -1621,6 +1684,7 @@ impl Engine {
             tracing::warn!(
                 %task_id,
                 agent = %producer_agent,
+                canonical = %canonical_agent,
                 error = %err,
                 "submit-time projection sink: file materialize failed (fail-open)"
             );
@@ -2500,7 +2564,7 @@ mod submit_time_projection_sink_tests {
         (engine, op_token, task_id, worker_token)
     }
 
-    /// Seeds `EngineState.agent_contexts[(task_id, attempt)]` directly —
+    /// Seeds `EngineState.agent_ctx[(task_id, attempt)].view` directly —
     /// the same snapshot `AgentContextMiddleware` writes at spawn time
     /// (see its module doc), stood up here without the full spawner
     /// stack so these tests can exercise `submit_output` in isolation.
@@ -2509,16 +2573,82 @@ mod submit_time_projection_sink_tests {
         let work_dir = work_dir.to_string();
         engine
             .with_state("test.seed_agent_context", move |s| {
-                s.agent_contexts.insert(
+                s.agent_ctx.insert(
                     (task_id, attempt),
-                    AgentContextView {
-                        work_dir: Some(work_dir),
-                        ..Default::default()
+                    crate::core::state::AgentCtxEntry {
+                        view: AgentContextView {
+                            work_dir: Some(work_dir),
+                            ..Default::default()
+                        },
+                        policy: Default::default(),
                     },
                 );
             })
             .await
-            .expect("seed agent_contexts");
+            .expect("seed agent_ctx");
+    }
+
+    /// GH #23 subtask-2: builds a fixture
+    /// [`crate::core::step_naming::StepNaming`] table declaring `producer`
+    /// → `canonical` (`AgentMeta.projection_name`), then seeds it into
+    /// `EngineState.step_namings` for `task_id` — the same snapshot
+    /// `EngineDispatcher::dispatch` stashes at dispatch time
+    /// (`blueprint.rs`'s "construct once, read many" contract), stood up
+    /// here without the full Blueprint-compile path so these tests can
+    /// exercise the canonical-sink resolution in isolation.
+    async fn seed_step_naming(engine: &Engine, task_id: &StepId, producer: &str, canonical: &str) {
+        use crate::blueprint::{
+            current_schema_version, AgentDef, AgentKind, AgentMeta, Blueprint, BlueprintMetadata,
+            CompilerHints, CompilerStrategy,
+        };
+        use crate::core::step_naming::StepNaming;
+        use mlua_flow_ir::{Expr, Node};
+
+        let flow = Node::Step {
+            ref_: producer.to_string(),
+            in_: Expr::Path {
+                at: "$.in".to_string(),
+            },
+            out: Expr::Path {
+                at: format!("$.{producer}_out"),
+            },
+        };
+        let bp = Blueprint {
+            schema_version: current_schema_version(),
+            id: "sink-canonical-ut".into(),
+            flow,
+            agents: vec![AgentDef {
+                name: producer.to_string(),
+                kind: AgentKind::RustFn,
+                spec: serde_json::json!({ "fn_id": producer }),
+                profile: None,
+                meta: Some(AgentMeta {
+                    projection_name: Some(canonical.to_string()),
+                    ..Default::default()
+                }),
+            }],
+            operators: vec![],
+            metas: vec![],
+            hints: CompilerHints::default(),
+            strategy: CompilerStrategy::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+        };
+        let (naming, warnings) = StepNaming::from_blueprint(&bp).expect("no collision");
+        assert!(warnings.is_empty(), "single-step fixture has no collisions");
+        let naming = Arc::new(naming);
+        let task_id = task_id.clone();
+        engine
+            .with_state("test.seed_step_naming", move |s| {
+                s.step_namings.insert(task_id, naming);
+            })
+            .await
+            .expect("seed step_namings");
     }
 
     fn final_event(value: Value, ok: bool) -> crate::worker::output::OutputEvent {
@@ -2560,7 +2690,7 @@ mod submit_time_projection_sink_tests {
         assert!(body.contains(r#""plan": "do it""#), "body: {body}");
     }
 
-    /// Subtask 4 Test #3: `work_dir` unresolved (no `agent_contexts`
+    /// Subtask 4 Test #3: `work_dir` unresolved (no `agent_ctx`
     /// snapshot for this `(task_id, attempt)`) — submit still succeeds,
     /// fail-open, no file.
     #[tokio::test]
@@ -2692,5 +2822,120 @@ mod submit_time_projection_sink_tests {
             .await
             .expect("dual-written record");
         assert!(matches!(record.event, OutputEvent::Final { ok: true, .. }));
+    }
+
+    /// GH #23 subtask-2 (canonical sink): a declared `projection_name`
+    /// (`AgentMeta.projection_name`, surfaced via `StepNaming`) redirects
+    /// `submit_output`'s Final canonical sink — both the Data-plane
+    /// dual-write name and the materialized file stem resolve to the
+    /// canonical name, not the raw `producer_agent`.
+    #[tokio::test]
+    async fn submit_output_final_uses_canonical_name_when_step_naming_declares_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (engine, _op, task_id, worker_token) = seeded_task("reviewer").await;
+        seed_agent_context(&engine, &task_id, 1, &dir.path().to_string_lossy()).await;
+        seed_step_naming(&engine, &task_id, "reviewer", "verdict-final").await;
+        let data_store: Arc<dyn crate::store::output::OutputStore> =
+            Arc::new(InMemoryOutputStore::new());
+        engine.set_output_store(data_store.clone());
+
+        engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!({"verdict": "pass"}), true),
+            )
+            .await
+            .expect("submit_output");
+
+        let record = data_store
+            .get_latest_by_name("verdict-final")
+            .await
+            .expect("dual-written record under canonical name");
+        assert!(matches!(record.event, OutputEvent::Final { ok: true, .. }));
+        assert!(
+            data_store.get_latest_by_name("reviewer").await.is_err(),
+            "raw producer_agent name must not be written once canonical resolves"
+        );
+
+        let expected_file = dir
+            .path()
+            .join("workspace/tasks")
+            .join(task_id.as_str())
+            .join("ctx/verdict-final.md");
+        assert!(
+            expected_file.exists(),
+            "materialized file stem must be canonical at {expected_file:?}"
+        );
+    }
+
+    /// GH #23 subtask-2: no `StepNaming` table snapshotted for this
+    /// `task_id` (the pre-GH-#23 / no-`with_step_naming` path) is a
+    /// defensive fail-open — the canonical sink falls back to the raw
+    /// `producer_agent`, byte-identical to
+    /// `submit_output_final_dual_writes_into_configured_output_store`
+    /// above (which never calls `seed_step_naming`).
+    #[tokio::test]
+    async fn submit_output_final_falls_back_to_producer_agent_when_no_step_naming_table() {
+        let (engine, _op, task_id, worker_token) = seeded_task("reviewer").await;
+        let data_store: Arc<dyn crate::store::output::OutputStore> =
+            Arc::new(InMemoryOutputStore::new());
+        engine.set_output_store(data_store.clone());
+
+        engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!({"verdict": "pass"}), true),
+            )
+            .await
+            .expect("submit_output");
+
+        let record = data_store
+            .get_latest_by_name("reviewer")
+            .await
+            .expect("fail-open dual-write under raw producer_agent name");
+        assert!(matches!(record.event, OutputEvent::Final { ok: true, .. }));
+    }
+
+    /// GH #23 subtask-2 (Layer 2): `OutputStore::get_latest_by_name_in_run`
+    /// resolves the value `submit_output` dual-wrote for this exact
+    /// `(task_id, attempt)` run, independent of `get_latest_by_name`'s
+    /// cross-Run race (two Runs sharing a producer name never bleed into
+    /// each other through the Run-scoped accessor).
+    #[tokio::test]
+    async fn submit_output_final_is_resolvable_via_run_scoped_lookup() {
+        let (engine, _op, task_id, worker_token) = seeded_task("reviewer").await;
+        let data_store: Arc<dyn crate::store::output::OutputStore> =
+            Arc::new(InMemoryOutputStore::new());
+        engine.set_output_store(data_store.clone());
+
+        engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!({"verdict": "pass"}), true),
+            )
+            .await
+            .expect("submit_output");
+
+        let record = data_store
+            .get_latest_by_name_in_run(task_id.as_str(), 1, "reviewer")
+            .await
+            .expect("run-scoped lookup resolves the dual-written record");
+        assert!(matches!(record.event, OutputEvent::Final { ok: true, .. }));
+
+        // A different attempt of the same task must not resolve — the
+        // Run-scoped lookup does not fall back across attempts.
+        assert!(
+            data_store
+                .get_latest_by_name_in_run(task_id.as_str(), 2, "reviewer")
+                .await
+                .is_err(),
+            "a different attempt must not resolve the same-named record"
+        );
     }
 }

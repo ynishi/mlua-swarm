@@ -10,6 +10,11 @@
 //!   contract) via an autoincrementing `seq` column.
 //! - `get_latest_by_name` picks the row with the largest `seq` for a given
 //!   `producer_agent`.
+//! - `get_latest_by_name_in_run` (GH #23 Layer 2) is the same query
+//!   additionally filtered to one `(task_id, attempt)` run — see
+//!   `ix_outputs_producer_run`, applied idempotently via `CREATE INDEX IF
+//!   NOT EXISTS` on every `open`/`open_in_memory` call, so no migration
+//!   step is needed for pre-existing databases.
 
 use super::{OutputEvent, OutputRecord, OutputRef, OutputStore, OutputStoreError};
 use async_trait::async_trait;
@@ -29,6 +34,7 @@ CREATE TABLE IF NOT EXISTS outputs (\
 );\
 CREATE INDEX IF NOT EXISTS ix_outputs_attempt ON outputs(task_id, attempt, seq);\
 CREATE INDEX IF NOT EXISTS ix_outputs_producer ON outputs(producer_agent, seq);\
+CREATE INDEX IF NOT EXISTS ix_outputs_producer_run ON outputs(producer_agent, task_id, attempt, seq);\
 ";
 
 /// SQLite-backed [`OutputStore`].
@@ -196,6 +202,50 @@ impl OutputStore for SqliteOutputStore {
         }
     }
 
+    async fn get_latest_by_name_in_run(
+        &self,
+        task_id: &str,
+        attempt: u32,
+        name: &str,
+    ) -> Result<OutputRecord, OutputStoreError> {
+        let name_str = name.to_string();
+        let task_id_str = task_id.to_string();
+        let task_id_for_notfound = task_id.to_string();
+        let name_for_notfound = name.to_string();
+        let attempt_i64 = attempt as i64;
+        let row = self
+            .isle
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT id, task_id, attempt, producer_agent, event_json, parent_refs_json \
+                     FROM outputs WHERE producer_agent = ?1 AND task_id = ?2 AND attempt = ?3 \
+                     ORDER BY seq DESC LIMIT 1",
+                    params![name_str, task_id_str, attempt_i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    },
+                )
+                .optional()
+            })
+            .await
+            .map_err(map_isle_err)?;
+        match row {
+            Some((id, task_id, attempt, producer, event, parent)) => {
+                decode_record(id, task_id, attempt, producer, event, parent)
+            }
+            None => Err(OutputStoreError::NotFound(format!(
+                "{task_id_for_notfound}/{attempt}/{name_for_notfound}"
+            ))),
+        }
+    }
+
     async fn list_for_attempt(
         &self,
         task_id: &str,
@@ -336,6 +386,67 @@ mod tests {
     async fn get_latest_by_name_unknown_returns_not_found() {
         let (s, driver) = SqliteOutputStore::open_in_memory().await.unwrap();
         let err = s.get_latest_by_name("nobody").await.unwrap_err();
+        assert!(matches!(err, OutputStoreError::NotFound(_)));
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_latest_by_name_in_run_does_not_cross_resolve_between_runs() {
+        let (s, driver) = SqliteOutputStore::open_in_memory().await.unwrap();
+        let id_t1 = s
+            .append("t1", 1, "same-producer", mk_final("run-1", true), vec![])
+            .await
+            .unwrap();
+        let id_t2 = s
+            .append("t2", 1, "same-producer", mk_final("run-2", true), vec![])
+            .await
+            .unwrap();
+
+        let got_t1 = s
+            .get_latest_by_name_in_run("t1", 1, "same-producer")
+            .await
+            .unwrap();
+        assert_eq!(got_t1.id, id_t1, "must not cross-resolve to t2's emit");
+
+        let got_t2 = s
+            .get_latest_by_name_in_run("t2", 1, "same-producer")
+            .await
+            .unwrap();
+        assert_eq!(got_t2.id, id_t2, "must not cross-resolve to t1's emit");
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_latest_by_name_in_run_returns_newest_within_run() {
+        let (s, driver) = SqliteOutputStore::open_in_memory().await.unwrap();
+        let _ = s
+            .append("t", 1, "p", mk_final("first", true), vec![])
+            .await
+            .unwrap();
+        let id2 = s
+            .append("t", 1, "p", mk_final("second", true), vec![])
+            .await
+            .unwrap();
+        let got = s.get_latest_by_name_in_run("t", 1, "p").await.unwrap();
+        assert_eq!(got.id, id2, "latest emit within the run wins");
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_latest_by_name_in_run_wrong_run_returns_not_found() {
+        let (s, driver) = SqliteOutputStore::open_in_memory().await.unwrap();
+        let _ = s
+            .append("t", 1, "same-producer", mk_final("x", true), vec![])
+            .await
+            .unwrap();
+        // Right name, wrong attempt — must not fall back to a different run.
+        let err = s
+            .get_latest_by_name_in_run("t", 2, "same-producer")
+            .await
+            .unwrap_err();
         assert!(matches!(err, OutputStoreError::NotFound(_)));
         drop(s);
         driver.shutdown().await.unwrap();
