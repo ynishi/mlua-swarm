@@ -29,6 +29,7 @@
 //! | `mse://guides/mcp-tool-reference`            | All `mse mcp` tools grouped by family.             |
 //! | `mse://guides/id-lifecycle`                  | Canonical ID inventory + lifecycle (issue #11).     |
 //! | `mse://guides/operator-execution-model`      | 3-hop execution model for `AgentKind::Operator` (WS thin-path). |
+//! | `mse://guides/agent-md-authoring`            | SubAgent (agent.md) canonical shape, size targets, fetch-vs-embed policy. |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
@@ -79,6 +80,7 @@ const MCP_TOOL_REFERENCE_BODY: &str = include_str!("./resources/guides/mcp-tool-
 const ID_LIFECYCLE_BODY: &str = include_str!("./resources/guides/id-lifecycle.md");
 const OPERATOR_EXECUTION_MODEL_BODY: &str =
     include_str!("./resources/guides/operator-execution-model.md");
+const AGENT_MD_AUTHORING_BODY: &str = include_str!("./resources/guides/agent-md-authoring.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -121,6 +123,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "The three-hop execution model for AgentKind::Operator (WS thin-path): Task IF → mse-server splice → MainAI → SubAgent. Explains the responsibility boundary at each hop.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(OPERATOR_EXECUTION_MODEL_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/agent-md-authoring",
+        title: "mse — Agent (agent.md) authoring guide",
+        description: "SubAgent prompt canonical shape (Role / When invoked / Tool guidance / Output format), size targets (≤ 200 lines / 25 KB), fetch-vs-embed policy for system_prompt / lightweight ctx / PreOut, and anti-patterns (CLAUDE.md duplication, accident logs, tool schema re-statement).",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(AGENT_MD_AUTHORING_BODY),
     },
     ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",

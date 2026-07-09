@@ -129,6 +129,95 @@ struct DoctorReq {
     bind: Option<String>,
 }
 
+/// Default `agent.md` size thresholds used by the `bp_doctor` tool when the
+/// caller does not override them.
+///
+/// Rationale is in the guide `mse://guides/agent-md-authoring §Size targets`:
+/// the fetched `system_prompt` body has to leave headroom in the SubAgent's
+/// context window for the actual task payload (Read results, `tool_result`
+/// bodies, PreOut file contents). Well above these thresholds, SubAgents on
+/// a 200 K-window model deterministically fail with "Prompt is too long" on
+/// the first non-trivial follow-up payload.
+///
+/// The BLOCK band is a report label, **not** enforcement — `bp_doctor` never
+/// prevents any dispatch. Models with larger context windows (e.g. Opus-tier
+/// or long-window Fable variants) can override the thresholds per call or
+/// pass `disable_block=true` to skip the BLOCK band entirely.
+const AGENT_MD_DEFAULT_WARN_BYTES: usize = 25 * 1024;
+const AGENT_MD_DEFAULT_WARN_LINES: usize = 200;
+const AGENT_MD_DEFAULT_BLOCK_BYTES: usize = 50 * 1024;
+const AGENT_MD_DEFAULT_BLOCK_LINES: usize = 500;
+
+/// Resolved severity thresholds for a single `bp_doctor` invocation. Built
+/// from `BpDoctorReq`, applying defaults where the caller omitted a field.
+#[derive(Debug, Clone, Copy)]
+struct AgentMdThresholds {
+    warn_bytes: usize,
+    warn_lines: usize,
+    block_bytes: usize,
+    block_lines: usize,
+    /// When true, BLOCK is not emitted — an agent that would otherwise be
+    /// BLOCK is reported as WARN instead (bytes/lines still shown raw).
+    disable_block: bool,
+}
+
+impl AgentMdThresholds {
+    fn from_req(
+        warn_bytes: Option<usize>,
+        warn_lines: Option<usize>,
+        block_bytes: Option<usize>,
+        block_lines: Option<usize>,
+        disable_block: Option<bool>,
+    ) -> Self {
+        Self {
+            warn_bytes: warn_bytes.unwrap_or(AGENT_MD_DEFAULT_WARN_BYTES),
+            warn_lines: warn_lines.unwrap_or(AGENT_MD_DEFAULT_WARN_LINES),
+            block_bytes: block_bytes.unwrap_or(AGENT_MD_DEFAULT_BLOCK_BYTES),
+            block_lines: block_lines.unwrap_or(AGENT_MD_DEFAULT_BLOCK_LINES),
+            // BLOCK is disabled by default. Modern Claude models (Opus-tier
+            // and long-window Fable variants) tolerate large system prompts,
+            // and the tool never enforces anything anyway — the label alone
+            // is not worth the false alarm. Callers who want the BLOCK band
+            // pass `disable_block=false` explicitly.
+            disable_block: disable_block.unwrap_or(true),
+        }
+    }
+}
+
+/// Pure classifier for `agent.md` severity — kept out of the tool method so it
+/// is directly unit-testable. Returns `"OK" | "WARN" | "BLOCK"`.
+///
+/// BLOCK dominates WARN when either dimension trips the higher band. When
+/// `thresholds.disable_block` is true, no agent is ever reported as BLOCK;
+/// over-block-threshold agents fall back to WARN.
+fn classify_agent_md_severity(
+    bytes: usize,
+    lines: usize,
+    thresholds: &AgentMdThresholds,
+) -> &'static str {
+    let over_block = bytes >= thresholds.block_bytes || lines >= thresholds.block_lines;
+    if over_block && !thresholds.disable_block {
+        "BLOCK"
+    } else if bytes >= thresholds.warn_bytes || lines >= thresholds.warn_lines {
+        "WARN"
+    } else {
+        "OK"
+    }
+}
+
+/// Aggregate the overall Blueprint verdict from per-agent severities.
+/// BLOCK dominates WARN dominates OK. An empty list is OK (nothing to warn
+/// about — the Blueprint has no agent bodies to fetch).
+fn aggregate_agent_md_verdict(severities: &[&str]) -> &'static str {
+    if severities.contains(&"BLOCK") {
+        "BLOCK"
+    } else if severities.contains(&"WARN") {
+        "WARN"
+    } else {
+        "OK"
+    }
+}
+
 fn default_true_bool() -> bool {
     true
 }
@@ -155,6 +244,39 @@ struct BpUnarchiveReq {
     /// mse serve bind address (default 127.0.0.1:7777).
     #[serde(default)]
     bind: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct BpDoctorReq {
+    /// Blueprint id to inspect (agent `profile.system_prompt` bodies are what
+    /// the SubAgent receives via fetch — this tool measures those directly).
+    id: String,
+    /// mse serve bind address (default 127.0.0.1:7777).
+    #[serde(default)]
+    bind: Option<String>,
+    /// Override WARN byte threshold. Default 25 * 1024 (25 KB). Set higher
+    /// when targeting a large-context model.
+    #[serde(default)]
+    warn_bytes: Option<usize>,
+    /// Override WARN line threshold. Default 200.
+    #[serde(default)]
+    warn_lines: Option<usize>,
+    /// Override BLOCK byte threshold. Default 50 * 1024 (50 KB). Ignored
+    /// when `disable_block=true`.
+    #[serde(default)]
+    block_bytes: Option<usize>,
+    /// Override BLOCK line threshold. Default 500. Ignored when
+    /// `disable_block=true`.
+    #[serde(default)]
+    block_lines: Option<usize>,
+    /// When true (default), the BLOCK severity band is not emitted —
+    /// over-threshold agents fall back to WARN. BLOCK is disabled by
+    /// default because modern Claude models (Opus-tier / long-window Fable
+    /// variants) tolerate large system prompts, and this tool never
+    /// enforces anything. Pass `disable_block=false` to opt into the BLOCK
+    /// band when running against a strict 200 K-window model.
+    #[serde(default)]
+    disable_block: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1154,6 +1276,95 @@ impl MseServer {
     }
 
     #[tool(
+        description = "Per-Blueprint agent.md size check. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0."
+    )]
+    async fn bp_doctor(
+        &self,
+        Parameters(req): Parameters<BpDoctorReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let bind = req
+            .bind
+            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+        let thresholds = AgentMdThresholds::from_req(
+            req.warn_bytes,
+            req.warn_lines,
+            req.block_bytes,
+            req.block_lines,
+            req.disable_block,
+        );
+        let url = format!("http://{bind}/v1/blueprints/{}/head", req.id);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| McpError::internal_error(format!("bp_doctor fetch: {e}"), None))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return json_result(&serde_json::json!({
+                "bp_id": req.id,
+                "bind": bind,
+                "http_status": status.as_u16(),
+                "error": body,
+                "guide_ref": "mse://guides/agent-md-authoring",
+            }));
+        }
+        let head: JsonValue = resp
+            .json()
+            .await
+            .map_err(|e| McpError::internal_error(format!("bp_doctor decode: {e}"), None))?;
+        let bp_value = head.get("blueprint").cloned().ok_or_else(|| {
+            McpError::internal_error("bp_doctor: response missing `blueprint`", None)
+        })?;
+        let bp: Blueprint = serde_json::from_value(bp_value)
+            .map_err(|e| McpError::internal_error(format!("bp_doctor bp parse: {e}"), None))?;
+
+        let mut per_agent = Vec::with_capacity(bp.agents.len());
+        let mut severities: Vec<&'static str> = Vec::with_capacity(bp.agents.len());
+        for agent in &bp.agents {
+            let (bytes, lines) = match &agent.profile {
+                Some(p) => (p.system_prompt.len(), p.system_prompt.lines().count()),
+                None => (0usize, 0usize),
+            };
+            let severity = classify_agent_md_severity(bytes, lines, &thresholds);
+            severities.push(severity);
+            per_agent.push(serde_json::json!({
+                "name": agent.name,
+                "kind": format!("{:?}", agent.kind),
+                "has_profile": agent.profile.is_some(),
+                "bytes": bytes,
+                "lines": lines,
+                "severity": severity,
+            }));
+        }
+        let verdict = aggregate_agent_md_verdict(&severities);
+        let over_threshold_count = severities.iter().filter(|s| **s != "OK").count();
+
+        let body = serde_json::json!({
+            "bp_id": req.id,
+            "bind": bind,
+            "http_status": status.as_u16(),
+            "verdict": verdict,
+            "agent_count": bp.agents.len(),
+            "over_threshold_count": over_threshold_count,
+            "thresholds": {
+                "warn_bytes": thresholds.warn_bytes,
+                "warn_lines": thresholds.warn_lines,
+                "block_bytes": thresholds.block_bytes,
+                "block_lines": thresholds.block_lines,
+                "disable_block": thresholds.disable_block,
+            },
+            "agents": per_agent,
+            "guide_ref": "mse://guides/agent-md-authoring",
+        });
+        json_result(&body)
+    }
+
+    #[tool(
         description = "Doctor snapshot: mse mcp self state (in-process store = InMemory ephemeral) + server-side config (backend / store root / ref_base / registered BP list) fetched from GET /v1/doctor. Answers 'where is the store?' and 'how many BPs are registered?' in a single call."
     )]
     async fn mse_doctor(
@@ -1905,5 +2116,152 @@ mod tests {
             inner.runs.get(&run_id).unwrap().status,
             RunStatus::Cancelled
         ));
+    }
+
+    // --- agent.md size classifier tests (bp_doctor pure logic) ---
+
+    /// Default request thresholds — matches what a caller with no override
+    /// gets. Note that `disable_block` defaults to `true` here, so BLOCK is
+    /// only exercised in tests that explicitly pass `Some(false)`.
+    fn default_thresholds() -> AgentMdThresholds {
+        AgentMdThresholds::from_req(None, None, None, None, None)
+    }
+
+    /// Same defaults, but with the BLOCK band explicitly re-enabled. Used
+    /// by tests that verify the BLOCK classification logic itself.
+    fn block_enabled_thresholds() -> AgentMdThresholds {
+        AgentMdThresholds::from_req(None, None, None, None, Some(false))
+    }
+
+    #[test]
+    fn classify_agent_md_severity_ok_at_zero() {
+        assert_eq!(classify_agent_md_severity(0, 0, &default_thresholds()), "OK");
+    }
+
+    #[test]
+    fn classify_agent_md_severity_ok_just_under_warn() {
+        assert_eq!(
+            classify_agent_md_severity(
+                AGENT_MD_DEFAULT_WARN_BYTES - 1,
+                AGENT_MD_DEFAULT_WARN_LINES - 1,
+                &default_thresholds()
+            ),
+            "OK"
+        );
+    }
+
+    #[test]
+    fn classify_agent_md_severity_warn_at_byte_threshold() {
+        // exactly 25 KB, 0 lines → WARN by bytes alone.
+        assert_eq!(
+            classify_agent_md_severity(AGENT_MD_DEFAULT_WARN_BYTES, 0, &default_thresholds()),
+            "WARN"
+        );
+    }
+
+    #[test]
+    fn classify_agent_md_severity_warn_at_line_threshold() {
+        // 0 bytes, 200 lines → WARN by lines alone.
+        assert_eq!(
+            classify_agent_md_severity(0, AGENT_MD_DEFAULT_WARN_LINES, &default_thresholds()),
+            "WARN"
+        );
+    }
+
+    #[test]
+    fn classify_agent_md_severity_block_at_byte_threshold() {
+        // exactly 50 KB, few lines → BLOCK by bytes alone (block band opted in).
+        assert_eq!(
+            classify_agent_md_severity(
+                AGENT_MD_DEFAULT_BLOCK_BYTES,
+                10,
+                &block_enabled_thresholds()
+            ),
+            "BLOCK"
+        );
+    }
+
+    #[test]
+    fn classify_agent_md_severity_block_at_line_threshold() {
+        // small bytes, 500 lines → BLOCK by lines alone (block band opted in).
+        assert_eq!(
+            classify_agent_md_severity(
+                1024,
+                AGENT_MD_DEFAULT_BLOCK_LINES,
+                &block_enabled_thresholds()
+            ),
+            "BLOCK"
+        );
+    }
+
+    #[test]
+    fn classify_agent_md_severity_block_dominates_warn_mixed() {
+        // 25 KB (WARN by bytes) but 500 lines (BLOCK by lines) → BLOCK wins
+        // (block band opted in).
+        assert_eq!(
+            classify_agent_md_severity(
+                AGENT_MD_DEFAULT_WARN_BYTES,
+                AGENT_MD_DEFAULT_BLOCK_LINES,
+                &block_enabled_thresholds()
+            ),
+            "BLOCK"
+        );
+    }
+
+    #[test]
+    fn classify_agent_md_severity_default_disables_block_downgrades_to_warn() {
+        // 60 KB, 600 lines would BLOCK if opted in; with default (disable_block=true) → WARN.
+        assert_eq!(
+            classify_agent_md_severity(60 * 1024, 600, &default_thresholds()),
+            "WARN"
+        );
+    }
+
+    #[test]
+    fn classify_agent_md_severity_default_disables_block_leaves_ok_alone() {
+        // Small file stays OK under defaults regardless of disable_block.
+        assert_eq!(
+            classify_agent_md_severity(1024, 20, &default_thresholds()),
+            "OK"
+        );
+    }
+
+    #[test]
+    fn classify_agent_md_severity_custom_warn_override_raises_bar() {
+        // Raise both WARN (100 KB / 1000 lines) and BLOCK (200 KB / 2000 lines),
+        // with BLOCK band explicitly opted in so we can observe all 3 bands.
+        let t = AgentMdThresholds::from_req(
+            Some(100 * 1024),
+            Some(1000),
+            Some(200 * 1024),
+            Some(2000),
+            Some(false),
+        );
+        assert_eq!(classify_agent_md_severity(50 * 1024, 400, &t), "OK");
+        assert_eq!(classify_agent_md_severity(120 * 1024, 400, &t), "WARN");
+        assert_eq!(classify_agent_md_severity(210 * 1024, 400, &t), "BLOCK");
+    }
+
+    #[test]
+    fn aggregate_agent_md_verdict_empty_is_ok() {
+        assert_eq!(aggregate_agent_md_verdict(&[]), "OK");
+    }
+
+    #[test]
+    fn aggregate_agent_md_verdict_all_ok() {
+        assert_eq!(aggregate_agent_md_verdict(&["OK", "OK", "OK"]), "OK");
+    }
+
+    #[test]
+    fn aggregate_agent_md_verdict_warn_dominates_ok() {
+        assert_eq!(aggregate_agent_md_verdict(&["OK", "WARN", "OK"]), "WARN");
+    }
+
+    #[test]
+    fn aggregate_agent_md_verdict_block_dominates_all() {
+        assert_eq!(
+            aggregate_agent_md_verdict(&["OK", "WARN", "BLOCK", "WARN"]),
+            "BLOCK"
+        );
     }
 }
