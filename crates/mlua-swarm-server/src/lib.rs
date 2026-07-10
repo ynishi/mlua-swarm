@@ -96,10 +96,12 @@ pub use operator_ws::{
 };
 pub use projection::{McpQueryAdapter, ProjectionSource, StepList, StepPathQuery, StepSummary};
 pub use tasks::{RunKickRequest, RunKickResponse, TaskDetailResponse};
-pub use worker::{worker_prompt, worker_result, PromptQuery, WorkerResultReq};
+pub use worker::{
+    worker_artifact, worker_prompt, worker_result, ArtifactQuery, PromptQuery, WorkerResultReq,
+};
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -377,8 +379,21 @@ pub fn build_router_full(
         // endpoints directly over HTTP. See the `worker` module doc for details.
         .route("/v1/worker/prompt", get(worker::worker_prompt))
         .route("/v1/worker/result", post(worker::worker_result))
-        // Simplified endpoint (= worker POSTs with just token + raw body; task_id is auto-looked-up)
-        .route("/v1/worker/submit", post(worker::worker_submit))
+        // Simplified endpoint (= worker POSTs with just token + raw body; task_id is auto-looked-up).
+        // `DefaultBodyLimit::max` is applied explicitly here (and on the sibling
+        // `/v1/worker/artifact` below) — same 2MB axum ships as its implicit
+        // global default, made visible rather than relied on silently.
+        .route(
+            "/v1/worker/submit",
+            post(worker::worker_submit).layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
+        // GH #36 ST1: named multi-part worker output. A worker stages one
+        // named part per POST here, then completes the attempt with the
+        // ordinary `/v1/worker/submit` above — see the `worker` module doc.
+        .route(
+            "/v1/worker/artifact",
+            post(worker::worker_artifact).layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
         // GH #31: `Http`-mode fetch target for `system_ref.uri` (raw baked system
         // bytes, same Bearer flow as `/v1/worker/prompt`) + live per-agent render-size
         // lookup for `bp_doctor` (no Bearer, same trust tier as blueprints `get_head`).

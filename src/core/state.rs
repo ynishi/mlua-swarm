@@ -609,6 +609,22 @@ pub struct EngineState {
     /// `submit_output`; the dispatch path pulls the terminal
     /// `OutputEvent::Final` off the tail and decides Pass / Blocked.
     pub output_store: HashMap<(StepId, u32), Vec<crate::worker::output::OutputEvent>>,
+    /// GH #36 ST1 (named multi-part worker output): the set of `Artifact`
+    /// names staged via `Engine::stage_worker_artifact_trusted` (= `POST
+    /// /v1/worker/artifact`) for `(task_id, attempt)`, in staging order.
+    ///
+    /// `output_store` is a SHARED per-attempt tail — besides a worker's own
+    /// staged parts, other producers append `OutputEvent::Artifact` events
+    /// to the SAME tail too (e.g. `AfterRunAuditMiddleware`'s
+    /// `"audit:<step_ref>"` sidecar finding, an intentionally
+    /// BP-chain-invisible observation — see `Engine::submit_output`'s doc,
+    /// "`Artifact` dual-write" section). `Engine::dispatch_attempt_with`'s
+    /// Final-pull assembly must fold ONLY a worker's own named parts into
+    /// `"parts"`, not every `Artifact` that happens to land on the tail —
+    /// this set is that distinguishing signal, so a step under audit keeps
+    /// its BP-chain value byte-identical to pre-GH-#36 unless the WORKER
+    /// itself opted in via `/v1/worker/artifact`.
+    pub worker_artifact_names: HashMap<(StepId, u32), Vec<String>>,
     /// Bounded in-process tail of recent `Event`s (most recent last),
     /// trimmed to `event_log_max` by `push_event`.
     pub event_log_tail: Vec<Event>,
@@ -635,6 +651,7 @@ impl EngineState {
             task_notifies: HashMap::new(),
             resources: HashMap::new(),
             output_store: HashMap::new(),
+            worker_artifact_names: HashMap::new(),
             event_log_tail: Vec::new(),
             event_log_max: 1024,
         }

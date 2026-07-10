@@ -95,6 +95,82 @@ pub(crate) fn render_directive_to_string(v: &Value) -> String {
     }
 }
 
+/// Renders a [`crate::worker::output::ContentRef`] down to the `Value` shape
+/// the BP-chain / `DispatchOutcome` consume. `Inline` passes its `value`
+/// through verbatim; `FileRef` is stringified into the same
+/// `{"file_ref", "mime", "size_hint"}` shape `materialize_final_submission`
+/// uses for its own file-materialize projection — one canonical
+/// stringification, not two independently-maintained copies (GH #36 ST1:
+/// shared by both the `Final`-pull and the `Artifact`-parts fold in
+/// [`Engine::dispatch_attempt_with`]'s doc).
+fn content_ref_to_value(content: crate::worker::output::ContentRef) -> Value {
+    match content {
+        crate::worker::output::ContentRef::Inline { value } => value,
+        crate::worker::output::ContentRef::FileRef {
+            path,
+            mime,
+            size_hint,
+        } => serde_json::json!({
+            "file_ref": path.to_string_lossy(),
+            "mime": mime,
+            "size_hint": size_hint,
+        }),
+    }
+}
+
+/// [`Engine::dispatch_attempt_with`]'s Final-pull assembly (GH #36 ST1:
+/// named multi-part worker output), factored out as a pure function of the
+/// output-event tail so it is unit-testable without a live `Engine` /
+/// spawner.
+///
+/// Finds the LAST `Final` event in `tail` (mirrors the pre-GH-#36 pull:
+/// "last Final wins" if more than one was ever appended) and folds every
+/// `Artifact` event in the SAME tail WHOSE NAME APPEARS IN `staged_names`
+/// into a `"parts"` object keyed by `Artifact.name` — walked in tail (=
+/// event-append) order, so a name staged more than once within the attempt
+/// is last-write-wins (`Map` insert semantics, not an accumulating list;
+/// `Engine::stage_worker_artifact_trusted`'s doc). `staged_names` is the
+/// WORKER's own opt-in allowlist (`EngineState.worker_artifact_names`'s
+/// doc) — an `Artifact` on the tail whose name is NOT in `staged_names`
+/// (e.g. `AfterRunAuditMiddleware`'s `"audit:<step_ref>"` sidecar finding)
+/// is left alone, exactly as before GH #36; this is what keeps an audited
+/// step's BP-chain value byte-identical when the worker itself never
+/// staged a part.
+///
+/// At least one matching part: the returned value is `{"out": <final
+/// value>, "parts": {<name>: <value>, ...}}`. Zero matching parts: the
+/// returned value is the plain final value, unchanged from the pre-GH-#36
+/// shape — this is the back-compat guarantee, not an incidental default.
+///
+/// `None` when `tail` carries no `Final` at all (the caller's pre-existing
+/// "no Final in output_tail" error path).
+fn fold_final_and_parts(
+    tail: &[crate::worker::output::OutputEvent],
+    staged_names: &[String],
+) -> Option<(Value, bool)> {
+    let (final_content, ok) = tail.iter().rev().find_map(|ev| match ev {
+        crate::worker::output::OutputEvent::Final { content, ok } => Some((content.clone(), *ok)),
+        _ => None,
+    })?;
+    let final_value = content_ref_to_value(final_content);
+
+    let mut parts = serde_json::Map::new();
+    for ev in tail {
+        if let crate::worker::output::OutputEvent::Artifact { name, content } = ev {
+            if staged_names.iter().any(|staged| staged == name) {
+                parts.insert(name.clone(), content_ref_to_value(content.clone()));
+            }
+        }
+    }
+
+    let value = if parts.is_empty() {
+        final_value
+    } else {
+        serde_json::json!({ "out": final_value, "parts": Value::Object(parts) })
+    };
+    Some((value, ok))
+}
+
 impl Engine {
     /// Backwards-compatible constructor that starts the engine without a
     /// layer registry, preserving the signature already used by ~88
@@ -445,6 +521,79 @@ impl Engine {
         self.materialize_final_submission(task_id, attempt, &content, ok)
             .await;
         Ok(())
+    }
+
+    /// Stage a named `Artifact` from a worker via a short handle (GH #36
+    /// ST1: named multi-part worker output). Trusted analog of
+    /// [`Self::submit_worker_result_trusted`] for `OutputEvent::Artifact`:
+    /// skips token verification for the same reason (the caller already
+    /// resolved `task_id` via `task_id_from_handle`, so the handle's
+    /// presence in `worker_handles` is itself the trust boundary).
+    ///
+    /// Appends to the same per-`(task_id, attempt)` `output_store` tail
+    /// [`Self::dispatch_attempt_with`]'s Final-pull later folds into
+    /// `{"out": <final>, "parts": {<name>: <value>, ...}}` (see that
+    /// method's doc for the fold semantics — event order, last-write-wins
+    /// per name), AND records `name` in `EngineState.worker_artifact_names`
+    /// — the fold's allowlist of the WORKER's own staged parts, as opposed
+    /// to every `Artifact` that happens to land on the shared tail (e.g. an
+    /// audit sidecar finding; see that field's doc). Also dual-writes to
+    /// the Data-plane `OutputStore` the same way [`Self::submit_output`]'s
+    /// `Artifact` arm does, via [`Self::materialize_artifact_submission`]
+    /// (the artifact's own `name` is its Data-plane key, no
+    /// canonicalization — see that method's doc).
+    pub async fn stage_worker_artifact_trusted(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+        name: String,
+        value: Value,
+    ) -> Result<(), EngineError> {
+        let content = crate::worker::output::ContentRef::Inline { value };
+        let task_id_for_apply = task_id.clone();
+        let name_for_apply = name.clone();
+        let content_for_apply = content.clone();
+        self.with_state("stage_worker_artifact_trusted.output", move |s| {
+            let ev = crate::worker::output::OutputEvent::Artifact {
+                name: name_for_apply.clone(),
+                content: content_for_apply,
+            };
+            s.output_store
+                .entry((task_id_for_apply.clone(), attempt))
+                .or_default()
+                .push(ev.clone());
+            s.worker_artifact_names
+                .entry((task_id_for_apply.clone(), attempt))
+                .or_default()
+                .push(name_for_apply);
+            s.push_event(crate::core::state::Event::WorkerOutput {
+                task_id: task_id_for_apply,
+                attempt,
+                event: ev,
+            });
+        })
+        .await?;
+        self.materialize_artifact_submission(task_id, attempt, &name, &content)
+            .await;
+        Ok(())
+    }
+
+    /// GH #36 ST1: the set of `Artifact` names staged for `(task_id,
+    /// attempt)` via [`Self::stage_worker_artifact_trusted`] — see
+    /// `EngineState.worker_artifact_names`'s doc. Used by
+    /// [`Self::dispatch_attempt_with`]'s Final-pull to distinguish a
+    /// worker's own named parts from any other `Artifact` producer on the
+    /// same tail.
+    async fn worker_artifact_names_for(&self, task_id: &StepId, attempt: u32) -> Vec<String> {
+        let key = (task_id.clone(), attempt);
+        self.with_state("worker_artifact_names_for", move |s| {
+            s.worker_artifact_names
+                .get(&key)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Mint a short handle and register it in the `worker_handles` map.
@@ -1111,37 +1260,29 @@ impl Engine {
         //    stringified. The value is fetched via output_tail (sink path).
         let signal_result: Result<(), String> = worker.join().await.map_err(|e| e.to_string());
 
-        // Pull the last Final from output_tail and use it as the value.
+        // Pull the last Final from output_tail and use it as the value. GH
+        // #36 ST1 (named multi-part worker output): also fold every
+        // `Artifact` the WORKER ITSELF staged on the same tail (via
+        // `stage_worker_artifact_trusted` / `POST /v1/worker/artifact`)
+        // into a `"parts"` object keyed by name — event order,
+        // last-write-wins per name (a name staged twice overwrites,
+        // mirroring `HashMap`/`Map` insert semantics, not an accumulating
+        // list). `worker_artifact_names_for` is the allowlist that scopes
+        // this to the worker's own opt-in parts — an `Artifact` some OTHER
+        // producer appended to this same tail (e.g.
+        // `AfterRunAuditMiddleware`'s `"audit:<step_ref>"` sidecar finding)
+        // is left untouched (see `fold_final_and_parts`'s doc). When at
+        // least one part was staged, the BP-chain value becomes `{"out":
+        // <final value>, "parts": {...}}`; zero parts staged (the
+        // pre-GH-#36 case, and every non-opt-in step) leaves the value
+        // exactly the plain `Final` value, byte-identical to before this
+        // change.
         let value_ok: Result<(Value, bool), String> = match signal_result {
             Ok(()) => {
                 let tail = self.output_tail(&task_id, attempt).await;
-                let last_final = tail.iter().rev().find_map(|ev| match ev {
-                    crate::worker::output::OutputEvent::Final { content, ok } => {
-                        Some((content.clone(), *ok))
-                    }
-                    _ => None,
-                });
-                match last_final {
-                    Some((crate::worker::output::ContentRef::Inline { value }, ok)) => {
-                        Ok((value, ok))
-                    }
-                    Some((
-                        crate::worker::output::ContentRef::FileRef {
-                            path,
-                            mime,
-                            size_hint,
-                        },
-                        ok,
-                    )) => Ok((
-                        serde_json::json!({
-                            "file_ref": path.to_string_lossy(),
-                            "mime": mime,
-                            "size_hint": size_hint,
-                        }),
-                        ok,
-                    )),
-                    None => Err("no Final in output_tail".to_string()),
-                }
+                let staged_names = self.worker_artifact_names_for(&task_id, attempt).await;
+                fold_final_and_parts(&tail, &staged_names)
+                    .ok_or_else(|| "no Final in output_tail".to_string())
             }
             Err(msg) => Err(msg),
         };
@@ -3554,6 +3695,178 @@ mod submit_time_projection_sink_tests {
                 .await
                 .is_err(),
             "a different attempt must not resolve the same-named record"
+        );
+    }
+}
+
+/// GH #36 ST1: named multi-part worker output. Covers (a) the pure
+/// `fold_final_and_parts` assembly `dispatch_attempt_with`'s Final-pull
+/// delegates to, (b) `stage_worker_artifact_trusted`'s per-attempt
+/// isolation on `EngineState.output_store` / `.worker_artifact_names` (the
+/// same `HashMap<(StepId, u32), _>` key shape `submit_worker_result_trusted`
+/// uses — a fresh attempt is a fresh key, so nothing to explicitly "clean
+/// up"), and (c) the allowlist behavior that keeps a non-opt-in `Artifact`
+/// producer (e.g. `AfterRunAuditMiddleware`) from being folded in.
+#[cfg(test)]
+mod named_multi_part_worker_output_tests {
+    use super::*;
+    use crate::worker::output::{ContentRef, OutputEvent};
+
+    fn artifact(name: &str, value: Value) -> OutputEvent {
+        OutputEvent::Artifact {
+            name: name.to_string(),
+            content: ContentRef::Inline { value },
+        }
+    }
+
+    fn final_ev(value: Value, ok: bool) -> OutputEvent {
+        OutputEvent::Final {
+            content: ContentRef::Inline { value },
+            ok,
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Two staged parts (both in `staged_names`) + a `Final` fold into
+    /// `{"out", "parts"}`, each value carried through verbatim.
+    #[test]
+    fn fold_final_and_parts_assembles_out_and_parts_shape() {
+        let tail = vec![
+            artifact("summary", serde_json::json!("the summary")),
+            artifact("diff", serde_json::json!({"lines": 3})),
+            final_ev(serde_json::json!("final text"), true),
+        ];
+        let staged = names(&["summary", "diff"]);
+        let (value, ok) = fold_final_and_parts(&tail, &staged).expect("Final present");
+        assert!(ok);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "out": "final text",
+                "parts": {
+                    "summary": "the summary",
+                    "diff": {"lines": 3},
+                }
+            })
+        );
+    }
+
+    /// Zero staged parts: the value is exactly the plain `Final` value — no
+    /// `{"out", "parts"}` wrapping. This is the back-compat guarantee (GH
+    /// #36 must not change the shape for a worker that never POSTs to
+    /// `/v1/worker/artifact`).
+    #[test]
+    fn fold_final_and_parts_with_no_parts_returns_plain_final_value() {
+        let tail = vec![final_ev(serde_json::json!("plain value"), true)];
+        let (value, ok) = fold_final_and_parts(&tail, &[]).expect("Final present");
+        assert!(ok);
+        assert_eq!(value, serde_json::json!("plain value"));
+    }
+
+    /// The same staged part `name` appearing twice in one attempt: the
+    /// LATER (tail-order) value wins — `parts` is a `Map`, not an
+    /// accumulating list.
+    #[test]
+    fn fold_final_and_parts_same_name_twice_last_write_wins() {
+        let tail = vec![
+            artifact("a", serde_json::json!("first")),
+            artifact("a", serde_json::json!("second")),
+            final_ev(serde_json::json!("f"), true),
+        ];
+        let staged = names(&["a"]);
+        let (value, _ok) = fold_final_and_parts(&tail, &staged).expect("Final present");
+        assert_eq!(
+            value,
+            serde_json::json!({"out": "f", "parts": {"a": "second"}})
+        );
+    }
+
+    /// No `Final` anywhere in the tail (only staged parts, e.g. the worker
+    /// crashed before submitting) — `None`, the caller's pre-existing "no
+    /// Final in output_tail" error path.
+    #[test]
+    fn fold_final_and_parts_returns_none_when_no_final_present() {
+        let tail = vec![artifact("a", serde_json::json!("v"))];
+        let staged = names(&["a"]);
+        assert!(fold_final_and_parts(&tail, &staged).is_none());
+    }
+
+    /// An `Artifact` on the tail whose name is NOT in `staged_names` (e.g.
+    /// `AfterRunAuditMiddleware`'s `"audit:<step_ref>"` sidecar finding on
+    /// an audited step's own tail) must NOT be folded into `"parts"` — the
+    /// value stays the plain `Final` value, exactly the pre-GH-#36
+    /// behavior for every producer that isn't the worker's own
+    /// `/v1/worker/artifact` staging. This is the regression this fold was
+    /// almost shipped without (see `dispatch_attempt_with`'s doc).
+    #[test]
+    fn fold_final_and_parts_ignores_artifacts_outside_the_staged_allowlist() {
+        let tail = vec![
+            final_ev(serde_json::json!({"echoed": "hi"}), true),
+            artifact("audit:echo", serde_json::json!({"finding": "clean"})),
+        ];
+        // `staged_names` empty: the worker itself never staged anything —
+        // the audit sidecar Artifact must be ignored.
+        let (value, ok) = fold_final_and_parts(&tail, &[]).expect("Final present");
+        assert!(ok);
+        assert_eq!(value, serde_json::json!({"echoed": "hi"}));
+    }
+
+    /// Mixed tail: one staged (allowlisted) part and one non-staged
+    /// (audit-style) `Artifact` — only the staged one is folded in.
+    #[test]
+    fn fold_final_and_parts_folds_only_the_staged_subset_of_a_mixed_tail() {
+        let tail = vec![
+            artifact("summary", serde_json::json!("s")),
+            artifact("audit:echo", serde_json::json!({"finding": "clean"})),
+            final_ev(serde_json::json!("f"), true),
+        ];
+        let staged = names(&["summary"]);
+        let (value, _ok) = fold_final_and_parts(&tail, &staged).expect("Final present");
+        assert_eq!(
+            value,
+            serde_json::json!({"out": "f", "parts": {"summary": "s"}})
+        );
+    }
+
+    /// `stage_worker_artifact_trusted` writes onto the `(task_id, attempt)`
+    /// key exactly like `submit_worker_result_trusted` does — a part staged
+    /// under attempt N is invisible to an `output_tail` / allowlist read of
+    /// attempt N+1 (a fresh attempt starts empty; nothing carries over).
+    #[tokio::test]
+    async fn stage_worker_artifact_trusted_is_isolated_per_attempt() {
+        let engine = Engine::new(EngineCfg::default());
+        let task_id = StepId::new();
+
+        engine
+            .stage_worker_artifact_trusted(&task_id, 1, "a".to_string(), serde_json::json!("v1"))
+            .await
+            .expect("stage attempt 1");
+
+        let attempt_1_tail = engine.output_tail(&task_id, 1).await;
+        assert_eq!(attempt_1_tail.len(), 1);
+        assert!(matches!(
+            &attempt_1_tail[0],
+            OutputEvent::Artifact { name, .. } if name == "a"
+        ));
+        assert_eq!(
+            engine.worker_artifact_names_for(&task_id, 1).await,
+            vec!["a".to_string()]
+        );
+
+        let attempt_2_tail = engine.output_tail(&task_id, 2).await;
+        assert!(
+            attempt_2_tail.is_empty(),
+            "attempt 2 must not see attempt 1's staged part"
+        );
+        assert!(
+            engine
+                .worker_artifact_names_for(&task_id, 2)
+                .await
+                .is_empty(),
+            "attempt 2's allowlist must not see attempt 1's staged name"
         );
     }
 }

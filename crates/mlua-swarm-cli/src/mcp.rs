@@ -481,9 +481,47 @@ struct WorkerSubmitReq {
     body: String,
     /// `false` marks the attempt failed (`?ok=false` — lands as
     /// `DispatchOutcome::Blocked`, the flow.ir Try catch path). Omitted /
-    /// `true` = normal success.
+    /// `true` = normal success. Mutually exclusive with `name` — a named
+    /// artifact part has no pass/fail state of its own (only the attempt,
+    /// completed via a later `ok=false`-capable submit, does).
     #[serde(default)]
     ok: Option<bool>,
+    /// GH #36 ST2: when given, this call **stages one named output part**
+    /// (`POST /v1/worker/artifact?name=<name>`) instead of completing the
+    /// attempt (`POST /v1/worker/submit`) — the task stays open, and the
+    /// worker may POST any number of additional named parts (same or
+    /// different `name`s) before finally submitting a plain (no-`name`)
+    /// call to complete. A step with staged parts ends up with output
+    /// shape `{"out": <final submit body>, "parts": {<name>: <value>,
+    /// ...}}`; a downstream step reads a part via bracket notation, e.g.
+    /// `"in": "$.<step>.parts[\"plan.md\"]"`. Re-staging the same `name`
+    /// within one attempt replaces the earlier value (last write wins).
+    /// Omitted (`None`) = unchanged legacy behavior (this call completes
+    /// the attempt).
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Builds the `/v1/worker/submit` or `/v1/worker/artifact?name=<name>`
+/// endpoint URL for [`MseServer::mse_worker_submit`]. `base_url`'s trailing
+/// slash (if any) is trimmed before joining. `name`, when given, is
+/// percent-encoded into the `name` query parameter via
+/// [`reqwest::Url::query_pairs_mut`] (`url`/`form_urlencoded` under the
+/// hood — handles dots, spaces, and non-ASCII without any hand-rolled
+/// escaping). Pure and side-effect-free so the URL shape is unit-testable
+/// without a network call. Error is the parse failure's `Display` text
+/// (the `url` crate is only reachable here via `reqwest`'s `pub use
+/// url::Url` re-export, not as a direct dependency, so its `ParseError`
+/// type is deliberately not named in this signature).
+fn worker_submit_endpoint_url(base_url: &str, name: Option<&str>) -> Result<reqwest::Url, String> {
+    let base = base_url.trim_end_matches('/');
+    let path = if name.is_some() { "artifact" } else { "submit" };
+    let mut url =
+        reqwest::Url::parse(&format!("{base}/v1/worker/{path}")).map_err(|e| e.to_string())?;
+    if let Some(name) = name {
+        url.query_pairs_mut().append_pair("name", name);
+    }
+    Ok(url)
 }
 
 // ---- tool param schemas ----
@@ -901,12 +939,22 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Normally `worker_handle` + `body` are the ONLY required params — base_url auto-resolves from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass it explicitly to override (or when the Bearer is a full capability_token). Optional ok=false marks the attempt failed (flow.ir Try catch path). Expects HTTP 204 and returns {submitted: true}; any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
+        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Normally `worker_handle` + `body` are the ONLY required params — base_url auto-resolves from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass it explicitly to override (or when the Bearer is a full capability_token). Optional ok=false marks the attempt failed (flow.ir Try catch path); mutually exclusive with `name`. Optional `name` (GH #36 ST2) stages ONE named output part instead of completing the attempt — POST /v1/worker/artifact?name=<name> — call again (same or different name) for more parts, then finish with a plain (no-name) call; the step's final output becomes {\"out\": <final submit body>, \"parts\": {<name>: <value>, ...}}, read downstream via bracket notation e.g. \"$.<step>.parts[\\\"plan.md\\\"]\". Expects HTTP 204 and returns {submitted: true} (name path) or {submitted: true} (plain path); any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
     )]
     async fn mse_worker_submit(
         &self,
         Parameters(req): Parameters<WorkerSubmitReq>,
     ) -> Result<CallToolResult, McpError> {
+        if req.name.is_some() && req.ok == Some(false) {
+            return Err(McpError::invalid_params(
+                "name and ok=false are mutually exclusive: `name` stages one named output \
+                 part (POST /v1/worker/artifact — no pass/fail state of its own), `ok=false` \
+                 marks the whole attempt failed via POST /v1/worker/submit — pass one or the \
+                 other, not both"
+                    .to_string(),
+                None,
+            ));
+        }
         let base_url = match req.base_url {
             Some(b) => b,
             None => self
@@ -924,17 +972,17 @@ impl MseServer {
                     )
                 })?,
         };
-        let base = base_url.trim_end_matches('/');
-        let url = format!("{base}/v1/worker/submit");
+        let url = worker_submit_endpoint_url(&base_url, req.name.as_deref())
+            .map_err(|e| McpError::invalid_params(format!("invalid base_url: {e}"), None))?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
         let mut request = client
-            .post(&url)
+            .post(url)
             .header("Authorization", format!("Bearer {}", req.worker_handle))
             .header("Content-Type", "text/plain");
-        if req.ok == Some(false) {
+        if req.name.is_none() && req.ok == Some(false) {
             request = request.query(&[("ok", "false")]);
         }
         let resp = request
@@ -2293,6 +2341,7 @@ mod tests {
                 base_url: None,
                 body: "RESULT".into(),
                 ok: None,
+                name: None,
             }))
             .await
             .unwrap_err();
@@ -2336,11 +2385,119 @@ mod tests {
                 base_url: Some(base_url),
                 body: "RESULT".into(),
                 ok: None,
+                name: None,
             }))
             .await
             .expect_err("unknown handle must surface the HTTP error");
         let msg = format!("{err:?}");
         assert!(msg.contains("expected 204"), "err: {msg}");
+    }
+
+    /// GH #36 ST2: `name` and `ok=false` are mutually exclusive — the
+    /// mismatch must be rejected as an MCP `invalid_params` error *before*
+    /// any HTTP I/O (base_url is a black-hole address on purpose, so a
+    /// network attempt would hang/timeout instead of failing fast).
+    #[tokio::test]
+    async fn mse_worker_submit_rejects_name_with_ok_false() {
+        let server = MseServer::new();
+        let err = server
+            .mse_worker_submit(Parameters(WorkerSubmitReq {
+                worker_handle: "wh-deadbeef".into(),
+                base_url: Some("http://127.0.0.1:1".into()),
+                body: "part body".into(),
+                ok: Some(false),
+                name: Some("plan.md".into()),
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("mutually exclusive"), "err: {msg}");
+    }
+
+    /// GH #36 ST2: a `name`-bearing submit call hits `POST
+    /// /v1/worker/artifact?name=<name>` (not `/v1/worker/submit`) against a
+    /// real in-process router — same "bogus handle surfaces the HTTP
+    /// error" shape as the sibling submit test above, confirming the URL
+    /// routing switch actually reaches the artifact endpoint.
+    #[tokio::test]
+    async fn mse_worker_submit_with_name_hits_the_artifact_endpoint() {
+        let engine = Engine::new(EngineCfg::default());
+        let router = mlua_swarm_server::build_router(engine);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let server = MseServer::new();
+        let err = server
+            .mse_worker_submit(Parameters(WorkerSubmitReq {
+                worker_handle: "wh-deadbeef".into(),
+                base_url: Some(base_url),
+                body: "part body".into(),
+                ok: None,
+                name: Some("plan.md".into()),
+            }))
+            .await
+            .expect_err("unknown handle must surface the HTTP error");
+        let msg = format!("{err:?}");
+        // Same shape as the plain-submit sibling test above (an unknown
+        // handle fails handle resolution inside the handler, not routing —
+        // a nonexistent route would 404 instead of reaching this
+        // HTTP-status-surfacing error path at all).
+        assert!(msg.contains("expected 204"), "err: {msg}");
+    }
+
+    // --- worker_submit_endpoint_url (pure URL-building) tests ---
+
+    #[test]
+    fn worker_submit_endpoint_url_no_name_hits_submit() {
+        let url = worker_submit_endpoint_url("http://127.0.0.1:7777", None).unwrap();
+        assert_eq!(url.as_str(), "http://127.0.0.1:7777/v1/worker/submit");
+    }
+
+    #[test]
+    fn worker_submit_endpoint_url_trims_trailing_slash() {
+        let with_slash = worker_submit_endpoint_url("http://127.0.0.1:7777/", None).unwrap();
+        let without_slash = worker_submit_endpoint_url("http://127.0.0.1:7777", None).unwrap();
+        assert_eq!(with_slash.as_str(), without_slash.as_str());
+    }
+
+    #[test]
+    fn worker_submit_endpoint_url_with_name_hits_artifact_and_round_trips() {
+        let url = worker_submit_endpoint_url("http://127.0.0.1:7777", Some("plan.md")).unwrap();
+        assert_eq!(url.path(), "/v1/worker/artifact");
+        let name = url
+            .query_pairs()
+            .find(|(k, _)| k == "name")
+            .map(|(_, v)| v.into_owned());
+        assert_eq!(name.as_deref(), Some("plan.md"));
+    }
+
+    /// Names with dots, spaces, and non-ASCII must round-trip through the
+    /// query string unscathed — `Url::query_pairs`/`query_pairs_mut` handle
+    /// the percent-encoding; this only asserts the decoded value survives,
+    /// not any particular encoded literal (encoding scheme is an
+    /// implementation detail of the `url` crate).
+    #[test]
+    fn worker_submit_endpoint_url_name_round_trips_special_chars() {
+        for name in ["a.b.c", "plan file.md", "計画.md", "a&b=c"] {
+            let url = worker_submit_endpoint_url("http://127.0.0.1:7777", Some(name)).unwrap();
+            let decoded = url
+                .query_pairs()
+                .find(|(k, _)| k == "name")
+                .map(|(_, v)| v.into_owned());
+            assert_eq!(decoded.as_deref(), Some(name), "name={name}");
+        }
+    }
+
+    #[test]
+    fn worker_submit_endpoint_url_rejects_malformed_base_url() {
+        let err = worker_submit_endpoint_url("not a url", None).unwrap_err();
+        assert!(!err.is_empty());
     }
 
     /// GH #31 test helper: seeds a real task + baked (possibly

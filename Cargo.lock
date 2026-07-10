@@ -805,9 +805,9 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flow-ir-core"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5414b043b302b8caa521aac3b633e98fd7b4512928cd67045fc977a24455b78c"
+checksum = "27013e9016565838e1d73a0c83573a7ef2eb822b5e4de7a6127ffea4da5a42ee"
 dependencies = [
  "serde",
  "serde_json",
@@ -1623,9 +1623,9 @@ dependencies = [
 
 [[package]]
 name = "mlua-flow-ir"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75c697be9c7cc46739cd17e816b6011954905a1196ae056bca24c1db419b2c7b"
+checksum = "5f6b7a034fc34a0a0f97c46f25f756af88e347c7b436d7f78b969676aa2290df"
 dependencies = [
  "async-recursion",
  "async-trait",

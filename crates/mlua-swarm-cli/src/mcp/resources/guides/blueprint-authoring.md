@@ -44,6 +44,43 @@ Every node is tagged with a `kind` discriminator:
 
 `out` / `at` / `counter` must always be `path` exprs (write targets).
 
+## Worker output: `out` vs named parts (GH #36)
+
+A `step` node's OUTPUT is normally a single JSON value — the worker's
+final `mse_worker_submit` `body` — addressable downstream via `{"op":
+"path", "at": "$.<step>"}`.
+
+A worker may additionally stage any number of *named* output parts
+before completing the attempt: call `mse_worker_submit` with `name` set
+(see `mse://guides/mcp-tool-reference` § Named multi-part output) once
+per part, then finish with an ordinary plain (no-`name`) submit. A step
+that staged at least one part ends up with OUTPUT shape
+
+```jsonc
+{ "out": /* the final plain-submit body */ "...", "parts": { "plan.md": "...", "notes": { "todo": "..." } } }
+```
+
+instead of the plain final-submit body alone. A downstream step reads a
+part with RFC 9535-style bracket-notation path syntax — required for any
+key containing a literal `.`, like a filename:
+
+```jsonc
+{ "op": "path", "at": "$.<step>.parts[\"plan.md\"]" }
+```
+
+Bracket segments chain directly (`$.<step>.parts["a"]["b"]`) or combine
+with dot segments in either order (`$.<step>.parts["notes"].todo`); keys
+support no escaping (a literal `"` inside a name cannot be represented).
+
+**Author caution**: once a step stages any parts, its OUTPUT becomes an
+Object (`{"out": ..., "parts": {...}}`) instead of the plain final-submit
+value — a downstream `eq`/`ne` expr comparing `$.<step>` directly against
+a string (or other scalar) no longer matches; address `$.<step>.out`
+instead (or a `parts[...]` entry). Keeping a worker's staging behavior in
+sync with the Blueprint's `in` exprs that read its output is the
+Blueprint author's responsibility — nothing in the schema enforces it
+automatically.
+
 ## Expr ops (`flow.ir` `Expr`)
 
 Every expr is tagged with an `op` discriminator:

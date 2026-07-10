@@ -119,10 +119,22 @@ pub struct ProjectionKey {
 impl ProjectionKey {
     /// Pure narrowing helper: resolves `self` against `ctx_data`, first by
     /// `step` (a direct key lookup) then by `path` (a `.`-separated walk of
-    /// nested object fields). Returns `None` if any segment is absent —
-    /// this is a pure lookup, not a fallible parse (an unparseable `path`
-    /// simply yields no match rather than an error, matching the
-    /// `Option`-returning contract callers expect from a resolve step).
+    /// nested object fields, or — GH #36 ST2 — RFC 9535-style bracket
+    /// notation for keys containing a literal `.`, e.g.
+    /// `$.parts["plan.md"]`). Returns `None` if any segment is absent, or
+    /// if a `[`-containing `path` is malformed — this is a pure lookup,
+    /// not a fallible parse (an unparseable `path` simply yields no match
+    /// rather than an error, matching the `Option`-returning contract
+    /// callers expect from a resolve step).
+    ///
+    /// Bracket syntax is kept in lockstep with `flow-ir-core::read_path`
+    /// (mlua-flow-ir 0.1.2)'s `parse_path_segments`: bracket segments
+    /// `["name"]` (double-quoted, no escaping — a literal `"` inside a
+    /// name cannot be represented) may be chained directly
+    /// (`$.a["x"]["y"]`) or combined with `.`-separated plain segments in
+    /// either order (`$.a["x"].b`, `$["x.y"].inner`). A `path` containing
+    /// no `[` takes the original dot-split code path unchanged — no
+    /// behavioural change for existing callers.
     pub fn resolve<'a>(&self, ctx_data: &'a Value) -> Option<&'a Value> {
         let mut current = match &self.step {
             Some(step) => ctx_data.get(step)?,
@@ -130,8 +142,15 @@ impl ProjectionKey {
         };
         if let Some(path) = &self.path {
             let path = path.strip_prefix("$.").unwrap_or(path.as_str());
-            for segment in path.split('.').filter(|s| !s.is_empty()) {
-                current = current.get(segment)?;
+            if path.contains('[') {
+                let segments = parse_bracket_path_segments(path)?;
+                for segment in &segments {
+                    current = current.get(segment)?;
+                }
+            } else {
+                for segment in path.split('.').filter(|s| !s.is_empty()) {
+                    current = current.get(segment)?;
+                }
             }
         }
         Some(current)
@@ -143,6 +162,94 @@ impl ProjectionKey {
     fn step_slug(&self) -> &str {
         self.step.as_deref().unwrap_or("_ctx")
     }
+}
+
+/// Parses a (`$.`-prefix-stripped, non-empty, `[`-containing) path into its
+/// object-key segments — the same RFC 9535-style bracket-notation syntax as
+/// `flow-ir-core::read_path`'s private `parse_path_segments` (mlua-flow-ir
+/// 0.1.2; syntax kept in lockstep by hand, not by sharing code — that
+/// helper is private to its crate). Supports:
+///
+/// - plain segment: any run of chars excluding `.` and `[`, non-empty.
+/// - bracket segment: `["<name>"]`, where `<name>` is one or more chars
+///   excluding `"` (no escape support — a key containing `"` is rejected).
+/// - plain segments are `.`-separated; a bracket segment may follow
+///   directly after the previous segment (`a["x"]`) or after a `.`
+///   (`a.["x"]`), and a bracket segment may itself be followed directly by
+///   another bracket (`a["x"]["y"]`) or by a `.` before the next plain
+///   segment (`a["x"].b`).
+///
+/// Returns `None` for any malformed sequence (unterminated bracket, missing
+/// quote, empty key, empty segment, bracket directly followed by an
+/// unseparated plain segment, ...) — [`ProjectionKey::resolve`] is a pure
+/// `Option`-returning lookup, not a fallible parse, so this never panics
+/// and never silently mis-segments; a malformed path is simply "no match".
+fn parse_bracket_path_segments(trimmed: &str) -> Option<Vec<String>> {
+    let bytes = trimmed.as_bytes();
+    let len = bytes.len();
+    let mut segments = Vec::new();
+    let mut i = 0usize;
+    // true at path start and immediately after a `.`: the next byte must
+    // begin a new segment (plain or bracket), not another `.` or EOF.
+    let mut expect_segment_start = true;
+
+    while i < len {
+        match bytes[i] {
+            b'[' => {
+                if i + 1 >= len || bytes[i + 1] != b'"' {
+                    return None;
+                }
+                let name_start = i + 2;
+                let mut j = name_start;
+                while j < len && bytes[j] != b'"' {
+                    j += 1;
+                }
+                if j >= len {
+                    return None;
+                }
+                let name = &trimmed[name_start..j];
+                if name.is_empty() {
+                    return None;
+                }
+                if j + 1 >= len || bytes[j + 1] != b']' {
+                    return None;
+                }
+                segments.push(name.to_string());
+                i = j + 2;
+                expect_segment_start = false;
+                // Only `.` or another `[` (or EOF) may directly follow a
+                // bracket segment — a bare plain-segment continuation
+                // (`a["x"]b`) is ambiguous and rejected.
+                if i < len && bytes[i] != b'.' && bytes[i] != b'[' {
+                    return None;
+                }
+            }
+            b'.' => {
+                if expect_segment_start {
+                    return None;
+                }
+                i += 1;
+                expect_segment_start = true;
+                if i >= len {
+                    return None;
+                }
+            }
+            _ => {
+                let start = i;
+                while i < len && bytes[i] != b'.' && bytes[i] != b'[' {
+                    i += 1;
+                }
+                segments.push(trimmed[start..i].to_string());
+                expect_segment_start = false;
+            }
+        }
+    }
+
+    if expect_segment_start {
+        return None;
+    }
+
+    Some(segments)
 }
 
 /// [`ProjectionAdapter::project`]'s return value — the locator a worker
@@ -476,6 +583,90 @@ mod tests {
         assert!(key(Some("planner"), Some("$.nested.missing"))
             .resolve(&sample_ctx_data())
             .is_none());
+    }
+
+    // --- GH #36 ST2: bracket-notation path resolve tests ---
+
+    fn parts_ctx_data() -> Value {
+        json!({
+            "worker_step": {
+                "out": "final answer",
+                "parts": {
+                    "plan.md": "the plan",
+                    "notes": { "todo": "ship it" }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn resolve_bracket_path_reads_key_with_literal_dot() {
+        let ctx_data = parts_ctx_data();
+        let resolved = key(Some("worker_step"), Some("$.parts[\"plan.md\"]"))
+            .resolve(&ctx_data)
+            .unwrap();
+        assert_eq!(resolved, &json!("the plan"));
+    }
+
+    #[test]
+    fn resolve_bracket_path_chained_brackets() {
+        let ctx_data = json!({
+            "s": { "a": { "x.y": { "z.w": "chained" } } }
+        });
+        let resolved = key(Some("s"), Some("$.a[\"x.y\"][\"z.w\"]"))
+            .resolve(&ctx_data)
+            .unwrap();
+        assert_eq!(resolved, &json!("chained"));
+    }
+
+    #[test]
+    fn resolve_bracket_path_followed_by_dot_segment() {
+        let ctx_data = parts_ctx_data();
+        let resolved = key(Some("worker_step"), Some("$.parts[\"notes\"].todo"))
+            .resolve(&ctx_data)
+            .unwrap();
+        assert_eq!(resolved, &json!("ship it"));
+    }
+
+    /// Existing dot-only paths (no `[`) must resolve byte-for-byte
+    /// identically after the bracket-notation addition — this is the
+    /// regression guard for "paths without `[` take the original
+    /// dot-split code path unchanged".
+    #[test]
+    fn resolve_dot_only_path_unchanged_by_bracket_support() {
+        let ctx_data = sample_ctx_data();
+        let resolved = key(Some("planner"), Some("$.nested.field"))
+            .resolve(&ctx_data)
+            .unwrap();
+        assert_eq!(resolved, &json!(42));
+    }
+
+    #[test]
+    fn resolve_bracket_path_missing_key_returns_none() {
+        assert!(
+            key(Some("worker_step"), Some("$.parts[\"does-not-exist\"]"))
+                .resolve(&parts_ctx_data())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_malformed_bracket_path_returns_none() {
+        let ctx_data = parts_ctx_data();
+        for malformed in [
+            "$.parts[\"plan.md\"",   // unterminated bracket (missing ])
+            "$.parts[plan.md]",      // missing quotes
+            "$.parts[\"\"]",         // empty key
+            "$.parts[\"plan.md\"]x", // unseparated plain-segment continuation
+            "$..parts[\"plan.md\"]", // empty segment (leading '.' right after prefix strip)
+        ] {
+            assert!(
+                key(Some("worker_step"), Some(malformed))
+                    .resolve(&ctx_data)
+                    .is_none(),
+                "expected None for malformed path {malformed:?}"
+            );
+        }
     }
 
     #[test]

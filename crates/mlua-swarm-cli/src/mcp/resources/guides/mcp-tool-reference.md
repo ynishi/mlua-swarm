@@ -67,7 +67,13 @@ recorded route (and are required when the Bearer is a full
 | tool | purpose | side effect |
 |---|---|---|
 | `mse_worker_fetch` | `GET <base_url>/v1/worker/prompt?task_id=<task_id>` with `Authorization: Bearer <worker_handle>` (the `wh-` short handle from the Spawn frame, or the full `capability_token`). Returns the server's `WorkerPayload` JSON verbatim (`{task_id, attempt, agent, prompt, system?}`). Params: `worker_handle`, `base_url?`, `task_id?` (`ST-<hex>`; validated before any network I/O; both auto-resolve from the recorded route). | Read-only; requires the `mse serve` at `base_url` reachable. |
-| `mse_worker_submit` | `POST <base_url>/v1/worker/submit` with the same Bearer and the raw `body` as `text/plain` (`task_id` resolves server-side from the Bearer). `ok=false` marks the attempt failed (`?ok=false`, the flow.ir Try catch path). Expects HTTP 204; returns `{submitted: true}`. Params: `worker_handle`, `body`, `base_url?` (auto-resolves from the recorded route), `ok?`. | Mutating — lands the attempt result (`submit_output` + `post_result`). |
+| `mse_worker_submit` | `POST <base_url>/v1/worker/submit` with the same Bearer and the raw `body` as `text/plain` (`task_id` resolves server-side from the Bearer). `ok=false` marks the attempt failed (`?ok=false`, the flow.ir Try catch path). Expects HTTP 204; returns `{submitted: true}`. Params: `worker_handle`, `body`, `base_url?` (auto-resolves from the recorded route), `ok?`, `name?` (GH #36 ST2, see below; mutually exclusive with `ok=false`). | Mutating — lands the attempt result (`submit_output` + `post_result`), or (with `name`) stages one output part without landing the attempt. |
+
+### Named multi-part output (`name`, GH #36 ST2)
+
+Pass `name` on `mse_worker_submit` to POST `<base_url>/v1/worker/artifact?name=<name>` instead of `/v1/worker/submit` — the task stays open, and this stages one named part rather than completing the attempt. Call again (same or a different `name`) for more parts; re-staging the same `name` within one attempt replaces the earlier value (last write wins). Finish the attempt with an ordinary plain (no-`name`) `mse_worker_submit` call, unchanged.
+
+A step that staged any parts ends up with output shape `{"out": <the final plain-submit body>, "parts": {<name>: <value>, ...}}`. A downstream step reads a part via bracket-notation path syntax, e.g. `"in": "$.<step>.parts[\"plan.md\"]"` — see `mse://guides/blueprint-authoring` for the full `Step.in` addressing example. `name` and `ok=false` are mutually exclusive (`invalid_params` if both are given): a named part has no pass/fail state of its own, only the attempt (completed via a later `ok=false`-capable plain submit) does.
 
 ## Server control (launchd wrapper)
 

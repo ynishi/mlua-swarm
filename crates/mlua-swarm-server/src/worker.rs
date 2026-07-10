@@ -27,6 +27,11 @@
 //!   to the output tail via `engine.submit_output(Final)` (= the canonical path
 //!   through which the dispatch layer decides Pass/Blocked) and updates
 //!   `task.last_result` via `engine.post_result`.
+//! - `POST /v1/worker/artifact?name=<name>` (GH #36 ST1) — stages one named
+//!   part per POST via `engine.stage_worker_artifact_trusted`. Completing the
+//!   attempt is still `POST /v1/worker/submit` / `/v1/worker/result` — this
+//!   route only stages; the dispatch layer's Final-pull folds every staged
+//!   part into `{"out": <final>, "parts": {<name>: <value>, ...}}`.
 //! - `GET /v1/worker/prompt/system?task_id=<tid>&attempt=<n>` (GH #31) —
 //!   raw baked `system` bytes for `(task_id, attempt)`, the `Http`-mode
 //!   fetch target for `system_ref.uri`. Same Bearer flow as
@@ -372,6 +377,83 @@ pub async fn worker_submit(
         .submit_worker_result_trusted(&task_id, attempt, value, ok)
         .await
         .map_err(|e| ApiError::engine(format!("submit_worker_result_trusted: {e}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Query params for `POST /v1/worker/artifact`.
+#[derive(Debug, Deserialize)]
+pub struct ArtifactQuery {
+    /// Artifact name (GH #36 ST1: named multi-part worker output). Required
+    /// and non-empty (400 otherwise) — becomes the object key
+    /// `Engine::dispatch_attempt_with`'s Final-pull folds this part under
+    /// (`{"out": <final>, "parts": {<name>: <value>, ...}}`, see that
+    /// method's doc). No character restriction is enforced here (a BP
+    /// author references it via bracket notation, e.g. `$.out.parts["a.b"]`).
+    pub name: String,
+}
+
+/// `POST /v1/worker/artifact?name=<name>`. Bearer = same short-handle /
+/// full-`CapToken` forms as [`worker_submit`]. Body = raw text/octet.
+///
+/// Simplification-axis sibling of [`worker_submit`] (GH #36 ST1): lets a
+/// worker with more than one named result POST each part independently —
+/// same 1-part-per-POST simplicity as `/v1/worker/submit`, no Single Big
+/// JSON the worker has to construct/escape itself — then complete the
+/// attempt with an ordinary `/v1/worker/submit` (unchanged). Staging alone
+/// never completes the attempt; `dispatch_attempt_with` only pulls the
+/// tail's `Final` (whichever endpoint submits it) and folds every staged
+/// `Artifact` into `"parts"` at that point.
+///
+/// Behavior:
+/// - `task_id` is auto-looked-up server-side from the token/handle, same as
+///   [`worker_submit`].
+/// - `name` is required and non-empty; missing or blank → 400.
+/// - Body raw bytes go as-is into `Value::String` (same trailing-whitespace
+///   trim as `worker_submit`) and are staged via
+///   [`mlua_swarm::core::engine::Engine::stage_worker_artifact_trusted`].
+/// - Staging the same `name` twice within one attempt: last write wins (the
+///   Final-pull fold walks the tail in event order — see its doc).
+pub async fn worker_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ArtifactQuery>,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, ApiError> {
+    let name = q.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("name must not be empty".into()));
+    }
+    let name = name.to_string();
+
+    let bearer = extract_bearer_raw(&headers)?;
+    let task_id = if let Some(handle) = parse_worker_handle(&bearer) {
+        state
+            .engine
+            .task_id_from_handle(handle)
+            .await
+            .map_err(|e| ApiError::engine(format!("task_id_from_handle: {e}")))?
+    } else {
+        let token = CapToken::decode(bearer.trim())
+            .map_err(|e| ApiError::bad_request(format!("invalid token: {e}")))?;
+        state
+            .engine
+            .task_id_from_token(&token)
+            .await
+            .map_err(|e| ApiError::engine(format!("task_id_from_token: {e}")))?
+    };
+    let attempt = state
+        .engine
+        .task_attempt(&task_id)
+        .await
+        .map_err(|e| ApiError::engine(format!("task_attempt: {e}")))?;
+    let body_str = String::from_utf8_lossy(&body).trim_end().to_string();
+    let value = Value::String(body_str);
+
+    state
+        .engine
+        .stage_worker_artifact_trusted(&task_id, attempt, name, value)
+        .await
+        .map_err(|e| ApiError::engine(format!("stage_worker_artifact_trusted: {e}")))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1344,5 +1426,122 @@ mod tests {
         .await;
         assert_eq!(body.agent, "coder");
         assert_eq!(body.last_rendered_bytes, Some(42));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // GH #36 ST1 — `POST /v1/worker/artifact`
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// A valid `?name=` + short-handle Bearer stages the raw body (trailing
+    /// whitespace trimmed, same as `worker_submit`) as an `Artifact` on the
+    /// task's current-attempt tail, and returns `204 No Content`.
+    #[tokio::test]
+    async fn worker_artifact_stages_and_204s_for_valid_request() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let status = worker_artifact(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(ArtifactQuery {
+                name: "summary".to_string(),
+            }),
+            axum::body::Bytes::from_static(b"hello artifact\n"),
+        )
+        .await
+        .expect("worker_artifact");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let tail = state.engine.output_tail(&task_id, 1).await;
+        assert_eq!(tail.len(), 1, "tail: {tail:?}");
+        match &tail[0] {
+            OutputEvent::Artifact { name, content } => {
+                assert_eq!(name, "summary");
+                match content {
+                    ContentRef::Inline { value } => {
+                        assert_eq!(value, &json!("hello artifact"));
+                    }
+                    other => panic!("expected Inline content, got {other:?}"),
+                }
+            }
+            other => panic!("expected Artifact event, got {other:?}"),
+        }
+    }
+
+    /// `?name=` missing entirely → axum's `Query` extractor rejection
+    /// (400), not a panic. `Query<ArtifactQuery>` is constructed directly
+    /// in this test (mirroring the other handlers' unit style, which call
+    /// the handler fn with an already-extracted `Query`) — an empty `name`
+    /// is exercised separately below since that case is NOT caught by the
+    /// extractor and must be checked in the handler body.
+    #[tokio::test]
+    async fn worker_artifact_rejects_blank_name() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let result = worker_artifact(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(ArtifactQuery {
+                name: "   ".to_string(),
+            }),
+            axum::body::Bytes::from_static(b"x"),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("expected 400 ApiError for blank name, got Ok"),
+            Err(e) => e,
+        };
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+
+        // Nothing was staged.
+        assert!(state.engine.output_tail(&task_id, 1).await.is_empty());
+    }
+
+    /// Staging the same `name` twice within one attempt is last-write-wins
+    /// on the folded value (`fold_final_and_parts` in `mlua_swarm::core::
+    /// engine`) — this test only asserts the raw tail carries both events
+    /// in order (the fold itself is covered by that crate's own unit
+    /// tests); `Engine::stage_worker_artifact_trusted`'s doc.
+    #[tokio::test]
+    async fn worker_artifact_staging_same_name_twice_appends_both_events_in_order() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        for body in [b"first".as_slice(), b"second".as_slice()] {
+            worker_artifact(
+                State(state.clone()),
+                bearer_headers(&handle),
+                Query(ArtifactQuery {
+                    name: "a".to_string(),
+                }),
+                axum::body::Bytes::copy_from_slice(body),
+            )
+            .await
+            .expect("worker_artifact");
+        }
+
+        let tail = state.engine.output_tail(&task_id, 1).await;
+        assert_eq!(tail.len(), 2, "tail: {tail:?}");
+        let values: Vec<&str> = tail
+            .iter()
+            .map(|ev| match ev {
+                OutputEvent::Artifact {
+                    content: ContentRef::Inline { value },
+                    ..
+                } => value.as_str().expect("string value"),
+                other => panic!("expected Artifact/Inline event, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(values, vec!["first", "second"]);
     }
 }
