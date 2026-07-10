@@ -49,6 +49,12 @@ pub enum TaskRecordStatus {
     Done,
     /// The Task's most recent Run failed.
     Failed,
+    /// The Task's most recent Run was still `Running` when the server
+    /// process restarted (issue #35 ST2 boot-time recovery sweep).
+    /// Terminal — in-flight `EngineState` is process-local and
+    /// unrecoverable; this variant records the fact without attempting to
+    /// reconstruct or resume it.
+    Interrupted,
 }
 
 /// One persisted `Task` row — the work-item identity.

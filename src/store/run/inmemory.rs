@@ -97,6 +97,17 @@ impl RunStore for InMemoryRunStore {
         record.updated_at = crate::types::now_unix();
         Ok(())
     }
+
+    async fn list_running(&self) -> Result<Vec<RunRecord>, RunStoreError> {
+        let inner = self.inner.lock().unwrap();
+        let records: Vec<RunRecord> = inner
+            .order
+            .iter()
+            .filter_map(|id| inner.records.get(id).cloned())
+            .filter(|r| r.status == RunStatus::Running)
+            .collect();
+        Ok(records)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -236,5 +247,23 @@ mod tests {
     #[tokio::test]
     async fn name_is_in_memory() {
         assert_eq!(InMemoryRunStore::new().name(), "in-memory");
+    }
+
+    #[tokio::test]
+    async fn list_running_filters_by_status() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        s.create(mk("R-2", "T-2", 200)).await.unwrap();
+        s.create(mk("R-3", "T-3", 300)).await.unwrap();
+        s.update_status(&RunId::parse("R-2").unwrap(), RunStatus::Running)
+            .await
+            .unwrap();
+        s.update_status(&RunId::parse("R-3").unwrap(), RunStatus::Done)
+            .await
+            .unwrap();
+        let running = s.list_running().await.unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, RunId::parse("R-2").unwrap());
+        assert_eq!(running[0].status, RunStatus::Running);
     }
 }

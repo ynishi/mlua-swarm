@@ -55,11 +55,29 @@ Notable flags (see `mse serve --help` for the full set):
   use a SQLite backend (via `rusqlite-isle`, thread-isolated `Connection`)
   for that store at the given path. Omit for the default in-memory
   store (lost on restart). Each flag is independent.
+- `--task-store-path <path>` / `--run-store-path <path>` — override the
+  SQLite path for the `TaskStore` / `RunStore`. Unlike the stores above,
+  these two are **persisted by default**: omitting both flags does not
+  fall back to in-memory — `mse serve` writes to
+  `~/.mse/store/task.sqlite` / `~/.mse/store/run.sqlite` unless
+  `--ephemeral` is set. An explicit path here always wins over
+  `--ephemeral`.
+- `--ephemeral` — restore the pre-issue-#35 in-memory `TaskStore`/`RunStore`
+  default (records are lost on restart). Has no effect when
+  `--task-store-path`/`--run-store-path` is set explicitly.
 - `--blueprint-ref-base <path>` — base dir for expanding `$file` /
   `$agent_md` refs in seeded Blueprint bodies.
 
-Routes served: `/v1/tasks`, `/v1/operators` (WS login flow), `/v1/blueprints`,
-`/v1/issues`, `/v1/enhance-settings`, `/v1/worker/*`.
+On boot, `mse serve` sweeps any `Run`/`Task` left `Running` from a prior
+process into a terminal `Interrupted` status (reason `"server restart"`) —
+persisted state never resumes an in-flight run, it is only marked so
+`GET /v1/runs/:id` reports the truth after a crash or restart.
+
+Routes served: `/v1/tasks`, `/v1/tasks/:id/runs` (re-kick), `/v1/status`
+(occupancy: `{running_runs, attached_operators}`, used by the
+`mlua_swarm_server_restart`/`_shutdown` MCP tools' busy-refusal guard),
+`/v1/operators` (WS login flow), `/v1/blueprints`, `/v1/issues`,
+`/v1/enhance-settings`, `/v1/worker/*`.
 
 ### `mse mcp`
 

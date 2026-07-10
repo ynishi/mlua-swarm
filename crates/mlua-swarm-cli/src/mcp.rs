@@ -358,12 +358,20 @@ struct ServerStatusReq {
 struct ServerShutdownReq {
     #[serde(default)]
     bind: Option<String>,
+    /// Skip the occupancy check (in-flight runs / attached operators) and
+    /// kill unconditionally. Default `false` — a busy server refuses.
+    #[serde(default)]
+    force: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct ServerRestartReq {
     #[serde(default)]
     bind: Option<String>,
+    /// Skip the occupancy check (in-flight runs / attached operators) and
+    /// kill unconditionally. Default `false` — a busy server refuses.
+    #[serde(default)]
+    force: Option<bool>,
 }
 
 // ---- S3 operator client tool param schemas ----
@@ -1743,7 +1751,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Fully stop mse serve via `launchctl bootout gui/<uid>/com.mse.server` (unloads the job; KeepAlive will not restart it until the next `mlua_swarm_server_start` / `mlua_swarm_server_restart`). Returns {bind, stopped}."
+        description = "Fully stop mse serve via `launchctl bootout gui/<uid>/com.mse.server` (unloads the job; KeepAlive will not restart it until the next `mlua_swarm_server_start` / `mlua_swarm_server_restart`). Refuses (structured error) if the server reports in-flight runs or attached operators via GET /v1/status; pass force=true to skip the check and kill unconditionally. Returns {bind, stopped}."
     )]
     async fn mlua_swarm_server_shutdown(
         &self,
@@ -1752,6 +1760,28 @@ impl MseServer {
         let bind = req
             .bind
             .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+        let force = req.force.unwrap_or(false);
+        if !force && server_control::healthz_ok(&bind).await {
+            match server_control::occupancy(&bind).await {
+                Ok(occ) if occ.running_runs > 0 || occ.attached_operators > 0 => {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "refusing to shutdown: {} in-flight run(s), {} attached \
+                             operator(s). Pass force=true to override.",
+                            occ.running_runs, occ.attached_operators,
+                        ),
+                        None,
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // Occupancy unknown (network hiccup / pre-ST4 server
+                    // binary) — fail open, do not block a legitimate
+                    // shutdown/restart indefinitely. Log for visibility.
+                    eprintln!("mse mcp: occupancy check failed, proceeding: {e}");
+                }
+            }
+        }
         match server_control::shutdown(&bind).await {
             Ok(out) => json_result(&out),
             Err(e) => Err(McpError::internal_error(e, None)),
@@ -1759,7 +1789,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Kill + restart mse serve via `launchctl kickstart -k gui/<uid>/com.mse.server`, then healthz-polls up to 30s. Use after editing ~/.mse/config.toml to pick up the new settings. Returns {status: started, bind}."
+        description = "Kill + restart mse serve via `launchctl kickstart -k gui/<uid>/com.mse.server`, then healthz-polls up to 30s. Use after editing ~/.mse/config.toml to pick up the new settings. Refuses (structured error) if the server reports in-flight runs or attached operators via GET /v1/status; pass force=true to skip the check and kill unconditionally. Returns {status: started, bind}."
     )]
     async fn mlua_swarm_server_restart(
         &self,
@@ -1768,6 +1798,28 @@ impl MseServer {
         let bind = req
             .bind
             .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+        let force = req.force.unwrap_or(false);
+        if !force && server_control::healthz_ok(&bind).await {
+            match server_control::occupancy(&bind).await {
+                Ok(occ) if occ.running_runs > 0 || occ.attached_operators > 0 => {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "refusing to restart: {} in-flight run(s), {} attached \
+                             operator(s). Pass force=true to override.",
+                            occ.running_runs, occ.attached_operators,
+                        ),
+                        None,
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // Occupancy unknown (network hiccup / pre-ST4 server
+                    // binary) — fail open, do not block a legitimate
+                    // shutdown/restart indefinitely. Log for visibility.
+                    eprintln!("mse mcp: occupancy check failed, proceeding: {e}");
+                }
+            }
+        }
         match server_control::restart(&bind).await {
             Ok(outcome) => json_result(&outcome),
             Err(e) => Err(McpError::internal_error(e, None)),

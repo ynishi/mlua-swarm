@@ -74,13 +74,23 @@ recorded route (and are required when the Bearer is a full
 `mse serve` lifecycle is owned by macOS launchd (`Label = com.mse.server`);
 these tools are thin wrappers, not a second process-management layer.
 
+Before killing the process, `mlua_swarm_server_shutdown` and
+`mlua_swarm_server_restart` poll `GET /v1/status` (`{running_runs,
+attached_operators}`) on the target `bind`. If either count is nonzero the
+call is refused with a structured error listing the counts; pass
+`force=true` to skip the check and kill unconditionally. When healthz is
+down, or the occupancy check itself errors (network hiccup, or a
+pre-issue-#35 server binary with no `/v1/status` route), the check is
+skipped and the call proceeds — the guard fails open rather than blocking a
+legitimate shutdown/restart indefinitely.
+
 | tool | purpose | side effect |
 |---|---|---|
 | `mse_doctor` | Combined snapshot: `mse mcp`'s own in-process state (in-memory Blueprint store, in-flight run count) + the server-side config/BP list fetched from `GET /v1/doctor` + an `audit_findings` section (GH #34): for every run this process is tracking with a known `task_id`, fetches `GET /v1/tasks/:id/runs/:run/steps` and flags entries whose `name` starts with `audit:`, reporting `{task_id, run_id, step, artifact_name}` per hit plus a `count`. Zero hits is an empty section, not an error; a steps-fetch failure for one run becomes a `notes` entry and never fails the whole call. Params: `bind?`. | Read-only; degrades gracefully if the server is down. |
 | `mlua_swarm_server_start` | `launchctl kickstart gui/<uid>/com.mse.server`, then healthz-polls up to 30s. No-op if already running. Errors with install instructions if the launchd job isn't bootstrapped. Params: `bind?`. | Mutating — starts a system service. |
 | `mlua_swarm_server_status` | healthz + a `launchctl print` summary (state/pid/last exit code). Params: `bind?`. | Read-only. |
-| `mlua_swarm_server_shutdown` | `launchctl bootout gui/<uid>/com.mse.server` (unloads the job; won't restart until the next start/restart). Params: `bind?`. | Mutating — stops a system service. |
-| `mlua_swarm_server_restart` | `launchctl kickstart -k gui/<uid>/com.mse.server`, then healthz-polls up to 30s. Use after editing `~/.mse/config.toml`. Params: `bind?`. | Mutating — restarts a system service. |
+| `mlua_swarm_server_shutdown` | `launchctl bootout gui/<uid>/com.mse.server` (unloads the job; won't restart until the next start/restart). Refuses if the server reports in-flight runs or attached operators (see the occupancy-guard paragraph above). Params: `bind?`, `force?` (default `false`; skip the occupancy check and kill unconditionally). | Mutating — stops a system service. |
+| `mlua_swarm_server_restart` | `launchctl kickstart -k gui/<uid>/com.mse.server`, then healthz-polls up to 30s. Use after editing `~/.mse/config.toml`. Refuses if the server reports in-flight runs or attached operators (see the occupancy-guard paragraph above). Params: `bind?`, `force?` (default `false`; skip the occupancy check and kill unconditionally). | Mutating — restarts a system service. |
 
 ## Where to go next
 
