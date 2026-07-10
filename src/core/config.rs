@@ -43,6 +43,11 @@ pub struct EngineCfg {
     /// directly by an Operator); `4` = default, which allows four levels of
     /// nested sub-tasks.
     pub max_spawn_depth: u32,
+    /// GH #31: threshold/mode/storage tuning for delivering an oversized
+    /// baked `system_prompt` by reference (`WorkerPayload.system_ref`)
+    /// instead of inline (`WorkerPayload.system`). See
+    /// [`SystemRefConfig`].
+    pub system_ref: SystemRefConfig,
 }
 
 impl EngineCfg {
@@ -86,6 +91,46 @@ impl Default for EngineCfg {
             token_secret: random_token_secret(),
             long_hold: LongHoldConfig::default(),
             max_spawn_depth: 4,
+            system_ref: SystemRefConfig::default(),
+        }
+    }
+}
+
+/// GH #31: server-side config for how a baked `system_prompt` too large
+/// to inline is delivered instead — see `Engine::fetch_worker_payload`'s
+/// threshold branch (`crate::core::engine`) for where this is consumed.
+/// Single server-side setting, not per-request: every fetch of a given
+/// `(task_id, attempt)` sees the same `mode` and `threshold_bytes`.
+#[derive(Debug, Clone)]
+pub struct SystemRefConfig {
+    /// Byte length of the baked `system` string above which
+    /// `Engine::fetch_worker_payload{,_trusted}` switches from inlining
+    /// the value (`WorkerPayload.system`) to a reference
+    /// (`WorkerPayload.system_ref`). Default (`25 * 1024`, 25 KiB)
+    /// matches `bp_doctor`'s existing WARN threshold
+    /// (`AGENT_MD_DEFAULT_WARN_BYTES` in
+    /// `crates/mlua-swarm-cli/src/mcp.rs`) — the same SubAgent
+    /// context-window headroom rationale that threshold documents
+    /// applies here to inline-vs-reference delivery.
+    pub threshold_bytes: usize,
+    /// Which [`crate::types::SystemRefMode`] an over-threshold response
+    /// uses to deliver its content.
+    pub mode: crate::types::SystemRefMode,
+    /// Directory `SystemRefMode::File` writes rendered `system` bodies
+    /// into (`<store_dir>/<task_id>-<attempt>.md`). No eviction policy —
+    /// files accumulate for the process lifetime (explicitly out of
+    /// scope; see the risk note on `Engine::fetch_worker_payload`).
+    pub store_dir: std::path::PathBuf,
+}
+
+impl Default for SystemRefConfig {
+    /// `threshold_bytes = 25 * 1024`, `mode = SystemRefMode::File`,
+    /// `store_dir = std::env::temp_dir().join("mse-system-ref")`.
+    fn default() -> Self {
+        Self {
+            threshold_bytes: 25 * 1024,
+            mode: crate::types::SystemRefMode::File,
+            store_dir: std::env::temp_dir().join("mse-system-ref"),
         }
     }
 }

@@ -1263,42 +1263,46 @@ impl Engine {
         self.verify_token_for_task(token, Verb::FetchPrompt, task_id)
             .await?;
         let task_id_clone = task_id.clone();
-        self.with_state("fetch_worker_payload", move |s| {
-            let task = s
-                .tasks
-                .get(&task_id_clone)
-                .ok_or_else(|| EngineError::TaskNotFound(task_id_clone.to_string()))?;
-            let attempt = task.attempt.max(1);
-            let prompt = s
-                .prompts
-                .get(&(task_id_clone.clone(), attempt))
-                .cloned()
-                .ok_or_else(|| {
-                    EngineError::ResourceNotFound(format!(
-                        "prompt({}, attempt={})",
-                        task_id_clone, attempt
-                    ))
-                })?;
-            let system = s
-                .systems
-                .get(&(task_id_clone.clone(), attempt))
-                .cloned()
-                .unwrap_or(None);
-            let agent = task.spec.agent.clone();
-            let context = s
-                .agent_ctx
-                .get(&(task_id_clone.clone(), attempt))
-                .map(|e| e.view.clone());
-            Ok::<_, EngineError>(crate::types::WorkerPayload {
-                task_id: task_id_clone.clone(),
-                attempt,
-                agent,
-                prompt: render_directive_to_string(&prompt),
-                system,
-                context,
+        let mut payload = self
+            .with_state("fetch_worker_payload", move |s| {
+                let task = s
+                    .tasks
+                    .get(&task_id_clone)
+                    .ok_or_else(|| EngineError::TaskNotFound(task_id_clone.to_string()))?;
+                let attempt = task.attempt.max(1);
+                let prompt = s
+                    .prompts
+                    .get(&(task_id_clone.clone(), attempt))
+                    .cloned()
+                    .ok_or_else(|| {
+                        EngineError::ResourceNotFound(format!(
+                            "prompt({}, attempt={})",
+                            task_id_clone, attempt
+                        ))
+                    })?;
+                let system = s
+                    .systems
+                    .get(&(task_id_clone.clone(), attempt))
+                    .cloned()
+                    .unwrap_or(None);
+                let agent = task.spec.agent.clone();
+                let context = s
+                    .agent_ctx
+                    .get(&(task_id_clone.clone(), attempt))
+                    .map(|e| e.view.clone());
+                Ok::<_, EngineError>(crate::types::WorkerPayload {
+                    task_id: task_id_clone.clone(),
+                    attempt,
+                    agent,
+                    prompt: render_directive_to_string(&prompt),
+                    system,
+                    context,
+                    system_ref: None,
+                })
             })
-        })
-        .await?
+            .await??;
+        self.apply_system_ref_threshold(&mut payload).await?;
+        Ok(payload)
     }
 
     /// Fetch a worker payload via a short handle. Skips token verification
@@ -1312,42 +1316,100 @@ impl Engine {
         task_id: &StepId,
     ) -> Result<crate::types::WorkerPayload, EngineError> {
         let task_id_clone = task_id.clone();
-        self.with_state("fetch_worker_payload_trusted", move |s| {
-            let task = s
-                .tasks
-                .get(&task_id_clone)
-                .ok_or_else(|| EngineError::TaskNotFound(task_id_clone.to_string()))?;
-            let attempt = task.attempt.max(1);
-            let prompt = s
-                .prompts
-                .get(&(task_id_clone.clone(), attempt))
-                .cloned()
-                .ok_or_else(|| {
-                    EngineError::ResourceNotFound(format!(
-                        "prompt({}, attempt={})",
-                        task_id_clone, attempt
-                    ))
-                })?;
-            let system = s
-                .systems
-                .get(&(task_id_clone.clone(), attempt))
-                .cloned()
-                .unwrap_or(None);
-            let agent = task.spec.agent.clone();
-            let context = s
-                .agent_ctx
-                .get(&(task_id_clone.clone(), attempt))
-                .map(|e| e.view.clone());
-            Ok::<_, EngineError>(crate::types::WorkerPayload {
-                task_id: task_id_clone.clone(),
-                attempt,
-                agent,
-                prompt: render_directive_to_string(&prompt),
-                system,
-                context,
+        let mut payload = self
+            .with_state("fetch_worker_payload_trusted", move |s| {
+                let task = s
+                    .tasks
+                    .get(&task_id_clone)
+                    .ok_or_else(|| EngineError::TaskNotFound(task_id_clone.to_string()))?;
+                let attempt = task.attempt.max(1);
+                let prompt = s
+                    .prompts
+                    .get(&(task_id_clone.clone(), attempt))
+                    .cloned()
+                    .ok_or_else(|| {
+                        EngineError::ResourceNotFound(format!(
+                            "prompt({}, attempt={})",
+                            task_id_clone, attempt
+                        ))
+                    })?;
+                let system = s
+                    .systems
+                    .get(&(task_id_clone.clone(), attempt))
+                    .cloned()
+                    .unwrap_or(None);
+                let agent = task.spec.agent.clone();
+                let context = s
+                    .agent_ctx
+                    .get(&(task_id_clone.clone(), attempt))
+                    .map(|e| e.view.clone());
+                Ok::<_, EngineError>(crate::types::WorkerPayload {
+                    task_id: task_id_clone.clone(),
+                    attempt,
+                    agent,
+                    prompt: render_directive_to_string(&prompt),
+                    system,
+                    context,
+                    system_ref: None,
+                })
             })
-        })
-        .await?
+            .await??;
+        self.apply_system_ref_threshold(&mut payload).await?;
+        Ok(payload)
+    }
+
+    /// GH #31: shared threshold-branch tail for
+    /// [`Self::fetch_worker_payload`] / [`Self::fetch_worker_payload_trusted`].
+    /// Both build a raw `WorkerPayload` inside `with_state` with `system`
+    /// populated as before and `system_ref: None`; this runs *outside* any
+    /// lock (R3 — `SystemRefMode::File`'s `tokio::fs` write is a genuine
+    /// `.await`, which `with_state`'s sync-closure contract forbids inside
+    /// the lock) and rewrites `payload.system` / `payload.system_ref` in
+    /// place per `SystemRefConfig.threshold_bytes`: over-threshold clears
+    /// `system` and populates `system_ref`; at-or-under-threshold leaves
+    /// `system` as-is and `system_ref` stays `None`. A no-op when
+    /// `payload.system` is already `None` (no `system_prompt` was baked).
+    async fn apply_system_ref_threshold(
+        &self,
+        payload: &mut crate::types::WorkerPayload,
+    ) -> Result<(), EngineError> {
+        let Some(rendered) = payload.system.take() else {
+            return Ok(());
+        };
+        let cfg = self.cfg().system_ref.clone();
+        if rendered.len() <= cfg.threshold_bytes {
+            payload.system = Some(rendered);
+            return Ok(());
+        }
+        use sha2::Digest;
+        let size_bytes = rendered.len() as u64;
+        let sha256 = hex::encode(sha2::Sha256::digest(rendered.as_bytes()));
+        let task_id = &payload.task_id;
+        let attempt = payload.attempt;
+        let system_ref = match cfg.mode {
+            crate::types::SystemRefMode::Http => crate::types::SystemRef {
+                // The engine has no knowledge of scheme/host here — see
+                // `SystemRefMode::Http`'s doc for who fills that in.
+                uri: format!("/v1/worker/prompt/system?task_id={task_id}&attempt={attempt}"),
+                sha256,
+                size_bytes,
+                mode: crate::types::SystemRefMode::Http,
+            },
+            crate::types::SystemRefMode::File => {
+                tokio::fs::create_dir_all(&cfg.store_dir).await?;
+                let path = cfg.store_dir.join(format!("{task_id}-{attempt}.md"));
+                tokio::fs::write(&path, rendered.as_bytes()).await?;
+                crate::types::SystemRef {
+                    uri: format!("file://{}", path.display()),
+                    sha256,
+                    size_bytes,
+                    mode: crate::types::SystemRefMode::File,
+                }
+            }
+        };
+        payload.system = None;
+        payload.system_ref = Some(system_ref);
+        Ok(())
     }
 
     /// Returns the effective [`mlua_swarm_schema::ContextPolicy`]
@@ -1475,10 +1537,64 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let task_id = task_id.clone();
         self.with_state("bake_worker_system_prompt", move |s| {
+            // GH #31: record this agent's most-recently-baked render size
+            // before `system` is moved into `s.systems.insert` below. Same
+            // `s.tasks.get(&task_id)` → `.spec.agent` lookup pattern
+            // `fetch_worker_payload` uses (see its doc for why this keying
+            // is load-bearing for a later `bp_doctor` route).
+            if let Some(rendered) = system.as_ref() {
+                if let Some(agent) = s.tasks.get(&task_id).map(|t| t.spec.agent.clone()) {
+                    s.agent_render_sizes.insert(agent, rendered.len());
+                }
+            }
             s.systems.insert((task_id, attempt), system);
         })
         .await?;
         Ok(())
+    }
+
+    /// GH #31: the most-recently-baked `system_prompt` render size (in
+    /// bytes) observed for `agent_name`, if `bake_worker_system_prompt` has
+    /// ever recorded one — last-write-wins across every `(task_id,
+    /// attempt)` dispatch of that agent. `None` when no `system_prompt`
+    /// has ever been baked for this agent name. Read by the `bp_doctor`
+    /// route this subtask's follow-up adds.
+    pub async fn agent_last_rendered_size(&self, agent_name: &str) -> Option<usize> {
+        let agent_name = agent_name.to_string();
+        self.with_state("agent_last_rendered_size", move |s| {
+            s.agent_render_sizes.get(&agent_name).copied()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// GH #31: plain read-through of the baked `system` string for
+    /// `(task_id, attempt)` from `EngineState.systems`, with no threshold
+    /// branching. Backs `GET /v1/worker/prompt/system` (the `Http`-mode
+    /// fetch target `system_ref.uri` points at) — that route needs the
+    /// exact raw bytes to serve as the response body for the client's
+    /// sha256 verification, not a `WorkerPayload`-wrapped value.
+    ///
+    /// Distinct from `apply_system_ref_threshold` (private, mutates an
+    /// already-built `WorkerPayload` in place after full construction):
+    /// this accessor has no threshold logic and is `pub` so
+    /// `mlua-swarm-server`'s `worker` module can call it directly.
+    ///
+    /// Returns `Ok(None)` if no baked system exists for that `(task_id,
+    /// attempt)` (either the task/attempt has no entry in `s.systems`, or
+    /// the entry is present but stores `None`) — the caller maps this to
+    /// a 404.
+    pub async fn raw_system_prompt(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+    ) -> Result<Option<String>, EngineError> {
+        let task_id = task_id.clone();
+        self.with_state("raw_system_prompt", move |s| {
+            s.systems.get(&(task_id, attempt)).cloned().unwrap_or(None)
+        })
+        .await
     }
 
     /// Fetch an arbitrary named resource previously stored via
@@ -2621,6 +2737,165 @@ mod initial_directive_value_passthrough_tests {
             .await
             .expect("fetch_prompt");
         assert_eq!(prompt, serde_json::json!("do the thing"));
+    }
+}
+
+/// GH #31: `fetch_worker_payload{,_trusted}`'s size-threshold branch
+/// between inline (`WorkerPayload.system`) and by-reference
+/// (`WorkerPayload.system_ref`) delivery, plus the `bake_worker_system_prompt`
+/// `agent_render_sizes` bookkeeping that feeds `agent_last_rendered_size`.
+#[cfg(test)]
+mod system_ref_threshold_tests {
+    use super::*;
+
+    async fn seeded_engine_with_cfg(cfg: EngineCfg) -> (Engine, CapToken, StepId) {
+        let engine = Engine::new(cfg);
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let task_id = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: "planner".to_string(),
+                    initial_directive: serde_json::json!("do the thing"),
+                    step_ctx: None,
+                },
+            )
+            .await
+            .expect("start_task");
+        (engine, op_token, task_id)
+    }
+
+    /// Same worker-token-minting fixture as
+    /// `initial_directive_value_passthrough_tests::mint_worker_token`
+    /// (kept local to this module — the two `mod`s do not share private
+    /// helpers across `cfg(test)` boundaries).
+    async fn mint_worker_token(engine: &Engine, task_id: &StepId) -> CapToken {
+        let worker_token = engine.signer().session(
+            format!("worker-of-{task_id}"),
+            Role::Worker,
+            vec!["*".into()],
+            Duration::from_secs(600),
+        );
+        let fp = worker_token.fingerprint();
+        let record = CapTokenRecord::from_worker_token(worker_token.clone(), task_id.clone());
+        engine
+            .with_state("test.mint_worker", move |s| {
+                s.tokens.insert(fp, record);
+            })
+            .await
+            .expect("mint worker token");
+        worker_token
+    }
+
+    /// Under-threshold: `system` stays inline, `system_ref` stays `None`.
+    #[tokio::test]
+    async fn under_threshold_stays_inline() {
+        let (engine, _op_token, task_id) = seeded_engine_with_cfg(EngineCfg::default()).await;
+        let worker_token = mint_worker_token(&engine, &task_id).await;
+        let rendered = "a short system prompt".to_string();
+        engine
+            .bake_worker_system_prompt(&task_id, 1, Some(rendered.clone()))
+            .await
+            .expect("bake");
+        let payload = engine
+            .fetch_worker_payload(&worker_token, &task_id)
+            .await
+            .expect("fetch_worker_payload");
+        assert_eq!(payload.system, Some(rendered));
+        assert!(payload.system_ref.is_none());
+    }
+
+    /// Over-threshold: `system` is cleared and `system_ref` is populated
+    /// with a `sha256` matching the known input string. Exercises
+    /// `fetch_worker_payload_trusted` (the `_trusted` sibling must be
+    /// behaviorally identical to `fetch_worker_payload`).
+    #[tokio::test]
+    async fn over_threshold_switches_to_system_ref_with_matching_sha256() {
+        let mut cfg = EngineCfg::default();
+        cfg.system_ref.threshold_bytes = 16;
+        cfg.system_ref.mode = crate::types::SystemRefMode::File;
+        cfg.system_ref.store_dir =
+            std::env::temp_dir().join(format!("mse-system-ref-test-{}", crate::types::now_unix()));
+        let (engine, _op_token, task_id) = seeded_engine_with_cfg(cfg).await;
+        let rendered =
+            "this system prompt is deliberately longer than the 16 byte threshold".to_string();
+        engine
+            .bake_worker_system_prompt(&task_id, 1, Some(rendered.clone()))
+            .await
+            .expect("bake");
+        let payload = engine
+            .fetch_worker_payload_trusted(&task_id)
+            .await
+            .expect("fetch_worker_payload_trusted");
+        assert!(
+            payload.system.is_none(),
+            "over-threshold response must not also inline `system`"
+        );
+        let system_ref = payload
+            .system_ref
+            .expect("over-threshold response must populate system_ref");
+        assert_eq!(system_ref.size_bytes, rendered.len() as u64);
+        assert_eq!(system_ref.mode, crate::types::SystemRefMode::File);
+        use sha2::Digest;
+        let expected_sha256 = hex::encode(sha2::Sha256::digest(rendered.as_bytes()));
+        assert_eq!(system_ref.sha256, expected_sha256);
+        assert!(system_ref.uri.starts_with("file://"));
+        let written = tokio::fs::read_to_string(system_ref.uri.trim_start_matches("file://"))
+            .await
+            .expect("File mode must have written the referenced path");
+        assert_eq!(written, rendered);
+    }
+
+    /// `Http` mode never writes a file — `system_ref.uri` is the bare path
+    /// the engine can construct on its own, scheme/host-free.
+    #[tokio::test]
+    async fn over_threshold_http_mode_constructs_path_only_uri() {
+        let mut cfg = EngineCfg::default();
+        cfg.system_ref.threshold_bytes = 16;
+        cfg.system_ref.mode = crate::types::SystemRefMode::Http;
+        let (engine, _op_token, task_id) = seeded_engine_with_cfg(cfg).await;
+        let worker_token = mint_worker_token(&engine, &task_id).await;
+        let rendered =
+            "this system prompt is deliberately longer than the 16 byte threshold".to_string();
+        engine
+            .bake_worker_system_prompt(&task_id, 1, Some(rendered))
+            .await
+            .expect("bake");
+        let payload = engine
+            .fetch_worker_payload(&worker_token, &task_id)
+            .await
+            .expect("fetch_worker_payload");
+        let system_ref = payload.system_ref.expect("system_ref must be populated");
+        assert_eq!(system_ref.mode, crate::types::SystemRefMode::Http);
+        assert_eq!(
+            system_ref.uri,
+            format!("/v1/worker/prompt/system?task_id={task_id}&attempt=1")
+        );
+    }
+
+    /// `bake_worker_system_prompt` records the render size keyed by agent
+    /// name (last-write-wins), readable via `agent_last_rendered_size`.
+    #[tokio::test]
+    async fn bake_records_agent_render_size_last_write_wins() {
+        let (engine, _op_token, task_id) = seeded_engine_with_cfg(EngineCfg::default()).await;
+        assert_eq!(engine.agent_last_rendered_size("planner").await, None);
+        engine
+            .bake_worker_system_prompt(&task_id, 1, Some("a".repeat(10)))
+            .await
+            .expect("bake 1");
+        assert_eq!(engine.agent_last_rendered_size("planner").await, Some(10));
+        engine
+            .bake_worker_system_prompt(&task_id, 2, Some("b".repeat(20)))
+            .await
+            .expect("bake 2");
+        assert_eq!(
+            engine.agent_last_rendered_size("planner").await,
+            Some(20),
+            "most-recently-observed size wins, not the largest"
+        );
     }
 }
 

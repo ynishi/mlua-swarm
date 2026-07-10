@@ -102,4 +102,10 @@ pub enum EngineError {
     /// variant yet.
     #[error("internal: {0}")]
     Internal(String),
+
+    /// GH #31: writing a `SystemRefMode::File` body to
+    /// `SystemRefConfig.store_dir` failed (directory creation or file
+    /// write, both via `tokio::fs`).
+    #[error("system_ref store write failed: {0}")]
+    SystemRefWrite(#[from] std::io::Error),
 }

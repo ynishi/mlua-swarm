@@ -511,6 +511,16 @@ pub struct EngineState {
     /// profile can be distinguished: an absent key means "not yet baked",
     /// while `Some(None)` means "baked and profile is explicitly absent".
     pub systems: HashMap<(StepId, u32), Option<String>>,
+    /// GH #31: per-agent-name "most-recently-baked `system_prompt` size"
+    /// bookkeeping, updated by `Engine::bake_worker_system_prompt`
+    /// whenever `system.is_some()` (keyed by `TaskState.spec.agent`, the
+    /// same lookup `fetch_worker_payload` uses). Last-write-wins is the
+    /// deliberate semantics — "most-recently-observed", not "largest" or
+    /// "per-attempt" — since this exists only to let `bp_doctor`-style
+    /// tooling ask "how big does this agent's rendered system prompt
+    /// currently run" without plumbing the live `Engine` into
+    /// `BlueprintsState`. Read via `Engine::agent_last_rendered_size`.
+    pub agent_render_sizes: HashMap<String, usize>,
     /// Per-attempt materialized [`crate::core::agent_context::AgentContextView`]
     /// (Contract C, GH #20) paired with the effective
     /// [`mlua_swarm_schema::ContextPolicy`] `AgentContextMiddleware` already
@@ -615,6 +625,7 @@ impl EngineState {
             sessions: HashMap::new(),
             prompts: HashMap::new(),
             systems: HashMap::new(),
+            agent_render_sizes: HashMap::new(),
             agent_ctx: HashMap::new(),
             step_namings: HashMap::new(),
             projection_placements: HashMap::new(),

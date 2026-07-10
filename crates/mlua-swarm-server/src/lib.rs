@@ -378,6 +378,17 @@ pub fn build_router_full(
         .route("/v1/worker/result", post(worker::worker_result))
         // Simplified endpoint (= worker POSTs with just token + raw body; task_id is auto-looked-up)
         .route("/v1/worker/submit", post(worker::worker_submit))
+        // GH #31: `Http`-mode fetch target for `system_ref.uri` (raw baked system
+        // bytes, same Bearer flow as `/v1/worker/prompt`) + live per-agent render-size
+        // lookup for `bp_doctor` (no Bearer, same trust tier as blueprints `get_head`).
+        .route(
+            "/v1/worker/prompt/system",
+            get(worker::worker_prompt_system),
+        )
+        .route(
+            "/v1/agents/:name/render-size",
+            get(worker::agent_render_size),
+        )
         // Data path (v9 Big Response handling, independent from Domain / verdict flow)
         .route("/v1/data/emit", post(data::data_emit))
         .route(

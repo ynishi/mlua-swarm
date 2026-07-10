@@ -27,6 +27,13 @@
 //!   to the output tail via `engine.submit_output(Final)` (= the canonical path
 //!   through which the dispatch layer decides Pass/Blocked) and updates
 //!   `task.last_result` via `engine.post_result`.
+//! - `GET /v1/worker/prompt/system?task_id=<tid>&attempt=<n>` (GH #31) —
+//!   raw baked `system` bytes for `(task_id, attempt)`, the `Http`-mode
+//!   fetch target for `system_ref.uri`. Same Bearer flow as
+//!   `/v1/worker/prompt`; body is `text/plain`, not JSON.
+//! - `GET /v1/agents/:name/render-size` (GH #31) — no Bearer required, same
+//!   trust tier as `GET /v1/blueprints/:id/head`. Live per-agent most-recently
+//!   observed render size, backing `bp_doctor`'s post-render check.
 //!
 //! ## Bearer authentication
 //!
@@ -43,7 +50,7 @@
 
 use axum::{
     extract::{Query, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{header, header::AUTHORIZATION, HeaderMap, StatusCode},
     Json,
 };
 use mlua_swarm::core::agent_context::StepPointer;
@@ -368,6 +375,103 @@ pub async fn worker_submit(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Query params for `GET /v1/worker/prompt/system`. Field names are fixed to
+/// `task_id` / `attempt` — this is the exact shape the engine bakes into
+/// `system_ref.uri`'s query string for `Http` mode (GH #31), so the names
+/// here must match verbatim.
+#[derive(Debug, Deserialize)]
+pub struct PromptSystemQuery {
+    /// Task the fetched raw system prompt belongs to; cross-checked
+    /// against the Bearer handle/token, same as [`PromptQuery::task_id`].
+    pub task_id: StepId,
+    /// Attempt number the baked system prompt was recorded under.
+    pub attempt: u32,
+}
+
+/// `GET /v1/worker/prompt/system?task_id=<tid>&attempt=<n>` (GH #31). The
+/// `Http`-mode fetch target for `system_ref.uri`: serves the exact baked
+/// `system` bytes for `(task_id, attempt)` as a raw `text/plain` body — not
+/// JSON-wrapped, since `mse_worker_fetch` needs the precise byte sequence to
+/// sha256-verify against `system_ref.sha256`.
+///
+/// Same Bearer auth flow as [`worker_prompt`] (short handle or full
+/// `CapToken`); 404 via [`ApiError::not_found`] if no baked system exists for
+/// that `(task_id, attempt)`.
+pub async fn worker_prompt_system(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<PromptSystemQuery>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    let task_id = q.task_id;
+    let attempt = q.attempt;
+    let bearer = extract_bearer_raw(&headers)?;
+    if let Some(handle) = parse_worker_handle(&bearer) {
+        let resolved = state
+            .engine
+            .task_id_from_handle(handle)
+            .await
+            .map_err(|e| ApiError::engine(format!("task_id_from_handle: {e}")))?;
+        if resolved != task_id {
+            return Err(ApiError::bad_request(format!(
+                "handle {handle} is bound to task {resolved}, not {task_id}"
+            )));
+        }
+    } else {
+        let token = CapToken::decode(bearer.trim())
+            .map_err(|e| ApiError::bad_request(format!("invalid token: {e}")))?;
+        state
+            .engine
+            .verify_token_for_task(&token, mlua_swarm::Verb::FetchPrompt, &task_id)
+            .await
+            .map_err(|e| ApiError::engine(format!("verify_token_for_task: {e}")))?;
+    }
+    let system = state
+        .engine
+        .raw_system_prompt(&task_id, attempt)
+        .await
+        .map_err(|e| ApiError::engine(format!("raw_system_prompt: {e}")))?
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "no baked system prompt for task {task_id} attempt {attempt}"
+            ))
+        })?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        system,
+    ))
+}
+
+/// Response body for `GET /v1/agents/:name/render-size`.
+#[derive(Debug, serde::Serialize)]
+pub struct AgentRenderSizeResponse {
+    /// The agent name looked up (echoed back verbatim from the path param).
+    pub agent: String,
+    /// Most-recently-baked `system_prompt` render size in bytes for this
+    /// agent, or `None` if `bake_worker_system_prompt` has never recorded
+    /// one (a freshly-added agent that has never been dispatched).
+    pub last_rendered_bytes: Option<usize>,
+}
+
+/// `GET /v1/agents/:name/render-size` (GH #31). Live per-agent-name lookup
+/// of the most-recently-baked `system_prompt` render size, backing
+/// `bp_doctor`'s post-render size check. No Bearer required — same
+/// unauthenticated trust tier as `GET /v1/blueprints/:id/head`
+/// (`blueprints::get_head`), an operator-diagnostic route.
+///
+/// `last_rendered_bytes: null` is a normal, expected response (a
+/// freshly-added agent that has never been dispatched yet) — always
+/// `200 OK`, never a 404.
+pub async fn agent_render_size(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Json<AgentRenderSizeResponse> {
+    let last_rendered_bytes = state.engine.agent_last_rendered_size(&name).await;
+    Json(AgentRenderSizeResponse {
+        agent: name,
+        last_rendered_bytes,
+    })
+}
+
 /// Extracts the raw string from the `Authorization` header (= strips the `Bearer `
 /// prefix). To let `worker_submit` accept both short handles and full tokens, we
 /// fetch the raw value before any decode.
@@ -429,6 +533,7 @@ fn decode_worker_bearer(headers: &HeaderMap) -> Result<CapToken, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
     use mlua_swarm::core::agent_context::AgentContextView;
     use mlua_swarm::core::config::EngineCfg;
     use mlua_swarm::core::engine::Engine;
@@ -522,6 +627,7 @@ mod tests {
                 run_id: Some(run_id.to_string()),
                 ..Default::default()
             }),
+            system_ref: None,
         }
     }
 
@@ -1014,5 +1120,229 @@ mod tests {
             steps[0].name, "plan-out",
             "StepPointer.name must be the canonical name"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // GH #31 — `/v1/worker/prompt/system` + `/v1/agents/:name/render-size`
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Seeds a task + baked system prompt + a short worker handle bound to
+    /// it, mirroring the shape `Engine::dispatch_attempt` would have
+    /// produced (minus the parts these two routes don't touch: no real
+    /// HMAC-signed `CapToken`, since `task_id_from_handle`'s handle → fp →
+    /// task_id chain is what's under test, not signature verification).
+    async fn seed_task_with_handle(
+        state: &AppState,
+        task_id: &StepId,
+        agent: &str,
+        attempt: u32,
+        system: Option<String>,
+    ) -> String {
+        let handle = format!("wh-{}", mlua_swarm::types::secure_hex(4));
+        let task_id = task_id.clone();
+        let agent = agent.to_string();
+        let handle_clone = handle.clone();
+        state
+            .engine
+            .with_state("test.seed_task_with_handle", move |s| {
+                let mut task = mlua_swarm::core::state::TaskState::new(
+                    task_id.clone(),
+                    mlua_swarm::core::state::TaskSpec {
+                        agent: agent.clone(),
+                        initial_directive: json!("x"),
+                        step_ctx: None,
+                    },
+                );
+                task.attempt = attempt;
+                s.tasks.insert(task_id.clone(), task);
+                s.systems.insert((task_id.clone(), attempt), system);
+                let token = CapToken {
+                    agent_id: agent,
+                    role: mlua_swarm::Role::Worker,
+                    scopes: vec!["*".to_string()],
+                    issued_at: 0,
+                    expire_at: u64::MAX,
+                    max_uses: None,
+                    nonce: format!("test-nonce-{task_id}"),
+                    sig_hex: String::new(),
+                };
+                let fp = token.fingerprint();
+                s.tokens.insert(
+                    fp.clone(),
+                    mlua_swarm::core::state::CapTokenRecord {
+                        token,
+                        uses_left: None,
+                        revoked: false,
+                        task_id: Some(task_id),
+                    },
+                );
+                s.worker_handles.insert(handle_clone, fp);
+            })
+            .await
+            .expect("seed_task_with_handle");
+        handle
+    }
+
+    fn bearer_headers(handle: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Bearer {handle}").parse().expect("header value"),
+        );
+        headers
+    }
+
+    /// `GET /v1/worker/prompt/system` returns the exact raw baked bytes
+    /// (not JSON-wrapped) with `Content-Type: text/plain`, for the
+    /// `(task_id, attempt)` the handle is bound to.
+    #[tokio::test]
+    async fn worker_prompt_system_returns_raw_bytes_for_baked_system() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let rendered = "# Hello\n\nThis is the baked system prompt.".to_string();
+        let handle =
+            seed_task_with_handle(&state, &task_id, "planner", 1, Some(rendered.clone())).await;
+
+        let resp = worker_prompt_system(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(PromptSystemQuery {
+                task_id: task_id.clone(),
+                attempt: 1,
+            }),
+        )
+        .await
+        .expect("worker_prompt_system")
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("content-type header")
+            .to_str()
+            .expect("ascii");
+        assert_eq!(content_type, "text/plain; charset=utf-8");
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        assert_eq!(body_bytes.as_ref(), rendered.as_bytes());
+    }
+
+    /// No baked system for the given `(task_id, attempt)` → 404, not a
+    /// panic or a 200-with-empty-body.
+    #[tokio::test]
+    async fn worker_prompt_system_404s_when_no_baked_system() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let result = worker_prompt_system(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(PromptSystemQuery {
+                task_id: task_id.clone(),
+                attempt: 1,
+            }),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("expected 404 ApiError, got Ok"),
+            Err(e) => e,
+        };
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A handle bound to a different task than the one requested must be
+    /// rejected (400) — this is the same cross-check `worker_prompt` does.
+    #[tokio::test]
+    async fn worker_prompt_system_rejects_handle_task_mismatch() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let other_task_id = StepId::new();
+        let handle =
+            seed_task_with_handle(&state, &task_id, "planner", 1, Some("x".to_string())).await;
+
+        let result = worker_prompt_system(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(PromptSystemQuery {
+                task_id: other_task_id,
+                attempt: 1,
+            }),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("expected 400 ApiError for task mismatch, got Ok"),
+            Err(e) => e,
+        };
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `GET /v1/agents/:name/render-size` requires no auth, and reports
+    /// `last_rendered_bytes: null` for an agent that has never had a
+    /// `system_prompt` baked — a normal 200, not a 404.
+    #[tokio::test]
+    async fn agent_render_size_returns_null_for_unknown_agent() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+
+        let Json(body) = agent_render_size(
+            State(state.clone()),
+            axum::extract::Path("never-dispatched".to_string()),
+        )
+        .await;
+        assert_eq!(body.agent, "never-dispatched");
+        assert_eq!(body.last_rendered_bytes, None);
+    }
+
+    /// Once `bake_worker_system_prompt` has recorded a render size for an
+    /// agent, the route reports the most-recently-observed value.
+    #[tokio::test]
+    async fn agent_render_size_reports_last_rendered_bytes() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        state
+            .engine
+            .with_state("test.seed_agent_ctx_for_bake", {
+                let task_id = task_id.clone();
+                move |s| {
+                    s.tasks.insert(
+                        task_id.clone(),
+                        mlua_swarm::core::state::TaskState::new(
+                            task_id,
+                            mlua_swarm::core::state::TaskSpec {
+                                agent: "coder".to_string(),
+                                initial_directive: json!("x"),
+                                step_ctx: None,
+                            },
+                        ),
+                    );
+                }
+            })
+            .await
+            .expect("seed task");
+        state
+            .engine
+            .bake_worker_system_prompt(&task_id, 1, Some("z".repeat(42)))
+            .await
+            .expect("bake_worker_system_prompt");
+
+        let Json(body) = agent_render_size(
+            State(state.clone()),
+            axum::extract::Path("coder".to_string()),
+        )
+        .await;
+        assert_eq!(body.agent, "coder");
+        assert_eq!(body.last_rendered_bytes, Some(42));
     }
 }
