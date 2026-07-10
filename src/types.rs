@@ -465,7 +465,8 @@ impl CapToken {
 /// SubAgent pull its task input in a single round-trip.
 ///
 /// - `system`: the rendered `AgentDef.profile.system_prompt` (`None`
-///   when the profile is absent).
+///   when the profile is absent, or when it was baked but is delivered
+///   by reference instead — see `system_ref` below).
 /// - `prompt`: `TaskSpec.initial_directive` rendered to `String` at
 ///   this boundary (issue #18). The engine stores
 ///   `initial_directive` as `Value` end-to-end
@@ -482,6 +483,9 @@ impl CapToken {
 ///   `(task_id, attempt)`, when `AgentContextMiddleware` was layered onto
 ///   the spawner stack that dispatched it. `None` on pre-#20 payloads
 ///   (backward compat) and whenever the middleware was never layered.
+/// - `system_ref`: GH #31 — populated instead of `system` when the baked
+///   `system_prompt` exceeds the server's configured size threshold. See
+///   [`SystemRef`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerPayload {
     /// The task this payload was fetched for. Typed [`StepId`] since issue
@@ -501,6 +505,67 @@ pub struct WorkerPayload {
     /// the struct doc above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<crate::core::agent_context::AgentContextView>,
+    /// GH #31: by-reference alternative to `system` when the baked
+    /// `system_prompt` exceeds the server's `SystemRefConfig.threshold_bytes`.
+    /// Exactly one of `system` / `system_ref` is ever `Some` when a
+    /// `system_prompt` was baked for this dispatch — never both `Some`,
+    /// never both `None` in that case. Absent (both `None`) only when no
+    /// `system_prompt` was baked at all (pre-existing `system: None`
+    /// semantics, unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_ref: Option<SystemRef>,
+}
+
+/// GH #31: a by-reference pointer to a baked `system_prompt` too large to
+/// inline into `WorkerPayload.system` — the fetch-time alternative chosen
+/// by `Engine::fetch_worker_payload{,_trusted}` once the rendered string
+/// exceeds `SystemRefConfig.threshold_bytes`. Carries enough to let a
+/// SubAgent (or any caller re-emitting this payload) fetch and verify the
+/// referenced content without re-deriving it from engine state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SystemRef {
+    /// Scheme-qualified location of the full `system_prompt` body.
+    /// `mode: File` carries a `file://<path>` URI (the exact path
+    /// `SystemRefMode::File` wrote to). `mode: Http` carries only the
+    /// **path** portion the engine can construct on its own
+    /// (`/v1/worker/prompt/system?task_id=<id>&attempt=<n>`) — see
+    /// [`SystemRefMode::Http`]'s doc for why the engine cannot fill in
+    /// scheme/host itself, and who is responsible for doing so.
+    pub uri: String,
+    /// Lowercase hex-encoded SHA-256 digest of the full referenced
+    /// `system_prompt` string (the same bytes `size_bytes` measures),
+    /// letting a fetcher verify the content it retrieves from `uri`
+    /// matches what was baked at dispatch time.
+    pub sha256: String,
+    /// Byte length of the referenced `system_prompt` content itself (not
+    /// of `uri`, not of any wrapper/envelope around it).
+    pub size_bytes: u64,
+    /// Which delivery mechanism `uri` uses — see [`SystemRefMode`].
+    pub mode: SystemRefMode,
+}
+
+/// GH #31: where a [`SystemRef`]'s content is actually served from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemRefMode {
+    /// Content is served live by the HTTP surface at `SystemRef.uri`,
+    /// backed by the unchanged `EngineState.systems` map — no persisted
+    /// storage is created for this mode. The engine itself only
+    /// constructs the **path** portion of `uri`
+    /// (`/v1/worker/prompt/system?task_id=<id>&attempt=<n>`): it has no
+    /// knowledge of scheme/host at fetch time, so the HTTP-layer caller
+    /// that re-emits this `SystemRef` (the route handler serving
+    /// `worker_prompt`) is responsible for prefixing `scheme://host` if a
+    /// fully-qualified URI is desired.
+    Http,
+    /// Content was written once, as a side effect of the fetch that
+    /// produced this `SystemRef`, to a local file under
+    /// `SystemRefConfig.store_dir`; `SystemRef.uri` is that file's
+    /// `file://<path>` URI. Re-fetching the same `(task_id, attempt)`
+    /// re-writes the same bytes to the same path — harmless in practice
+    /// (SubAgents fetch their prompt once per attempt) but not
+    /// deduplicated.
+    File,
 }
 
 /// Error returned when `CapToken::decode` fails.
@@ -857,6 +922,7 @@ mod worker_payload_context_tests {
             system: None,
             prompt: "do the thing".to_string(),
             context: None,
+            system_ref: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert!(
@@ -875,9 +941,89 @@ mod worker_payload_context_tests {
             system: None,
             prompt: "do the thing".to_string(),
             context: Some(view.clone()),
+            system_ref: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
         let round_tripped: WorkerPayload = serde_json::from_value(json).unwrap();
         assert_eq!(round_tripped.context, Some(view));
+    }
+}
+
+// GH #31: `WorkerPayload.system_ref` / `SystemRef` / `SystemRefMode` shape
+// round-trip and backcompat.
+#[cfg(test)]
+mod system_ref_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_json_without_system_ref_deserializes_to_none() {
+        // Shape a pre-#31 WorkerPayload would have serialized (no
+        // `system_ref` key at all).
+        let legacy = serde_json::json!({
+            "task_id": "ST-1",
+            "attempt": 1,
+            "agent": "planner",
+            "prompt": "do the thing",
+        });
+        let payload: WorkerPayload =
+            serde_json::from_value(legacy).expect("legacy shape must deserialize");
+        assert!(payload.system_ref.is_none());
+    }
+
+    #[test]
+    fn system_ref_none_serializes_with_key_absent() {
+        let payload = WorkerPayload {
+            task_id: StepId::parse("ST-1").unwrap(),
+            attempt: 1,
+            agent: "planner".to_string(),
+            system: Some("small prompt".to_string()),
+            prompt: "do the thing".to_string(),
+            context: None,
+            system_ref: None,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(
+            json.as_object().unwrap().get("system_ref").is_none(),
+            "system_ref: None must not appear in the serialized object"
+        );
+    }
+
+    #[test]
+    fn system_ref_some_round_trips_and_excludes_system() {
+        let system_ref = SystemRef {
+            uri: "file:///tmp/mse-system-ref/ST-1-1.md".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 30_000,
+            mode: SystemRefMode::File,
+        };
+        let payload = WorkerPayload {
+            task_id: StepId::parse("ST-1").unwrap(),
+            attempt: 1,
+            agent: "planner".to_string(),
+            system: None,
+            prompt: "do the thing".to_string(),
+            context: None,
+            system_ref: Some(system_ref.clone()),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(
+            json.as_object().unwrap().get("system").is_none(),
+            "system: None must not appear in the serialized object"
+        );
+        let round_tripped: WorkerPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped.system_ref, Some(system_ref));
+        assert!(round_tripped.system.is_none());
+    }
+
+    #[test]
+    fn system_ref_mode_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(SystemRefMode::Http).unwrap(),
+            serde_json::json!("http")
+        );
+        assert_eq!(
+            serde_json::to_value(SystemRefMode::File).unwrap(),
+            serde_json::json!("file")
+        );
     }
 }

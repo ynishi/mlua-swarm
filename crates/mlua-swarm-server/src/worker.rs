@@ -522,6 +522,7 @@ mod tests {
                 run_id: Some(run_id.to_string()),
                 ..Default::default()
             }),
+            system_ref: None,
         }
     }
 
