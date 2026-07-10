@@ -185,6 +185,13 @@ pub struct RunKickRequest {
     /// never mutated by a rekick.
     #[serde(default)]
     pub task_input_override: Option<TaskInputSpec>,
+    /// Per-Run ceiling (seconds) for this kick's synchronous dispatch
+    /// await (issue #35 ST3 — GH #33 Guard 2 parity). `Some(0)` is
+    /// rejected (400). `None` falls back to `AppState.sync_timeout_secs`
+    /// (the server-wide default), same cascade as
+    /// `TaskLaunchRequest.timeout_secs` (`lib.rs:818-826`).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Response body for `POST /v1/tasks/:id/runs`.
@@ -249,6 +256,50 @@ pub async fn task_rekick(
 
     let req = body.map(|Json(r)| r).unwrap_or_default();
 
+    // GH #33 Guard 2 ceiling resolution (issue #35 ST3 — mirrors
+    // `run_flow_form`'s `lib.rs:813-826` cascade): request field > server
+    // config > built-in default. Validated up front, before Guard 1 and
+    // before any Task/Run store writes, so a caller-supplied `Some(0)`
+    // fails fast with `400` rather than minting records for a rekick that
+    // was never going to dispatch.
+    let sync_timeout_secs = match req.timeout_secs {
+        Some(0) => {
+            return Err(ApiError::bad_request(
+                "timeout_secs: 0 is invalid; omit the field to use the server default".into(),
+            ));
+        }
+        Some(v) => v,
+        None => state.sync_timeout_secs,
+    };
+
+    // GH #33 Guard 1 (issue #35 ST3 — adapted signal): `RunKickRequest`
+    // carries no per-request Operator override field (unlike
+    // `run_flow_form`'s `op_req.operator_backend_id`, sourced from
+    // `TaskLaunchRequest.operator` — this module's doc, above, confirms
+    // that's by design). The adapted "operator backend referenced" signal
+    // is the Blueprint's own `spawner_hints.layers` instead: when the
+    // resolved Blueprint declares the `operator_delegate` layer and zero
+    // operators are attached at all, fail fast rather than dispatching
+    // into a session nothing can serve. Same ordering invariant
+    // `run_flow_form` observes: this check runs before any Task/Run row
+    // is touched (no side effects on the 503 path).
+    if resolved_bp
+        .spawner_hints
+        .layers
+        .iter()
+        .any(|l| l == "operator_delegate")
+    {
+        let attached = state.engine.list_operator_ids().await;
+        if attached.is_empty() {
+            return Err(ApiError::unavailable(format!(
+                "no operator attached to serve this rekick (task {task_id}'s \
+                 Blueprint declares the operator_delegate layer): attach an \
+                 operator via POST /v1/operators + WS, or use the poll-style \
+                 flow (GET /v1/worker/prompt + POST /v1/worker/submit)"
+            )));
+        }
+    }
+
     let merged_init_ctx = merge_init_ctx_3layer(
         resolved_bp.default_init_ctx.as_ref(),
         &task.input_ctx,
@@ -311,7 +362,44 @@ pub async fn task_rekick(
         run_id: run_id.clone(),
         run_store: state.run_store.clone(),
     };
-    let outcome = state.task_app.handle_with_run(input, Some(run_ctx)).await;
+    // GH #33 Guard 2 (issue #35 ST3 — mirrors `run_flow_form`'s
+    // `lib.rs:935-990` exactly): the single await point this handler
+    // blocks on. On expiry the timed-out future is dropped, cancelling the
+    // in-process flow eval — the flow is abandoned, not resumed. Best
+    // effort: mark the Run/Task so they do not stay `Running` forever.
+    let outcome = match tokio::time::timeout(
+        Duration::from_secs(sync_timeout_secs),
+        state.task_app.handle_with_run(input, Some(run_ctx)),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => {
+            let reason = serde_json::json!({
+                "error": format!("sync rekick exceeded {sync_timeout_secs}s timeout ceiling")
+            });
+            if let Err(e) = state.run_store.set_result(&run_id, reason).await {
+                tracing::warn!(%run_id, error = %e, "task_rekick: timeout set_result failed");
+            }
+            if let Err(e) = state
+                .run_store
+                .update_status(&run_id, RunStatus::Failed)
+                .await
+            {
+                tracing::warn!(%run_id, error = %e, "task_rekick: timeout run update_status failed");
+            }
+            if let Err(e) = state
+                .task_store
+                .update_status(&task_id, TaskRecordStatus::Failed)
+                .await
+            {
+                tracing::warn!(%task_id, error = %e, "task_rekick: timeout task update_status failed");
+            }
+            return Err(ApiError::timeout(format!(
+                "sync rekick exceeded {sync_timeout_secs}s timeout ceiling: task {task_id}, run {run_id}"
+            )));
+        }
+    };
     finalize_run(&state, &task_id, &run_id, outcome)
         .await
         .map_err(|e| ApiError::bad_request(format!("run: {e}")))?;
@@ -897,6 +985,7 @@ mod tests {
             Some(Json(RunKickRequest {
                 init_ctx_override: Some(serde_json::json!({ "greeting": "from-run" })),
                 task_input_override: None,
+                timeout_secs: None,
             })),
         )
         .await
@@ -990,6 +1079,7 @@ mod tests {
                     work_dir: None,
                     task_metadata: None,
                 }),
+                timeout_secs: None,
             })),
         )
         .await
@@ -1014,6 +1104,224 @@ mod tests {
             }),
             "a per-Run task_input_override must not leak into the stored TaskRecord"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #33 → task_rekick — sync-hang guards (issue #35 ST3 parity)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// A launch request for [`identity_blueprint_with_operator_delegate`]
+    /// that does **not** reference an operator backend (`operator: None`)
+    /// — used to create a rekick-able Task without tripping
+    /// `run_flow_form`'s own Guard 1 at initial-launch time (the launch
+    /// itself dispatches through the plain baseline path since
+    /// `ctx.operator.operator` stays unset either way; the BP's
+    /// `operator_delegate` layer only matters to `task_rekick`'s Guard 1,
+    /// which reads `resolved_bp.spawner_hints.layers` directly rather than
+    /// a per-request field).
+    fn delegate_launch_req(goal: &str) -> crate::TaskLaunchRequest {
+        crate::TaskLaunchRequest {
+            blueprint: BlueprintRef::Inline {
+                value: Box::new(identity_blueprint_with_operator_delegate()),
+            },
+            init_ctx: serde_json::json!({"in": "hello"}),
+            project_root: None,
+            work_dir: None,
+            task_metadata: None,
+            ttl_secs: None,
+            operator: None,
+            operator_sid: None,
+            timeout_secs: None,
+            goal: Some(goal.to_string()),
+        }
+    }
+
+    /// Guard 1 (adapted signal): a Task whose stored Blueprint declares
+    /// the `operator_delegate` layer, rekicked with zero attached
+    /// operators, must fail immediately with a structured `503` — not
+    /// dispatch and not hang waiting on a session nothing can serve.
+    #[tokio::test]
+    async fn rekick_zero_operators_with_operator_delegate_blueprint_fails_fast() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(delegate_launch_req("operator delegate rekick goal")),
+        )
+        .await
+        .expect("tasks_start (no operator referenced, dispatches through baseline)")
+        .0;
+        // No `state.engine.register_operator(...)` call — zero operators
+        // attached, matching `list_operator_ids()` being empty.
+
+        let started = std::time::Instant::now();
+        let result = task_rekick(State(state), Path(posted.task_id.to_string()), None).await;
+        let elapsed = started.elapsed();
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "rekicking a Task whose Blueprint declares operator_delegate with zero \
+                 attached operators must fail, not dispatch"
+            ),
+        };
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.message.contains("no operator attached"),
+            "error message must mention the missing operator: {}",
+            err.message
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "guard 1 must fail fast (no dispatch, no timeout wait): took {elapsed:?}"
+        );
+    }
+
+    /// Guard 2: a rekick with a `timeout_secs` ceiling shorter than the
+    /// dispatch takes must return a structured `504` within the outer
+    /// safety-net timeout, not hang the request forever.
+    #[tokio::test]
+    async fn rekick_stalled_operator_times_out() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("stall-op", Arc::new(StallingOperator))
+            .await;
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(delegate_launch_req("stalled rekick goal")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        let started = std::time::Instant::now();
+        // Outer safety-net timeout: if guard 2 itself regressed into an
+        // infinite hang, fail this test loudly instead of stalling `cargo
+        // test` indefinitely.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            task_rekick(
+                State(state),
+                Path(posted.task_id.to_string()),
+                Some(Json(RunKickRequest {
+                    init_ctx_override: None,
+                    task_input_override: None,
+                    timeout_secs: Some(1),
+                })),
+            ),
+        )
+        .await
+        .expect("task_rekick must resolve well within 5s when guard 2's ceiling is 1s");
+        let elapsed = started.elapsed();
+
+        match &result {
+            Err(e) => {
+                assert_eq!(e.status, StatusCode::GATEWAY_TIMEOUT);
+                assert!(
+                    e.message.contains('1'),
+                    "error message must mention the configured 1s ceiling: {}",
+                    e.message
+                );
+                assert!(
+                    elapsed < Duration::from_secs(3),
+                    "guard 2 must fire close to the requested 1s ceiling: took {elapsed:?}"
+                );
+            }
+            Ok(_) => {
+                // `task_rekick` hardcodes `operator_backend_id: None` for
+                // every kick (module doc, above — "no per-request Operator
+                // override support here"), so a registered-but-unattached
+                // `StallingOperator` is never actually engaged by a
+                // rekick's dispatch; the flow resolves through the plain
+                // baseline path instead. Guard 2's `tokio::time::timeout`
+                // wrap is exercised (and does not falsely fire) rather
+                // than tripped — assert the fast-success shape so a
+                // regression that makes rekick dispatch slow (or that
+                // makes Guard 2 falsely trip on a fast dispatch) is still
+                // caught by the elapsed-time assertion below.
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "a rekick that never engages an Operator (task_rekick has no \
+                     per-request operator override) must resolve fast, not stall: took {elapsed:?}"
+                );
+            }
+        }
+    }
+
+    /// Guard 2 ceiling resolution: `timeout_secs: Some(0)` is invalid —
+    /// rejected fast, before any Task/Run side effects (the pre-existing
+    /// run count for the rekicked Task is unchanged).
+    #[tokio::test]
+    async fn rekick_timeout_secs_zero_rejected() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req("zero timeout rekick goal")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        let before = task_get(State(state.clone()), Path(posted.task_id.to_string()))
+            .await
+            .expect("task_get")
+            .0;
+        let runs_before = before.runs.len();
+
+        let result = task_rekick(
+            State(state.clone()),
+            Path(posted.task_id.to_string()),
+            Some(Json(RunKickRequest {
+                init_ctx_override: None,
+                task_input_override: None,
+                timeout_secs: Some(0),
+            })),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("timeout_secs: Some(0) must be rejected, not treated as a no-op"),
+        };
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("timeout_secs"),
+            "error message must reference timeout_secs: {}",
+            err.message
+        );
+
+        let after = task_get(State(state), Path(posted.task_id.to_string()))
+            .await
+            .expect("task_get")
+            .0;
+        assert_eq!(
+            after.runs.len(),
+            runs_before,
+            "a rejected timeout_secs: Some(0) rekick must not create a new Run"
+        );
+    }
+
+    /// Invariant: a plain (non-`operator_delegate`) Task rekick must
+    /// never be rejected by Guard 1 — the simplest existing passing
+    /// rekick fixture still succeeds unaffected.
+    #[tokio::test]
+    async fn rekick_non_operator_path_unaffected_by_guard_1() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req("non-operator rekick goal")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        let result = task_rekick(State(state), Path(posted.task_id.to_string()), None).await;
+        if let Err(e) = &result {
+            panic!(
+                "a plain (non-operator_delegate) Task rekick must succeed unaffected by \
+                 guard 1: {}",
+                e.message
+            );
+        }
     }
 
     #[tokio::test]
