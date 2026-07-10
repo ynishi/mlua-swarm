@@ -60,6 +60,7 @@ use axum::{
 };
 use mlua_swarm::core::agent_context::StepPointer;
 use mlua_swarm::core::step_naming::StepNaming;
+use mlua_swarm::store::run::RunStatus;
 use mlua_swarm::{CapToken, ContentRef, OutputEvent, RunId, StepId, WorkerPayload};
 use mlua_swarm_schema::ContextPolicy;
 use serde::Deserialize;
@@ -359,6 +360,9 @@ pub async fn worker_submit(
         .task_attempt(&task_id)
         .await
         .map_err(|e| ApiError::engine(format!("task_attempt: {e}")))?;
+    // GH #37: fail loud (410) instead of silently accepting a submit whose
+    // addressed Run is already terminal — see `reject_if_run_terminal`.
+    reject_if_run_terminal(&state, &task_id, attempt).await?;
     // Strip trailing whitespace (newlines, etc.) so flow.ir `Eq` string matches
     // don't drift on `"BLOCKED\n" == "BLOCKED"` false results. Origin: the recent clean-up
     // verdict_loop smoke — sharp-edge removal. Internal `\n` inside the raw bytes
@@ -446,6 +450,9 @@ pub async fn worker_artifact(
         .task_attempt(&task_id)
         .await
         .map_err(|e| ApiError::engine(format!("task_attempt: {e}")))?;
+    // GH #37: fail loud (410) instead of silently staging a part whose
+    // addressed Run is already terminal — see `reject_if_run_terminal`.
+    reject_if_run_terminal(&state, &task_id, attempt).await?;
     let body_str = String::from_utf8_lossy(&body).trim_end().to_string();
     let value = Value::String(body_str);
 
@@ -455,6 +462,59 @@ pub async fn worker_artifact(
         .await
         .map_err(|e| ApiError::engine(format!("stage_worker_artifact_trusted: {e}")))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// GH #37: terminal-run guard shared by [`worker_submit`] / [`worker_artifact`].
+///
+/// Resolves the dispatch task's `AgentContextView.run_id` (threaded at
+/// spawn time when a `RunContext` accompanied the launch) and rejects the
+/// submit with `410 Gone` when the addressed Run has already reached a
+/// terminal status (`Done` / `Failed` / `Interrupted`) — the flow-eval
+/// driver for that Run is gone, so the staged/final value could never be
+/// folded into a flow context. Before this guard, such a submit was
+/// silently accepted with `204` and the worker's output orphaned — the
+/// exact failure shape observed when a long-running worker outlived the
+/// GH #33 sync launch ceiling.
+///
+/// Every resolution step is fail-open (missing agent-ctx entry / missing
+/// `run_id` / unparseable id / unknown Run → `Ok(())`), matching this
+/// crate's other best-effort projection hooks: a pre-run-tracking dispatch
+/// must keep working exactly as before.
+async fn reject_if_run_terminal(
+    state: &AppState,
+    task_id: &StepId,
+    attempt: u32,
+) -> Result<(), ApiError> {
+    let tid = task_id.clone();
+    let run_id_str = match state
+        .engine
+        .with_state("worker_terminal_run_guard", move |s| {
+            s.agent_ctx
+                .get(&(tid, attempt))
+                .and_then(|e| e.view.run_id.clone())
+        })
+        .await
+    {
+        Ok(Some(rid)) => rid,
+        _ => return Ok(()),
+    };
+    let Ok(run_id) = RunId::parse(run_id_str) else {
+        return Ok(());
+    };
+    let Ok(rec) = state.run_store.get(&run_id).await else {
+        return Ok(());
+    };
+    match rec.status {
+        RunStatus::Done | RunStatus::Failed | RunStatus::Interrupted => {
+            Err(ApiError::gone(format!(
+                "run {run_id} is already terminal ({:?}): this attempt's output cannot be \
+                 delivered to a flow context; re-kick the task (POST /v1/tasks/:id/runs) and \
+                 fetch a fresh prompt",
+                rec.status
+            )))
+        }
+        RunStatus::Pending | RunStatus::Running => Ok(()),
+    }
 }
 
 /// Query params for `GET /v1/worker/prompt/system`. Field names are fixed to
@@ -1543,5 +1603,113 @@ mod tests {
             })
             .collect();
         assert_eq!(values, vec!["first", "second"]);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #37 — terminal-run guard (`reject_if_run_terminal`)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Links a seeded dispatch task to a Run the same way
+    /// `AgentContextMiddleware` does at spawn time: an `agent_ctx` entry
+    /// whose view carries the `run_id`.
+    async fn link_task_to_run(state: &AppState, task_id: &StepId, attempt: u32, run_id: &RunId) {
+        let tid = task_id.clone();
+        let rid_str = run_id.to_string();
+        state
+            .engine
+            .with_state("test.link_task_to_run", move |s| {
+                let mut entry = mlua_swarm::core::state::AgentCtxEntry::default();
+                entry.view.run_id = Some(rid_str);
+                s.agent_ctx.insert((tid, attempt), entry);
+            })
+            .await
+            .expect("link_task_to_run");
+    }
+
+    /// GH #37: a submit / artifact addressed at a Run that already
+    /// reached a terminal status must be rejected with `410 Gone` — the
+    /// flow-eval driver for that Run is gone, so a silent `204` here
+    /// would orphan the worker's output.
+    #[tokio::test]
+    async fn submit_and_artifact_against_terminal_run_return_410() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store.clone());
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let owner_task = TaskId::new();
+        let run_id = RunId::new();
+        let mut rec = run_record(&owner_task, &run_id, vec![]);
+        rec.status = RunStatus::Failed;
+        run_store.create(rec).await.expect("run create");
+        link_task_to_run(&state, &task_id, 1, &run_id).await;
+
+        let err = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery { ok: None }),
+            axum::body::Bytes::from_static(b"LATE OUTPUT"),
+        )
+        .await
+        .expect_err("a submit against a Failed run must be rejected");
+        assert_eq!(err.status, StatusCode::GONE);
+        assert!(
+            err.message.contains(&run_id.to_string()),
+            "the 410 must name the terminal run: {}",
+            err.message
+        );
+
+        let err = worker_artifact(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(ArtifactQuery {
+                name: "part.md".to_string(),
+            }),
+            axum::body::Bytes::from_static(b"LATE PART"),
+        )
+        .await
+        .expect_err("an artifact staged against a Failed run must be rejected");
+        assert_eq!(err.status, StatusCode::GONE);
+
+        // The rejected values must not have reached the output tail.
+        let tail = state.engine.output_tail(&task_id, 1).await;
+        assert!(tail.is_empty(), "rejected submits must not land: {tail:?}");
+    }
+
+    /// GH #37 fail-open contract: the guard must never turn a
+    /// would-have-succeeded submit into a failure — no run linkage at
+    /// all, an unknown Run, and a live (`Running`) Run all pass.
+    #[tokio::test]
+    async fn terminal_run_guard_is_fail_open() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store.clone());
+        let task_id = StepId::new();
+        seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        // (a) No agent-ctx linkage at all (pre-run-tracking dispatch).
+        reject_if_run_terminal(&state, &task_id, 1)
+            .await
+            .expect("no linkage must fail open");
+
+        // (b) Linked to a Run the store does not know.
+        let unknown_run = RunId::new();
+        link_task_to_run(&state, &task_id, 1, &unknown_run).await;
+        reject_if_run_terminal(&state, &task_id, 1)
+            .await
+            .expect("unknown run must fail open");
+
+        // (c) Linked to a live Run.
+        let owner_task = TaskId::new();
+        let live_run = RunId::new();
+        run_store
+            .create(run_record(&owner_task, &live_run, vec![]))
+            .await
+            .expect("run create");
+        link_task_to_run(&state, &task_id, 1, &live_run).await;
+        reject_if_run_terminal(&state, &task_id, 1)
+            .await
+            .expect("a Running run must pass the guard");
     }
 }

@@ -553,6 +553,14 @@ struct SwarmRunReq {
     /// keyed by `AgentDef.name`, value is `main_ai` / `automate` / `composite`.
     #[serde(default)]
     operator_kind_overrides: Option<HashMap<String, String>>,
+    /// GH #37: opt into the detached (asynchronous) launch. `false`
+    /// (default) keeps the blocking run-to-completion behavior. `true`
+    /// returns `{run_id, task_id, status: "running"}` immediately — the
+    /// flow eval continues in the background bounded by `timeout_secs`
+    /// (in-process) / the server run TTL (id proxy); poll `swarm_status`
+    /// for the terminal status and result.
+    #[serde(default)]
+    detach: Option<bool>,
 }
 
 /// How to resolve a Blueprint for `swarm_run`. Symmetric with the
@@ -1005,7 +1013,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Run a Blueprint to completion via TaskApplication.handle. Blocking. Returns run_id + final_ctx + bound_version. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline)."
+        description = "Run a Blueprint via TaskApplication.handle. Blocking by default (returns run_id + final_ctx + bound_version on completion); pass `detach: true` for the asynchronous launch — returns `{run_id, task_id, status: \"running\"}` immediately, poll `swarm_status` for the result. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline)."
     )]
     async fn swarm_run(
         &self,
@@ -1017,6 +1025,7 @@ impl MseServer {
         let run_id_typed = RunId::new();
         let run_id = run_id_typed.to_string();
         let ttl = Duration::from_secs(req.timeout_secs.unwrap_or(300));
+        let detach = req.detach.unwrap_or(false);
 
         // Normalize BlueprintInput → BlueprintSelector.
         let selector = match req.blueprint {
@@ -1037,6 +1046,7 @@ impl MseServer {
                     req.operator_id,
                     req.operator_kind,
                     req.operator_kind_overrides,
+                    detach,
                 )
                 .await;
         }
@@ -1161,6 +1171,42 @@ impl MseServer {
             Err(_) => None,
         };
 
+        // GH #37 detached launch (in-process path): the eval runs in its
+        // own spawned task bounded by `ttl` alone; the spawned task owns
+        // finalizing both the local run trace and the `RunHandle`, and the
+        // tool returns `{run_id, task_id, status: "running"}` immediately.
+        // Poll `swarm_status` for the terminal status and result.
+        if detach {
+            let state_bg = self.state.clone();
+            let run_id_bg = run_id.clone();
+            let run_id_typed_bg = run_id_typed.clone();
+            let run_store_bg = run_store.clone();
+            tokio::spawn(async move {
+                let result =
+                    tokio::time::timeout(ttl, task_app.handle_with_run(input, run_ctx)).await;
+                let (status, store_status, final_ctx) = match result {
+                    Ok(Ok(out)) => (RunStatus::Done, StoreRunStatus::Done, Some(out.final_ctx)),
+                    Ok(Err(_)) | Err(_) => (RunStatus::Failed, StoreRunStatus::Failed, None),
+                };
+                let _ = run_store_bg
+                    .update_status(&run_id_typed_bg, store_status)
+                    .await;
+                if let Some(fc) = final_ctx {
+                    let _ = run_store_bg.set_result(&run_id_typed_bg, fc).await;
+                }
+                let mut inner = state_bg.write().await;
+                if let Some(h) = inner.runs.get_mut(&run_id_bg) {
+                    h.status = status;
+                }
+            });
+            return json_result(&serde_json::json!({
+                "run_id": run_id,
+                "task_id": task_id_typed,
+                "status": "running",
+                "detached": true,
+            }));
+        }
+
         let exec = task_app.handle_with_run(input, run_ctx);
         let result = tokio::time::timeout(ttl, exec).await;
 
@@ -1261,6 +1307,7 @@ impl MseServer {
         operator_id: Option<String>,
         operator_kind: Option<String>,
         operator_kind_overrides: Option<HashMap<String, String>>,
+        detach: bool,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut inner = self.state.write().await;
@@ -1305,6 +1352,13 @@ impl MseServer {
             init_ctx.unwrap_or_else(|| serde_json::json!({})),
         );
         payload.insert("ttl_secs".into(), JsonValue::from(ttl.as_secs()));
+        if detach {
+            // GH #37: opt the server into the detached launch — it answers
+            // `202 {run_id, task_id, status: "running", final_ctx: null}`
+            // immediately; the `status` field is folded into the response
+            // parsing below.
+            payload.insert("detach".into(), JsonValue::Bool(true));
+        }
         if !operator_obj.is_empty() {
             payload.insert("operator".into(), JsonValue::Object(operator_obj));
         }
@@ -1364,12 +1418,25 @@ impl MseServer {
                 .get("task_id")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            // GH #37: the server reports the launch outcome in `status` —
+            // `"done"` for the synchronous path, `"running"` for a
+            // detached (`202 Accepted`) launch. Absent (pre-#37 server)
+            // means the old always-synchronous behavior: done.
+            let status_str = parsed
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("done")
+                .to_string();
             (
-                RunStatus::Done,
+                if status_str == "running" {
+                    RunStatus::Running
+                } else {
+                    RunStatus::Done
+                },
                 serde_json::json!({
                     "run_id": effective_run_id.clone(),
                     "task_id": parsed.get("task_id").cloned().unwrap_or(JsonValue::Null),
-                    "status": "done",
+                    "status": status_str,
                     "final_ctx": parsed.get("final_ctx").cloned().unwrap_or(JsonValue::Null),
                     "bound_version": parsed.get("bound_version").cloned().unwrap_or(JsonValue::Null),
                     "effective_ttl_secs": parsed.get("effective_ttl_secs").cloned().unwrap_or(JsonValue::Null),
@@ -2078,6 +2145,7 @@ mod tests {
             operator_id: None,
             operator_kind: None,
             operator_kind_overrides: None,
+            detach: None,
         };
         let res = server.swarm_run(Parameters(req)).await.unwrap();
         assert!(!res.content.is_empty());
@@ -2108,6 +2176,7 @@ mod tests {
             operator_id: None,
             operator_kind: None,
             operator_kind_overrides: None,
+            detach: None,
         };
         let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
         let text = extract_text_payload(&result);
@@ -2125,6 +2194,50 @@ mod tests {
         assert_eq!(parsed["history_len"], 0, "Inline mode -> 0");
     }
 
+    /// GH #37: `detach: true` returns `{status: "running", detached: true}`
+    /// immediately; the eval completes in the background and
+    /// `swarm_status` eventually reports `done` with the result persisted
+    /// in the local run store.
+    #[tokio::test]
+    async fn swarm_run_detached_returns_running_and_completes_in_background() {
+        let server = MseServer::new();
+        let bp_json = serde_json::to_value(identity_blueprint()).expect("serialize blueprint");
+        let req = SwarmRunReq {
+            blueprint: BlueprintInput::BareInline(bp_json),
+            init_ctx: Some(serde_json::json!({"in": "hello"})),
+            timeout_secs: Some(10),
+            operator_id: None,
+            operator_kind: None,
+            operator_kind_overrides: None,
+            detach: Some(true),
+        };
+        let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
+        let text = extract_text_payload(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("parse json");
+        assert_eq!(parsed["status"], "running", "payload: {text}");
+        assert_eq!(parsed["detached"], true, "payload: {text}");
+        let run_id = parsed["run_id"].as_str().expect("run_id").to_string();
+
+        // Poll swarm_status until the background eval finishes (~5s cap).
+        let mut last = String::new();
+        for _ in 0..50 {
+            let status_res = server
+                .swarm_status(Parameters(SwarmStatusReq {
+                    run_id: run_id.clone(),
+                }))
+                .await
+                .expect("swarm_status");
+            last = extract_text_payload(&status_res);
+            let status: serde_json::Value = serde_json::from_str(&last).expect("parse status");
+            match status["status"].as_str() {
+                Some("done") => return,
+                Some("running") => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                other => panic!("unexpected status {other:?}: {last}"),
+            }
+        }
+        panic!("detached run did not reach done within ~5s: {last}");
+    }
+
     /// Issue #13: an in-process run mints R-/T- prefixed ids and traces its
     /// steps into the local run store, visible via `swarm_status`.
     #[tokio::test]
@@ -2138,6 +2251,7 @@ mod tests {
             operator_id: None,
             operator_kind: None,
             operator_kind_overrides: None,
+            detach: None,
         };
         let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
         let parsed: serde_json::Value =
@@ -2181,6 +2295,7 @@ mod tests {
             operator_id: None,
             operator_kind: None,
             operator_kind_overrides: None,
+            detach: None,
         };
         let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
         let text = extract_text_payload(&result);
@@ -2202,6 +2317,7 @@ mod tests {
             operator_id: None,
             operator_kind: None,
             operator_kind_overrides: None,
+            detach: None,
         };
         let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
         let text = extract_text_payload(&result);
@@ -2228,6 +2344,7 @@ mod tests {
             operator_id: None,
             operator_kind: None,
             operator_kind_overrides: None,
+            detach: None,
         };
         let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
         let _ = std::fs::remove_file(&name);
@@ -2863,6 +2980,7 @@ mod tests {
                 operator_id: None,
                 operator_kind: None,
                 operator_kind_overrides: None,
+                detach: None,
             }))
             .await
             .unwrap();

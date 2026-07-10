@@ -662,6 +662,19 @@ pub struct TaskLaunchRequest {
     /// stores an empty string — the flow-eval path itself never reads it.
     #[serde(default)]
     goal: Option<String>,
+    /// GH #37: opt into the detached (asynchronous) launch. `false` (the
+    /// default; existing clients are unaffected) keeps the synchronous
+    /// launch: the handler drives the flow eval inline and returns the
+    /// `final_ctx` on completion. `true` spawns the flow eval as a
+    /// detached background task and returns `202 Accepted` immediately
+    /// with `{task_id, run_id, status: "running"}` (`final_ctx` is
+    /// `null`) — the run's only lifetime bound is `ttl_secs`, and its
+    /// outcome is observed via `GET /v1/runs/:id` (or the `swarm_status`
+    /// MCP tool). Mutually exclusive with `timeout_secs` (the sync-launch
+    /// ceiling has no meaning for a detached run; combining them is a
+    /// `400`).
+    #[serde(default)]
+    detach: bool,
 }
 
 /// Operator inject sub-schema of [`TaskLaunchRequest`] (`kind` / `id` /
@@ -742,6 +755,25 @@ pub struct TaskLaunchResponse {
     /// re-fetches it (`step_entries` included).
     #[schemars(with = "String")]
     run_id: RunId,
+    /// Launch outcome at response time (GH #37). The synchronous path
+    /// (default) reports `done` — the flow eval completed before this
+    /// response was built. A detached launch (`detach: true`) reports
+    /// `running` — the eval continues in the background; poll `GET
+    /// /v1/runs/:id` for the terminal status and result.
+    status: RunStatus,
+}
+
+/// `tasks_start`'s reply — a [`TaskLaunchResponse`] plus the HTTP status
+/// it rides out on (`200 OK` for the synchronous path, `202 Accepted` for
+/// a detached launch, GH #37). A tuple struct with the body first so
+/// handler-level tests keep their established `.0` access to the response
+/// body regardless of which path produced it.
+pub struct TaskLaunchReply(pub TaskLaunchResponse, pub StatusCode);
+
+impl IntoResponse for TaskLaunchReply {
+    fn into_response(self) -> Response {
+        (self.1, Json(self.0)).into_response()
+    }
 }
 
 /// Which layer of the TTL cascade (request body → BP metadata → server
@@ -770,9 +802,8 @@ pub enum TtlSource {
 async fn tasks_start(
     State(state): State<AppState>,
     Json(req): Json<TaskLaunchRequest>,
-) -> Result<Json<TaskLaunchResponse>, ApiError> {
-    let resp = run_flow_form(&state, req).await?;
-    Ok(Json(resp))
+) -> Result<TaskLaunchReply, ApiError> {
+    run_flow_form(&state, req).await
 }
 
 /// Flow-form path (= via `TaskApplication::handle_with_run`).
@@ -808,10 +839,24 @@ async fn tasks_start(
 ///   cancels the in-process flow eval (the flow is abandoned, not
 ///   resumed; intended v1 semantics) — and the Task/Run records are
 ///   best-effort marked `Failed` so they do not stay `Running` forever.
+///
+/// # GH #37 — detached launch (`detach: true`)
+///
+/// The sync semantics above tie the flow-eval driver's lifetime to this
+/// request's future — a long-running detached worker that outlives the
+/// ceiling gets its (individually successful) `/v1/worker/*` submits
+/// orphaned when the driver is cancelled. `detach: true` decouples them:
+/// the eval (plus `finalize_run`) runs in a `tokio::spawn`ed background
+/// task whose only lifetime bound is the resolved `ttl_secs` (marked
+/// `Failed` on expiry, same best-effort persistence as Guard 2), and the
+/// handler returns `202 Accepted` with `status: "running"` immediately.
+/// Guard 1 still applies (checked before any store write); Guard 2's
+/// ceiling does not (`timeout_secs` + `detach` together is a `400`).
+/// Client disconnect after the `202` cannot cancel the run.
 async fn run_flow_form(
     state: &AppState,
     req: TaskLaunchRequest,
-) -> Result<TaskLaunchResponse, ApiError> {
+) -> Result<TaskLaunchReply, ApiError> {
     use mlua_swarm::application::{BlueprintRef as AppBlueprintRef, TaskApplicationInput};
     use mlua_swarm::OperatorKind;
 
@@ -867,14 +912,26 @@ async fn run_flow_form(
     // Validated up front — before any TaskRecord/RunRecord side effects —
     // so a caller-supplied `Some(0)` fails fast with `400` rather than
     // minting records for a launch that was never going to dispatch.
-    let sync_timeout_secs = match req.timeout_secs {
-        Some(0) => {
+    // GH #37: `detach: true` makes the sync ceiling meaningless (the
+    // detached run is bounded by `ttl_secs` alone) — combining the two
+    // is rejected here, same fail-fast-before-side-effects ordering.
+    let detach = req.detach;
+    let sync_timeout_secs = match (detach, req.timeout_secs) {
+        (true, Some(_)) => {
+            return Err(ApiError::bad_request(
+                "timeout_secs is the synchronous launch ceiling and does not apply to a \
+                 detached launch (detach: true), whose lifetime bound is ttl_secs — omit \
+                 timeout_secs"
+                    .into(),
+            ));
+        }
+        (false, Some(0)) => {
             return Err(ApiError::bad_request(
                 "timeout_secs: 0 is invalid; omit the field to use the server default".into(),
             ));
         }
-        Some(v) => v,
-        None => state.sync_timeout_secs,
+        (false, Some(v)) => v,
+        (_, None) => state.sync_timeout_secs,
     };
 
     // GH #33 Guard 1: operator readiness precheck. Coarse signal — this
@@ -979,6 +1036,80 @@ async fn run_flow_form(
         run_id: run_id.clone(),
         run_store: state.run_store.clone(),
     };
+    let input = TaskApplicationInput {
+        blueprint,
+        operator_id: operator_id.clone(),
+        role: Role::Operator,
+        ttl: Duration::from_secs(ttl_secs),
+        init_ctx,
+        operator_kind,
+        bridge_id: op_req.senior_bridge_id,
+        hook_id: op_req.spawn_hook_id,
+        operator_backend_id: op_req.operator_backend_id,
+        operator_kind_overrides,
+        task_input: task_input_spec,
+    };
+
+    // GH #37 detached launch: the eval driver runs in its own spawned
+    // task — its lifetime is bound to `ttl_secs`, not to this request's
+    // future (client disconnect / handler completion cannot cancel it).
+    // The spawned task owns the run to its terminal status: `finalize_run`
+    // on completion, or the same best-effort `Failed` marking as Guard 2
+    // if the ttl ceiling expires first.
+    if detach {
+        let bg_state = state.clone();
+        let bg_task_id = task_id.clone();
+        let bg_run_id = run_id.clone();
+        tokio::spawn(async move {
+            let outcome = match tokio::time::timeout(
+                Duration::from_secs(ttl_secs),
+                bg_state.task_app.handle_with_run(input, Some(run_ctx)),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_elapsed) => {
+                    let reason = json!({
+                        "error": format!("detached run exceeded {ttl_secs}s ttl ceiling"),
+                    });
+                    if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
+                        tracing::warn!(%bg_run_id, error = %e, "run_flow_form: detached ttl set_result failed");
+                    }
+                    if let Err(e) = bg_state
+                        .run_store
+                        .update_status(&bg_run_id, RunStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_run_id, error = %e, "run_flow_form: detached ttl run update_status(Failed) failed");
+                    }
+                    if let Err(e) = bg_state
+                        .task_store
+                        .update_status(&bg_task_id, TaskRecordStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_task_id, error = %e, "run_flow_form: detached ttl task update_status(Failed) failed");
+                    }
+                    return;
+                }
+            };
+            // `finalize_run` persists both the Ok and Err outcomes itself;
+            // the passthrough return value has no consumer here.
+            let _ = tasks::finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
+        });
+        return Ok(TaskLaunchReply(
+            TaskLaunchResponse {
+                final_ctx: Value::Null,
+                bound_version: None,
+                effective_ttl_secs: ttl_secs,
+                ttl_source,
+                task_id,
+                run_id,
+                status: RunStatus::Running,
+            },
+            StatusCode::ACCEPTED,
+        ));
+    }
+
     // GH #33 Guard 2: the single await point this handler blocks on. On
     // expiry the timed-out future is dropped, cancelling the in-process
     // flow eval — the flow is abandoned, not resumed (intended v1
@@ -986,22 +1117,7 @@ async fn run_flow_form(
     // this handler makes, out of scope here).
     let outcome = match tokio::time::timeout(
         Duration::from_secs(sync_timeout_secs),
-        state.task_app.handle_with_run(
-            TaskApplicationInput {
-                blueprint,
-                operator_id: operator_id.clone(),
-                role: Role::Operator,
-                ttl: Duration::from_secs(ttl_secs),
-                init_ctx,
-                operator_kind,
-                bridge_id: op_req.senior_bridge_id,
-                hook_id: op_req.spawn_hook_id,
-                operator_backend_id: op_req.operator_backend_id,
-                operator_kind_overrides,
-                task_input: task_input_spec,
-            },
-            Some(run_ctx),
-        ),
+        state.task_app.handle_with_run(input, Some(run_ctx)),
     )
     .await
     {
@@ -1046,14 +1162,18 @@ async fn run_flow_form(
         .await
         .map_err(|e| ApiError::bad_request(format!("run: {e}")))?;
 
-    Ok(TaskLaunchResponse {
-        final_ctx: out.final_ctx,
-        bound_version: out.bound_version.map(|v| format!("{:?}", v)),
-        effective_ttl_secs: ttl_secs,
-        ttl_source,
-        task_id,
-        run_id,
-    })
+    Ok(TaskLaunchReply(
+        TaskLaunchResponse {
+            final_ctx: out.final_ctx,
+            bound_version: out.bound_version.map(|v| format!("{:?}", v)),
+            effective_ttl_secs: ttl_secs,
+            ttl_source,
+            task_id,
+            run_id,
+            status: RunStatus::Done,
+        },
+        StatusCode::OK,
+    ))
 }
 
 /// issue #19 ST2 direct sibling-field resolver — extracts the three
@@ -1194,6 +1314,16 @@ impl ApiError {
             message: m,
         }
     }
+    /// Builds a `410 Gone` with the given message (GH #37 — worker
+    /// submit/artifact addressed at a Run that already reached a terminal
+    /// status; the silent-`204`-then-orphan alternative is the failure
+    /// shape this replaces).
+    pub fn gone(m: String) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            message: m,
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -1314,6 +1444,7 @@ mod tests {
             operator_sid: None,
             timeout_secs: None,
             goal: None,
+            detach: false,
         }
     }
 

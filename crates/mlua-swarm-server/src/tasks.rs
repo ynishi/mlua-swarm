@@ -192,6 +192,14 @@ pub struct RunKickRequest {
     /// `TaskLaunchRequest.timeout_secs` (`lib.rs:818-826`).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// GH #37: opt into the detached (asynchronous) rekick — same
+    /// semantics as `TaskLaunchRequest.detach`. `false` (default) keeps
+    /// the synchronous dispatch; `true` spawns the flow eval as a
+    /// detached background task bounded by the run TTL alone and returns
+    /// `202 Accepted` with `status: "running"` immediately. Mutually
+    /// exclusive with `timeout_secs` (`400` when combined).
+    #[serde(default)]
+    pub detach: bool,
 }
 
 /// Response body for `POST /v1/tasks/:id/runs`.
@@ -203,6 +211,11 @@ pub struct RunKickResponse {
     /// The freshly minted Run id for this kick.
     #[schemars(with = "String")]
     pub run_id: RunId,
+    /// Kick outcome at response time (GH #37). The synchronous path
+    /// reports the dispatched run's terminal-side status (`done`); a
+    /// detached kick reports `running` — poll `GET /v1/runs/:id` for the
+    /// terminal status and result.
+    pub status: RunStatus,
 }
 
 /// `POST /v1/tasks/:id/runs`. Re-kicks an existing Task: reads its stored
@@ -270,14 +283,26 @@ pub async fn task_rekick(
     // before any Task/Run store writes, so a caller-supplied `Some(0)`
     // fails fast with `400` rather than minting records for a rekick that
     // was never going to dispatch.
-    let sync_timeout_secs = match req.timeout_secs {
-        Some(0) => {
+    // GH #37: `detach: true` makes the sync ceiling meaningless (the
+    // detached kick is bounded by the run TTL alone) — combining the two
+    // is rejected here, same fail-fast-before-side-effects ordering.
+    let detach = req.detach;
+    let sync_timeout_secs = match (detach, req.timeout_secs) {
+        (true, Some(_)) => {
+            return Err(ApiError::bad_request(
+                "timeout_secs is the synchronous rekick ceiling and does not apply to a \
+                 detached rekick (detach: true), whose lifetime bound is the run TTL — omit \
+                 timeout_secs"
+                    .into(),
+            ));
+        }
+        (false, Some(0)) => {
             return Err(ApiError::bad_request(
                 "timeout_secs: 0 is invalid; omit the field to use the server default".into(),
             ));
         }
-        Some(v) => v,
-        None => state.sync_timeout_secs,
+        (false, Some(v)) => v,
+        (_, None) => state.sync_timeout_secs,
     };
 
     // GH #33 Guard 1 (issue #35 ST3 — adapted signal): `RunKickRequest`
@@ -370,6 +395,63 @@ pub async fn task_rekick(
         run_id: run_id.clone(),
         run_store: state.run_store.clone(),
     };
+
+    // GH #37 detached rekick: same driver-detach semantics as
+    // `run_flow_form` — the eval runs in its own spawned task bounded by
+    // the run TTL alone, `finalize_run` (or the ttl-expiry `Failed`
+    // marking) is owned by that task, and this handler returns `202
+    // Accepted` immediately.
+    if detach {
+        let ttl_secs = crate::default_run_ttl();
+        let bg_state = state.clone();
+        let bg_task_id = task_id.clone();
+        let bg_run_id = run_id.clone();
+        tokio::spawn(async move {
+            let outcome = match tokio::time::timeout(
+                Duration::from_secs(ttl_secs),
+                bg_state.task_app.handle_with_run(input, Some(run_ctx)),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_elapsed) => {
+                    let reason = serde_json::json!({
+                        "error": format!("detached rekick exceeded {ttl_secs}s ttl ceiling"),
+                    });
+                    if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
+                        tracing::warn!(%bg_run_id, error = %e, "task_rekick: detached ttl set_result failed");
+                    }
+                    if let Err(e) = bg_state
+                        .run_store
+                        .update_status(&bg_run_id, RunStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_run_id, error = %e, "task_rekick: detached ttl run update_status failed");
+                    }
+                    if let Err(e) = bg_state
+                        .task_store
+                        .update_status(&bg_task_id, TaskRecordStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_task_id, error = %e, "task_rekick: detached ttl task update_status failed");
+                    }
+                    return;
+                }
+            };
+            // `finalize_run` persists both the Ok and Err outcomes itself;
+            // the passthrough return value has no consumer here.
+            let _ = finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
+        });
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(RunKickResponse {
+                task_id,
+                run_id,
+                status: RunStatus::Running,
+            }),
+        ));
+    }
+
     // GH #33 Guard 2 (issue #35 ST3 — mirrors `run_flow_form`'s
     // `lib.rs:935-990` exactly): the single await point this handler
     // blocks on. On expiry the timed-out future is dropped, cancelling the
@@ -414,7 +496,11 @@ pub async fn task_rekick(
 
     Ok((
         StatusCode::CREATED,
-        Json(RunKickResponse { task_id, run_id }),
+        Json(RunKickResponse {
+            task_id,
+            run_id,
+            status: RunStatus::Done,
+        }),
     ))
 }
 
@@ -548,6 +634,7 @@ mod tests {
             operator_sid: None,
             timeout_secs: None,
             goal: Some(goal.to_string()),
+            detach: false,
         }
     }
 
@@ -681,6 +768,7 @@ mod tests {
             operator_sid: None,
             timeout_secs,
             goal: Some("operator delegate test goal".to_string()),
+            detach: false,
         }
     }
 
@@ -792,6 +880,180 @@ mod tests {
             err.message.contains("timeout_secs"),
             "error message must reference timeout_secs: {}",
             err.message
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #37 — detached launch / rekick (driver decoupled from request)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Polls the run store until the given Run reaches a terminal status,
+    /// panicking after ~5s — the detached paths complete in the
+    /// background, so tests must wait on the store rather than the
+    /// response.
+    async fn wait_for_terminal_run(state: &AppState, run_id: &RunId) -> RunRecord {
+        for _ in 0..50 {
+            let rec = state.run_store.get(run_id).await.expect("run get");
+            if !matches!(rec.status, RunStatus::Pending | RunStatus::Running) {
+                return rec;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("run {run_id} did not reach a terminal status within ~5s");
+    }
+
+    /// GH #37: `detach: true` returns `202 Accepted` immediately with
+    /// `status: "running"` and a null `final_ctx`; the eval completes in
+    /// the background and the Run/Task reach `Done` with the result and
+    /// step trace persisted — the same terminal state the sync path
+    /// produces.
+    #[tokio::test]
+    async fn detached_launch_returns_202_and_completes_in_background() {
+        let state = test_state();
+        let mut req = post_tasks_req("detached goal");
+        req.detach = true;
+
+        let reply = crate::tasks_start(State(state.clone()), Json(req))
+            .await
+            .expect("tasks_start (detached)");
+        assert_eq!(reply.1, StatusCode::ACCEPTED);
+        let posted = reply.0;
+        assert_eq!(posted.status, RunStatus::Running);
+        assert_eq!(
+            posted.final_ctx,
+            serde_json::Value::Null,
+            "a detached launch has no final_ctx at response time"
+        );
+
+        let rec = wait_for_terminal_run(&state, &posted.run_id).await;
+        assert_eq!(rec.status, RunStatus::Done);
+        assert!(
+            rec.result_ref.is_some(),
+            "finalize_run must persist the background eval's final_ctx"
+        );
+        assert_eq!(
+            rec.step_entries.len(),
+            1,
+            "the background eval must trace its step_entries like the sync path: {:?}",
+            rec.step_entries
+        );
+        let task = state
+            .task_store
+            .get(&posted.task_id)
+            .await
+            .expect("task get");
+        assert_eq!(task.status, TaskRecordStatus::Done);
+    }
+
+    /// GH #37: `detach: true` + `timeout_secs` is contradictory (the sync
+    /// ceiling has no meaning for a detached run) — rejected with `400`
+    /// before any Task/Run side effects.
+    #[tokio::test]
+    async fn detached_launch_with_timeout_secs_rejected() {
+        let state = test_state();
+        let mut req = post_tasks_req("detached + ceiling goal");
+        req.detach = true;
+        req.timeout_secs = Some(60);
+
+        let err = match crate::tasks_start(State(state.clone()), Json(req)).await {
+            Err(e) => e,
+            Ok(_) => panic!("detach + timeout_secs must be rejected"),
+        };
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("detach"),
+            "error message must explain the detach/timeout_secs conflict: {}",
+            err.message
+        );
+        let tasks = state.task_store.list().await.expect("task list");
+        assert!(
+            tasks.is_empty(),
+            "the 400 must fire before any TaskRecord is minted"
+        );
+    }
+
+    /// GH #37: a detached rekick returns `202 Accepted` with `status:
+    /// "running"` immediately and completes in the background, adding a
+    /// second `Done` Run to the same Task.
+    #[tokio::test]
+    async fn rekick_detached_returns_202_and_completes_in_background() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req("detached rekick goal")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        let (status, rekicked) = task_rekick(
+            State(state.clone()),
+            Path(posted.task_id.to_string()),
+            Some(Json(RunKickRequest {
+                init_ctx_override: None,
+                task_input_override: None,
+                timeout_secs: None,
+                detach: true,
+            })),
+        )
+        .await
+        .expect("task_rekick (detached)");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(rekicked.0.status, RunStatus::Running);
+        assert_ne!(rekicked.0.run_id, posted.run_id);
+
+        let rec = wait_for_terminal_run(&state, &rekicked.0.run_id).await;
+        assert_eq!(rec.status, RunStatus::Done);
+        assert!(
+            rec.result_ref.is_some(),
+            "finalize_run must persist the background rekick's final_ctx"
+        );
+    }
+
+    /// GH #37: `detach: true` + `timeout_secs` on the rekick path is the
+    /// same contradiction as on the launch path — `400`, no new Run
+    /// minted.
+    #[tokio::test]
+    async fn rekick_detached_with_timeout_secs_rejected() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req("detached rekick ceiling goal")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        let err = match task_rekick(
+            State(state.clone()),
+            Path(posted.task_id.to_string()),
+            Some(Json(RunKickRequest {
+                init_ctx_override: None,
+                task_input_override: None,
+                timeout_secs: Some(60),
+                detach: true,
+            })),
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("detach + timeout_secs must be rejected on rekick"),
+        };
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("detach"),
+            "error message must explain the detach/timeout_secs conflict: {}",
+            err.message
+        );
+        let runs = state
+            .run_store
+            .list_by_task(&posted.task_id)
+            .await
+            .expect("runs list");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the 400 must fire before a second Run is minted"
         );
     }
 
@@ -942,6 +1204,7 @@ mod tests {
             operator_sid: None,
             timeout_secs: None,
             goal: Some("st4 rekick goal".to_string()),
+            detach: false,
         }
     }
 
@@ -994,6 +1257,7 @@ mod tests {
                 init_ctx_override: Some(serde_json::json!({ "greeting": "from-run" })),
                 task_input_override: None,
                 timeout_secs: None,
+                detach: false,
             })),
         )
         .await
@@ -1088,6 +1352,7 @@ mod tests {
                     task_metadata: None,
                 }),
                 timeout_secs: None,
+                detach: false,
             })),
         )
         .await
@@ -1141,6 +1406,7 @@ mod tests {
             operator_sid: None,
             timeout_secs: None,
             goal: Some(goal.to_string()),
+            detach: false,
         }
     }
 
@@ -1215,6 +1481,7 @@ mod tests {
                     init_ctx_override: None,
                     task_input_override: None,
                     timeout_secs: Some(1),
+                    detach: false,
                 })),
             ),
         )
@@ -1283,6 +1550,7 @@ mod tests {
                 init_ctx_override: None,
                 task_input_override: None,
                 timeout_secs: Some(0),
+                detach: false,
             })),
         )
         .await;

@@ -1259,6 +1259,7 @@ mod tests {
             operator_sid: None,
             timeout_secs: None,
             goal: Some("projection test goal".to_string()),
+            detach: false,
         }
     }
 
@@ -1318,6 +1319,7 @@ mod tests {
             operator_sid: None,
             timeout_secs: None,
             goal: Some("projection test goal (declared name)".to_string()),
+            detach: false,
         }
     }
 
@@ -1546,6 +1548,7 @@ mod tests {
             operator_sid: None,
             timeout_secs: None,
             goal: Some("projection placement test goal".to_string()),
+            detach: false,
         };
         let posted = crate::tasks_start(State(state.clone()), Json(req))
             .await
@@ -1717,6 +1720,7 @@ mod tests {
             operator_sid: None,
             timeout_secs: None,
             goal: None,
+            detach: false,
         };
 
         // `TaskLaunchResponse` (the `Ok` side) does not implement `Debug`,
@@ -1803,6 +1807,7 @@ mod tests {
                 init_ctx_override: Some(json!({ "greeting": "second" })),
                 task_input_override: None,
                 timeout_secs: None,
+                detach: false,
             })),
         )
         .await
@@ -2335,6 +2340,7 @@ mod tests {
             operator_sid: None,
             timeout_secs: None,
             goal: None,
+            detach: false,
         };
 
         let state_bg = state.clone();
