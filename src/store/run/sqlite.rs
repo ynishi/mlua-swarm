@@ -357,6 +357,40 @@ impl RunStore for SqliteRunStore {
             Ok(())
         }
     }
+
+    async fn list_running(&self) -> Result<Vec<RunRecord>, RunStoreError> {
+        let status_json = serde_json::to_string(&RunStatus::Running)
+            .map_err(|e| RunStoreError::Other(format!("encode status: {e}")))?;
+        let rows = self
+            .isle
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, task_id, status, step_entries_json, operator_sid, \
+                     result_ref_json, created_at, updated_at FROM runs \
+                     WHERE status = ?1",
+                )?;
+                let iter = stmt.query_map(params![status_json], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                })?;
+                let mut out = Vec::new();
+                for r in iter {
+                    out.push(r?);
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(map_isle_err)?;
+        rows.into_iter().map(row_to_record).collect()
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -537,6 +571,26 @@ mod tests {
         assert_eq!(got.task_id, TaskId::parse("T-keep").unwrap());
         assert_eq!(got.step_entries.len(), 1);
         assert_eq!(got.step_entries[0].step_ref, Some("step-a".into()));
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_running_filters_by_status() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        s.create(mk("R-2", "T-2", 200)).await.unwrap();
+        s.create(mk("R-3", "T-3", 300)).await.unwrap();
+        s.update_status(&RunId::parse("R-2").unwrap(), RunStatus::Running)
+            .await
+            .unwrap();
+        s.update_status(&RunId::parse("R-3").unwrap(), RunStatus::Done)
+            .await
+            .unwrap();
+        let running = s.list_running().await.unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, RunId::parse("R-2").unwrap());
+        assert_eq!(running[0].status, RunStatus::Running);
         drop(s);
         driver.shutdown().await.unwrap();
     }
