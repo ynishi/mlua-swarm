@@ -34,6 +34,31 @@ pub fn default_store_path() -> PathBuf {
     }
 }
 
+/// Default `TaskStore` SQLite path, `~/.mse/store/task.sqlite` (issue
+/// #35 ST1 — persist-by-default). Same `$HOME` fallback as
+/// [`default_config_path`].
+pub fn default_task_store_path() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home)
+            .join(".mse")
+            .join("store")
+            .join("task.sqlite"),
+        Err(_) => PathBuf::from(".mse/store/task.sqlite"),
+    }
+}
+
+/// Default `RunStore` SQLite path, `~/.mse/store/run.sqlite`. Sibling of
+/// [`default_task_store_path`].
+pub fn default_run_store_path() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home)
+            .join(".mse")
+            .join("store")
+            .join("run.sqlite"),
+        Err(_) => PathBuf::from(".mse/store/run.sqlite"),
+    }
+}
+
 /// TOML config schema. All fields are optional — a missing field falls back
 /// to the CLI-supplied value or the built-in default at [`resolve`] time.
 /// Unknown fields are a hard error (`deny_unknown_fields`; typo guard).
@@ -67,6 +92,12 @@ pub struct FileConfig {
     /// Path to the SQLite database file backing the `RunStore` (one kick of
     /// a Task). `None` = fall back to `InMemoryRunStore` (process-volatile).
     pub run_store_path: Option<PathBuf>,
+    /// Opt-out flag: when `true`, restores the InMemory default for
+    /// `task_store_path`/`run_store_path` even though the built-in default
+    /// (issue #35 ST1) is now to persist. Has no effect when an explicit
+    /// `task_store_path`/`run_store_path` (CLI or file) is set — explicit
+    /// paths always win. `None` = fall back to `false`.
+    pub ephemeral: Option<bool>,
     /// Seed blueprint id used in combined-mode default routing.
     pub seed_blueprint_id: Option<String>,
     /// snake_case `AgentKind` literal (`operator` / `agent_block` / `rust_fn` /
@@ -107,6 +138,8 @@ pub struct CliOverrides {
     pub task_store_path: Option<PathBuf>,
     /// `--run-store-path` value (mirrors [`FileConfig::run_store_path`]).
     pub run_store_path: Option<PathBuf>,
+    /// `--ephemeral` flag (mirrors [`FileConfig::ephemeral`]).
+    pub ephemeral: Option<bool>,
     /// `--seed-blueprint-id` value.
     pub seed_blueprint_id: Option<String>,
     /// `--default-agent-kind` value (snake_case `AgentKind` literal, unvalidated).
@@ -220,6 +253,8 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
         None => default.bind,
     };
 
+    let ephemeral = cli.ephemeral.or(file.ephemeral).unwrap_or(false);
+
     Ok(ResolvedConfig {
         bind,
         enable_enhance_flow: cli
@@ -237,8 +272,20 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .or(file.enhance_setting_store_path),
         enhance_log_store_path: cli.enhance_log_store_path.or(file.enhance_log_store_path),
         output_store_path: cli.output_store_path.or(file.output_store_path),
-        task_store_path: cli.task_store_path.or(file.task_store_path),
-        run_store_path: cli.run_store_path.or(file.run_store_path),
+        task_store_path: cli.task_store_path.or(file.task_store_path).or_else(|| {
+            if ephemeral {
+                None
+            } else {
+                Some(default_task_store_path())
+            }
+        }),
+        run_store_path: cli.run_store_path.or(file.run_store_path).or_else(|| {
+            if ephemeral {
+                None
+            } else {
+                Some(default_run_store_path())
+            }
+        }),
         seed_blueprint_id: cli
             .seed_blueprint_id
             .or(file.seed_blueprint_id)
@@ -376,6 +423,51 @@ mod tests {
     #[test]
     fn resolve_task_and_run_store_path_default_none() {
         let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
+        assert_eq!(
+            resolved.task_store_path,
+            Some(default_task_store_path()),
+            "issue #35 ST1: task_store_path now persists by default"
+        );
+        assert_eq!(
+            resolved.run_store_path,
+            Some(default_run_store_path()),
+            "issue #35 ST1: run_store_path now persists by default"
+        );
+    }
+
+    #[test]
+    fn resolve_ephemeral_true_restores_in_memory_default() {
+        let cli = CliOverrides {
+            ephemeral: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, FileConfig::default()).expect("resolve");
+        assert_eq!(resolved.task_store_path, None);
+        assert_eq!(resolved.run_store_path, None);
+    }
+
+    #[test]
+    fn resolve_explicit_path_wins_over_ephemeral() {
+        let cli = CliOverrides {
+            task_store_path: Some(PathBuf::from("/tmp/explicit-tasks.db")),
+            ephemeral: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, FileConfig::default()).expect("resolve");
+        assert_eq!(
+            resolved.task_store_path,
+            Some(PathBuf::from("/tmp/explicit-tasks.db")),
+            "explicit path must win over ephemeral"
+        );
+    }
+
+    #[test]
+    fn resolve_ephemeral_from_file_config() {
+        let file = FileConfig {
+            ephemeral: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file).expect("resolve");
         assert_eq!(resolved.task_store_path, None);
         assert_eq!(resolved.run_store_path, None);
     }

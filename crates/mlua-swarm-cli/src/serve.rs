@@ -128,6 +128,16 @@ pub struct Args {
     /// config file's `sync_timeout_secs`; built-in default is 300s.
     #[arg(long)]
     sync_timeout_secs: Option<u64>,
+    /// Opt-out of the persist-by-default `TaskStore`/`RunStore` (issue #35
+    /// ST1): restores the previous InMemory default. Has no effect when an
+    /// explicit `--task-store-path`/`--run-store-path` (or the config
+    /// file's equivalent) is set — explicit paths always win over both
+    /// `--ephemeral` and the persist-by-default. Mirrors the config file's
+    /// `ephemeral`. A pure switch: absent = no override (defers to the
+    /// config file / built-in default `false`); passing it always forces
+    /// `true`.
+    #[arg(long)]
+    ephemeral: bool,
 }
 
 fn parse_agent_kind_cli(s: &str) -> Result<mlua_swarm::blueprint::AgentKind, String> {
@@ -157,6 +167,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         output_store_path: args.output_store_path.clone(),
         task_store_path: args.task_store_path.clone(),
         run_store_path: args.run_store_path.clone(),
+        ephemeral: if args.ephemeral { Some(true) } else { None },
         seed_blueprint_id: args.seed_blueprint_id.clone(),
         default_agent_kind: args.default_agent_kind.clone(),
         token_secret: args.token_secret.clone(),
