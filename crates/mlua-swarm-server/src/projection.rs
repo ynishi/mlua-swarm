@@ -1802,6 +1802,7 @@ mod tests {
             Some(Json(crate::tasks::RunKickRequest {
                 init_ctx_override: Some(json!({ "greeting": "second" })),
                 task_input_override: None,
+                timeout_secs: None,
             })),
         )
         .await
