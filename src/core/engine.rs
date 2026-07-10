@@ -1569,6 +1569,34 @@ impl Engine {
         .flatten()
     }
 
+    /// GH #31: plain read-through of the baked `system` string for
+    /// `(task_id, attempt)` from `EngineState.systems`, with no threshold
+    /// branching. Backs `GET /v1/worker/prompt/system` (the `Http`-mode
+    /// fetch target `system_ref.uri` points at) — that route needs the
+    /// exact raw bytes to serve as the response body for the client's
+    /// sha256 verification, not a `WorkerPayload`-wrapped value.
+    ///
+    /// Distinct from `apply_system_ref_threshold` (private, mutates an
+    /// already-built `WorkerPayload` in place after full construction):
+    /// this accessor has no threshold logic and is `pub` so
+    /// `mlua-swarm-server`'s `worker` module can call it directly.
+    ///
+    /// Returns `Ok(None)` if no baked system exists for that `(task_id,
+    /// attempt)` (either the task/attempt has no entry in `s.systems`, or
+    /// the entry is present but stores `None`) — the caller maps this to
+    /// a 404.
+    pub async fn raw_system_prompt(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+    ) -> Result<Option<String>, EngineError> {
+        let task_id = task_id.clone();
+        self.with_state("raw_system_prompt", move |s| {
+            s.systems.get(&(task_id, attempt)).cloned().unwrap_or(None)
+        })
+        .await
+    }
+
     /// Fetch an arbitrary named resource previously stored via
     /// `set_resource`. Not task-scoped — any valid token with the
     /// `FetchData` verb may read any key.
