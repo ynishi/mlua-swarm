@@ -39,7 +39,12 @@
 //!   / `effort` / `tools` / `worker_binding`) is dumped into an
 //!   `extras` `Value` — a future-proof carry for C-C-specific fields.
 //! - The body is kept verbatim, from just after the closing `---` to
-//!   the end of the file.
+//!   the end of the file. Body headings (e.g. `## Input`, `## When
+//!   invoked:`, `## Output format`) are treated as opaque prompt text —
+//!   no structural extraction. Any input contract stated under a body
+//!   heading is a prose convention the worker follows because the body
+//!   is verbatim in its system prompt (matches
+//!   `mse://guides/agent-md-authoring` § "Input is not a section").
 
 use crate::blueprint::{AgentDef, AgentKind, AgentProfile};
 use serde_json::{Map, Value};

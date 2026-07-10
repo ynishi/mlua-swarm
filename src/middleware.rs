@@ -742,51 +742,54 @@ impl SpawnerAdapter for LongHoldWrapped {
 }
 
 // ─── AfterRunAuditMiddleware (GH #34: Blueprint-declared after-run audit hooks) ──
-//
-// Wraps every spawn. After a matched step's inner signal SETTLES (`Ok`;
-// see the invariant below), dispatches the Blueprint-declared audit
-// agent(s) for that step as an independent, synthetic sub-task — via
-// `Engine::start_task` + `Engine::dispatch_attempt_with`, the same
-// "recursive swarming" path a `Role::Worker` token is allow-listed for
-// (`types::WORKER_SWARM_VERBS`) — reusing the AUDITED step's own worker
-// token. Findings are persisted as an `OutputEvent::Artifact` named
-// `"audit:<step_ref>"` on the AUDITED step's own output tail.
-//
-// # Invariant (binding, issue.md #1/#2/#3)
-//
-// Observational only: every failure in the audit path (spawn/dispatch
-// failure, audit worker failure, submit failure) is `tracing::warn!`-logged
-// and swallowed. The audited step's own signal, returned to the caller,
-// is ALWAYS the original inner signal, bit-for-bit — same `signal?; ...;
-// Ok(())` shape as `SeniorEscalationMiddleware` above, so an inner `Err`
-// short-circuits the audit entirely and propagates untouched, and an
-// inner `Ok(())` always returns as `Ok(())` regardless of what happens
-// inside the audit.
-//
-// # Recursion guard
-//
-// An agent name declared as an `AuditDef.agent` (an "auditor") is never
-// itself audited — even if a real flow Step happens to be named after a
-// declared auditor (e.g. a Blueprint audits every step via `steps: None`
-// and also has a flow Step literally named after the auditor). The
-// audit's OWN dispatch additionally never revisits this layer to begin
-// with: it goes through `router` (the raw `CompiledAgentTable` —
-// `Compiler::compile`'s name→adapter table), not the fully-layered stack
-// this middleware itself sits inside, so there is no path back into
-// `AfterRunAuditWrapped::spawn` from an audit dispatch. The name-set
-// check below is a second, independent belt-and-suspenders guard for the
-// real-flow-Step scenario above.
 
 /// One-paragraph instruction handed to the audit agent alongside the
-/// structured `after_run_audit` envelope (see the module comment above
-/// [`AfterRunAuditMiddleware`] for the full contract).
+/// structured `after_run_audit` envelope (see [`AfterRunAuditMiddleware`]
+/// for the full contract).
 const AUDIT_INSTRUCTION: &str = "Inspect this step's transcript/output for degradations, tool \
     failures, or silent fallbacks, and emit your findings as a structured JSON object in your \
     final output.";
 
-/// Blueprint-declared after-run audit hook layer (GH #34). See the
-/// module comment above this type for the full contract; wired
-/// conditionally by `service::task_launch::TaskLaunchService::launch`
+/// Blueprint-declared after-run audit hook layer (GH #34).
+///
+/// Wraps every spawn. After a matched step's inner signal SETTLES (`Ok`),
+/// dispatches the Blueprint-declared audit agent(s) for that step as an
+/// independent, synthetic sub-task — via `Engine::start_task` +
+/// `Engine::dispatch_attempt_with`, the same "recursive swarming" path a
+/// `Role::Worker` token is allow-listed for (`types::WORKER_SWARM_VERBS`) —
+/// reusing the AUDITED step's own worker token. Findings are persisted as
+/// an `OutputEvent::Artifact` named `"audit:<step_ref>"` on the AUDITED
+/// step's own output tail. Downstream steps read those findings via
+/// `WorkerPayload.context.steps["audit:<step_ref>"]` (fold-final drops
+/// them from the BP-chain value, but `Engine::submit_output` dual-writes
+/// every Artifact into `OutputStore` keyed by its own name — see
+/// `src/core/engine.rs`).
+///
+/// # Invariant (observational-only, binding — issue.md #1/#2/#3)
+///
+/// Every failure in the audit path (spawn/dispatch failure, audit worker
+/// failure, submit failure) is `tracing::warn!`-logged and swallowed. The
+/// audited step's own signal, returned to the caller, is ALWAYS the
+/// original inner signal, bit-for-bit — same `signal?; ...; Ok(())` shape
+/// as `SeniorEscalationMiddleware` above, so an inner `Err` short-circuits
+/// the audit entirely and propagates untouched, and an inner `Ok(())`
+/// always returns as `Ok(())` regardless of what happens inside the audit.
+///
+/// # Recursion guard
+///
+/// An agent name declared as an `AuditDef.agent` (an "auditor") is never
+/// itself audited — even if a real flow Step happens to be named after a
+/// declared auditor (e.g. a Blueprint audits every step via `steps: None`
+/// and also has a flow Step literally named after the auditor). The
+/// audit's OWN dispatch additionally never revisits this layer to begin
+/// with: it goes through `router` (the raw `CompiledAgentTable` —
+/// `Compiler::compile`'s name→adapter table), not the fully-layered stack
+/// this middleware itself sits inside, so there is no path back into
+/// `AfterRunAuditWrapped::spawn` from an audit dispatch. The name-set
+/// check in `audit_def_matches_step` (below) is a second, independent
+/// belt-and-suspenders guard for the real-flow-Step scenario.
+///
+/// Wired conditionally by `service::task_launch::TaskLaunchService::launch`
 /// (empty `Blueprint.audits` → no layer, invariant #4 — byte-identical
 /// behavior).
 pub struct AfterRunAuditMiddleware {

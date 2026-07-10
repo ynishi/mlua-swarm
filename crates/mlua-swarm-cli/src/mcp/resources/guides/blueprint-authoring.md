@@ -53,8 +53,14 @@ final `mse_worker_submit` `body` — addressable downstream via `{"op":
 A worker may additionally stage any number of *named* output parts
 before completing the attempt: call `mse_worker_submit` with `name` set
 (see `mse://guides/mcp-tool-reference` § Named multi-part output) once
-per part, then finish with an ordinary plain (no-`name`) submit. A step
-that staged at least one part ends up with OUTPUT shape
+per part, then finish with an ordinary plain (no-`name`) submit. The
+set of `name` values a worker submits is its **staged-names allowlist**
+— that allowlist alone determines what the engine folds into the
+`parts` map on that step's OUTPUT. Any other artifact the worker (or a
+middleware) emits — most notably the after-run audit sidecar
+`audit:<step_ref>` (see § Reading prior-step OUTPUT below) — bypasses
+the fold and is only reachable via the Worker axis. A step that staged
+at least one part ends up with OUTPUT shape
 
 ```jsonc
 { "out": /* the final plain-submit body */ "...", "parts": { "plan.md": "...", "notes": { "todo": "..." } } }
@@ -80,6 +86,57 @@ instead (or a `parts[...]` entry). Keeping a worker's staging behavior in
 sync with the Blueprint's `in` exprs that read its output is the
 Blueprint author's responsibility — nothing in the schema enforces it
 automatically.
+
+## Reading prior-step OUTPUT (Worker axis): `context.steps`
+
+The `$.<step>` / `$.<step>.parts[...]` paths above are the **BP axis** —
+a downstream step declares what to read at Blueprint-authoring time and
+the folded value flows into its `in`. Fine when the caller knows the
+shape in advance.
+
+The **Worker axis** is the complementary read-back path for a SubAgent
+that decides at runtime which prior-step OUTPUT to pull. Every step's
+OUTPUT is dual-recorded in the engine's `OutputStore` and surfaced via
+`WorkerPayload.context.steps` as a `StepPointer` (GH #20 Contract C; see
+`mse://guides/operator-execution-model` § Hop 4), filtered by the
+current step's `ContextPolicy.steps` allowlist / `steps_exclude`
+denylist:
+
+```jsonc
+"context": {
+  "steps": {
+    "planner":       { "name": "planner",       "size_bytes": 1834, "file_path": "/…/ctx/planner.json",       "content_url": "…", "sha256": "…" },
+    "audit:planner": { "name": "audit:planner", "size_bytes":  412, "file_path": "/…/ctx/audit-planner.json", "content_url": "…", "sha256": "…" }
+  }
+}
+```
+
+Key facts:
+
+- **Pointer-only invariant** — a `StepPointer` never carries the OUTPUT
+  content itself (no preview, no content bytes inline). The SubAgent
+  fetches the actual bytes via `file_path` (local FS `Read`) or
+  `content_url` (server HTTP GET, verifiable against `sha256`). Choose
+  `file_path` on same-host SubAgents (the common case); choose
+  `content_url` when the SubAgent runs elsewhere.
+- **`audit:<step_ref>` is a first-class entry** — after-run audit
+  artifacts (GH #34) surface as top-level `context.steps` keys named
+  `audit:<step_ref>`, **not** as a nested field of the audited step. The
+  BP axis (`$.<step>.audit[...]` or similar) does not reach them — audit
+  findings are observational sidecars that the fold-final path drops
+  from the BP-chain value but the Data-plane dual-write preserves for
+  Worker-axis consumers. See `mse://guides/operator-execution-model` §
+  After-run audits.
+- **Keys are canonical step names** — the map key is the step's
+  canonical name resolved from `AgentMeta.projection_name` (GH #23), so
+  `ContextPolicy.steps` / `steps_exclude` entries are matched against
+  canonical names, not any renamed alias.
+- **BP-chain scope vs Data-plane scope** — the fold-final path
+  (`fold_final_and_parts`, `src/core/engine.rs`) only stages a step's
+  `mse_worker_submit`-with-`name` artifacts (the `staged_names`
+  allowlist from § Worker output) into the BP-chain value. Other
+  artifacts (audits, out-of-band submissions) bypass fold but remain
+  reachable via `context.steps`.
 
 ## Expr ops (`flow.ir` `Expr`)
 
