@@ -366,6 +366,55 @@ the MainAI's launch prompt (hop 3) or from files inside `work_dir`
 (the classic `issue.md` pattern). The SubAgent never talks to the WS
 session and never sees the `Spawn.directive` text.
 
+## Prompt delivery modes (GH #31)
+
+Hop 4's `WorkerPayload` carries the baked `system` prompt in one of two
+mutually-exclusive modes, decided server-side (per-config, not
+per-request) against a size threshold (default 25 KiB, matching
+`bp_doctor`'s existing WARN threshold):
+
+- **`system: Some(...)` (inline)** — the default for prompts under the
+  threshold. Unchanged from the pre-GH #31 contract: the fetched
+  `WorkerPayload` carries the full rendered string directly, and a
+  SubAgent (or MCP tool relaying the fetch) has the text the moment the
+  fetch call returns.
+- **`system_ref: Some(...)` (by-reference)** — used instead of `system`
+  once the rendered prompt exceeds the threshold. The payload carries a
+  `SystemRef { uri, sha256, size_bytes, mode }` pointer rather than the
+  text itself:
+  - `mode: Http` — `uri` is a bare path
+    (`/v1/worker/prompt/system?task_id=...&attempt=...`); the resolving
+    caller `GET`s it (prefixed with the same `base_url` the main fetch
+    used) to retrieve the raw bytes.
+  - `mode: File` — `uri` is a `file://<path>` URI; the resolving caller
+    reads that path directly.
+  - Either way, the caller sha256-verifies the retrieved bytes against
+    `system_ref.sha256` before trusting them.
+
+**SubAgent-side flow, inline mode**: fetch → `system` is already the
+persona text → adopt it as system prompt → proceed. No extra step.
+
+**SubAgent-side flow, by-reference mode**: fetch → `system` is absent,
+`system_ref` is populated → resolve `system_ref` (download/read,
+sha256-verify with one retry on mismatch, write the verified bytes to a
+local file, read the file back to confirm the write landed) → **only
+then** load the file's contents as the system prompt and proceed.
+`mse_worker_fetch` (the MCP tool wrapping hop 4 for MCP-based SubAgents)
+performs this resolution automatically and returns the original payload
+plus a `system_ref_resolution: {ok, path, sha256, size_bytes}` (or
+`{ok: false, stage, error}` on failure) companion value.
+
+> **This caveat is load-bearing, not optional colour**: a
+> `system_ref_resolution.ok: true` (or any successful by-reference
+> resolution, MCP-tool-mediated or not) means only that **the referenced
+> file was written to disk intact and its bytes match the advertised
+> sha256** — it does **not** mean the SubAgent has loaded that file's
+> contents into its own LLM context yet. Verifying the file on disk and
+> adopting its contents as the running persona are two separate steps;
+> a caller that stops at "the tool returned `ok: true`" without also
+> reading the file and using it as the system prompt has not actually
+> completed hop 4.
+
 ## After-run audits (GH #34)
 
 `Blueprint.audits: Vec<AuditDef>` declares agents the engine auto-kicks
