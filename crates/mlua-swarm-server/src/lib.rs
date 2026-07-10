@@ -344,6 +344,7 @@ pub fn build_router_full(
     };
     Router::new()
         .route("/v1/healthz", get(healthz))
+        .route("/v1/status", get(status_get))
         // session = collection (POST = attach, DELETE = detach, sid via Authorization)
         .route(
             "/v1/sessions",
@@ -466,6 +467,42 @@ pub fn default_registry_with_enhance_flow() -> SpawnerRegistry {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Response body for `GET /v1/status` (issue #35 ST4 — lifecycle
+/// occupancy guard). Cheap-to-poll summary of "is it safe to kill this
+/// server right now".
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct StatusResponse {
+    /// Count of `Run`s currently `Running` (`RunStore::list_running`).
+    /// Degrades to `0` on a store error rather than 500ing — see
+    /// module doc rationale.
+    pub running_runs: usize,
+    /// Count of attached Operator ids (`engine.list_operator_ids()`,
+    /// same idiom as `run_flow_form`'s Guard 1).
+    pub attached_operators: usize,
+}
+
+/// `GET /v1/status`. Infallible summary for the ST4 occupancy guard —
+/// store/engine query failures degrade the corresponding count to `0`
+/// (logged via `tracing::warn!`) rather than 500ing, since this
+/// endpoint may be polled frequently by a lifecycle-check caller that
+/// should not itself become a hang/error surface.
+async fn status_get(State(state): State<AppState>) -> Json<StatusResponse> {
+    let running_runs = state
+        .run_store
+        .list_running()
+        .await
+        .map(|v| v.len())
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "status_get: list_running failed");
+            0
+        });
+    let attached_operators = state.engine.list_operator_ids().await.len();
+    Json(StatusResponse {
+        running_runs,
+        attached_operators,
+    })
 }
 
 #[derive(Deserialize)]
@@ -1332,5 +1369,83 @@ mod tests {
     fn build_task_input_spec_from_request_returns_none_when_no_fields_present() {
         let req = task_req(json!({"unrelated": "value"}), None, None, None);
         assert!(build_task_input_spec_from_request(&req).is_none());
+    }
+
+    /// Minimal `AppState` for the `status_get` handler-fn-direct-call test
+    /// below — same construction shape as `tasks.rs::test_state()`
+    /// (mirrors what `build_router_full` does internally, skipping the
+    /// `Router` wrapper).
+    fn status_test_state() -> AppState {
+        let engine = Engine::new(mlua_swarm::EngineCfg::default());
+        let compiler = mlua_swarm::Compiler::new(default_registry());
+        let launch = Arc::new(mlua_swarm::TaskLaunchService::new(engine.clone(), compiler));
+        AppState {
+            engine,
+            sessions: Arc::new(Mutex::new(SessionStore::default())),
+            task_app: Arc::new(mlua_swarm::TaskApplication::new_inline_only(launch)),
+            ws_operator_factory: None,
+            data_store: Arc::new(mlua_swarm::store::output::InMemoryOutputStore::new()),
+            operator_sessions: Arc::new(Mutex::new(HashMap::new())),
+            roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
+            task_store: Arc::new(mlua_swarm::store::task::InMemoryTaskStore::new()),
+            run_store: Arc::new(mlua_swarm::store::run::InMemoryRunStore::new()),
+            base_url: None,
+            sync_timeout_secs: 300,
+        }
+    }
+
+    /// issue #35 ST4 Acceptance Criteria: `GET /v1/status` reports the
+    /// count of `Running` `Run`s (`RunStore::list_running`) and attached
+    /// Operator ids (`engine.list_operator_ids()`), called directly as a
+    /// handler fn (no `Router` wrapper — this crate's established
+    /// unit-test convention).
+    #[tokio::test]
+    async fn status_get_reports_running_runs_and_operators() {
+        let state = status_test_state();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        state
+            .run_store
+            .create(RunRecord {
+                id: RunId::new(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("seed running RunRecord");
+
+        // Throwaway `Operator` impl — only registration/list-count matters
+        // for this test, `execute` is never dispatched (same idiom as
+        // `tasks.rs::StallingOperator`).
+        struct NoopOperator;
+        #[async_trait::async_trait]
+        impl mlua_swarm::Operator for NoopOperator {
+            async fn execute(
+                &self,
+                _ctx: &mlua_swarm::Ctx,
+                _system: Option<String>,
+                _prompt: Value,
+                _worker: Option<mlua_swarm::WorkerBinding>,
+                _worker_token: mlua_swarm::CapToken,
+            ) -> Result<mlua_swarm::WorkerResult, mlua_swarm::WorkerError> {
+                unimplemented!("not exercised by this test — only registration/list matters")
+            }
+        }
+        state
+            .engine
+            .register_operator("test-op", Arc::new(NoopOperator))
+            .await;
+
+        let Json(resp) = status_get(State(state)).await;
+        assert_eq!(resp.running_runs, 1);
+        assert_eq!(resp.attached_operators, 1);
     }
 }

@@ -43,6 +43,30 @@ pub async fn healthz_ok(bind: &str) -> bool {
     }
 }
 
+/// `GET /v1/status` on the running `mse serve` process (issue #35 ST4
+/// — lifecycle occupancy guard). `Err` covers both network failure and
+/// an older server binary predating this route (404) — callers should
+/// treat `Err` as "occupancy unknown", not "occupancy = busy" (see the
+/// MCP tool handlers' fail-open-on-Err policy).
+pub async fn occupancy(bind: &str) -> Result<Occupancy, String> {
+    let url = format!("http://{bind}/v1/status");
+    let client = reqwest::Client::builder()
+        .timeout(HEALTHZ_TIMEOUT)
+        .build()
+        .map_err(|e| format!("occupancy: client build failed: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("occupancy: request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("occupancy: non-success status {}", resp.status()));
+    }
+    resp.json::<Occupancy>()
+        .await
+        .map_err(|e| format!("occupancy: decode failed: {e}"))
+}
+
 fn current_uid() -> u32 {
     // launchctl targets are `gui/<uid>/<label>`, so the numeric uid is only
     // meaningful on Unix. On Windows this whole module's tools (`launchctl
@@ -252,6 +276,18 @@ pub struct StatusOutcome {
     pub launchd_last_exit_code: Option<i64>,
 }
 
+/// Mirrors `mlua_swarm_server::StatusResponse` — kept as a distinct,
+/// independently-`Deserialize`d type (rather than importing the
+/// `mlua_swarm_server` crate into `mlua-swarm-cli`'s MCP module, which
+/// this module does not otherwise depend on) so this crate's HTTP
+/// client stays a plain JSON consumer, same posture as `healthz_ok`'s
+/// plain-text `"ok"` check.
+#[derive(serde::Deserialize)]
+pub struct Occupancy {
+    pub running_runs: usize,
+    pub attached_operators: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +349,40 @@ com.mse.server = {
         let target = domain_target();
         assert!(target.starts_with("gui/"));
         assert!(target.ends_with(LAUNCHD_LABEL));
+    }
+
+    /// `occupancy()` makes a real HTTP call — a full integration test (spin
+    /// up an actual `axum::serve` on a random port bound to a
+    /// `build_router_full`-constructed router, hit `occupancy()` against
+    /// it) is preferred over mocking, since no `#[tool]`/HTTP-calling test
+    /// exists yet in this file (only the pure-logic parsers above are
+    /// covered). No `launchctl` is involved — this only exercises the
+    /// `GET /v1/status` round trip.
+    #[tokio::test]
+    async fn occupancy_parses_status_response() {
+        let engine = mlua_swarm::Engine::new(mlua_swarm::EngineCfg::default());
+        let router = mlua_swarm_server::build_router_full(
+            engine,
+            mlua_swarm_server::default_registry(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            300,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let bind = addr.to_string();
+
+        let occ = occupancy(&bind).await.expect("occupancy() must succeed");
+        assert_eq!(occ.running_runs, 0);
+        assert_eq!(occ.attached_operators, 0);
     }
 }
