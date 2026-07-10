@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/ynishi/mlua-swarm/compare/v0.8.0...v0.9.0) - 2026-07-10
+
+### Added
+
+- worker degradation reporting + sync-launch timeout bump (GH #32, GH #39)
+- named multi-part worker output on the Blueprint chain ([#36](https://github.com/ynishi/mlua-swarm/pull/36))
+- RunStatus::Interrupted + boot-time recovery sweep (issue #35 ST2)
+- system_ref resolution in mse_worker_fetch + bp_doctor delivery note (GH #31)
+- *(server)* add /v1/worker/prompt/system and /v1/agents/:name/render-size routes
+- *(core,server)* Subtask 1 — SystemRef wire shape + Engine threshold branch (GH #31)
+- *(schema,core,server,cli)* Blueprint-declared after-run audit hooks (GH #34)
+- detach the flow-eval driver from the sync launch request ([#37](https://github.com/ynishi/mlua-swarm/pull/37))
+- add lifecycle occupancy guard to restart/shutdown MCP tools
+- persist-by-default Task/Run stores + --ephemeral opt-out (#35 ST1)
+
+### Fixed
+
+- apply GH #33 sync-hang guards to task_rekick (issue #35 ST3)
+- *(server,cli)* fail loud on sync task launch instead of hanging (GH #33)
+
+### Other
+
+- expand rustdoc/guide for audit middleware and Worker axis
+- document GH #35 restart-resilience feature set
+
 ## [0.8.0](https://github.com/ynishi/mlua-swarm/compare/v0.7.0...v0.8.0) - 2026-07-09
 
 ### Added
