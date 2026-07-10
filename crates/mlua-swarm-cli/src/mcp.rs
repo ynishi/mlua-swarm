@@ -445,6 +445,15 @@ struct WorkerFetchReq {
     /// auto-resolution as `base_url` (from the Spawn frame's `task_id`).
     #[serde(default)]
     task_id: Option<String>,
+    /// GH #31: local path `system_ref` resolution (by-reference delivery
+    /// mode) writes the verified `system` bytes to, once downloaded/read
+    /// and sha256-verified. Optional — defaults to `<temp
+    /// dir>/{task_id}-{attempt}.md`, matching the server-side `File`-mode
+    /// store's naming convention (different directory/host, same naming
+    /// intent). Ignored entirely when the fetched payload has no
+    /// `system_ref` (inline `system` case).
+    #[serde(default)]
+    system_ref_path: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -709,7 +718,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Worker-side fetch: GET <base_url>/v1/worker/prompt?task_id=<task_id> with `Authorization: Bearer <worker_handle>`. Normally the `worker_handle` (`wh-` short handle from the Spawn frame) is the ONLY required param — base_url and task_id auto-resolve from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass them explicitly to override (or when the Bearer is a full capability_token). Returns the server's WorkerPayload JSON verbatim ({task_id, attempt, agent, prompt, system?, context?} — `context` is the AgentContextView task-level context: project_root / work_dir / task_metadata / run_id / project_name_alias, GH #20 Contract C). Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
+        description = "Worker-side fetch: GET <base_url>/v1/worker/prompt?task_id=<task_id> with `Authorization: Bearer <worker_handle>`. Normally the `worker_handle` (`wh-` short handle from the Spawn frame) is the ONLY required param — base_url and task_id auto-resolve from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass them explicitly to override (or when the Bearer is a full capability_token). Returns the server's WorkerPayload JSON verbatim ({task_id, attempt, agent, prompt, system?, context?} — `context` is the AgentContextView task-level context: project_root / work_dir / task_metadata / run_id / project_name_alias, GH #20 Contract C). Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved. GH #31: when the fetched payload carries `system_ref` instead of `system` (the baked prompt exceeded the server's by-reference size threshold), this tool automatically resolves it — downloads (`Http` mode) or reads (`File` mode) the referenced content, sha256-verifies it against `system_ref.sha256` (one retry on mismatch), writes the verified bytes to a local file (default `<temp dir>/{task_id}-{attempt}.md`, override with `system_ref_path`), and reads the file back to confirm the write landed. On full success the returned JSON is the original payload verbatim plus a top-level `system_ref_resolution: {ok: true, path, sha256, size_bytes}` companion field — `ok: true` here means only that the file was written to disk intact, NOT that the caller has loaded its contents into an LLM context. On any resolution failure the tool returns a standalone `{ok: false, stage: \"download\"|\"hash_mismatch\"|\"write\", error}` value instead of the payload (this is a value-level result, not a McpError — the outer WorkerPayload fetch itself already succeeded)."
     )]
     async fn mse_worker_fetch(
         &self,
@@ -769,7 +778,118 @@ impl MseServer {
         }
         let payload: JsonValue = serde_json::from_str(&body)
             .map_err(|e| McpError::internal_error(format!("worker fetch decode: {e}"), None))?;
-        json_result(&payload)
+
+        // GH #31: `system_ref` (by-reference delivery) resolution. Absent
+        // key ⇒ inline `system` case — pass through byte-for-byte
+        // unchanged (debt #1's compatibility boundary; do not touch).
+        let Some(system_ref_value) = payload.get("system_ref") else {
+            return json_result(&payload);
+        };
+        let system_ref: mlua_swarm::types::SystemRef =
+            match serde_json::from_value(system_ref_value.clone()) {
+                Ok(sr) => sr,
+                Err(e) => {
+                    return json_result(&serde_json::json!({
+                        "ok": false,
+                        "stage": "download",
+                        "error": format!("system_ref decode: {e}"),
+                    }));
+                }
+            };
+        let attempt = payload.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        let mut bytes = match fetch_system_ref_bytes(&client, base, &system_ref).await {
+            Ok(b) => b,
+            Err(e) => {
+                return json_result(&serde_json::json!({
+                    "ok": false,
+                    "stage": "download",
+                    "error": e,
+                }));
+            }
+        };
+        use sha2::Digest;
+        let mut sha256_hex = hex::encode(sha2::Sha256::digest(&bytes));
+        if sha256_hex != system_ref.sha256 {
+            // One retry on mismatch, per Acceptance Criteria.
+            bytes = match fetch_system_ref_bytes(&client, base, &system_ref).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return json_result(&serde_json::json!({
+                        "ok": false,
+                        "stage": "download",
+                        "error": e,
+                    }));
+                }
+            };
+            sha256_hex = hex::encode(sha2::Sha256::digest(&bytes));
+            if sha256_hex != system_ref.sha256 {
+                return json_result(&serde_json::json!({
+                    "ok": false,
+                    "stage": "hash_mismatch",
+                    "error": format!(
+                        "sha256 mismatch after 1 retry: expected {}, got {}",
+                        system_ref.sha256, sha256_hex
+                    ),
+                }));
+            }
+        }
+
+        let write_path = req
+            .system_ref_path
+            .clone()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("{}-{}.md", task_id.as_str(), attempt))
+            });
+        if let Err(e) = tokio::fs::write(&write_path, &bytes).await {
+            return json_result(&serde_json::json!({
+                "ok": false,
+                "stage": "write",
+                "error": format!("write {}: {e}", write_path.display()),
+            }));
+        }
+        let readback = match tokio::fs::read(&write_path).await {
+            Ok(rb) => rb,
+            Err(e) => {
+                return json_result(&serde_json::json!({
+                    "ok": false,
+                    "stage": "write",
+                    "error": format!("readback {}: {e}", write_path.display()),
+                }));
+            }
+        };
+        if readback != bytes {
+            return json_result(&serde_json::json!({
+                "ok": false,
+                "stage": "write",
+                "error": format!(
+                    "readback mismatch at {}: wrote {} bytes, read back {}",
+                    write_path.display(),
+                    bytes.len(),
+                    readback.len()
+                ),
+            }));
+        }
+
+        // Success: pass the original payload through verbatim, plus a
+        // top-level `system_ref_resolution` companion field. `ok: true`
+        // here means "file written to disk intact" only — it does NOT
+        // mean the caller has loaded the content into an LLM context
+        // (see the "Prompt delivery modes" guide section).
+        let mut out = payload.clone();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert(
+                "system_ref_resolution".to_string(),
+                serde_json::json!({
+                    "ok": true,
+                    "path": write_path.display().to_string(),
+                    "sha256": sha256_hex,
+                    "size_bytes": bytes.len(),
+                }),
+            );
+        }
+        json_result(&out)
     }
 
     #[tool(
@@ -1359,7 +1479,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Per-Blueprint agent.md size check. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0."
+        description = "Per-Blueprint agent.md size check. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline."
     )]
     async fn bp_doctor(
         &self,
@@ -1415,14 +1535,47 @@ impl MseServer {
             };
             let severity = classify_agent_md_severity(bytes, lines, &thresholds);
             severities.push(severity);
-            per_agent.push(serde_json::json!({
+
+            // GH #31: live post-render size lookup, reusing the same
+            // `bind`/`client` already constructed above (Subtask 2's new
+            // route). `last_rendered_bytes: null` is a normal response
+            // (agent never dispatched) — always 200, never a 404.
+            let render_size_url = format!("http://{bind}/v1/agents/{}/render-size", agent.name);
+            let last_rendered_bytes: Option<usize> = match client.get(&render_size_url).send().await
+            {
+                Ok(resp) if resp.status().is_success() => resp
+                    .json::<JsonValue>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("last_rendered_bytes").cloned())
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize),
+                _ => None,
+            };
+
+            let mut entry = serde_json::json!({
                 "name": agent.name,
                 "kind": format!("{:?}", agent.kind),
                 "has_profile": agent.profile.is_some(),
                 "bytes": bytes,
                 "lines": lines,
                 "severity": severity,
-            }));
+                "last_rendered_bytes": last_rendered_bytes,
+            });
+            // Delivery-mode note: only when the post-render size crosses
+            // the same `thresholds.warn_bytes` single-source-of-truth
+            // that Engine's `SystemRefConfig.threshold_bytes` mirrors —
+            // omit the key entirely (not `false`/`null`) when under
+            // threshold, matching the per-agent entry's other
+            // conditional-presence fields.
+            if let Some(rendered_bytes) = last_rendered_bytes {
+                if rendered_bytes >= thresholds.warn_bytes {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("delivery".to_string(), serde_json::json!("system_ref"));
+                    }
+                }
+            }
+            per_agent.push(entry);
         }
         let verdict = aggregate_agent_md_verdict(&severities);
         let over_threshold_count = severities.iter().filter(|s| **s != "OK").count();
@@ -1703,6 +1856,50 @@ fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![Content::text(text)]))
+}
+
+/// GH #31: fetches (`Http` mode) or reads (`File` mode) the content a
+/// `SystemRef` points to. `base` is the already-`trim_end_matches('/')`d
+/// server root (only consulted for `Http` mode when `system_ref.uri` is a
+/// bare path, per the shipped Subtask 1 contract — `Http`-mode `uri` is
+/// never fully-qualified). Errors are returned as a display string, not a
+/// typed error — the caller wraps every failure into a value-level
+/// `{ok: false, stage: "download", ...}` JSON result, never an `McpError`.
+async fn fetch_system_ref_bytes(
+    client: &reqwest::Client,
+    base: &str,
+    system_ref: &mlua_swarm::types::SystemRef,
+) -> Result<Vec<u8>, String> {
+    match system_ref.mode {
+        mlua_swarm::types::SystemRefMode::Http => {
+            let url = if system_ref.uri.starts_with("http://")
+                || system_ref.uri.starts_with("https://")
+            {
+                system_ref.uri.clone()
+            } else {
+                format!("{base}{}", system_ref.uri)
+            };
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("download {url}: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("download {url}: HTTP {}", status.as_u16()));
+            }
+            resp.bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|e| format!("download {url}: {e}"))
+        }
+        mlua_swarm::types::SystemRefMode::File => {
+            let path = system_ref.uri.trim_start_matches("file://");
+            tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("read {path}: {e}"))
+        }
+    }
 }
 
 pub async fn run() -> Result<()> {
@@ -2012,6 +2209,7 @@ mod tests {
                 // (base_url is a black-hole address on purpose).
                 base_url: Some("http://127.0.0.1:1".into()),
                 task_id: Some("T-abc".into()),
+                system_ref_path: None,
             }))
             .await
             .unwrap_err();
@@ -2030,6 +2228,7 @@ mod tests {
                 worker_handle: "wh-noroute".into(),
                 base_url: None,
                 task_id: None,
+                system_ref_path: None,
             }))
             .await
             .unwrap_err();
@@ -2072,6 +2271,7 @@ mod tests {
                 worker_handle: "wh-deadbeef".into(),
                 base_url: Some(base_url.clone()),
                 task_id: Some("ST-nope".into()),
+                system_ref_path: None,
             }))
             .await
             .expect_err("unknown handle must surface the HTTP error");
@@ -2089,6 +2289,216 @@ mod tests {
             .expect_err("unknown handle must surface the HTTP error");
         let msg = format!("{err:?}");
         assert!(msg.contains("expected 204"), "err: {msg}");
+    }
+
+    /// GH #31 test helper: seeds a real task + baked (possibly
+    /// over-threshold) `system` prompt + a bound `wh-` short handle, the
+    /// exact shape `Engine::dispatch_attempt` would have produced — mirrors
+    /// `crates/mlua-swarm-server/src/worker.rs`'s own
+    /// `seed_task_with_handle` test helper (not reusable directly: it's
+    /// private to that crate), built from the public `Engine::with_state`
+    /// + `core::state` surface.
+    async fn gh31_seed_task_with_handle(
+        engine: &Engine,
+        task_id: &StepId,
+        agent: &str,
+        attempt: u32,
+        system: Option<String>,
+    ) -> String {
+        let handle = format!("wh-{}", mlua_swarm::types::secure_hex(4));
+        let task_id = task_id.clone();
+        let agent = agent.to_string();
+        let handle_clone = handle.clone();
+        engine
+            .with_state("test.gh31_seed_task_with_handle", move |s| {
+                let mut task = mlua_swarm::core::state::TaskState::new(
+                    task_id.clone(),
+                    mlua_swarm::core::state::TaskSpec {
+                        agent: agent.clone(),
+                        initial_directive: serde_json::json!("x"),
+                        step_ctx: None,
+                    },
+                );
+                task.attempt = attempt;
+                s.tasks.insert(task_id.clone(), task);
+                s.prompts
+                    .insert((task_id.clone(), attempt), serde_json::json!("x"));
+                s.systems.insert((task_id.clone(), attempt), system);
+                let token = mlua_swarm::CapToken {
+                    agent_id: agent,
+                    role: mlua_swarm::Role::Worker,
+                    scopes: vec!["*".to_string()],
+                    issued_at: 0,
+                    expire_at: u64::MAX,
+                    max_uses: None,
+                    nonce: format!("test-nonce-{task_id}"),
+                    sig_hex: String::new(),
+                };
+                let fp = token.fingerprint();
+                s.tokens.insert(
+                    fp.clone(),
+                    mlua_swarm::core::state::CapTokenRecord {
+                        token,
+                        uses_left: None,
+                        revoked: false,
+                        task_id: Some(task_id),
+                    },
+                );
+                s.worker_handles.insert(handle_clone, fp);
+            })
+            .await
+            .expect("gh31_seed_task_with_handle");
+        handle
+    }
+
+    /// GH #31 subtask-3 E2E: a real server, with `system_ref` config
+    /// tuned to a tiny threshold so an intentionally-oversized
+    /// `system_prompt` triggers `File`-mode by-reference delivery, then
+    /// `mse_worker_fetch` resolves it — asserts `{ok: true, path, sha256,
+    /// size_bytes}` in `system_ref_resolution`, that the sha256 matches a
+    /// manually-computed hash of the known input, and that the file at
+    /// `path` contains the exact original content.
+    #[tokio::test]
+    async fn mse_worker_fetch_resolves_system_ref_file_mode_end_to_end() {
+        let unique = format!("{}-{}", std::process::id(), StepId::new());
+        let mut cfg = EngineCfg::default();
+        cfg.system_ref.threshold_bytes = 16;
+        cfg.system_ref.mode = mlua_swarm::types::SystemRefMode::File;
+        cfg.system_ref.store_dir =
+            std::env::temp_dir().join(format!("mse-mcp-system-ref-{unique}"));
+        let engine = Engine::new(cfg);
+
+        let task_id = StepId::new();
+        let rendered =
+            "this system prompt is deliberately longer than the 16 byte threshold".to_string();
+        let handle =
+            gh31_seed_task_with_handle(&engine, &task_id, "planner", 1, Some(rendered.clone()))
+                .await;
+
+        let router = mlua_swarm_server::build_router(engine);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let server = MseServer::new();
+        let result = server
+            .mse_worker_fetch(Parameters(WorkerFetchReq {
+                worker_handle: handle,
+                base_url: Some(base_url),
+                task_id: Some(task_id.as_str().to_string()),
+                system_ref_path: None,
+            }))
+            .await
+            .expect("mse_worker_fetch");
+        let value: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("mse_worker_fetch json");
+
+        assert!(
+            value.get("system").is_none(),
+            "over-threshold payload must not also inline `system`: {value}"
+        );
+        assert!(
+            value.get("system_ref").is_some(),
+            "payload must still carry the original system_ref: {value}"
+        );
+        assert_eq!(value["task_id"], task_id.as_str());
+        assert_eq!(value["attempt"], 1);
+        assert_eq!(value["agent"], "planner");
+
+        let resolution = value
+            .get("system_ref_resolution")
+            .expect("system_ref_resolution present on success");
+        assert_eq!(resolution["ok"], true, "resolution: {resolution}");
+
+        use sha2::Digest;
+        let expected_sha256 = hex::encode(sha2::Sha256::digest(rendered.as_bytes()));
+        assert_eq!(resolution["sha256"], expected_sha256);
+        assert_eq!(resolution["size_bytes"], rendered.len());
+
+        let path = resolution["path"].as_str().expect("path is a string");
+        let written = tokio::fs::read_to_string(path)
+            .await
+            .expect("mse_worker_fetch must have written the resolved file");
+        assert_eq!(written, rendered);
+    }
+
+    /// GH #31 subtask-3 E2E, `hash_mismatch` path: a minimal fake HTTP
+    /// server (not the real `Engine`) serves a `WorkerPayload` whose
+    /// `system_ref.sha256` deliberately does not match the bytes served at
+    /// `system_ref.uri` (simulating server/client corruption or a stale
+    /// hash). A fake server (rather than tampering with the real `Engine`'s
+    /// `File`-mode store) is necessary here: `apply_system_ref_threshold`
+    /// re-renders and re-writes the store file from the live in-memory
+    /// `system` string on every `/v1/worker/prompt` fetch (Phase 3 Option
+    /// B's documented re-fetch behavior), so any tamper made against a real
+    /// engine's store file gets silently overwritten with the original
+    /// (correct) content the moment `mse_worker_fetch`'s own outer fetch
+    /// re-triggers that route — there is no race-free way to hold a real
+    /// `Engine`'s store content mismatched across the outer fetch and the
+    /// by-reference download. Expects a standalone `{ok: false, stage:
+    /// "hash_mismatch", error}` value, not an `McpError`, and not the
+    /// passed-through payload.
+    #[tokio::test]
+    async fn mse_worker_fetch_reports_hash_mismatch_after_one_retry() {
+        const ACTUAL_BYTES: &[u8] = b"actual bytes served by the fake system_ref route";
+        const WRONG_SHA256: &str =
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let app = axum::Router::new()
+            .route(
+                "/v1/worker/prompt",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "task_id": "ST-fakefakefakefake",
+                        "attempt": 1,
+                        "agent": "planner",
+                        "prompt": "x",
+                        "system_ref": {
+                            "uri": "/system-bytes",
+                            "sha256": WRONG_SHA256,
+                            "size_bytes": ACTUAL_BYTES.len(),
+                            "mode": "http",
+                        },
+                    }))
+                }),
+            )
+            .route(
+                "/system-bytes",
+                axum::routing::get(|| async { ACTUAL_BYTES.to_vec() }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let server = MseServer::new();
+        let result = server
+            .mse_worker_fetch(Parameters(WorkerFetchReq {
+                worker_handle: "wh-deadbeef".into(),
+                base_url: Some(base_url),
+                task_id: Some("ST-fakefakefakefake".into()),
+                system_ref_path: None,
+            }))
+            .await
+            .expect("mse_worker_fetch must return a value-level result, not an McpError");
+        let value: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("mse_worker_fetch json");
+
+        assert_eq!(value["ok"], false, "value: {value}");
+        assert_eq!(value["stage"], "hash_mismatch", "value: {value}");
+        assert!(
+            value.get("error").and_then(|e| e.as_str()).is_some(),
+            "value: {value}"
+        );
     }
 
     /// ST5 (`projection-adapter`) removal confirmation: `mse_ctx_get` no
