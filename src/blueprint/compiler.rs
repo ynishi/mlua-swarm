@@ -1539,6 +1539,7 @@ mod meta_ref_validation_tests {
             default_context_policy: None,
             projection_placement: None,
             audits: vec![],
+            degradation_policy: None,
         }
     }
 
@@ -1709,6 +1710,7 @@ mod audit_agent_validation_tests {
             default_context_policy: None,
             projection_placement: None,
             audits,
+            degradation_policy: None,
         }
     }
 
@@ -1807,6 +1809,7 @@ mod projection_placement_compile_tests {
             default_context_policy: None,
             projection_placement,
             audits: vec![],
+            degradation_policy: None,
         }
     }
 

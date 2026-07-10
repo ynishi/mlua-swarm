@@ -66,6 +66,7 @@
 //!     default_context_policy: None,
 //!     projection_placement: None,
 //!     audits: vec![],
+//!     degradation_policy: None,
 //! };
 //!
 //! assert_eq!(bp.id.as_str(), "hello");
@@ -103,6 +104,7 @@
 //!     default_context_policy: None,
 //!     projection_placement: None,
 //!     audits: vec![],
+//!     degradation_policy: None,
 //! };
 //!
 //! let json = serde_json::to_string(&bp).unwrap();
@@ -372,6 +374,34 @@ pub struct Blueprint {
     /// flow — audits are purely observational.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audits: Vec<AuditDef>,
+    /// GH #32 — Blueprint-declared policy for worker-reported degradations
+    /// (see `mlua-swarm` core's `RunRecord.degradations` /
+    /// `DegradationEntry`). `None` (the default) is schema-only for now:
+    /// [`DegradationPolicy::Warn`] and [`DegradationPolicy::Fail`] carry the
+    /// same observational behavior at this point — degradations are always
+    /// persisted, never gate the flow. Engine enforcement of `Fail`
+    /// (terminating a Run on any reported degradation) is a follow-up; this
+    /// field only declares author intent today. Every pre-#32 Blueprint is
+    /// unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_policy: Option<DegradationPolicy>,
+}
+
+/// GH #32 — Blueprint-declared policy for worker-reported degradations. See
+/// [`Blueprint::degradation_policy`] for the (currently schema-only)
+/// enforcement contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradationPolicy {
+    /// Observational only (today's only enforced behavior, regardless of
+    /// which variant is declared): degradations are persisted to
+    /// `RunRecord.degradations` and surfaced via `mse_doctor` /
+    /// `GET /v1/runs/:id`, but never change the Run's outcome.
+    Warn,
+    /// Declares intent to terminate the Run on any reported degradation.
+    /// Not yet enforced by the engine — schema-only until the follow-up
+    /// lands.
+    Fail,
 }
 
 /// GH #34 — one Blueprint-declared after-run audit hook. See
@@ -1019,6 +1049,7 @@ mod tests {
             default_context_policy: None,
             projection_placement: None,
             audits: vec![],
+            degradation_policy: None,
         }
     }
 
@@ -1531,5 +1562,63 @@ mod tests {
         );
         let dump = v.to_string();
         assert!(dump.contains("AuditDef"), "AuditDef definition in schema");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GH #32: `Blueprint.degradation_policy`, `DegradationPolicy`
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn blueprint_without_degradation_policy_deserializes_to_none() {
+        let json = serde_json::json!({
+            "schema_version": current_schema_version(),
+            "id": "no-degradation-policy-ut",
+            "flow": { "kind": "seq", "children": [] },
+        });
+        let bp: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(bp.degradation_policy, None);
+    }
+
+    #[test]
+    fn blueprint_degradation_policy_omitted_when_none() {
+        let bp = minimal_bp(None);
+        let json = serde_json::to_value(&bp).expect("serializes");
+        assert!(
+            json.as_object()
+                .unwrap()
+                .get("degradation_policy")
+                .is_none(),
+            "degradation_policy key must be absent when None: {json}"
+        );
+    }
+
+    #[test]
+    fn blueprint_degradation_policy_warn_and_fail_roundtrip() {
+        for (label, expected) in [
+            ("warn", DegradationPolicy::Warn),
+            ("fail", DegradationPolicy::Fail),
+        ] {
+            let mut bp = minimal_bp(None);
+            bp.degradation_policy = Some(expected);
+            let json = serde_json::to_string(&bp).expect("serializes");
+            assert!(json.contains(&format!("\"degradation_policy\":\"{label}\"")));
+            let back: Blueprint = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back.degradation_policy, Some(expected));
+        }
+    }
+
+    #[test]
+    fn degradation_policy_rejects_unknown_variant() {
+        let json = serde_json::json!({
+            "schema_version": current_schema_version(),
+            "id": "degradation-policy-unknown-variant-ut",
+            "flow": { "kind": "seq", "children": [] },
+            "degradation_policy": "ignore",
+        });
+        let err = serde_json::from_value::<Blueprint>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "expected an unknown-variant rejection, got: {err}"
+        );
     }
 }

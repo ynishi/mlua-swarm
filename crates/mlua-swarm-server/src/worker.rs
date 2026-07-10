@@ -39,6 +39,17 @@
 //! - `GET /v1/agents/:name/render-size` (GH #31) — no Bearer required, same
 //!   trust tier as `GET /v1/blueprints/:id/head`. Live per-agent most-recently
 //!   observed render size, backing `bp_doctor`'s post-render check.
+//! - `POST /v1/worker/degradation` (GH #32) — structured JSON `{tool, error,
+//!   fallback, note?}`, same Bearer flow as [`worker_submit`]. An
+//!   **independent channel**: entries are appended to `RunRecord.degradations`
+//!   via `RunStore::append_degradation` directly and never touch
+//!   `OutputStore` / the fold path (Crux invariant 2 — a degradation must
+//!   never surface as step OUTPUT). `step_ref` / `attempt` / `at` are
+//!   server-injected, never trusted from the client. Silent `204` (no
+//!   append) when the dispatch task carries no Run linkage — same
+//!   fail-open contract as [`reject_if_run_terminal`]'s own resolution
+//!   steps, since a pre-run-tracking dispatch has nowhere to record a
+//!   degradation and that must not become a client-visible error.
 //!
 //! ## Bearer authentication
 //!
@@ -60,7 +71,7 @@ use axum::{
 };
 use mlua_swarm::core::agent_context::StepPointer;
 use mlua_swarm::core::step_naming::StepNaming;
-use mlua_swarm::store::run::RunStatus;
+use mlua_swarm::store::run::{DegradationEntry, RunStatus, RunStoreError};
 use mlua_swarm::{CapToken, ContentRef, OutputEvent, RunId, StepId, WorkerPayload};
 use mlua_swarm_schema::ContextPolicy;
 use serde::Deserialize;
@@ -464,6 +475,124 @@ pub async fn worker_artifact(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Body for `POST /v1/worker/degradation` (GH #32).
+#[derive(Debug, Deserialize)]
+pub struct DegradationBody {
+    /// The tool (or capability) the worker attempted to use.
+    pub tool: String,
+    /// The error that triggered the fallback, in the worker's own words.
+    pub error: String,
+    /// What the worker substituted instead of failing.
+    pub fallback: String,
+    /// Optional free-form context from the worker.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `POST /v1/worker/degradation` (GH #32). Bearer = same short-handle /
+/// full-`CapToken` forms as [`worker_submit`]. Body = JSON, not raw bytes —
+/// this endpoint carries structured data, unlike its raw-bytes siblings.
+///
+/// Independent channel: appends a [`DegradationEntry`] to
+/// `RunRecord.degradations` via `RunStore::append_degradation` directly.
+/// Never touches `OutputStore` / the fold path (Crux invariant 2 — a
+/// degradation must not surface as step OUTPUT / `$.step.parts`).
+///
+/// Behavior:
+/// - `task_id` is auto-looked-up server-side from the token/handle, same as
+///   [`worker_submit`] / [`worker_artifact`].
+/// - GH #37 terminal-run guard applies first — a degradation addressed at
+///   an already-terminal Run is rejected with `410 Gone`
+///   ([`reject_if_run_terminal`]), same as a submit/artifact would be.
+/// - `step_ref` / `attempt` / `at` are server-injected — `step_ref` is the
+///   fetching agent's resolved name (`AgentContextView.agent`, the best
+///   proxy for `Step.ref` available at this layer), `attempt` is the
+///   task's current attempt, `at` is now (Unix epoch seconds). The client
+///   body never supplies any of the three.
+/// - No Run linkage in `agent_ctx` (a pre-run-tracking dispatch), an
+///   unparseable `run_id`, or an `append_degradation` call against a Run
+///   the store doesn't actually hold (`RunStoreError::NotFound` — the same
+///   condition [`reject_if_run_terminal`] itself fails open on) all take
+///   the same silent `204 No Content` path, logged via `tracing::warn!` —
+///   this is a legitimate no-tracking codepath, not a client error. Any
+///   other `RunStore` failure propagates as `ApiError::engine`.
+pub async fn worker_degradation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DegradationBody>,
+) -> Result<StatusCode, ApiError> {
+    let bearer = extract_bearer_raw(&headers)?;
+    let task_id = if let Some(handle) = parse_worker_handle(&bearer) {
+        state
+            .engine
+            .task_id_from_handle(handle)
+            .await
+            .map_err(|e| ApiError::engine(format!("task_id_from_handle: {e}")))?
+    } else {
+        let token = CapToken::decode(bearer.trim())
+            .map_err(|e| ApiError::bad_request(format!("invalid token: {e}")))?;
+        state
+            .engine
+            .task_id_from_token(&token)
+            .await
+            .map_err(|e| ApiError::engine(format!("task_id_from_token: {e}")))?
+    };
+    let attempt = state
+        .engine
+        .task_attempt(&task_id)
+        .await
+        .map_err(|e| ApiError::engine(format!("task_attempt: {e}")))?;
+    // GH #37: the same terminal-run guard `worker_submit` / `worker_artifact`
+    // apply — a dead Run must not accumulate signals.
+    reject_if_run_terminal(&state, &task_id, attempt).await?;
+
+    // Same `with_state` resolution pattern as `reject_if_run_terminal`: an
+    // engine-level failure here is fail-open too (`_ => ...`), matching
+    // that guard's own "every resolution step is fail-open" contract —
+    // this lookup isn't a second, stricter gate on top of it.
+    let tid = task_id.clone();
+    let (run_id_str, agent) = match state
+        .engine
+        .with_state("worker_degradation_run_lookup", move |s| {
+            s.agent_ctx.get(&(tid, attempt)).and_then(|e| {
+                e.view
+                    .run_id
+                    .clone()
+                    .map(|run_id| (run_id, e.view.agent.clone()))
+            })
+        })
+        .await
+    {
+        Ok(Some(pair)) => pair,
+        _ => {
+            tracing::warn!(%task_id, "worker_degradation: no run linkage for this task; entry dropped");
+            return Ok(StatusCode::NO_CONTENT);
+        }
+    };
+    let Ok(run_id) = RunId::parse(run_id_str) else {
+        tracing::warn!(%task_id, "worker_degradation: run_id failed to parse; entry dropped");
+        return Ok(StatusCode::NO_CONTENT);
+    };
+
+    let entry = DegradationEntry {
+        tool: body.tool,
+        error: body.error,
+        fallback: body.fallback,
+        note: body.note,
+        step_ref: Some(agent),
+        attempt: Some(attempt),
+        at: crate::tasks::now_secs(),
+    };
+    match state.run_store.append_degradation(&run_id, entry).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(RunStoreError::NotFound(_)) => {
+            tracing::warn!(%task_id, %run_id, "worker_degradation: run not found in run_store; entry dropped");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => Err(ApiError::engine(format!("append_degradation: {e}"))),
+    }
+}
+
 /// GH #37: terminal-run guard shared by [`worker_submit`] / [`worker_artifact`].
 ///
 /// Resolves the dispatch task's `AgentContextView.run_id` (threaded at
@@ -748,6 +877,7 @@ mod tests {
             task_id: task_id.clone(),
             status: RunStatus::Running,
             step_entries,
+            degradations: Vec::new(),
             operator_sid: None,
             result_ref: None,
             created_at: 0,
@@ -1174,6 +1304,7 @@ mod tests {
             default_context_policy: None,
             projection_placement: None,
             audits: vec![],
+            degradation_policy: None,
         }
     }
 
@@ -1711,5 +1842,178 @@ mod tests {
         reject_if_run_terminal(&state, &task_id, 1)
             .await
             .expect("a Running run must pass the guard");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #32 — `POST /v1/worker/degradation`
+    // ──────────────────────────────────────────────────────────────────
+
+    fn degradation_body(tool: &str, note: Option<&str>) -> DegradationBody {
+        DegradationBody {
+            tool: tool.to_string(),
+            error: "boom".to_string(),
+            fallback: "used cached value".to_string(),
+            note: note.map(str::to_string),
+        }
+    }
+
+    /// [`link_task_to_run`] plus the `view.agent` name — production's
+    /// `AgentContextMiddleware` sets both fields on the same `agent_ctx`
+    /// entry; the shared GH #37 helper only needed `run_id`, so this
+    /// sibling fills in `agent` too for tests that assert on the
+    /// server-injected `step_ref`.
+    async fn link_task_to_run_with_agent(
+        state: &AppState,
+        task_id: &StepId,
+        attempt: u32,
+        run_id: &RunId,
+        agent: &str,
+    ) {
+        let tid = task_id.clone();
+        let rid_str = run_id.to_string();
+        let agent = agent.to_string();
+        state
+            .engine
+            .with_state("test.link_task_to_run_with_agent", move |s| {
+                let mut entry = mlua_swarm::core::state::AgentCtxEntry::default();
+                entry.view.run_id = Some(rid_str);
+                entry.view.agent = agent;
+                s.agent_ctx.insert((tid, attempt), entry);
+            })
+            .await
+            .expect("link_task_to_run_with_agent");
+    }
+
+    /// A worker-reported degradation is persisted to the linked Run's
+    /// `degradations` with the server-injected `step_ref` / `attempt` /
+    /// `at` fields filled in — the client body never supplies any of the
+    /// three.
+    #[tokio::test]
+    async fn worker_degradation_persists_entry_when_run_tracked() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store.clone());
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let owner_task = TaskId::new();
+        let run_id = RunId::new();
+        run_store
+            .create(run_record(&owner_task, &run_id, vec![]))
+            .await
+            .expect("run create");
+        link_task_to_run_with_agent(&state, &task_id, 1, &run_id, "planner").await;
+
+        let status = worker_degradation(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Json(degradation_body("web_search", Some("rate limited"))),
+        )
+        .await
+        .expect("worker_degradation");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let rec = run_store.get(&run_id).await.expect("run get");
+        assert_eq!(
+            rec.degradations.len(),
+            1,
+            "degradations: {:?}",
+            rec.degradations
+        );
+        let entry = &rec.degradations[0];
+        assert_eq!(entry.tool, "web_search");
+        assert_eq!(entry.error, "boom");
+        assert_eq!(entry.fallback, "used cached value");
+        assert_eq!(entry.note.as_deref(), Some("rate limited"));
+        assert_eq!(entry.step_ref.as_deref(), Some("planner"));
+        assert_eq!(entry.attempt, Some(1));
+        assert!(entry.at > 0, "at must be a real timestamp: {}", entry.at);
+    }
+
+    /// Two entries POSTed in sequence are appended in order.
+    #[tokio::test]
+    async fn worker_degradation_appends_in_order() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store.clone());
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let owner_task = TaskId::new();
+        let run_id = RunId::new();
+        run_store
+            .create(run_record(&owner_task, &run_id, vec![]))
+            .await
+            .expect("run create");
+        link_task_to_run(&state, &task_id, 1, &run_id).await;
+
+        for tool in ["first_tool", "second_tool"] {
+            worker_degradation(
+                State(state.clone()),
+                bearer_headers(&handle),
+                Json(degradation_body(tool, None)),
+            )
+            .await
+            .expect("worker_degradation");
+        }
+
+        let rec = run_store.get(&run_id).await.expect("run get");
+        let tools: Vec<&str> = rec.degradations.iter().map(|e| e.tool.as_str()).collect();
+        assert_eq!(tools, vec!["first_tool", "second_tool"]);
+    }
+
+    /// A task whose `agent_ctx` carries no Run linkage (pre-run-tracking
+    /// dispatch) silently 204s — nothing to append to, and this must not
+    /// surface as a client error.
+    #[tokio::test]
+    async fn worker_degradation_silent_ok_when_no_run_tracked() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let status = worker_degradation(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Json(degradation_body("some_tool", None)),
+        )
+        .await
+        .expect("worker_degradation must not error on missing run linkage");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// GH #37 terminal-run guard applies to the degradation channel too — a
+    /// dead Run must not accumulate signals.
+    #[tokio::test]
+    async fn worker_degradation_rejects_terminal_run() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store.clone());
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let owner_task = TaskId::new();
+        let run_id = RunId::new();
+        let mut rec = run_record(&owner_task, &run_id, vec![]);
+        rec.status = RunStatus::Done;
+        run_store.create(rec).await.expect("run create");
+        link_task_to_run(&state, &task_id, 1, &run_id).await;
+
+        let err = worker_degradation(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Json(degradation_body("some_tool", None)),
+        )
+        .await
+        .expect_err("a degradation against a Done run must be rejected");
+        assert_eq!(err.status, StatusCode::GONE);
+
+        let rec = run_store.get(&run_id).await.expect("run get");
+        assert!(
+            rec.degradations.is_empty(),
+            "rejected degradation must not land: {:?}",
+            rec.degradations
+        );
     }
 }

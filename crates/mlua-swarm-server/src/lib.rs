@@ -405,6 +405,9 @@ pub fn build_router_full(
             "/v1/agents/:name/render-size",
             get(worker::agent_render_size),
         )
+        // GH #32: structured worker degradation reporting — independent channel,
+        // never touches OutputStore / the fold path. See the `worker` module doc.
+        .route("/v1/worker/degradation", post(worker::worker_degradation))
         // Data path (v9 Big Response handling, independent from Domain / verdict flow)
         .route("/v1/data/emit", post(data::data_emit))
         .route(
@@ -1024,6 +1027,7 @@ async fn run_flow_form(
             task_id: task_id.clone(),
             status: RunStatus::Running,
             step_entries: Vec::new(),
+            degradations: Vec::new(),
             operator_sid: req.operator_sid.clone(),
             result_ref: None,
             created_at: now,
@@ -1560,6 +1564,7 @@ mod tests {
                 task_id: TaskId::new(),
                 status: RunStatus::Running,
                 step_entries: Vec::new(),
+                degradations: Vec::new(),
                 operator_sid: None,
                 result_ref: None,
                 created_at: now,

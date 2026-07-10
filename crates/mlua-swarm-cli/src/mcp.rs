@@ -500,6 +500,34 @@ struct WorkerSubmitReq {
     /// the attempt).
     #[serde(default)]
     name: Option<String>,
+    /// GH #32 ST3: optional structured worker-degradation entries. When
+    /// non-empty, each entry is POSTed to `/v1/worker/degradation` BEFORE
+    /// this call's own submit/artifact POST (serial, in append order) —
+    /// an independent channel from `body`/`name`, never folded into step
+    /// OUTPUT (see [`mlua_swarm::store::run::DegradationEntry`]'s doc for
+    /// the invariant). Omitted (`None`) = unchanged pre-#32 behavior.
+    #[serde(default)]
+    degradations: Option<Vec<DegradationInput>>,
+}
+
+/// Client-facing shape for one worker-reported degradation entry (GH #32
+/// ST3) — mirrors the wire body `mlua-swarm-server`'s `POST
+/// /v1/worker/degradation` endpoint expects
+/// (`crates/mlua-swarm-server/src/worker.rs`'s `DegradationBody`). The
+/// server-injected metadata (`step_ref` / `attempt` / `at`) is deliberately
+/// NOT part of this client-facing shape — the worker only supplies what it
+/// observed.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct DegradationInput {
+    /// The tool (or capability) the worker attempted to use.
+    tool: String,
+    /// The error that triggered the fallback, in the worker's own words.
+    error: String,
+    /// What the worker substituted instead of failing.
+    fallback: String,
+    /// Optional free-form context from the worker.
+    #[serde(default)]
+    note: Option<String>,
 }
 
 /// Builds the `/v1/worker/submit` or `/v1/worker/artifact?name=<name>`
@@ -522,6 +550,18 @@ fn worker_submit_endpoint_url(base_url: &str, name: Option<&str>) -> Result<reqw
         url.query_pairs_mut().append_pair("name", name);
     }
     Ok(url)
+}
+
+/// Builds the `/v1/worker/degradation` endpoint URL for
+/// [`MseServer::mse_worker_submit`]'s pre-submit degradation POSTs (GH #32
+/// ST3). `base_url`'s trailing slash (if any) is trimmed before joining;
+/// no query params — unlike [`worker_submit_endpoint_url`]'s `name` case,
+/// the degradation body carries its shape as a JSON payload, not a query
+/// key. Pure and side-effect-free, mirroring `worker_submit_endpoint_url`'s
+/// own unit-testable shape.
+fn worker_degradation_endpoint_url(base_url: &str) -> Result<reqwest::Url, String> {
+    let base = base_url.trim_end_matches('/');
+    reqwest::Url::parse(&format!("{base}/v1/worker/degradation")).map_err(|e| e.to_string())
 }
 
 // ---- tool param schemas ----
@@ -947,7 +987,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Normally `worker_handle` + `body` are the ONLY required params — base_url auto-resolves from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass it explicitly to override (or when the Bearer is a full capability_token). Optional ok=false marks the attempt failed (flow.ir Try catch path); mutually exclusive with `name`. Optional `name` (GH #36 ST2) stages ONE named output part instead of completing the attempt — POST /v1/worker/artifact?name=<name> — call again (same or different name) for more parts, then finish with a plain (no-name) call; the step's final output becomes {\"out\": <final submit body>, \"parts\": {<name>: <value>, ...}}, read downstream via bracket notation e.g. \"$.<step>.parts[\\\"plan.md\\\"]\". Expects HTTP 204 and returns {submitted: true} (name path) or {submitted: true} (plain path); any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
+        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Normally `worker_handle` + `body` are the ONLY required params — base_url auto-resolves from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass it explicitly to override (or when the Bearer is a full capability_token). Optional ok=false marks the attempt failed (flow.ir Try catch path); mutually exclusive with `name`. Optional `name` (GH #36 ST2) stages ONE named output part instead of completing the attempt — POST /v1/worker/artifact?name=<name> — call again (same or different name) for more parts, then finish with a plain (no-name) call; the step's final output becomes {\"out\": <final submit body>, \"parts\": {<name>: <value>, ...}}, read downstream via bracket notation e.g. \"$.<step>.parts[\\\"plan.md\\\"]\". Optional `degradations` array (GH #32 ST3) — each entry POSTed to /v1/worker/degradation before the main submit, structured tool-failure trace persisted on the Run record. Backward compat: absent field = pre-#32 behavior. Expects HTTP 204 and returns {submitted: true} (name path) or {submitted: true} (plain path); any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
     )]
     async fn mse_worker_submit(
         &self,
@@ -980,12 +1020,49 @@ impl MseServer {
                     )
                 })?,
         };
-        let url = worker_submit_endpoint_url(&base_url, req.name.as_deref())
-            .map_err(|e| McpError::invalid_params(format!("invalid base_url: {e}"), None))?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
+
+        // GH #32 ST3: pre-submit degradation reporting. Each entry is
+        // POSTed to `/v1/worker/degradation` BEFORE the submit/artifact
+        // call below (serial, in append order — not parallelized, since
+        // ordering matters for the append semantics and the POSTs are
+        // cheap). Independent channel from `body`/`name` — never folded
+        // into step OUTPUT. A non-204 response fails loud: the caller
+        // opted into structured degradation reporting, so it must not be
+        // silently swallowed.
+        if let Some(entries) = req.degradations.filter(|v| !v.is_empty()) {
+            let deg_url = worker_degradation_endpoint_url(&base_url)
+                .map_err(|e| McpError::invalid_params(format!("invalid base_url: {e}"), None))?;
+            for entry in entries {
+                let resp = client
+                    .post(deg_url.clone())
+                    .header("Authorization", format!("Bearer {}", req.worker_handle))
+                    .header("Content-Type", "application/json")
+                    .json(&entry)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(format!("worker degradation: {e}"), None)
+                    })?;
+                let status = resp.status();
+                if status != reqwest::StatusCode::NO_CONTENT {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(McpError::internal_error(
+                        format!(
+                            "worker degradation: HTTP {} (expected 204) — {body}",
+                            status.as_u16()
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+
+        let url = worker_submit_endpoint_url(&base_url, req.name.as_deref())
+            .map_err(|e| McpError::invalid_params(format!("invalid base_url: {e}"), None))?;
         let mut request = client
             .post(url)
             .header("Authorization", format!("Bearer {}", req.worker_handle))
@@ -1156,6 +1233,7 @@ impl MseServer {
                 task_id: task_id_typed.clone(),
                 status: StoreRunStatus::Running,
                 step_entries: Vec::new(),
+                degradations: Vec::new(),
                 operator_sid: None,
                 result_ref: None,
                 created_at: now,
@@ -1724,7 +1802,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Doctor snapshot: mse mcp self state (in-process store = InMemory ephemeral) + server-side config (backend / store root / ref_base / registered BP list) fetched from GET /v1/doctor + an audit_findings section (GH #34) flagging `audit:<step>` artifacts across every run this mse mcp process is tracking. Answers 'where is the store?', 'how many BPs are registered?', and 'did any after-run audit leave a finding?' in a single call."
+        description = "Doctor snapshot: mse mcp self state (in-process store = InMemory ephemeral) + server-side config (backend / store root / ref_base / registered BP list) fetched from GET /v1/doctor + an audit_findings section (GH #34) flagging `audit:<step>` artifacts across every run this mse mcp process is tracking + a `degradations` section (GH #32) counting per-Run structured worker-degradation entries. Answers 'where is the store?', 'how many BPs are registered?', 'did any after-run audit leave a finding?', and 'did any worker report a degraded fallback?' in a single call."
     )]
     async fn mse_doctor(
         &self,
@@ -1763,6 +1841,10 @@ impl MseServer {
                 .collect();
             (inner.runs.len(), tracked)
         };
+        // GH #32: the degradations scan below iterates the same tracked-run
+        // list the audit scan consumes — clone before the audit `for` loop
+        // takes ownership.
+        let tracked_runs_for_degradations = tracked_runs.clone();
 
         // GH #34: audit_findings — for each tracked run whose task_id is
         // known, fetch its steps via the same HTTP steps API
@@ -1813,6 +1895,69 @@ impl MseServer {
             audit_fetch_notes.push("mse serve down; audit_findings scan skipped".to_string());
         }
 
+        // GH #32 ST3: degradations — for each tracked run whose task_id is
+        // known, fetch the plain `RunRecord` via `GET /v1/runs/:id` (not
+        // the steps listing above — degradations never surface there,
+        // per Crux invariant 2) and sum its `degradations` array length.
+        // Same fail-safe contract as `audit_findings`: this scan NEVER
+        // fails the doctor call, every error becomes a note; a run whose
+        // `degradations` is absent or empty is skipped (no entry in
+        // `runs`).
+        let mut degradation_runs: Vec<JsonValue> = Vec::new();
+        let mut degradation_total: usize = 0;
+        let mut degradation_notes: Vec<String> = Vec::new();
+        if server_up {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build();
+            match client {
+                Ok(client) => {
+                    for (run_id, task_id) in tracked_runs_for_degradations {
+                        let Some(task_id) = task_id else {
+                            continue;
+                        };
+                        let url = format!("http://{bind}/v1/runs/{run_id}");
+                        match client.get(&url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.json::<JsonValue>().await {
+                                    Ok(run_body) => {
+                                        let count = run_body
+                                            .get("degradations")
+                                            .and_then(|v| v.as_array())
+                                            .map(|a| a.len())
+                                            .unwrap_or(0);
+                                        if count > 0 {
+                                            degradation_total += count;
+                                            degradation_runs.push(serde_json::json!({
+                                                "run_id": run_id,
+                                                "task_id": task_id,
+                                                "count": count,
+                                            }));
+                                        }
+                                    }
+                                    Err(e) => degradation_notes.push(format!(
+                                        "run {run_id} (task {task_id}): run decode failed: {e}"
+                                    )),
+                                }
+                            }
+                            Ok(resp) => degradation_notes.push(format!(
+                                "run {run_id} (task {task_id}): run fetch returned HTTP {}",
+                                resp.status().as_u16()
+                            )),
+                            Err(e) => degradation_notes.push(format!(
+                                "run {run_id} (task {task_id}): run fetch failed: {e}"
+                            )),
+                        }
+                    }
+                }
+                Err(e) => {
+                    degradation_notes.push(format!("degradations scan client build failed: {e}"))
+                }
+            }
+        } else {
+            degradation_notes.push("mse serve down; degradations scan skipped".to_string());
+        }
+
         let body = serde_json::json!({
             "mse_mcp": {
                 "in_process_blueprint_store": "InMemory (ephemeral, mse mcp process-local)",
@@ -1830,6 +1975,11 @@ impl MseServer {
                 "count": audit_findings.len(),
                 "findings": audit_findings,
                 "notes": audit_fetch_notes,
+            },
+            "degradations": {
+                "count": degradation_total,
+                "runs": degradation_runs,
+                "notes": degradation_notes,
             },
         });
         json_result(&body)
@@ -2123,6 +2273,7 @@ mod tests {
             default_context_policy: None,
             projection_placement: None,
             audits: vec![],
+            degradation_policy: None,
         }
     }
 
@@ -2459,6 +2610,7 @@ mod tests {
                 body: "RESULT".into(),
                 ok: None,
                 name: None,
+                degradations: None,
             }))
             .await
             .unwrap_err();
@@ -2503,6 +2655,7 @@ mod tests {
                 body: "RESULT".into(),
                 ok: None,
                 name: None,
+                degradations: None,
             }))
             .await
             .expect_err("unknown handle must surface the HTTP error");
@@ -2524,6 +2677,7 @@ mod tests {
                 body: "part body".into(),
                 ok: Some(false),
                 name: Some("plan.md".into()),
+                degradations: None,
             }))
             .await
             .unwrap_err();
@@ -2557,6 +2711,7 @@ mod tests {
                 body: "part body".into(),
                 ok: None,
                 name: Some("plan.md".into()),
+                degradations: None,
             }))
             .await
             .expect_err("unknown handle must surface the HTTP error");
@@ -2566,6 +2721,86 @@ mod tests {
         // a nonexistent route would 404 instead of reaching this
         // HTTP-status-surfacing error path at all).
         assert!(msg.contains("expected 204"), "err: {msg}");
+    }
+
+    /// GH #32 ST3: a `degradations`-bearing submit call POSTs each entry to
+    /// `/v1/worker/degradation` BEFORE the plain submit — against a real
+    /// in-process router, a bogus (never-minted) handle fails handle
+    /// resolution inside `worker_degradation` itself (500, not 204), which
+    /// must surface as a `worker degradation: HTTP ...` error — proving
+    /// the pre-submit POST actually fires and its failure short-circuits
+    /// before the submit POST is ever attempted.
+    #[tokio::test]
+    async fn mse_worker_submit_posts_degradations_before_submit() {
+        let engine = Engine::new(EngineCfg::default());
+        let router = mlua_swarm_server::build_router(engine);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let server = MseServer::new();
+        let err = server
+            .mse_worker_submit(Parameters(WorkerSubmitReq {
+                worker_handle: "wh-deadbeef".into(),
+                base_url: Some(base_url),
+                body: "RESULT".into(),
+                ok: None,
+                name: None,
+                degradations: Some(vec![DegradationInput {
+                    tool: "code_index".into(),
+                    error: "unavailable".into(),
+                    fallback: "grep".into(),
+                    note: None,
+                }]),
+            }))
+            .await
+            .expect_err("unknown handle must surface the HTTP error");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("worker degradation: HTTP"),
+            "the pre-submit degradation POST must fail first, not the plain submit: {msg}"
+        );
+        assert!(
+            !msg.contains("worker submit: HTTP"),
+            "the plain submit POST must never fire once the degradation POST fails: {msg}"
+        );
+    }
+
+    /// GH #32 ST3: without `degradations`, the request path is byte-for-byte
+    /// the pre-#32 behavior — the error is the existing `worker submit:
+    /// HTTP ...` message, proving the new field is truly opt-in.
+    #[tokio::test]
+    async fn mse_worker_submit_without_degradations_unchanged() {
+        let engine = Engine::new(EngineCfg::default());
+        let router = mlua_swarm_server::build_router(engine);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let server = MseServer::new();
+        let err = server
+            .mse_worker_submit(Parameters(WorkerSubmitReq {
+                worker_handle: "wh-deadbeef".into(),
+                base_url: Some(base_url),
+                body: "RESULT".into(),
+                ok: None,
+                name: None,
+                degradations: None,
+            }))
+            .await
+            .expect_err("unknown handle must surface the HTTP error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("worker submit: HTTP"), "err: {msg}");
     }
 
     // --- worker_submit_endpoint_url (pure URL-building) tests ---
@@ -2614,6 +2849,27 @@ mod tests {
     #[test]
     fn worker_submit_endpoint_url_rejects_malformed_base_url() {
         let err = worker_submit_endpoint_url("not a url", None).unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    // --- worker_degradation_endpoint_url (GH #32 ST3, pure URL-building) ---
+
+    #[test]
+    fn worker_degradation_endpoint_url_shape() {
+        let with_slash = worker_degradation_endpoint_url("http://127.0.0.1:7777/").unwrap();
+        let without_slash = worker_degradation_endpoint_url("http://127.0.0.1:7777").unwrap();
+        assert_eq!(with_slash.as_str(), without_slash.as_str());
+        assert_eq!(
+            without_slash.as_str(),
+            "http://127.0.0.1:7777/v1/worker/degradation"
+        );
+        assert_eq!(without_slash.path(), "/v1/worker/degradation");
+        assert_eq!(without_slash.query_pairs().count(), 0);
+    }
+
+    #[test]
+    fn worker_degradation_endpoint_url_rejects_malformed_base_url() {
+        let err = worker_degradation_endpoint_url("not a url").unwrap_err();
         assert!(!err.is_empty());
     }
 
@@ -3374,6 +3630,7 @@ mod tests {
                 steps: None,
                 mode: AuditMode::Sync,
             }],
+            degradation_policy: None,
         };
 
         let client = reqwest::Client::new();
@@ -3498,5 +3755,83 @@ mod tests {
         assert_eq!(findings[0]["run_id"], "R-stub");
         assert_eq!(findings[0]["step"], "worker");
         assert_eq!(findings[0]["artifact_name"], "audit:worker");
+    }
+
+    /// GH #32 ST3: `mse_doctor`'s own HTTP-calling + extraction logic for
+    /// the `degradations` section, isolated the same way
+    /// `mse_doctor_surfaces_audit_findings_via_stub_steps_api` isolates the
+    /// `audit_findings` one — a stub router serving the real `GET
+    /// /v1/runs/:id` response *shape* (a plain `RunRecord` with a
+    /// non-empty `degradations` array), not a real dispatch.
+    #[tokio::test]
+    async fn mse_doctor_degradations_scan_present_in_response() {
+        use axum::extract::Path as AxumPath;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        async fn stub_healthz() -> &'static str {
+            "ok"
+        }
+        async fn stub_run(AxumPath(run_id): AxumPath<String>) -> Json<JsonValue> {
+            Json(serde_json::json!({
+                "id": run_id,
+                "task_id": "T-stub",
+                "status": "running",
+                "step_entries": [],
+                "degradations": [
+                    {
+                        "tool": "code_index",
+                        "error": "unavailable",
+                        "fallback": "grep",
+                        "step_ref": "worker",
+                        "attempt": 1,
+                        "at": 0,
+                    }
+                ],
+                "operator_sid": null,
+                "result_ref": null,
+                "created_at": 0,
+                "updated_at": 0,
+            }))
+        }
+
+        let router = Router::new()
+            .route("/v1/healthz", get(stub_healthz))
+            .route("/v1/runs/:run_id", get(stub_run));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let bind = addr.to_string();
+
+        let server = MseServer::new();
+        {
+            let mut inner = server.state.write().await;
+            inner.runs.insert(
+                "R-stub".into(),
+                RunHandle {
+                    run_id: "R-stub".into(),
+                    status: RunStatus::Running,
+                    task_id: Some("T-stub".into()),
+                },
+            );
+        }
+        let result = server
+            .mse_doctor(Parameters(DoctorReq { bind: Some(bind) }))
+            .await
+            .expect("mse_doctor must never fail on a degradations-scan issue");
+        let json: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("doctor json");
+        assert_eq!(json["degradations"]["count"], 1, "body: {json}");
+        let runs = json["degradations"]["runs"]
+            .as_array()
+            .expect("degradations.runs array");
+        assert_eq!(runs.len(), 1, "body: {json}");
+        assert_eq!(runs[0]["run_id"], "R-stub");
+        assert_eq!(runs[0]["task_id"], "T-stub");
+        assert_eq!(runs[0]["count"], 1);
     }
 }

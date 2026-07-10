@@ -376,6 +376,7 @@ mod tests {
             default_context_policy: None,
             projection_placement: None,
             audits: vec![],
+            degradation_policy: None,
         }
     }
 

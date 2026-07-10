@@ -53,6 +53,37 @@ pub enum RunStatus {
     Interrupted,
 }
 
+/// One worker-reported degradation entry — a worker fell back to a
+/// substitute behavior instead of failing outright (e.g. a tool call errored
+/// and the worker used a cached/default value). Independent channel from
+/// [`StepEntry`]/`result_ref`: degradations never flow through step OUTPUT
+/// or the fold path (GH #32; sibling of the GH #34 audit sidecar — both
+/// keep observational signal off the BP-chain value). Reported via `POST
+/// /v1/worker/degradation`; the server injects `step_ref`/`attempt`/`at`
+/// before persisting.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DegradationEntry {
+    /// The tool (or capability) the worker attempted to use.
+    pub tool: String,
+    /// The error that triggered the fallback, in the worker's own words.
+    pub error: String,
+    /// What the worker substituted instead of failing.
+    pub fallback: String,
+    /// Optional free-form context from the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The Blueprint step ref (`Step.ref`) this degradation was reported
+    /// under, if known. Server-injected metadata, not worker-supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_ref: Option<String>,
+    /// The attempt number this degradation was reported under, if known.
+    /// Server-injected metadata, not worker-supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// Unix epoch seconds — when this entry was recorded. Server-injected.
+    pub at: u64,
+}
+
 /// One entry in a Run's step trace — appended as the engine dispatches
 /// (and finishes) each step. Purely observational: no field here is
 /// consulted for flow control.
@@ -83,6 +114,12 @@ pub struct RunRecord {
     pub status: RunStatus,
     /// Trace of dispatched steps, in append order.
     pub step_entries: Vec<StepEntry>,
+    /// Worker-reported degradations, in append order (GH #32). Independent
+    /// channel from [`Self::step_entries`]/[`Self::result_ref`] — see
+    /// [`DegradationEntry`]'s doc for the invariant. `[]` (the default) =
+    /// no degradations reported — every pre-#32 Run is unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degradations: Vec<DegradationEntry>,
     /// Operator session id bound to this Run, if any (WS operator
     /// correlation).
     pub operator_sid: Option<String>,
@@ -172,6 +209,16 @@ pub trait RunStore: Send + Sync {
     /// Append one step-trace entry to a Run's `step_entries`, bumping
     /// `updated_at` to now.
     async fn append_step_entry(&self, id: &RunId, entry: StepEntry) -> Result<(), RunStoreError>;
+
+    /// Append one worker-reported degradation to a Run's `degradations`
+    /// (GH #32), bumping `updated_at` to now. Independent of
+    /// [`Self::append_step_entry`] — degradations never flow through step
+    /// OUTPUT/fold.
+    async fn append_degradation(
+        &self,
+        id: &RunId,
+        entry: DegradationEntry,
+    ) -> Result<(), RunStoreError>;
 
     /// Update a Run's status, bumping `updated_at` to now.
     async fn update_status(&self, id: &RunId, status: RunStatus) -> Result<(), RunStoreError>;

@@ -2,7 +2,8 @@
 //! default.
 
 use super::{
-    Inner, RunId, RunRecord, RunStatus, RunStore, RunStoreError, SharedInner, StepEntry, TaskId,
+    DegradationEntry, Inner, RunId, RunRecord, RunStatus, RunStore, RunStoreError, SharedInner,
+    StepEntry, TaskId,
 };
 use async_trait::async_trait;
 use std::sync::Mutex;
@@ -72,6 +73,21 @@ impl RunStore for InMemoryRunStore {
         Ok(())
     }
 
+    async fn append_degradation(
+        &self,
+        id: &RunId,
+        entry: DegradationEntry,
+    ) -> Result<(), RunStoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner
+            .records
+            .get_mut(id)
+            .ok_or_else(|| RunStoreError::NotFound(id.clone()))?;
+        record.degradations.push(entry);
+        record.updated_at = crate::types::now_unix();
+        Ok(())
+    }
+
     async fn update_status(&self, id: &RunId, status: RunStatus) -> Result<(), RunStoreError> {
         let mut inner = self.inner.lock().unwrap();
         let record = inner
@@ -125,10 +141,23 @@ mod tests {
             task_id: TaskId::parse(task_id).unwrap(),
             status: RunStatus::Pending,
             step_entries: vec![],
+            degradations: vec![],
             operator_sid: None,
             result_ref: None,
             created_at,
             updated_at: created_at,
+        }
+    }
+
+    fn mk_degradation(tool: &str, at: u64) -> DegradationEntry {
+        DegradationEntry {
+            tool: tool.to_string(),
+            error: "boom".to_string(),
+            fallback: "cached-default".to_string(),
+            note: None,
+            step_ref: Some("worker".to_string()),
+            attempt: Some(1),
+            at,
         }
     }
 
@@ -202,6 +231,56 @@ mod tests {
         assert_eq!(got.step_entries[0].step_ref, Some("step-a".into()));
         assert_eq!(got.step_entries[1].step_ref, Some("step-b".into()));
         assert!(got.updated_at >= got.created_at);
+    }
+
+    #[tokio::test]
+    async fn append_degradation_accumulates_in_order() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        s.append_degradation(
+            &RunId::parse("R-1").unwrap(),
+            mk_degradation("web_search", 101),
+        )
+        .await
+        .unwrap();
+        s.append_degradation(
+            &RunId::parse("R-1").unwrap(),
+            mk_degradation("code_exec", 102),
+        )
+        .await
+        .unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
+        assert_eq!(got.degradations.len(), 2);
+        assert_eq!(got.degradations[0].tool, "web_search");
+        assert_eq!(got.degradations[1].tool, "code_exec");
+        assert!(got.updated_at >= got.created_at);
+    }
+
+    #[tokio::test]
+    async fn append_degradation_unknown_run_fails() {
+        let s = InMemoryRunStore::new();
+        let err = s
+            .append_degradation(
+                &RunId::parse("R-nope").unwrap(),
+                mk_degradation("web_search", 1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RunStoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn append_degradation_bumps_updated_at() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        s.append_degradation(
+            &RunId::parse("R-1").unwrap(),
+            mk_degradation("web_search", 200),
+        )
+        .await
+        .unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
+        assert!(got.updated_at > 100);
     }
 
     #[tokio::test]

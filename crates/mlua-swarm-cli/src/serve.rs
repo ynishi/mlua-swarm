@@ -130,7 +130,7 @@ pub struct Args {
     /// Ceiling (seconds) for the `POST /v1/tasks` synchronous launch await
     /// (GH #33 Guard 2). Per-request `timeout_secs` in the request body
     /// takes priority; this is the server-wide fallback. Overrides the
-    /// config file's `sync_timeout_secs`; built-in default is 300s.
+    /// config file's `sync_timeout_secs`; built-in default is 3600s (60 min).
     #[arg(long)]
     sync_timeout_secs: Option<u64>,
     /// Opt-out of the persist-by-default `TaskStore`/`RunStore` (issue #35
@@ -563,6 +563,7 @@ fn seed_blueprint(id: &str) -> Blueprint {
         default_context_policy: None,
         projection_placement: None,
         audits: vec![],
+        degradation_policy: None,
     }
 }
 
@@ -616,6 +617,7 @@ mod tests {
                 task_id: running_task_id.clone(),
                 status: RunStatus::Running,
                 step_entries: vec![],
+                degradations: vec![],
                 operator_sid: None,
                 result_ref: None,
                 created_at: 1,
@@ -629,6 +631,7 @@ mod tests {
                 task_id: done_task_id.clone(),
                 status: RunStatus::Done,
                 step_entries: vec![],
+                degradations: vec![],
                 operator_sid: None,
                 result_ref: None,
                 created_at: 2,

@@ -471,6 +471,72 @@ way any other in-process AgentBlock worker does; the observational
 invariant and the `audit:<step_ref>` artifact naming are identical either
 way.
 
+## Worker degradation reporting
+
+Hop 4's raw `body` carries the attempt's result; it says nothing about
+*how* that result was produced. A worker that hits a tool failure mid-task
+often has a cheap escape hatch — fall back to a weaker method and still
+submit a plausible-looking result — and the submit-side contract gives it
+no way to say so. `POST /v1/worker/degradation` (GH #32) is a **separate
+observational channel**, sibling of the after-run audit sidecar above:
+both keep execution-quality signal off the BP-chain value, so a
+`$.<step>` read never sees anything but the worker's own result.
+
+A worker (or the MainAI harness driving it) has two entry points:
+
+- **Direct HTTP** — `POST <base_url>/v1/worker/degradation` with
+  `Authorization: Bearer <worker_handle>` and `Content-Type:
+  application/json`:
+
+  ```jsonc
+  {
+    "tool": "code-index",
+    "error": "project-binding mismatch; empty result set",
+    "fallback": "grep + manual read",
+    "note": "index scoped to the wrong worktree" // optional
+  }
+  ```
+
+  The server injects `step_ref`, `attempt`, and `at` on the persisted
+  entry — never trust the client body for those.
+
+- **`mse_worker_submit`'s `degradations` array** (`mse://guides/mcp-tool-reference`)
+  — pass one entry per tool failure alongside the ordinary submit call:
+
+  ```jsonc
+  {
+    "worker_handle": "wh-...",
+    "body": "<the actual result>",
+    "degradations": [
+      { "tool": "code-index", "error": "project-binding mismatch",
+        "fallback": "grep + manual read" }
+    ]
+  }
+  ```
+
+  Each entry is POSTed to `/v1/worker/degradation` before the call's own
+  submit body lands. An absent (or omitted) `degradations` field is
+  pre-#32 behavior — nothing changes.
+
+Entries land on `RunRecord.degradations` — a flat list at the Run level,
+each entry carrying its own `step_ref` for locality — and surface via
+`GET /v1/runs/:id`, the same read path that already returns
+`step_entries`. `mse_doctor` reports a `degradations` section counting
+non-empty runs, so an operator or MainAI can spot a degraded run without
+walking the full run record.
+
+**The contract**: a worker SHOULD report every tool failure it works
+around through this channel rather than silently substituting it away.
+Honesty becomes cheap, and downstream gates get a machine-checkable
+signal that the execution path was compromised — the same motivation as
+the audit sidecar above, from the worker's own side instead of an
+after-the-fact observer's.
+
+`Blueprint.degradation_policy` (`mse://guides/blueprint-authoring`) is
+schema-only today: `warn` (the default) and `fail` both record author
+intent, but neither currently changes a Run's outcome — engine
+enforcement of `fail` is a follow-up.
+
 ---
 
 ## Responsibility summary

@@ -737,6 +737,7 @@ mod tests {
             default_context_policy: None,
             projection_placement: None,
             audits: vec![],
+            degradation_policy: None,
         }
     }
 
@@ -1107,6 +1108,7 @@ mod tests {
                 task_id: TaskId::new(),
                 status: RunStatus::Running,
                 step_entries: Vec::new(),
+                degradations: Vec::new(),
                 operator_sid: None,
                 result_ref: None,
                 created_at: 0,

@@ -108,7 +108,7 @@ pub struct FileConfig {
     /// Ceiling (seconds) for the `POST /v1/tasks` synchronous launch await
     /// (GH #33 Guard 2). Overridable per-request via `TaskLaunchRequest
     /// .timeout_secs`; this is the server-wide fallback when the request
-    /// omits it. `None` = fall back to the built-in default (300s, see
+    /// omits it. `None` = fall back to the built-in default (3600s / 60 min, see
     /// [`ResolvedConfig`]'s `Default` impl).
     pub sync_timeout_secs: Option<u64>,
 }
@@ -189,7 +189,7 @@ pub struct ResolvedConfig {
     /// Shared secret used to verify/sign `CapToken` HMAC signatures.
     pub token_secret: Option<String>,
     /// Ceiling (seconds) for the `POST /v1/tasks` synchronous launch await
-    /// (GH #33 Guard 2). Always set — defaults to 300s (see
+    /// (GH #33 Guard 2). Always set — defaults to 3600s / 60 min (see
     /// [`default_sync_timeout_secs`]) when neither CLI nor config file
     /// provides one. A per-request `TaskLaunchRequest.timeout_secs`
     /// override, when present, takes priority over this server-wide value.
@@ -218,8 +218,15 @@ impl Default for ResolvedConfig {
 }
 
 /// Built-in default sync-launch timeout ceiling (GH #33 Guard 2), seconds.
+/// 3600s / 60 min — sized for LLM-driven agent flows where individual
+/// spawns routinely take 60-180s and full phases run 20-40 min. The
+/// previous 300s ceiling under-shot the primary workload; users hitting
+/// it were legitimate long-running runs, not stuck ones. Callers who
+/// want faster fail-loud can override per-request
+/// (`TaskLaunchRequest.timeout_secs`) or server-wide (config or CLI).
+/// GH #39.
 pub fn default_sync_timeout_secs() -> u64 {
-    300
+    3600
 }
 
 fn default_bind() -> SocketAddr {
@@ -477,9 +484,9 @@ mod tests {
     // ──────────────────────────────────────────────────────────────────
 
     #[test]
-    fn resolve_sync_timeout_secs_default_300_when_cli_and_file_absent() {
+    fn resolve_sync_timeout_secs_default_when_cli_and_file_absent() {
         let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
-        assert_eq!(resolved.sync_timeout_secs, 300);
+        assert_eq!(resolved.sync_timeout_secs, 3600);
         assert_eq!(resolved.sync_timeout_secs, default_sync_timeout_secs());
     }
 

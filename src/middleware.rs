@@ -1253,6 +1253,7 @@ mod after_run_audit_tests {
             default_context_policy: None,
             projection_placement: None,
             audits,
+            degradation_policy: None,
         }
     }
 

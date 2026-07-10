@@ -20,7 +20,8 @@ generate programmatically; for the exact, always-current JSON Schema fetch
   "metadata": { "description": "...", "tags": [] }, // optional
   "spawner_hints": { "layers": [] },   // optional, middleware capability keys
   "default_agent_kind": "operator",    // optional, defaults to "operator"
-  "default_operator_kind": "automate"  // optional, no default (falls through the cascade)
+  "default_operator_kind": "automate", // optional, no default (falls through the cascade)
+  "degradation_policy": "warn"         // optional, "warn" (default) | "fail" (opt-in, schema-only today — see the worker degradation reporting section in `mse://guides/operator-execution-model`)
 }
 ```
 

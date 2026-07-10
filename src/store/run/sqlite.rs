@@ -2,11 +2,12 @@
 //!
 //! The `Connection` is confined to a dedicated OS thread by `AsyncIsle`;
 //! every call is a typed closure dispatched over a bounded channel.
-//! `step_entries` and `result_ref` are stored as JSON blobs — the former is
-//! a pure trace/observability artifact (not queried relationally), the
-//! latter is caller-defined payload shape. `append_step_entry` runs as a
-//! read-modify-write inside a single transaction so concurrent appenders
-//! don't clobber each other's entries.
+//! `step_entries`, `degradations`, and `result_ref` are stored as JSON
+//! blobs — the former two are pure trace/observability artifacts (not
+//! queried relationally), the latter is caller-defined payload shape.
+//! `append_step_entry`/`append_degradation` run as a read-modify-write
+//! inside a single transaction so concurrent appenders don't clobber each
+//! other's entries.
 //!
 //! ## Schema
 //!
@@ -16,6 +17,7 @@
 //!   task_id            TEXT NOT NULL,
 //!   status             TEXT NOT NULL,      -- JSON-encoded `RunStatus`
 //!   step_entries_json  TEXT NOT NULL,      -- JSON-encoded `Vec<StepEntry>`
+//!   degradations_json  TEXT NOT NULL DEFAULT '[]', -- JSON-encoded `Vec<DegradationEntry>` (GH #32)
 //!   operator_sid       TEXT,
 //!   result_ref_json    TEXT,               -- JSON-encoded `serde_json::Value`, NULL when unset
 //!   created_at         INTEGER NOT NULL,
@@ -23,8 +25,16 @@
 //! );
 //! CREATE INDEX IF NOT EXISTS ix_runs_task_id ON runs(task_id, created_at);
 //! ```
+//!
+//! `degradations_json` was added after the initial release (GH #32); the
+//! migration is applied idempotently on open via a `PRAGMA table_info(runs)`
+//! existence check followed by `ALTER TABLE runs ADD COLUMN degradations_json
+//! TEXT NOT NULL DEFAULT '[]'` when missing, so pre-existing database files
+//! pick up the column without a manual migration step.
 
-use super::{RunId, RunRecord, RunStatus, RunStore, RunStoreError, StepEntry, TaskId};
+use super::{
+    DegradationEntry, RunId, RunRecord, RunStatus, RunStore, RunStoreError, StepEntry, TaskId,
+};
 use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
 use rusqlite_isle::{AsyncIsle, AsyncIsleDriver, IsleError};
@@ -36,6 +46,7 @@ CREATE TABLE IF NOT EXISTS runs (\
   task_id            TEXT NOT NULL, \
   status             TEXT NOT NULL, \
   step_entries_json  TEXT NOT NULL, \
+  degradations_json  TEXT NOT NULL DEFAULT '[]', \
   operator_sid       TEXT, \
   result_ref_json    TEXT, \
   created_at         INTEGER NOT NULL, \
@@ -43,6 +54,25 @@ CREATE TABLE IF NOT EXISTS runs (\
 );\
 CREATE INDEX IF NOT EXISTS ix_runs_task_id ON runs(task_id, created_at);\
 ";
+
+/// Idempotently ensures `runs.degradations_json` exists — for database
+/// files created before GH #32 introduced the column. Fresh databases get
+/// the column from [`SCHEMA_SQL`] directly; this only fires the `ALTER
+/// TABLE` on pre-existing files where `runs` was created without it.
+fn migrate_degradations_column(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(runs)")?;
+    let has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<String>, _>>()?
+        .iter()
+        .any(|name| name == "degradations_json");
+    if !has_column {
+        conn.execute_batch(
+            "ALTER TABLE runs ADD COLUMN degradations_json TEXT NOT NULL DEFAULT '[]';",
+        )?;
+    }
+    Ok(())
+}
 
 /// SQLite-backed persistent [`RunStore`].
 ///
@@ -60,7 +90,8 @@ impl SqliteRunStore {
     /// migrations.
     pub async fn open(path: impl AsRef<Path>) -> Result<(Self, AsyncIsleDriver), RunStoreError> {
         let (isle, driver) = AsyncIsle::spawn(path.as_ref().to_path_buf(), |conn| {
-            conn.execute_batch(SCHEMA_SQL)
+            conn.execute_batch(SCHEMA_SQL)?;
+            migrate_degradations_column(conn)
         })
         .await
         .map_err(map_isle_err)?;
@@ -69,9 +100,12 @@ impl SqliteRunStore {
 
     /// Open an ephemeral in-memory database (tests, doctests).
     pub async fn open_in_memory() -> Result<(Self, AsyncIsleDriver), RunStoreError> {
-        let (isle, driver) = AsyncIsle::open_in_memory(|conn| conn.execute_batch(SCHEMA_SQL))
-            .await
-            .map_err(map_isle_err)?;
+        let (isle, driver) = AsyncIsle::open_in_memory(|conn| {
+            conn.execute_batch(SCHEMA_SQL)?;
+            migrate_degradations_column(conn)
+        })
+        .await
+        .map_err(map_isle_err)?;
         Ok((Self { isle }, driver))
     }
 }
@@ -81,9 +115,10 @@ fn map_isle_err(e: IsleError) -> RunStoreError {
 }
 
 /// One `runs` SELECT row in column order: id, task_id, status,
-/// step_entries_json, operator_sid, result_ref_json, created_at,
-/// updated_at.
+/// step_entries_json, degradations_json, operator_sid, result_ref_json,
+/// created_at, updated_at.
 type RunRow = (
+    String,
     String,
     String,
     String,
@@ -94,12 +129,16 @@ type RunRow = (
     i64,
 );
 
+const RUN_SELECT_COLUMNS: &str = "id, task_id, status, step_entries_json, degradations_json, \
+     operator_sid, result_ref_json, created_at, updated_at";
+
 fn row_to_record(row: RunRow) -> Result<RunRecord, RunStoreError> {
     let (
         id,
         task_id,
         status_json,
         step_entries_json,
+        degradations_json,
         operator_sid,
         result_ref_json,
         created_at,
@@ -109,6 +148,8 @@ fn row_to_record(row: RunRow) -> Result<RunRecord, RunStoreError> {
         .map_err(|e| RunStoreError::Other(format!("decode status: {e}")))?;
     let step_entries: Vec<StepEntry> = serde_json::from_str(&step_entries_json)
         .map_err(|e| RunStoreError::Other(format!("decode step_entries: {e}")))?;
+    let degradations: Vec<DegradationEntry> = serde_json::from_str(&degradations_json)
+        .map_err(|e| RunStoreError::Other(format!("decode degradations: {e}")))?;
     let result_ref: Option<serde_json::Value> = match result_ref_json {
         Some(text) => Some(
             serde_json::from_str(&text)
@@ -127,6 +168,7 @@ fn row_to_record(row: RunRow) -> Result<RunRecord, RunStoreError> {
         task_id,
         status,
         step_entries,
+        degradations,
         operator_sid,
         result_ref,
         created_at: created_at as u64,
@@ -148,6 +190,8 @@ impl RunStore for SqliteRunStore {
             .map_err(|e| RunStoreError::Other(format!("encode status: {e}")))?;
         let step_entries_json = serde_json::to_string(&record.step_entries)
             .map_err(|e| RunStoreError::Other(format!("encode step_entries: {e}")))?;
+        let degradations_json = serde_json::to_string(&record.degradations)
+            .map_err(|e| RunStoreError::Other(format!("encode degradations: {e}")))?;
         let operator_sid = record.operator_sid.clone();
         let result_ref_json = record
             .result_ref
@@ -173,14 +217,15 @@ impl RunStore for SqliteRunStore {
                     ));
                 }
                 tx.execute(
-                    "INSERT INTO runs (id, task_id, status, step_entries_json, operator_sid, \
-                     result_ref_json, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO runs (id, task_id, status, step_entries_json, \
+                     degradations_json, operator_sid, result_ref_json, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         id,
                         task_id,
                         status_json,
                         step_entries_json,
+                        degradations_json,
                         operator_sid,
                         result_ref_json,
                         created_at,
@@ -208,8 +253,7 @@ impl RunStore for SqliteRunStore {
             .isle
             .call(move |conn| {
                 conn.query_row(
-                    "SELECT id, task_id, status, step_entries_json, operator_sid, \
-                     result_ref_json, created_at, updated_at FROM runs WHERE id = ?1",
+                    &format!("SELECT {RUN_SELECT_COLUMNS} FROM runs WHERE id = ?1"),
                     params![id_str],
                     |row| {
                         Ok((
@@ -217,10 +261,11 @@ impl RunStore for SqliteRunStore {
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
-                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(4)?,
                             row.get::<_, Option<String>>(5)?,
-                            row.get::<_, i64>(6)?,
+                            row.get::<_, Option<String>>(6)?,
                             row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
                         ))
                     },
                 )
@@ -239,21 +284,21 @@ impl RunStore for SqliteRunStore {
         let rows = self
             .isle
             .call(move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT id, task_id, status, step_entries_json, operator_sid, \
-                     result_ref_json, created_at, updated_at FROM runs \
-                     WHERE task_id = ?1 ORDER BY created_at ASC",
-                )?;
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {RUN_SELECT_COLUMNS} FROM runs \
+                     WHERE task_id = ?1 ORDER BY created_at ASC"
+                ))?;
                 let iter = stmt.query_map(params![task_id_str], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
-                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(6)?,
                         row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
                     ))
                 })?;
                 let mut out = Vec::new();
@@ -293,6 +338,51 @@ impl RunStore for SqliteRunStore {
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 tx.execute(
                     "UPDATE runs SET step_entries_json = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![new_json, updated_at, id_str],
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await
+            .map_err(map_isle_err)?;
+
+        if updated {
+            Ok(())
+        } else {
+            Err(RunStoreError::NotFound(id_for_notfound))
+        }
+    }
+
+    async fn append_degradation(
+        &self,
+        id: &RunId,
+        entry: DegradationEntry,
+    ) -> Result<(), RunStoreError> {
+        let id_str = id.to_string();
+        let id_for_notfound = id.clone();
+        let updated_at = crate::types::now_unix() as i64;
+
+        let updated = self
+            .isle
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                let existing: Option<String> = tx
+                    .query_row(
+                        "SELECT degradations_json FROM runs WHERE id = ?1",
+                        params![id_str],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(existing_json) = existing else {
+                    return Ok(false);
+                };
+                let mut entries: Vec<DegradationEntry> = serde_json::from_str(&existing_json)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                entries.push(entry);
+                let new_json = serde_json::to_string(&entries)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                tx.execute(
+                    "UPDATE runs SET degradations_json = ?1, updated_at = ?2 WHERE id = ?3",
                     params![new_json, updated_at, id_str],
                 )?;
                 tx.commit()?;
@@ -364,21 +454,20 @@ impl RunStore for SqliteRunStore {
         let rows = self
             .isle
             .call(move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT id, task_id, status, step_entries_json, operator_sid, \
-                     result_ref_json, created_at, updated_at FROM runs \
-                     WHERE status = ?1",
-                )?;
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {RUN_SELECT_COLUMNS} FROM runs WHERE status = ?1"
+                ))?;
                 let iter = stmt.query_map(params![status_json], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
-                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(6)?,
                         row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
                     ))
                 })?;
                 let mut out = Vec::new();
@@ -408,10 +497,23 @@ mod tests {
             task_id: TaskId::parse(task_id).unwrap(),
             status: RunStatus::Pending,
             step_entries: vec![],
+            degradations: vec![],
             operator_sid: None,
             result_ref: None,
             created_at,
             updated_at: created_at,
+        }
+    }
+
+    fn mk_degradation(tool: &str, at: u64) -> DegradationEntry {
+        DegradationEntry {
+            tool: tool.to_string(),
+            error: "boom".to_string(),
+            fallback: "cached-default".to_string(),
+            note: None,
+            step_ref: Some("worker".to_string()),
+            attempt: Some(1),
+            at,
         }
     }
 
@@ -513,6 +615,61 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RunStoreError::NotFound(_)));
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_degradation_accumulates_in_order() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        s.append_degradation(
+            &RunId::parse("R-1").unwrap(),
+            mk_degradation("web_search", 101),
+        )
+        .await
+        .unwrap();
+        s.append_degradation(
+            &RunId::parse("R-1").unwrap(),
+            mk_degradation("code_exec", 102),
+        )
+        .await
+        .unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
+        assert_eq!(got.degradations.len(), 2);
+        assert_eq!(got.degradations[0].tool, "web_search");
+        assert_eq!(got.degradations[1].tool, "code_exec");
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_degradation_unknown_run_fails() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        let err = s
+            .append_degradation(
+                &RunId::parse("R-nope").unwrap(),
+                mk_degradation("web_search", 1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RunStoreError::NotFound(_)));
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_degradation_bumps_updated_at() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        s.append_degradation(
+            &RunId::parse("R-1").unwrap(),
+            mk_degradation("web_search", 200),
+        )
+        .await
+        .unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
+        assert!(got.updated_at > 100);
         drop(s);
         driver.shutdown().await.unwrap();
     }

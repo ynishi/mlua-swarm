@@ -370,6 +370,7 @@ pub async fn task_rekick(
             task_id: task_id.clone(),
             status: RunStatus::Running,
             step_entries: Vec::new(),
+            degradations: Vec::new(),
             operator_sid: None,
             result_ref: None,
             created_at: now,
@@ -594,6 +595,7 @@ mod tests {
             default_context_policy: None,
             projection_placement: None,
             audits: vec![],
+            degradation_policy: None,
         }
     }
 
@@ -1184,6 +1186,7 @@ mod tests {
             default_context_policy: None,
             projection_placement: None,
             audits: vec![],
+            degradation_policy: None,
         }
     }
 
