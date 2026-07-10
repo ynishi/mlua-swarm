@@ -91,13 +91,18 @@ pub struct Args {
     #[arg(long)]
     output_store_path: Option<std::path::PathBuf>,
     /// Path to the SQLite database file backing the `TaskStore` (issue #13
-    /// ID-hierarchy `POST /v1/tasks` work-item records). Omit for the
-    /// in-memory default. Overrides `task_store_path` in the config file.
+    /// ID-hierarchy `POST /v1/tasks` work-item records). Persisted by
+    /// default even when omitted (issue #35 ST1): falls back to
+    /// `~/.mse/store/task.sqlite` unless `--ephemeral` is set. Overrides
+    /// `task_store_path` in the config file, and always wins over
+    /// `--ephemeral` / the persist-by-default when set.
     #[arg(long)]
     task_store_path: Option<std::path::PathBuf>,
     /// Path to the SQLite database file backing the `RunStore` (one kick of
-    /// a Task). Omit for the in-memory default. Overrides `run_store_path`
-    /// in the config file.
+    /// a Task). Persisted by default even when omitted (issue #35 ST1):
+    /// falls back to `~/.mse/store/run.sqlite` unless `--ephemeral` is set.
+    /// Overrides `run_store_path` in the config file, and always wins over
+    /// `--ephemeral` / the persist-by-default when set.
     #[arg(long)]
     run_store_path: Option<std::path::PathBuf>,
     /// Merges the 4 enhance-flow workers (patch-spawner / patch-applier /

@@ -223,6 +223,14 @@ pub struct RunKickResponse {
 /// The body is optional (`Option<Json<RunKickRequest>>`) — no body, or a
 /// body with both fields absent, preserves the pre-#19 rekick behavior
 /// byte-for-byte (`must_not_simplify #3`).
+///
+/// Issue #35 ST3 ports the GH #33 sync-hang guards from `run_flow_form` to
+/// this handler, both checked before any Task/Run store write: Guard 1
+/// (503) fails fast when the resolved Blueprint declares the
+/// `operator_delegate` spawner-hint layer and no operator is attached;
+/// Guard 2 (504) wraps the dispatch await in `RunKickRequest.timeout_secs`
+/// (falling back to the server-wide `sync_timeout_secs`), marking the
+/// Run/Task `Failed` rather than leaving them `Running` forever on expiry.
 pub async fn task_rekick(
     State(state): State<AppState>,
     Path(id): Path<String>,
