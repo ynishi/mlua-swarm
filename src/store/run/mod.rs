@@ -46,6 +46,11 @@ pub enum RunStatus {
     Done,
     /// The Run failed.
     Failed,
+    /// The Run was still `Running` when the server process restarted
+    /// (issue #35 ST2 boot-time recovery sweep). Terminal — in-flight
+    /// `EngineState` is process-local and unrecoverable; this variant
+    /// records the fact without attempting to reconstruct or resume it.
+    Interrupted,
 }
 
 /// One entry in a Run's step trace — appended as the engine dispatches
@@ -177,6 +182,10 @@ pub trait RunStore: Send + Sync {
         id: &RunId,
         result_ref: serde_json::Value,
     ) -> Result<(), RunStoreError>;
+
+    /// List every Run currently `Running` (issue #35 ST2 boot sweep +
+    /// ST4 occupancy check reuse this). No ordering guarantee.
+    async fn list_running(&self) -> Result<Vec<RunRecord>, RunStoreError>;
 }
 
 // ──────────────────────────────────────────────────────────────────────────

@@ -353,6 +353,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         None => Arc::new(InMemoryRunStore::new()),
     };
 
+    recover_interrupted_runs(&task_store, &run_store).await;
+
     // Issue #8: source the public base URL from the same bind the
     // listener will use, so `WSOperatorSession` can render it into
     // Spawn directives literally (no example port drift).
@@ -440,6 +442,56 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Boot-time recovery sweep (issue #35 ST2): any Run left `Running` from
+/// a previous process (crash / supervisor restart) is marked
+/// `Interrupted` with a structured reason; the owning Task is marked
+/// `Interrupted` likewise. Terminal-only — never touches `EngineState`,
+/// never re-dispatches. Only meaningful when the store is persistent
+/// (issue #35 ST1); on a fresh `InMemoryRunStore` this is always a no-op
+/// (nothing survives to sweep).
+async fn recover_interrupted_runs(
+    task_store: &std::sync::Arc<dyn mlua_swarm::store::task::TaskStore>,
+    run_store: &std::sync::Arc<dyn mlua_swarm::store::run::RunStore>,
+) {
+    let running = match run_store.list_running().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("mse serve: boot sweep: list_running failed: {e}");
+            return;
+        }
+    };
+    for run in running {
+        let reason = serde_json::json!({"error": "server restart"});
+        if let Err(e) = run_store.set_result(&run.id, reason).await {
+            eprintln!(
+                "mse serve: boot sweep: run {} set_result failed: {e}",
+                run.id
+            );
+        }
+        if let Err(e) = run_store
+            .update_status(&run.id, mlua_swarm::store::run::RunStatus::Interrupted)
+            .await
+        {
+            eprintln!(
+                "mse serve: boot sweep: run {} update_status failed: {e}",
+                run.id
+            );
+        }
+        if let Err(e) = task_store
+            .update_status(
+                &run.task_id,
+                mlua_swarm::store::task::TaskRecordStatus::Interrupted,
+            )
+            .await
+        {
+            eprintln!(
+                "mse serve: boot sweep: task {} update_status failed: {e}",
+                run.task_id
+            );
+        }
+    }
+}
+
 /// Awaits `SIGTERM` (Unix). `launchctl bootout` sends `SIGTERM` to request a
 /// graceful shutdown, so this is that handler's registration point (see
 /// (see the server-lifecycle design). If the
@@ -506,5 +558,96 @@ fn seed_blueprint(id: &str) -> Blueprint {
         default_context_policy: None,
         projection_placement: None,
         audits: vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlua_swarm::store::run::{RunRecord, RunStatus};
+    use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus};
+    use mlua_swarm::types::{RunId, TaskId};
+
+    #[tokio::test]
+    async fn recover_interrupted_runs_marks_running_as_interrupted() {
+        let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+
+        let running_task_id = TaskId::parse("T-running").unwrap();
+        let done_task_id = TaskId::parse("T-done").unwrap();
+        let running_run_id = RunId::parse("R-running").unwrap();
+        let done_run_id = RunId::parse("R-done").unwrap();
+
+        task_store
+            .create(TaskRecord {
+                id: running_task_id.clone(),
+                goal: "resolve issue #35".into(),
+                blueprint_ref: json!({}),
+                input_ctx: json!({}),
+                task_input_spec: None,
+                status: TaskRecordStatus::Running,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        task_store
+            .create(TaskRecord {
+                id: done_task_id.clone(),
+                goal: "unrelated done task".into(),
+                blueprint_ref: json!({}),
+                input_ctx: json!({}),
+                task_input_spec: None,
+                status: TaskRecordStatus::Done,
+                created_at: 2,
+                updated_at: 2,
+            })
+            .await
+            .unwrap();
+
+        run_store
+            .create(RunRecord {
+                id: running_run_id.clone(),
+                task_id: running_task_id.clone(),
+                status: RunStatus::Running,
+                step_entries: vec![],
+                operator_sid: None,
+                result_ref: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        run_store
+            .create(RunRecord {
+                id: done_run_id.clone(),
+                task_id: done_task_id.clone(),
+                status: RunStatus::Done,
+                step_entries: vec![],
+                operator_sid: None,
+                result_ref: None,
+                created_at: 2,
+                updated_at: 2,
+            })
+            .await
+            .unwrap();
+
+        recover_interrupted_runs(&task_store, &run_store).await;
+
+        let running_run = run_store.get(&running_run_id).await.unwrap();
+        assert_eq!(running_run.status, RunStatus::Interrupted);
+        assert_eq!(
+            running_run.result_ref,
+            Some(json!({"error": "server restart"}))
+        );
+        let running_task = task_store.get(&running_task_id).await.unwrap();
+        assert_eq!(running_task.status, TaskRecordStatus::Interrupted);
+
+        // Control: the Done run/task pair is untouched.
+        let done_run = run_store.get(&done_run_id).await.unwrap();
+        assert_eq!(done_run.status, RunStatus::Done);
+        assert_eq!(done_run.result_ref, None);
+        let done_task = task_store.get(&done_task_id).await.unwrap();
+        assert_eq!(done_task.status, TaskRecordStatus::Done);
     }
 }
