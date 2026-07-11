@@ -347,7 +347,9 @@ mod tests {
             flow: FlowNode::Step {
                 ref_: "worker".into(),
                 in_: Expr::Lit { value: Value::Null },
-                out: Expr::Path { at: "$.out".into() },
+                out: Expr::Path {
+                    at: "$.out".parse().expect("literal test path: $.out"),
+                },
             },
             agents: vec![AgentDef {
                 name: "worker".into(),

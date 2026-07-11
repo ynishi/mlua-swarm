@@ -315,7 +315,10 @@ fn out_top_segment(expr: &Expr) -> Option<String> {
     let Expr::Path { at } = expr else {
         return None;
     };
-    let trimmed = at.strip_prefix("$.").or_else(|| at.strip_prefix('$'))?;
+    let rendered = at.to_string();
+    let trimmed = rendered
+        .strip_prefix("$.")
+        .or_else(|| rendered.strip_prefix('$'))?;
     trimmed
         .split('.')
         .find(|s| !s.is_empty())
@@ -333,7 +336,9 @@ mod tests {
     use serde_json::json;
 
     fn path(s: &str) -> Expr {
-        Expr::Path { at: s.to_string() }
+        Expr::Path {
+            at: s.parse().expect("literal test path"),
+        }
     }
 
     fn step(ref_: &str, out: &str) -> Node {

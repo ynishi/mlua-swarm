@@ -3186,10 +3186,12 @@ mod submit_time_projection_sink_tests {
         let flow = Node::Step {
             ref_: producer.to_string(),
             in_: Expr::Path {
-                at: "$.in".to_string(),
+                at: "$.in".parse().expect("literal test path: $.in"),
             },
             out: Expr::Path {
-                at: format!("$.{producer}_out"),
+                at: format!("$.{producer}_out")
+                    .parse()
+                    .expect("literal test path"),
             },
         };
         let bp = Blueprint {

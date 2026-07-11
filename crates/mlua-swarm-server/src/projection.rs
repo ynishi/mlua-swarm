@@ -1652,19 +1652,19 @@ mod tests {
                 FlowNode::Step {
                     ref_: "step-a".to_string(),
                     in_: Expr::Path {
-                        at: "$.greeting".to_string(),
+                        at: "$.greeting".parse().expect("literal test path: $.greeting"),
                     },
                     out: Expr::Path {
-                        at: "$.a_out".to_string(),
+                        at: "$.a_out".parse().expect("literal test path: $.a_out"),
                     },
                 },
                 FlowNode::Step {
                     ref_: "step-b".to_string(),
                     in_: Expr::Path {
-                        at: "$.greeting".to_string(),
+                        at: "$.greeting".parse().expect("literal test path: $.greeting"),
                     },
                     out: Expr::Path {
-                        at: "$.b_out".to_string(),
+                        at: "$.b_out".parse().expect("literal test path: $.b_out"),
                     },
                 },
             ],
@@ -2278,19 +2278,19 @@ mod tests {
                 FlowNode::Step {
                     ref_: "step1".to_string(),
                     in_: Expr::Path {
-                        at: "$.greeting".to_string(),
+                        at: "$.greeting".parse().expect("literal test path: $.greeting"),
                     },
                     out: Expr::Path {
-                        at: "$.step1".to_string(),
+                        at: "$.step1".parse().expect("literal test path: $.step1"),
                     },
                 },
                 FlowNode::Step {
                     ref_: "step2".to_string(),
                     in_: Expr::Path {
-                        at: "$.step1".to_string(),
+                        at: "$.step1".parse().expect("literal test path: $.step1"),
                     },
                     out: Expr::Path {
-                        at: "$.step2".to_string(),
+                        at: "$.step2".parse().expect("literal test path: $.step2"),
                     },
                 },
             ],

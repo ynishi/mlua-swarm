@@ -690,7 +690,9 @@ mod tests {
     use std::sync::Arc;
 
     fn path(s: &str) -> Expr {
-        Expr::Path { at: s.to_string() }
+        Expr::Path {
+            at: s.parse().expect("literal test path"),
+        }
     }
     fn step(ref_: &str, in_: Expr, out: Expr) -> FlowNode {
         FlowNode::Step {

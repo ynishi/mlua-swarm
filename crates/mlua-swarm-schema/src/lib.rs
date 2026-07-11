@@ -44,7 +44,7 @@
 //!     flow: Node::Step {
 //!         ref_: "greeter".into(),
 //!         in_: Expr::Lit { value: json!({"name": "world"}) },
-//!         out: Expr::Path { at: "$.greeting".into() },
+//!         out: Expr::Path { at: "$.greeting".parse().unwrap() },
 //!     },
 //!     agents: vec![AgentDef {
 //!         name: "greeter".into(),

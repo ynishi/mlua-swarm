@@ -1275,10 +1275,10 @@ mod tests {
             flow: Node::Step {
                 ref_: "planner".to_string(),
                 in_: Expr::Path {
-                    at: "$.in".to_string(),
+                    at: "$.in".parse().expect("literal test path: $.in"),
                 },
                 out: Expr::Path {
-                    at: "$.plan".to_string(),
+                    at: "$.plan".parse().expect("literal test path: $.plan"),
                 },
             },
             agents: vec![AgentDef {

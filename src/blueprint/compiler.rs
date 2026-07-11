@@ -1515,7 +1515,7 @@ mod meta_ref_validation_tests {
             ref_: agent_ref.to_string(),
             in_,
             out: Expr::Path {
-                at: "$.output".into(),
+                at: "$.output".parse().expect("literal test path: $.output"),
             },
         }
     }
@@ -1559,7 +1559,7 @@ mod meta_ref_validation_tests {
             simple_flow(
                 "worker",
                 Expr::Path {
-                    at: "$.input".into(),
+                    at: "$.input".parse().expect("literal test path: $.input"),
                 },
             ),
         );
@@ -1583,7 +1583,7 @@ mod meta_ref_validation_tests {
             simple_flow(
                 "worker",
                 Expr::Path {
-                    at: "$.input".into(),
+                    at: "$.input".parse().expect("literal test path: $.input"),
                 },
             ),
         );
@@ -1642,7 +1642,7 @@ mod meta_ref_validation_tests {
             simple_flow(
                 "worker",
                 Expr::Path {
-                    at: "$.input".into(),
+                    at: "$.input".parse().expect("literal test path: $.input"),
                 },
             ),
         );
@@ -1690,10 +1690,10 @@ mod audit_agent_validation_tests {
             flow: FlowNode::Step {
                 ref_: "worker".to_string(),
                 in_: Expr::Path {
-                    at: "$.input".into(),
+                    at: "$.input".parse().expect("literal test path: $.input"),
                 },
                 out: Expr::Path {
-                    at: "$.output".into(),
+                    at: "$.output".parse().expect("literal test path: $.output"),
                 },
             },
             agents,
@@ -1783,10 +1783,10 @@ mod projection_placement_compile_tests {
             flow: FlowNode::Step {
                 ref_: "worker".to_string(),
                 in_: Expr::Path {
-                    at: "$.input".into(),
+                    at: "$.input".parse().expect("literal test path: $.input"),
                 },
                 out: Expr::Path {
-                    at: "$.output".into(),
+                    at: "$.output".parse().expect("literal test path: $.output"),
                 },
             },
             agents: vec![AgentDef {

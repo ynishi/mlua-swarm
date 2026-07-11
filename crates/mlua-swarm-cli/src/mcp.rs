@@ -2243,8 +2243,12 @@ mod tests {
             id: "mse mcp-l2-identity".into(),
             flow: FlowNode::Step {
                 ref_: AG_IDENTITY.into(),
-                in_: Expr::Path { at: "$.in".into() },
-                out: Expr::Path { at: "$.out".into() },
+                in_: Expr::Path {
+                    at: "$.in".parse().expect("literal test path: $.in"),
+                },
+                out: Expr::Path {
+                    at: "$.out".parse().expect("literal test path: $.out"),
+                },
             },
             agents: vec![AgentDef {
                 name: AG_IDENTITY.into(),
@@ -3593,9 +3597,11 @@ mod tests {
             flow: FlowNode::Step {
                 ref_: "echo".into(),
                 in_: Expr::Path {
-                    at: "$.input".into(),
+                    at: "$.input".parse().expect("literal test path: $.input"),
                 },
-                out: Expr::Path { at: "$.out".into() },
+                out: Expr::Path {
+                    at: "$.out".parse().expect("literal test path: $.out"),
+                },
             },
             agents: vec![
                 AgentDef {
