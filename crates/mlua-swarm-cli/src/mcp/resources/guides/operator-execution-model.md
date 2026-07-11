@@ -133,6 +133,38 @@ is consumed per-spawn by `AgentContextMiddleware` and lands in the
 Agent/LLM-boundary runtime bag (`ctx.meta.runtime` / `AgentContextView`) —
 it never touches flow-ir eval at all.
 
+### `allow_file_submit` opt-in for the `@file:` sentinel (GH #43)
+
+The `POST /v1/worker/submit` and `POST /v1/worker/artifact` endpoints
+accept an `@file:<abs-path>` sentinel body — the SubAgent writes a large
+payload under its task `work_dir` and submits the one-line sentinel
+instead of streaming the payload back through the LLM. See hop 4 below
+for the SubAgent-side contract.
+
+The sentinel is **opt-in per step (default-deny)**: without an opt-in the
+server rejects the sentinel body with `400`. The opt-in rides the supply
+tiers above — declare `allow_file_submit: true` at any tier, and
+`AgentContextMiddleware` folds it into `AgentContextView.extra` at spawn
+time, where the sentinel resolver reads it:
+
+| Tier | Declaration |
+|---|---|
+| Step | `Step.in.$step_meta.inline = {"allow_file_submit": true, ...}` (per-step, overrides Agent / BP-global) |
+| Agent | `AgentMeta.ctx = {"allow_file_submit": true, ...}` (all dispatches of this agent) |
+| BP-global | `Blueprint.default_agent_ctx = {"allow_file_submit": true, ...}` (all agents unless overridden) |
+
+The value is checked with strict-equality against the JSON boolean
+`true`: a string `"true"`, the integer `1`, or `false` all reject with
+`400`, mirroring how the other named `AgentContextView` fields are typed.
+
+The path guards (`work_dir` allowlist, ≤ 2 MiB, `404` on missing file)
+apply on top of the opt-in check — they are independent gates. Pre-#43
+Blueprints that don't declare the key still work byte-for-byte for
+inline bodies; only sentinel bodies now require the opt-in.
+
+For the agent-side (agent.md) contract around choosing inline vs
+sentinel, see `mse://guides/agent-md-authoring` § Output contract.
+
 ### Step projection naming (GH #23): `AgentMeta.projection_name`
 
 A dispatched Step's OUTPUT used to be addressable under two independent
@@ -553,4 +585,5 @@ enforcement of `fail` is a follow-up.
 - `mse://api/http-endpoints` — HTTP wire body schemas for the Task IF surface.
 - `mse://api/blueprint-schema` — Blueprint schema, including `default_init_ctx`.
 - `mse://guides/id-lifecycle` — the five ID layers (Blueprint, Task, Run, Step, Attempt).
+- `mse://guides/agent-md-authoring` — SubAgent (agent.md) canonical shape, size targets, and the agent-side Output contract (inline body vs `@file:` sentinel).
 - `mse://guides/mcp-tool-reference` — `mse_operator_join` / `mse_pending_wait` / `mse_ack` details.

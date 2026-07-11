@@ -41,6 +41,32 @@ The Anthropic official examples (`code-reviewer`, `debugger`, `data-scientist`,
 input. Do not enumerate example inputs in the durable prompt — that content is
 per-invocation and belongs in the caller's `Task` dispatch, not in agent.md.
 
+## Output contract: inline body vs `@file:` sentinel
+
+`POST /v1/worker/submit` accepts two body forms. Declare **exactly one** in
+the agent's Output format section — never present both as alternatives in a
+single agent.md (an LLM given a choice tends to defensively do both, writing
+the file *and* re-emitting the full body inline):
+
+- **Inline body (the default).** The submit body is the output itself — a
+  short literal (`DONE ...`, `PASS|BLOCKED`) or a markdown report. Use this
+  unless the payload is genuinely too large to re-emit.
+- **`@file:<abs-path>` sentinel.** The worker `Write`s the payload to a file
+  under its task `work_dir` and submits the single line
+  `@file:<abs-path>`; the server resolves the file into the body. The step
+  must be opted in on the Blueprint side — see
+  `mse://guides/operator-execution-model` § `allow_file_submit` opt-in for
+  the declaration form and precedence. Without the opt-in the server
+  rejects the sentinel with `400`. Path guards apply either way (absolute
+  path, under `work_dir`, ≤ 2 MiB).
+
+**Self-report convention.** If the agent uses a tool outside the set its
+prompt intends, or falls back to another tool after a failure, it should
+report that via `POST /v1/worker/degradation` (`{tool, error, fallback,
+note}`) instead of silently working around it. Reports surface in the run
+record and in `mse_doctor`'s degradations section, which is the standard
+post-run checkpoint for contract deviations.
+
 ## Size targets
 
 There is **no official byte limit** in the Claude Code SubAgent docs, but
@@ -136,8 +162,11 @@ crashes on the first non-trivial file.
    (not example values)?
 5. Does it declare its **Output format** concretely enough that the caller
    can parse or verify the return?
+6. Does it commit to **one submit form** (inline body *or* `@file:` sentinel,
+   never both) — and if `@file:`, does the Blueprint declare
+   `allow_file_submit: true` for the step?
 
-Five yeses → ship it. Any no → shrink and re-check.
+Six yeses → ship it. Any no → shrink and re-check.
 
 ## References
 
@@ -145,6 +174,8 @@ Five yeses → ship it. Any no → shrink and re-check.
 - [Subagents in the SDK — Claude Agent SDK Docs][sdk-subagents]
 - [Effective context engineering for AI agents — Anthropic Engineering][context]
 - [Writing effective tools for AI agents — Anthropic Engineering][tools]
+- `mse://guides/operator-execution-model` — Operator-kind 3-hop execution model this SubAgent is dispatched under (Spawn.directive rendering, supply tiers, `allow_file_submit` opt-in).
+- `mse://guides/blueprint-authoring` — Blueprint document shape that names this agent.
 
 [sub-agents]: https://code.claude.com/docs/en/sub-agents
 [sdk-subagents]: https://code.claude.com/docs/en/agent-sdk/subagents

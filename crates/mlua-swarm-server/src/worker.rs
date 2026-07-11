@@ -315,6 +315,163 @@ pub async fn worker_result(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Body-level protocol prefix recognized by [`worker_submit`] and
+/// [`worker_artifact`] (GH #42). When the trimmed request body starts with
+/// this sentinel, the rest is treated as an absolute path; the file is
+/// read and its contents replace the submitted body. Non-sentinel bodies
+/// are unchanged.
+///
+/// See [`resolve_file_sentinel`] for the resolution rules and guards.
+const FILE_SENTINEL_PREFIX: &str = "@file:";
+
+/// Byte ceiling on the resolved-file body, matching the HTTP
+/// `DefaultBodyLimit` applied to inline bodies at the router (2 MiB, see
+/// the `/v1/worker/submit` layer in `crate::app_router`). Sentinel
+/// bodies bypass that axum body layer (the request itself is small), so
+/// the guard is checked in [`resolve_file_sentinel`] instead.
+const FILE_SENTINEL_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// `AgentContextView.extra` key that opts a step into `@file:` sentinel
+/// resolution (GH #43). Declared through the GH #21 meta channels
+/// (`Blueprint.metas` / `AgentMeta.ctx` / step-level `$step_meta`) and
+/// folded into the view at spawn time by `AgentContextMiddleware`.
+///
+/// Default-deny: absent, or any value other than the strict boolean
+/// `true` (a string `"true"` does not count), rejects the sentinel with
+/// `400`. The v0.9.x line has no sentinel at all, so deny-by-default is
+/// the released-behavior-compatible default; a step whose output
+/// contract legitimately needs file submission opts in with one
+/// declaration.
+const FILE_SENTINEL_ALLOW_KEY: &str = "allow_file_submit";
+
+/// Resolves the `@file:<abs-path>` sentinel (GH #42) when present at the
+/// start of `body_str`. When absent, returns `body_str` unchanged — this
+/// is the byte-for-byte compatible path for all pre-#42 workers.
+///
+/// # Sentinel form
+///
+/// The trimmed body is `@file:<abs-path>` on a single line — a worker
+/// materializes the large payload to a file under its task's `work_dir`
+/// with its existing `Write` capability, then submits the sentinel body
+/// instead of streaming the payload back through the LLM.
+///
+/// # Guards
+///
+/// - Empty / multi-line path → `400`.
+/// - Relative path → `400` (the allowlist works only in
+///   canonicalized-absolute form).
+/// - `AgentContextView` not materialized for `(task_id, attempt)` → `400`
+///   (spawn must have run through `AgentContextMiddleware`; without a
+///   view there is no allowlist root to check against).
+/// - `view.extra[`[`FILE_SENTINEL_ALLOW_KEY`]`]` is not boolean `true` →
+///   `400` (GH #43 — file submission is opt-in per step; default-deny).
+/// - `view.work_dir` is `None` → `400`.
+/// - Canonicalized path is not under canonicalized `work_dir` → `400`
+///   (blocks `..`-escapes and symlinks pointing outside the allowlist).
+/// - File does not exist → `404`.
+/// - File size > [`FILE_SENTINEL_MAX_BYTES`] → `413`.
+/// - Any other I/O / canonicalize error → `500`.
+///
+/// The resolved contents are `trim_end()`-ed to match the inline path's
+/// own trailing-whitespace strip, so the downstream `Value::String` is
+/// observationally identical whether the body arrived inline or via
+/// sentinel.
+async fn resolve_file_sentinel(
+    state: &AppState,
+    task_id: &StepId,
+    attempt: u32,
+    body_str: String,
+) -> Result<String, ApiError> {
+    let Some(rest) = body_str.strip_prefix(FILE_SENTINEL_PREFIX) else {
+        return Ok(body_str);
+    };
+    let path_str = rest.trim();
+    if path_str.is_empty() {
+        return Err(ApiError::bad_request(
+            "@file: sentinel: empty path".to_string(),
+        ));
+    }
+    if path_str.contains('\n') || path_str.contains('\r') {
+        return Err(ApiError::bad_request(
+            "@file: sentinel: path must be a single line".to_string(),
+        ));
+    }
+    let path = std::path::Path::new(path_str);
+    if !path.is_absolute() {
+        return Err(ApiError::bad_request(format!(
+            "@file: sentinel: path must be absolute (got {path_str:?})"
+        )));
+    }
+    let view = state
+        .engine
+        .agent_context_for(task_id, attempt)
+        .await
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "@file: sentinel: no AgentContextView for this task/attempt \
+                 (spawn must run through AgentContextMiddleware to enable \
+                 sentinel resolution)"
+                    .to_string(),
+            )
+        })?;
+    // GH #43: file submission is opt-in per step (default-deny). Strict
+    // boolean `true` only — folded from the Blueprint meta channels by
+    // `AgentContextMiddleware` at spawn time.
+    if view.extra.get(FILE_SENTINEL_ALLOW_KEY) != Some(&Value::Bool(true)) {
+        return Err(ApiError::bad_request(format!(
+            "@file: sentinel: file submission is not allowed for this step \
+             (declare `{FILE_SENTINEL_ALLOW_KEY}: true` via `$step_meta` / \
+             `AgentMeta.ctx` / `Blueprint.metas`; strict boolean `true` \
+             required)"
+        )));
+    }
+    let work_dir = view.work_dir.ok_or_else(|| {
+        ApiError::bad_request("@file: sentinel: task has no resolved work_dir".to_string())
+    })?;
+    let work_dir_canon = tokio::fs::canonicalize(&work_dir).await.map_err(|e| {
+        ApiError::engine(format!(
+            "@file: sentinel: canonicalize work_dir {work_dir:?}: {e}"
+        ))
+    })?;
+    let path_canon = match tokio::fs::canonicalize(path).await {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::not_found(format!(
+                "@file: sentinel: file not found: {path_str}"
+            )));
+        }
+        Err(e) => {
+            return Err(ApiError::engine(format!(
+                "@file: sentinel: canonicalize {path_str:?}: {e}"
+            )));
+        }
+    };
+    if !path_canon.starts_with(&work_dir_canon) {
+        return Err(ApiError::bad_request(format!(
+            "@file: sentinel: path {} is not under work_dir {} (canonicalized: {} vs {})",
+            path_str,
+            work_dir,
+            path_canon.display(),
+            work_dir_canon.display(),
+        )));
+    }
+    let meta = tokio::fs::metadata(&path_canon)
+        .await
+        .map_err(|e| ApiError::engine(format!("@file: sentinel: metadata {path_str:?}: {e}")))?;
+    if meta.len() > FILE_SENTINEL_MAX_BYTES {
+        return Err(ApiError::payload_too_large(format!(
+            "@file: sentinel: file size {} exceeds limit {}",
+            meta.len(),
+            FILE_SENTINEL_MAX_BYTES
+        )));
+    }
+    let bytes = tokio::fs::read(&path_canon)
+        .await
+        .map_err(|e| ApiError::engine(format!("@file: sentinel: read {path_str:?}: {e}")))?;
+    // Match the `trim_end()` the inline path applies (see `worker_submit`).
+    Ok(String::from_utf8_lossy(&bytes).trim_end().to_string())
+}
+
 /// `POST /v1/worker/submit`. Bearer = encoded `CapToken`. Body = raw text/octet.
 ///
 /// Simplification-axis endpoint for SubAgents. Removes the JSON construction,
@@ -322,6 +479,14 @@ pub async fn worker_result(
 /// worker completes a POST with just token + raw body. Origin: the recent clean-up
 /// of the SubAgent contract drift (fewer IDs to pass around, multi-line escape
 /// accidents eliminated).
+///
+/// **GH #42 `@file:` sentinel**: workers whose result body is too large to
+/// re-emit inline (multi-KB structured output) may `Write` the payload to
+/// a file under their task's `work_dir` and submit the body
+/// `@file:<abs-path>` instead — see [`resolve_file_sentinel`].
+/// Non-sentinel bodies pass through unchanged. The step must opt in via
+/// `allow_file_submit: true` (GH #43, default-deny — see
+/// [`FILE_SENTINEL_ALLOW_KEY`]).
 ///
 /// Behavior:
 /// - `task_id` is auto-looked-up server-side from the token (already bound to the `CapToken`).
@@ -379,6 +544,9 @@ pub async fn worker_submit(
     // verdict_loop smoke — sharp-edge removal. Internal `\n` inside the raw bytes
     // is preserved (= only trailing).
     let body_str = String::from_utf8_lossy(&body).trim_end().to_string();
+    // GH #42: `@file:<abs-path>` sentinel — pass through unchanged when
+    // absent (byte-for-byte compat with pre-#42 callers).
+    let body_str = resolve_file_sentinel(&state, &task_id, attempt, body_str).await?;
     let value = Value::String(body_str);
 
     // The handle path = trusted internal API (= the server-minted handle is validated
@@ -465,6 +633,8 @@ pub async fn worker_artifact(
     // addressed Run is already terminal — see `reject_if_run_terminal`.
     reject_if_run_terminal(&state, &task_id, attempt).await?;
     let body_str = String::from_utf8_lossy(&body).trim_end().to_string();
+    // GH #42: same `@file:<abs-path>` sentinel as `worker_submit`.
+    let body_str = resolve_file_sentinel(&state, &task_id, attempt, body_str).await?;
     let value = Value::String(body_str);
 
     state
@@ -2015,5 +2185,386 @@ mod tests {
             "rejected degradation must not land: {:?}",
             rec.degradations
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #42 — `@file:<abs-path>` sentinel resolution in `worker_submit`
+    // / `worker_artifact`. Guards each verified independently: sentinel
+    // resolves to the file's trimmed contents; path outside `work_dir`,
+    // missing file, oversized file, and non-sentinel bodies each get the
+    // documented behavior.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Seeds an `agent_ctx` entry whose view carries `work_dir` and, when
+    /// `allow_file_submit` is `Some`, that value under the GH #43
+    /// [`FILE_SENTINEL_ALLOW_KEY`] in `view.extra` — matching the shape
+    /// `AgentContextMiddleware` writes at spawn time. Sentinel resolution
+    /// requires both the `work_dir` and the strict `Bool(true)` opt-in.
+    async fn seed_work_dir(
+        state: &AppState,
+        task_id: &StepId,
+        attempt: u32,
+        work_dir: &str,
+        allow_file_submit: Option<Value>,
+    ) {
+        let tid = task_id.clone();
+        let work_dir = work_dir.to_string();
+        state
+            .engine
+            .with_state("test.seed_work_dir", move |s| {
+                let mut entry = mlua_swarm::core::state::AgentCtxEntry::default();
+                entry.view.work_dir = Some(work_dir);
+                if let Some(v) = allow_file_submit {
+                    entry
+                        .view
+                        .extra
+                        .insert(FILE_SENTINEL_ALLOW_KEY.to_string(), v);
+                }
+                s.agent_ctx.insert((tid, attempt), entry);
+            })
+            .await
+            .expect("seed_work_dir");
+    }
+
+    /// Sentinel body `@file:<abs-path>` resolves to the file's trimmed
+    /// contents and reaches the `OutputStore` via the normal Final-append
+    /// path — same 204 the inline path returns.
+    #[tokio::test]
+    async fn worker_submit_resolves_file_sentinel_under_work_dir() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store.clone(), run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let work_dir = tmp.path().to_path_buf();
+        seed_work_dir(
+            &state,
+            &task_id,
+            1,
+            work_dir.to_str().expect("work_dir utf-8"),
+            Some(Value::Bool(true)),
+        )
+        .await;
+
+        let payload_path = work_dir.join("scout.md");
+        let payload = "## Context Package (broad)\n\nlarge body content\n";
+        tokio::fs::write(&payload_path, payload)
+            .await
+            .expect("write payload");
+        let body = format!(
+            "@file:{}",
+            payload_path.to_str().expect("payload path utf-8")
+        );
+
+        let status = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery { ok: None }),
+            axum::body::Bytes::from(body),
+        )
+        .await
+        .expect("worker_submit sentinel");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Final event lands with the file's trimmed contents on
+        // `EngineState.output_store` (the in-memory tail
+        // `submit_worker_result_trusted` writes to).
+        let tid = task_id.clone();
+        let value = state
+            .engine
+            .with_state("test.inspect_output_store", move |s| {
+                s.output_store.get(&(tid.clone(), 1)).and_then(|evs| {
+                    evs.iter().find_map(|ev| match ev {
+                        OutputEvent::Final {
+                            content: ContentRef::Inline { value },
+                            ..
+                        } => Some(value.clone()),
+                        _ => None,
+                    })
+                })
+            })
+            .await
+            .expect("with_state")
+            .expect("Final event present");
+        assert_eq!(value, Value::String(payload.trim_end().to_string()));
+    }
+
+    /// A non-sentinel body is passed through byte-for-byte (pre-#42
+    /// callers see zero behavior change).
+    #[tokio::test]
+    async fn worker_submit_passes_non_sentinel_body_unchanged() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store.clone(), run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+        // No agent_ctx / work_dir seeded — the inline path must not
+        // require one.
+
+        let status = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery { ok: None }),
+            axum::body::Bytes::from_static(b"DONE yes=1 maybe=0 no=0"),
+        )
+        .await
+        .expect("worker_submit inline");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let tid = task_id.clone();
+        let value = state
+            .engine
+            .with_state("test.inspect_output_store", move |s| {
+                s.output_store.get(&(tid.clone(), 1)).and_then(|evs| {
+                    evs.iter().find_map(|ev| match ev {
+                        OutputEvent::Final {
+                            content: ContentRef::Inline { value },
+                            ..
+                        } => Some(value.clone()),
+                        _ => None,
+                    })
+                })
+            })
+            .await
+            .expect("with_state")
+            .expect("Final event present");
+        assert_eq!(value, Value::String("DONE yes=1 maybe=0 no=0".to_string()));
+    }
+
+    /// Sentinel with a path outside the task's `work_dir` (`..`-escape
+    /// via a sibling tempdir) → `400`. `canonicalize` collapses the
+    /// `..`, so a symlink pointing outside the allowlist would be caught
+    /// by the same check.
+    #[tokio::test]
+    async fn worker_submit_rejects_sentinel_path_outside_work_dir() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let allowed = tempfile::tempdir().expect("allowed tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        seed_work_dir(
+            &state,
+            &task_id,
+            1,
+            allowed.path().to_str().expect("utf-8"),
+            Some(Value::Bool(true)),
+        )
+        .await;
+
+        let outside_file = outside.path().join("leak.md");
+        tokio::fs::write(&outside_file, b"outside content")
+            .await
+            .expect("write outside");
+        let body = format!(
+            "@file:{}",
+            outside_file.to_str().expect("outside path utf-8")
+        );
+
+        let err = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery { ok: None }),
+            axum::body::Bytes::from(body),
+        )
+        .await
+        .expect_err("outside-work_dir sentinel must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Sentinel pointing at a non-existent file → `404`.
+    #[tokio::test]
+    async fn worker_submit_rejects_sentinel_missing_file() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_work_dir(
+            &state,
+            &task_id,
+            1,
+            tmp.path().to_str().expect("utf-8"),
+            Some(Value::Bool(true)),
+        )
+        .await;
+        let missing = tmp.path().join("does-not-exist.md");
+        let body = format!("@file:{}", missing.to_str().expect("utf-8"));
+
+        let err = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery { ok: None }),
+            axum::body::Bytes::from(body),
+        )
+        .await
+        .expect_err("missing-file sentinel must be rejected");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    /// Sentinel body with a relative path → `400` before any FS lookup.
+    #[tokio::test]
+    async fn worker_submit_rejects_sentinel_relative_path() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let err = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery { ok: None }),
+            axum::body::Bytes::from_static(b"@file:relative/path.md"),
+        )
+        .await
+        .expect_err("relative-path sentinel must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Sentinel body when the task has no `AgentContextView` (spawn
+    /// didn't run through `AgentContextMiddleware`) → `400`. This is the
+    /// documented pre-condition for sentinel use.
+    #[tokio::test]
+    async fn worker_submit_rejects_sentinel_without_agent_context_view() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+        // No seed_work_dir — the agent_ctx map has no entry for this task.
+
+        let err = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery { ok: None }),
+            axum::body::Bytes::from_static(b"@file:/tmp/anywhere.md"),
+        )
+        .await
+        .expect_err("missing AgentContextView must reject sentinel");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The same sentinel form works on `POST /v1/worker/artifact` — the
+    /// artifact endpoint shares the resolver with `worker_submit`, so the
+    /// resolved file contents land under the artifact's `name` key.
+    #[tokio::test]
+    async fn worker_artifact_resolves_file_sentinel_under_work_dir() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_work_dir(
+            &state,
+            &task_id,
+            1,
+            tmp.path().to_str().expect("utf-8"),
+            Some(Value::Bool(true)),
+        )
+        .await;
+
+        let payload_path = tmp.path().join("part.md");
+        let payload = "artifact part body\n";
+        tokio::fs::write(&payload_path, payload)
+            .await
+            .expect("write payload");
+        let body = format!("@file:{}", payload_path.to_str().expect("utf-8"));
+
+        let status = worker_artifact(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(ArtifactQuery {
+                name: "scout".to_string(),
+            }),
+            axum::body::Bytes::from(body),
+        )
+        .await
+        .expect("worker_artifact sentinel");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// GH #43 — sentinel with `work_dir` seeded but no
+    /// `allow_file_submit` opt-in → `400` (default-deny). The file exists
+    /// and sits under `work_dir`, so the rejection is attributable to the
+    /// missing opt-in alone.
+    #[tokio::test]
+    async fn worker_submit_rejects_sentinel_without_allow_flag() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_work_dir(&state, &task_id, 1, tmp.path().to_str().expect("utf-8"), None).await;
+
+        let payload_path = tmp.path().join("out.md");
+        tokio::fs::write(&payload_path, b"resolvable body")
+            .await
+            .expect("write payload");
+        let body = format!("@file:{}", payload_path.to_str().expect("utf-8"));
+
+        let err = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery { ok: None }),
+            axum::body::Bytes::from(body),
+        )
+        .await
+        .expect_err("missing opt-in must reject sentinel");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("not allowed"),
+            "rejection must name the opt-in guard, got: {}",
+            err.message
+        );
+    }
+
+    /// GH #43 — the opt-in is the strict boolean `true`: `Bool(false)`
+    /// and the string `"true"` are both rejected with `400`.
+    #[tokio::test]
+    async fn worker_submit_rejects_sentinel_with_non_true_allow_values() {
+        for allow in [Value::Bool(false), Value::String("true".to_string())] {
+            let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+            let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+            let state = test_state(data_store, run_store);
+            let task_id = StepId::new();
+            let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            seed_work_dir(
+                &state,
+                &task_id,
+                1,
+                tmp.path().to_str().expect("utf-8"),
+                Some(allow.clone()),
+            )
+            .await;
+
+            let payload_path = tmp.path().join("out.md");
+            tokio::fs::write(&payload_path, b"resolvable body")
+                .await
+                .expect("write payload");
+            let body = format!("@file:{}", payload_path.to_str().expect("utf-8"));
+
+            let err = worker_submit(
+                State(state.clone()),
+                bearer_headers(&handle),
+                Query(SubmitQuery { ok: None }),
+                axum::body::Bytes::from(body),
+            )
+            .await
+            .expect_err("non-true opt-in value must reject sentinel");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "value: {allow:?}");
+        }
     }
 }

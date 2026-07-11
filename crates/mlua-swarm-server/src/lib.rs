@@ -1328,6 +1328,15 @@ impl ApiError {
             message: m,
         }
     }
+    /// Builds a `413 Payload Too Large` with the given message (GH #42 —
+    /// `@file:` sentinel resolves to a file larger than the shared
+    /// `DefaultBodyLimit`; same size ceiling as the inline body path).
+    pub fn payload_too_large(m: String) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: m,
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

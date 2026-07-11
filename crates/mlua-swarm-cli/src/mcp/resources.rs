@@ -133,7 +133,7 @@ pub const RESOURCES: &[ResourceEntry] = &[
     ResourceEntry {
         uri: "mse://guides/agent-md-authoring",
         title: "mse — Agent (agent.md) authoring guide",
-        description: "SubAgent prompt canonical shape (Role / When invoked / Tool guidance / Output format), size targets (≤ 200 lines / 25 KB), fetch-vs-embed policy for system_prompt / lightweight ctx / PreOut, and anti-patterns (CLAUDE.md duplication, accident logs, tool schema re-statement).",
+        description: "SubAgent prompt canonical shape (Role / When invoked / Tool guidance / Output format), Output contract (inline body vs @file: sentinel, opt-in per step), size targets (≤ 200 lines / 25 KB), fetch-vs-embed policy, and anti-patterns.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(AGENT_MD_AUTHORING_BODY),
     },
