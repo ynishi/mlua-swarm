@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/ynishi/mlua-swarm/compare/v0.9.1...v0.9.2) - 2026-07-12
+
+### Added
+
+- bp_explain_agent — dry-run explain of BP agent materialization
+- bp_explain_agents batch + tool_drift wrapper_only 2-tier split
+- *(server)* @file:<abs-path> submit sentinel + per-step opt-in (GH #42 + GH #43)
+
+### Fixed
+
+- bp_explain_agent contract allow-list uses full MCP tool identifiers
+
 ## [0.9.1](https://github.com/ynishi/mlua-swarm/compare/v0.9.0...v0.9.1) - 2026-07-11
 
 ### Other
