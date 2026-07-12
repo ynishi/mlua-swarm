@@ -151,6 +151,64 @@ the "PreOut via `Read`" case: if agent.md consumes 77 K of the 200 K window
 just for the system prompt, `Read` results have nowhere to go and the agent
 crashes on the first non-trivial file.
 
+## Verifying how your agent materializes (`bp_explain_agent`)
+
+Once an agent.md is wired into a Blueprint (`profile.worker_binding` set,
+or reachable via `$agent_md`), do not guess whether the definition
+survived the compile/spawn pipeline intact — check it. Two faces expose
+the same read-only, dry-run view, resolved statically from the
+Blueprint's head commit alone (no engine state touched, nothing
+dispatched):
+
+- **HTTP**: `GET /v1/blueprints/:bp_id/agents/:agent/explain` on
+  `mse serve` — the source of truth. Same unauthenticated trust tier and
+  404 mapping as `GET /v1/agents/:name/render-size`.
+- **MCP**: `bp_explain_agent {bp_id, agent, bind?, wrapper_dir?}` —
+  proxies the HTTP response, then adds the one check the server cannot do
+  itself: when the agent has a `worker_binding`, it reads the worker
+  wrapper `.claude/agents/<variant>.md` (override with `wrapper_dir`,
+  default `.claude/agents`) and diffs its frontmatter `tools` against
+  `declared_tools.tools`, returned as
+  `tool_drift: {matched, declared_only, wrapper_only}`.
+
+The response covers `blueprint` (id/version), `agent` (name/kind),
+`worker_binding`/`binding_note`, `declared_tools`, `system_prompt`
+(bytes/lines/`template_variables`/`template_syntax_error`),
+`effective_ctx`, and `output`
+(`projection_name`/`naming_warnings`/`parts_note`). Three things matter
+most when reading it:
+
+1. **`declared_tools` never grants anything.** It is `profile.tools`,
+   verbatim, marked `informational: true` — the effective tool surface an
+   Operator-dispatched SubAgent actually gets is whatever the worker
+   wrapper's frontmatter declares. `bp_explain_agent`'s
+   `tool_drift.declared_only` is the single most useful field this whole
+   view produces: a tool your agent.md lists but the wrapper does not
+   grant is silently unusable, and neither a successful compile nor a
+   successful spawn tells you that on its own. `wrapper_missing: true`
+   (+ `wrapper_error`) means the drift check could not run at all —
+   treat that result as "unverified", not "clean".
+2. **`effective_ctx` only resolves the 3 static tiers** —
+   `AgentInline > MetaRef > BpGlobal` (`AgentMeta.ctx` beats
+   `AgentMeta.meta_ref` beats `Blueprint.default_agent_ctx`), reusing the
+   exact merge `AgentContextMiddleware` runs at spawn time rather than
+   re-implementing it. The full runtime cascade is
+   `Run > Task > Step > Agent > BP-global`; the Run/Task/Step tiers only
+   exist once a launch or a dispatched Step supplies them, so this static
+   view has nothing to show for them (`effective_ctx.note` states this).
+3. **`output.projection_name` and the part-staging shape change.** If the
+   agent's step ever stages named output parts
+   (`mse_worker_submit` with `name`), the step's OUTPUT changes shape to
+   `{"out", "parts"}` — see `output.parts_note`. A downstream `Step.in`
+   written against the plain (non-parts) shape breaks the moment staging
+   is introduced for that step; check this before wiring a consumer.
+
+**Phase 2 carry**: this view does not analyze flow expr consumers — which
+`$.step` references read this agent's output, and in what shape. That
+requires walking the `mlua-flow-ir` `flow` tree and is out of scope for
+the current implementation; cross-reference `output.projection_name`
+against the Blueprint's `flow` manually until that lands.
+
 ## Quick self-check before you commit an agent.md
 
 1. Is the file **≤ 200 lines / ≤ 25 KB**?

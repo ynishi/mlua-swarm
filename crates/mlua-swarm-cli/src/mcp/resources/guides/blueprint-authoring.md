@@ -265,3 +265,6 @@ Blueprint is under Enhance management.
   `flow` itself is opaque in the schema — its grammar is owned by the
   `mlua-flow-ir` crate, referenced above).
 - Tool-level operations (running, archiving, schema fetch): `mse://guides/mcp-tool-reference`.
+- Verifying an `AgentDef`'s materialized tools/ctx/output before a run
+  (`bp_explain_agent`): `mse://guides/agent-md-authoring` §
+  Verifying how your agent materializes.

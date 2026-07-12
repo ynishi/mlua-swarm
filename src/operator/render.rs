@@ -68,6 +68,7 @@
 //!   — no silent fallback, fail loud.
 
 use minijinja::{Environment, UndefinedBehavior, Value};
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 /// Render errors. Anything from minijinja is wrapped as `Template`.
@@ -85,6 +86,16 @@ impl From<minijinja::Error> for RenderError {
     }
 }
 
+/// Shared `Environment` construction for every entry point in this module
+/// (`render_system` / `template_variables`) — keeps the `auto_escape` /
+/// `UndefinedBehavior` settings from drifting apart between the two.
+fn build_env() -> Environment<'static> {
+    let mut env = Environment::new();
+    env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
+    env.set_undefined_behavior(UndefinedBehavior::Strict);
+    env
+}
+
 /// Render a `system_prompt` template in strict mode with auto-escape
 /// disabled.
 ///
@@ -93,9 +104,7 @@ impl From<minijinja::Error> for RenderError {
 /// When it is not an object, this function binds the value under a
 /// single variable named `value`, reachable as `{{ value }}`.
 pub fn render_system(template: &str, slots: &serde_json::Value) -> Result<String, RenderError> {
-    let mut env = Environment::new();
-    env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
-    env.set_undefined_behavior(UndefinedBehavior::Strict);
+    let env = build_env();
 
     let tmpl = env.template_from_str(template)?;
     let value = Value::from_serialize(slots);
@@ -120,6 +129,23 @@ pub fn slots_from_prompt(prompt: &serde_json::Value) -> serde_json::Value {
         v @ serde_json::Value::Object(_) => v.clone(),
         other => serde_json::json!({ "directive": other }),
     }
+}
+
+/// Enumerate the template variables `template` requires but never binds
+/// itself (e.g. `{% for %}`/`{% set %}`-declared names are excluded).
+///
+/// Uses the same `Environment` configuration as [`render_system`] (shared
+/// via [`build_env`], so the two entry points cannot drift apart) and
+/// minijinja 2.21's `Template::undeclared_variables(false)`. A syntax
+/// error surfaces here (via `template_from_str`'s `Err`) rather than as an
+/// empty set — `undeclared_variables` itself silently returns an empty
+/// `HashSet` when it fails to re-parse the (already-compiled) source, so
+/// the syntax check must happen at `template_from_str` time, before that
+/// call.
+pub fn template_variables(template: &str) -> Result<BTreeSet<String>, RenderError> {
+    let env = build_env();
+    let tmpl = env.template_from_str(template)?;
+    Ok(tmpl.undeclared_variables(false).into_iter().collect())
 }
 
 #[cfg(test)]
@@ -202,5 +228,45 @@ mod tests {
         // A top-level array is not an object, so fall back to wrapping in `directive`.
         let v = slots_from_prompt(&json!(["a", "b"]));
         assert_eq!(v["directive"], json!(["a", "b"]));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // template_variables (subtask-1, explain-agent)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn template_variables_lists_two_undeclared_vars() {
+        let vars = template_variables("hello {{ directive }}, mode={{ mode }}").expect("parse ok");
+        let expected: BTreeSet<String> = ["directive", "mode"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(vars, expected);
+    }
+
+    #[test]
+    fn template_variables_no_vars_is_empty() {
+        let vars = template_variables("hello, world").expect("parse ok");
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn template_variables_syntax_error_is_err() {
+        let err = template_variables("hello {{ unclosed").expect_err("syntax error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("syntax") || msg.contains("unexpected"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn template_variables_for_loop_bound_var_not_enumerated() {
+        // `x` is bound by the `{% for %}`, so it must not appear — only
+        // `items` (the collection the loop iterates over) is undeclared.
+        let vars =
+            template_variables("{% for x in items %}{{ x }},{% endfor %}").expect("parse ok");
+        let expected: BTreeSet<String> = ["items"].into_iter().map(String::from).collect();
+        assert_eq!(vars, expected);
     }
 }

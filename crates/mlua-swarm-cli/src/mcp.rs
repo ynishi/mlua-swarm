@@ -339,6 +339,71 @@ struct BpDoctorReq {
     disable_block: Option<bool>,
 }
 
+/// Default directory holding worker wrapper `.md` files, relative to the
+/// mse-mcp process CWD — matches the Claude Code convention
+/// (`.claude/agents/<variant>.md`).
+const DEFAULT_WRAPPER_DIR: &str = ".claude/agents";
+
+#[derive(Deserialize, JsonSchema)]
+struct BpExplainAgentReq {
+    /// Blueprint id (registered on the HTTP server).
+    bp_id: String,
+    /// Agent name inside the blueprint.
+    agent: String,
+    /// mse serve bind address (default 127.0.0.1:7777).
+    #[serde(default)]
+    bind: Option<String>,
+    /// Directory holding worker wrapper `.md` files (default
+    /// `.claude/agents`). The wrapper lookup is a Claude Code backend
+    /// concern and happens client-side; the server never reads wrapper
+    /// files.
+    #[serde(default)]
+    wrapper_dir: Option<String>,
+}
+
+/// Per-tool classification comparing a Blueprint agent's declared
+/// (informational-only) `profile.tools` against the worker wrapper's
+/// actual frontmatter `tools` list. Set comparison — order-independent,
+/// exact string match, duplicates deduped, output vectors sorted
+/// (backed by `BTreeSet`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct ToolDrift {
+    /// Present in both the Blueprint's declared tools and the wrapper's
+    /// actual tools.
+    matched: Vec<String>,
+    /// Declared in the Blueprint but absent from the wrapper — the agent
+    /// designer believes this tool is usable, but the wrapper does not
+    /// actually grant it. The most important signal of the three.
+    declared_only: Vec<String>,
+    /// Present in the wrapper but never declared in the Blueprint —
+    /// informational only (the wrapper grants something the Blueprint
+    /// never mentions).
+    wrapper_only: Vec<String>,
+}
+
+/// Compare Blueprint-declared tools against the wrapper's actual
+/// frontmatter tools. Pure, unit-testable (bp_doctor's classifier
+/// functions follow the same convention).
+fn diff_tools(declared: &[String], wrapper: &[String]) -> ToolDrift {
+    use std::collections::BTreeSet;
+    let declared_set: BTreeSet<&String> = declared.iter().collect();
+    let wrapper_set: BTreeSet<&String> = wrapper.iter().collect();
+    ToolDrift {
+        matched: declared_set
+            .intersection(&wrapper_set)
+            .map(|s| (*s).clone())
+            .collect(),
+        declared_only: declared_set
+            .difference(&wrapper_set)
+            .map(|s| (*s).clone())
+            .collect(),
+        wrapper_only: wrapper_set
+            .difference(&declared_set)
+            .map(|s| (*s).clone())
+            .collect(),
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct ServerStartReq {
     /// listen address to healthz-poll after `launchctl kickstart` (default "127.0.0.1:7777").
@@ -1799,6 +1864,111 @@ impl MseServer {
             "guide_ref": "mse://guides/agent-md-authoring",
         });
         json_result(&body)
+    }
+
+    #[tool(
+        description = "Explain how a Blueprint agent's definition materializes into its runtime worker contract — read-only, dry-run. Proxies GET /v1/blueprints/:bp_id/agents/:agent/explain (identity / declared_tools / system_prompt template diagnostics / effective_ctx 3-tier cascade / output projection naming), then augments the response with a client-side check the server cannot do itself: when the agent has a `worker_binding`, the worker wrapper `.claude/agents/<variant>.md` (override via `wrapper_dir`) is read and its frontmatter `tools` compared against `declared_tools.tools` via a new `tool_drift: {matched, declared_only, wrapper_only}` field — `declared_only` is the most important signal (tools the Blueprint author believes are usable but the wrapper does not actually grant). `tool_drift` is `null` when the agent has no `worker_binding` (nothing to compare against — same case the underlying `binding_note` already explains). A missing or unparsable wrapper file sets `wrapper_missing: true` + `wrapper_error` and leaves `tool_drift: null` — this is the tool's primary reason for existing (the current biggest invisibility point in the agent.md → worker pipeline). 404s exactly like the underlying endpoint: unregistered Blueprint or unknown agent name."
+    )]
+    async fn bp_explain_agent(
+        &self,
+        Parameters(req): Parameters<BpExplainAgentReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let bind = req
+            .bind
+            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+        let url = format!(
+            "http://{bind}/v1/blueprints/{}/agents/{}/explain",
+            req.bp_id, req.agent
+        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
+        let resp =
+            client.get(&url).send().await.map_err(|e| {
+                McpError::internal_error(format!("bp_explain_agent fetch: {e}"), None)
+            })?;
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return json_result(&serde_json::json!({
+                "bp_id": req.bp_id,
+                "agent": req.agent,
+                "bind": bind,
+                "http_status": status.as_u16(),
+                "error": body_text,
+            }));
+        }
+        let mut explain: JsonValue = serde_json::from_str(&body_text)
+            .map_err(|e| McpError::internal_error(format!("bp_explain_agent decode: {e}"), None))?;
+
+        // The server never reads wrapper files (Claude Code backend
+        // concern, kept client-side) — this is the one piece of the
+        // explain view this tool adds on top of the HTTP truth.
+        let variant = explain
+            .get("worker_binding")
+            .and_then(|v| v.get("variant"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        let declared_tools: Vec<String> = explain
+            .get("declared_tools")
+            .and_then(|v| v.get("tools"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let (tool_drift, wrapper_missing, wrapper_error): (
+            Option<ToolDrift>,
+            bool,
+            Option<String>,
+        ) = match &variant {
+            None => (None, false, None),
+            Some(variant) => {
+                let wrapper_dir = req
+                    .wrapper_dir
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_WRAPPER_DIR.to_string());
+                let wrapper_path = format!("{wrapper_dir}/{variant}.md");
+                match std::fs::read_to_string(&wrapper_path) {
+                    Ok(text) => match mlua_swarm::lua::agent_md_loader::parse(
+                        &text,
+                        &wrapper_path,
+                        mlua_swarm::blueprint::AgentKind::Operator,
+                    ) {
+                        Ok(def) => {
+                            let wrapper_tools = def.profile.map(|p| p.tools).unwrap_or_default();
+                            (
+                                Some(diff_tools(&declared_tools, &wrapper_tools)),
+                                false,
+                                None,
+                            )
+                        }
+                        Err(e) => (None, true, Some(format!("parse {wrapper_path}: {e}"))),
+                    },
+                    Err(e) => (None, true, Some(format!("read {wrapper_path}: {e}"))),
+                }
+            }
+        };
+
+        if let Some(obj) = explain.as_object_mut() {
+            obj.insert(
+                "tool_drift".to_string(),
+                serde_json::to_value(&tool_drift).unwrap_or(JsonValue::Null),
+            );
+            obj.insert(
+                "wrapper_missing".to_string(),
+                serde_json::json!(wrapper_missing),
+            );
+            if let Some(err) = wrapper_error {
+                obj.insert("wrapper_error".to_string(), serde_json::json!(err));
+            }
+        }
+        json_result(&explain)
     }
 
     #[tool(
@@ -3409,6 +3579,52 @@ mod tests {
             aggregate_agent_md_verdict(&["OK", "WARN", "BLOCK", "WARN"]),
             "BLOCK"
         );
+    }
+
+    // ─── explain-agent subtask-3: diff_tools drift classifier ──────────────
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn diff_tools_exact_match_yields_matched_only() {
+        let declared = strs(&["Read", "Edit"]);
+        let wrapper = strs(&["Read", "Edit"]);
+        let drift = diff_tools(&declared, &wrapper);
+        assert_eq!(drift.matched, strs(&["Edit", "Read"]));
+        assert!(drift.declared_only.is_empty());
+        assert!(drift.wrapper_only.is_empty());
+    }
+
+    #[test]
+    fn diff_tools_mixed_case_reports_both_sides() {
+        let declared = strs(&["Read", "Bash", "Edit"]);
+        let wrapper = strs(&["Read", "Grep"]);
+        let drift = diff_tools(&declared, &wrapper);
+        assert_eq!(drift.matched, strs(&["Read"]));
+        assert_eq!(drift.declared_only, strs(&["Bash", "Edit"]));
+        assert_eq!(drift.wrapper_only, strs(&["Grep"]));
+    }
+
+    #[test]
+    fn diff_tools_both_empty_yields_all_empty_fields() {
+        let drift = diff_tools(&[], &[]);
+        assert!(drift.matched.is_empty());
+        assert!(drift.declared_only.is_empty());
+        assert!(drift.wrapper_only.is_empty());
+    }
+
+    #[test]
+    fn diff_tools_dedups_duplicate_entries_and_is_case_sensitive() {
+        // "Read" duplicated in `declared`; "read" (lowercase) in `wrapper`
+        // is a distinct string — exact match only, no case folding.
+        let declared = strs(&["Read", "Read", "Edit"]);
+        let wrapper = strs(&["Read", "read"]);
+        let drift = diff_tools(&declared, &wrapper);
+        assert_eq!(drift.matched, strs(&["Read"]));
+        assert_eq!(drift.declared_only, strs(&["Edit"]));
+        assert_eq!(drift.wrapper_only, strs(&["read"]));
     }
 
     // ─── GH #34: mse_doctor audit_findings surfacing (subtask-2) ───────────

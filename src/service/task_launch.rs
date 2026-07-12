@@ -68,7 +68,7 @@ use thiserror::Error;
 /// (`OperatorDelegateMiddleware`) can resolve the binding via `ctx.agent`
 /// like every other agent-keyed table (`CompiledAgentTable.routes` idiom).
 /// Agents without a declared binding are simply absent (no silent default).
-fn derive_worker_bindings(blueprint: &Blueprint) -> HashMap<String, WorkerBinding> {
+pub(crate) fn derive_worker_bindings(blueprint: &Blueprint) -> HashMap<String, WorkerBinding> {
     blueprint
         .agents
         .iter()
@@ -126,7 +126,7 @@ fn derive_audits(blueprint: &Blueprint) -> Vec<AuditDef> {
 /// this function stays defensive and never panics — it logs a warning and
 /// skips the base layer, letting the agent's own inline `ctx` (if any)
 /// stand alone.
-fn derive_agent_ctx(blueprint: &Blueprint) -> (Option<Value>, HashMap<String, Value>) {
+pub(crate) fn derive_agent_ctx(blueprint: &Blueprint) -> (Option<Value>, HashMap<String, Value>) {
     let global = blueprint.default_agent_ctx.clone();
     let meta_pool = derive_step_metas(blueprint);
     let per_agent = blueprint
@@ -164,7 +164,7 @@ fn derive_agent_ctx(blueprint: &Blueprint) -> (Option<Value>, HashMap<String, Va
 /// entirely — the malformed-shape case is left to
 /// `AgentContextMiddleware`'s own tier merge, which already warns + skips
 /// a non-`Object` tier value downstream, never failing the spawn).
-fn shallow_merge_inline_wins(base: Value, inline: Value) -> Value {
+pub(crate) fn shallow_merge_inline_wins(base: Value, inline: Value) -> Value {
     match (base, inline) {
         (Value::Object(mut base), Value::Object(inline)) => {
             for (k, v) in inline {

@@ -14,7 +14,11 @@ use mlua_swarm::blueprint::store::{
     blueprint_version, BlueprintId, BlueprintStore, CommitMetadata,
 };
 use mlua_swarm::blueprint::{default_global_agent_kind, AgentKind, Blueprint};
+use mlua_swarm::core::explain::{explain_agent_ctx, CtxTier};
+use mlua_swarm::core::step_naming::StepNaming;
+use mlua_swarm::operator::render::template_variables;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -60,6 +64,10 @@ pub fn build_blueprints_router_with_refs(
     Router::new()
         .route("/v1/blueprints/:id/head", get(get_head))
         .route("/v1/blueprints/:id/history", get(get_history))
+        .route(
+            "/v1/blueprints/:id/agents/:agent/explain",
+            get(explain_agent),
+        )
         .route("/v1/blueprints/:id/unarchive", post(unarchive_blueprint))
         .route(
             "/v1/blueprints/:id",
@@ -327,4 +335,521 @@ async fn get_history(
     }
     let count = entries.len();
     Ok(Json(HistoryResponse { count, entries }))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// GET /v1/blueprints/:id/agents/:agent/explain
+// ──────────────────────────────────────────────────────────────────────────
+
+/// `blueprint` field of [`ExplainAgentResponse`]: which Blueprint this
+/// explain view was resolved against.
+#[derive(Debug, Serialize)]
+struct ExplainBlueprintRef {
+    /// Blueprint id (echoed back from the path param).
+    id: String,
+    /// Head commit version (`Trace.version`, debug-formatted — same
+    /// convention as [`HeadResponse::version`]).
+    version: String,
+}
+
+/// `agent` field of [`ExplainAgentResponse`]: the resolved agent's
+/// identity, verbatim from the Blueprint's `AgentDef`.
+#[derive(Debug, Serialize)]
+struct ExplainAgentRef {
+    /// Agent name (= `AgentDef.name`, echoed back from the path param).
+    name: String,
+    /// Worker IMPL kind (= `AgentDef.kind`).
+    kind: AgentKind,
+}
+
+/// `worker_binding` field of [`ExplainAgentResponse`] when the agent
+/// declares one. Mirrors `mlua_swarm::operator::WorkerBinding::variant`;
+/// its `tools` half is reported separately under `declared_tools`, so it
+/// is not duplicated here.
+#[derive(Debug, Serialize)]
+struct ExplainWorkerBinding {
+    /// Worker variant name (`AgentDef.profile.worker_binding`).
+    variant: String,
+}
+
+/// `declared_tools` field of [`ExplainAgentResponse`].
+#[derive(Debug, Serialize)]
+struct ExplainDeclaredTools {
+    /// `AgentDef.profile.tools`, verbatim (`[]` when `profile` is absent).
+    tools: Vec<String>,
+    /// Always `true` — see [`Self::note`].
+    informational: bool,
+    /// Explains why `tools` does not grant anything by itself.
+    note: String,
+}
+
+/// `system_prompt` field of [`ExplainAgentResponse`], present when
+/// `AgentDef.profile.system_prompt` is non-empty.
+#[derive(Debug, Serialize)]
+struct ExplainSystemPrompt {
+    /// UTF-8 byte length of the raw (unrendered) template.
+    bytes: usize,
+    /// Line count of the raw template (`str::lines` count).
+    lines: usize,
+    /// Variables `mlua_swarm::operator::render::template_variables`
+    /// reports the template requires. Empty when
+    /// [`Self::template_syntax_error`] is `Some`.
+    template_variables: Vec<String>,
+    /// `Some(message)` when the template failed to parse; `None`
+    /// otherwise.
+    template_syntax_error: Option<String>,
+    /// Explains the non-`Object` `initial_directive` binding rule.
+    note: String,
+}
+
+/// One key's entry in [`ExplainEffectiveCtx::keys`].
+#[derive(Debug, Serialize)]
+struct ExplainCtxKeyEntry {
+    /// The value this key resolves to (the winning tier's value).
+    value: serde_json::Value,
+    /// Which static tier supplied [`Self::value`] — one of
+    /// `"agent_inline"` / `"meta_ref"` / `"bp_global"`.
+    winning_tier: String,
+}
+
+/// `effective_ctx` field of [`ExplainAgentResponse`]: the static 3-tier
+/// cascade resolution `mlua_swarm::core::explain::explain_agent_ctx`
+/// computes (byte-identical to the runtime merge — see that function's
+/// doc for why this reuses rather than reimplements the merge).
+#[derive(Debug, Serialize)]
+struct ExplainEffectiveCtx {
+    /// Per-key winner table.
+    keys: BTreeMap<String, ExplainCtxKeyEntry>,
+    /// Explains that Run/Task/Step runtime tiers are out of scope here.
+    note: String,
+}
+
+/// `output` field of [`ExplainAgentResponse`].
+#[derive(Debug, Serialize)]
+struct ExplainOutput {
+    /// The canonical step-projection name
+    /// (`StepNaming::canonical_of_producer`), or the agent name itself as
+    /// a fallback — see [`Self::naming_warnings`].
+    projection_name: String,
+    /// Non-empty when [`Self::projection_name`] fell back to the agent
+    /// name, or `StepNaming::from_blueprint` itself failed (explain is a
+    /// diagnostic view, so neither case 500s — see [`explain_agent`]'s
+    /// doc).
+    naming_warnings: Vec<String>,
+    /// Explains the `{"out","parts"}` OUTPUT shape change for parts
+    /// staging.
+    parts_note: String,
+}
+
+/// Response body for `GET /v1/blueprints/:id/agents/:agent/explain`.
+#[derive(Debug, Serialize)]
+struct ExplainAgentResponse {
+    /// Which Blueprint this view was resolved against.
+    blueprint: ExplainBlueprintRef,
+    /// The resolved agent's identity.
+    agent: ExplainAgentRef,
+    /// The Blueprint-baked worker binding, if declared.
+    worker_binding: Option<ExplainWorkerBinding>,
+    /// `Some(reason)` when [`Self::worker_binding`] is `None`.
+    binding_note: Option<String>,
+    /// The agent's declared (informational-only) tool list.
+    declared_tools: ExplainDeclaredTools,
+    /// The rendered-template diagnostics, when `profile.system_prompt` is
+    /// non-empty.
+    system_prompt: Option<ExplainSystemPrompt>,
+    /// The static ctx cascade resolution.
+    effective_ctx: ExplainEffectiveCtx,
+    /// The step-projection naming resolution.
+    output: ExplainOutput,
+}
+
+/// Maps a static [`CtxTier`] to the wire label
+/// [`ExplainCtxKeyEntry::winning_tier`] reports.
+fn ctx_tier_label(tier: CtxTier) -> &'static str {
+    match tier {
+        CtxTier::AgentInline => "agent_inline",
+        CtxTier::MetaRef => "meta_ref",
+        CtxTier::BpGlobal => "bp_global",
+    }
+}
+
+/// Builds [`ExplainSystemPrompt`] from a non-empty `profile.system_prompt`
+/// template.
+fn explain_system_prompt(template: &str) -> ExplainSystemPrompt {
+    let (variables, template_syntax_error): (Vec<String>, Option<String>) =
+        match template_variables(template) {
+            Ok(vars) => (vars.into_iter().collect(), None),
+            Err(e) => (Vec::new(), Some(e.to_string())),
+        };
+    ExplainSystemPrompt {
+        bytes: template.len(),
+        lines: template.lines().count(),
+        template_variables: variables,
+        template_syntax_error,
+        note: "when the step directive is not a JSON object, only `value` is bound at render \
+               time"
+            .to_string(),
+    }
+}
+
+/// `GET /v1/blueprints/:id/agents/:agent/explain` — read-only, dry-run
+/// visualization of how `agent`'s Blueprint definition materializes into
+/// its runtime worker contract (see `workspace/tasks/explain-agent/issue.md`
+/// for the full design rationale). Same unauthenticated trust tier as
+/// [`get_head`] (an operator-diagnostic route; no engine state is touched
+/// — every value here is resolved statically from the head Blueprint
+/// alone).
+///
+/// 404s when the Blueprint id itself is not found (same error mapping as
+/// [`get_head`]) or when `agent` is not a name in `bp.agents` (JSON body:
+/// `{"error", "agent", "available"}`). A `StepNaming::from_blueprint`
+/// failure does not 500 — `output.projection_name` falls back to the
+/// agent name and the failure is reported via `output.naming_warnings`
+/// (this endpoint is a diagnostic view, not a compile gate).
+async fn explain_agent(
+    State(state): State<BlueprintsState>,
+    Path((id, agent)): Path<(String, String)>,
+) -> Result<Json<ExplainAgentResponse>, (StatusCode, String)> {
+    let store = state.store;
+    let bp_id = BlueprintId::new(id.clone());
+    let traced = store
+        .read_head(&bp_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("read_head: {e}")))?;
+    let bp = traced.value;
+    let version = format!("{:?}", traced.trace.version);
+
+    let Some(agent_def) = bp.agents.iter().find(|ad| ad.name == agent) else {
+        let available: Vec<&str> = bp.agents.iter().map(|ad| ad.name.as_str()).collect();
+        return Err((
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "error": "agent not found in blueprint",
+                "agent": agent,
+                "available": available,
+            })
+            .to_string(),
+        ));
+    };
+
+    let profile = agent_def.profile.as_ref();
+
+    let (worker_binding, binding_note) = match profile.and_then(|p| p.worker_binding.as_ref()) {
+        Some(variant) => (
+            Some(ExplainWorkerBinding {
+                variant: variant.clone(),
+            }),
+            None,
+        ),
+        None => (
+            None,
+            Some(
+                "no worker_binding declared; WS operator dispatch will fail at compile \
+                 (InvalidSpec)"
+                    .to_string(),
+            ),
+        ),
+    };
+
+    let declared_tools = ExplainDeclaredTools {
+        tools: profile.map(|p| p.tools.clone()).unwrap_or_default(),
+        informational: true,
+        note: "declared tools do not grant anything; the effective tool surface is the worker \
+               wrapper's frontmatter (see operator.rs WorkerBinding doc)"
+            .to_string(),
+    };
+
+    let system_prompt = profile
+        .filter(|p| !p.system_prompt.is_empty())
+        .map(|p| explain_system_prompt(&p.system_prompt));
+
+    let ctx_keys = explain_agent_ctx(&bp, &agent).unwrap_or_default();
+    let effective_ctx = ExplainEffectiveCtx {
+        keys: ctx_keys
+            .into_iter()
+            .map(|(k, resolution)| {
+                (
+                    k,
+                    ExplainCtxKeyEntry {
+                        value: resolution.value,
+                        winning_tier: ctx_tier_label(resolution.winning_tier).to_string(),
+                    },
+                )
+            })
+            .collect(),
+        note: "static tiers only; Run/Task/Step runtime tiers always win over these \
+               (only-if-absent insertion order)"
+            .to_string(),
+    };
+
+    let (projection_name, naming_warnings) = match StepNaming::from_blueprint(&bp) {
+        Ok((naming, _soft_warnings)) => match naming.canonical_of_producer(&agent) {
+            Some(canonical) => (canonical.to_string(), Vec::new()),
+            None => (
+                agent.clone(),
+                vec![format!(
+                    "agent '{agent}' does not appear in the blueprint's flow; using the agent \
+                     name as a fallback projection name"
+                )],
+            ),
+        },
+        Err(e) => (
+            agent.clone(),
+            vec![format!("StepNaming::from_blueprint failed: {e}")],
+        ),
+    };
+
+    let output = ExplainOutput {
+        projection_name,
+        naming_warnings,
+        parts_note: "if the worker stages named artifact parts, the step OUTPUT changes shape \
+                     to {\"out\", \"parts\"}; reference via $.<step>.out"
+            .to_string(),
+    };
+
+    Ok(Json(ExplainAgentResponse {
+        blueprint: ExplainBlueprintRef { id, version },
+        agent: ExplainAgentRef {
+            name: agent_def.name.clone(),
+            kind: agent_def.kind.clone(),
+        },
+        worker_binding,
+        binding_note,
+        declared_tools,
+        system_prompt,
+        effective_ctx,
+        output,
+    }))
+}
+
+#[cfg(test)]
+mod explain_agent_tests {
+    use super::*;
+    use mlua_swarm::blueprint::store::InMemoryBlueprintStore;
+    use mlua_swarm::blueprint::{
+        current_schema_version, AgentDef, AgentMeta, AgentProfile, BlueprintMetadata,
+        CompilerHints, CompilerStrategy,
+    };
+    use serde_json::json;
+
+    fn agent_def(name: &str, profile: Option<AgentProfile>, meta: Option<AgentMeta>) -> AgentDef {
+        AgentDef {
+            name: name.to_string(),
+            kind: AgentKind::RustFn,
+            spec: json!({ "fn_id": name }),
+            profile,
+            meta,
+        }
+    }
+
+    /// A single-step Blueprint whose sole Step dispatches `agent_name` —
+    /// enough for `StepNaming::from_blueprint` to resolve a real (non-
+    /// fallback) `canonical_of_producer` entry.
+    fn single_step_bp(
+        bp_id: &str,
+        agent_name: &str,
+        profile: Option<AgentProfile>,
+        meta: Option<AgentMeta>,
+        default_agent_ctx: Option<serde_json::Value>,
+    ) -> Blueprint {
+        Blueprint {
+            schema_version: current_schema_version(),
+            id: bp_id.into(),
+            flow: serde_json::from_value(json!({
+                "kind": "step",
+                "ref": agent_name,
+                "in": {"op": "path", "at": "$.input"},
+                "out": {"op": "path", "at": "$.out"},
+            }))
+            .expect("flow parse"),
+            agents: vec![agent_def(agent_name, profile, meta)],
+            operators: vec![],
+            metas: vec![],
+            hints: CompilerHints::default(),
+            strategy: CompilerStrategy::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx,
+            default_context_policy: None,
+            projection_placement: None,
+            audits: vec![],
+            degradation_policy: None,
+        }
+    }
+
+    async fn seed(store: &InMemoryBlueprintStore, bp: &Blueprint) {
+        let bp_id = BlueprintId::new(bp.id.as_str());
+        let v = blueprint_version(bp).expect("version");
+        store
+            .write_new(&bp_id, bp, &[], CommitMetadata::seed(bp_id.clone(), v, 0))
+            .await
+            .expect("write_new");
+    }
+
+    fn state_with(store: InMemoryBlueprintStore) -> BlueprintsState {
+        BlueprintsState {
+            store: Arc::new(store),
+            ref_base: None,
+            cli_default_agent_kind: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn full_case_reports_binding_ctx_override_and_system_prompt() {
+        let profile = AgentProfile {
+            system_prompt: "Hello {{ name }}, mode={{ mode }}".to_string(),
+            tools: vec!["Read".to_string(), "Grep".to_string()],
+            worker_binding: Some("mse-worker-knowledge".to_string()),
+            ..Default::default()
+        };
+        let meta = AgentMeta {
+            ctx: Some(json!({ "work_dir": "/inline" })),
+            ..Default::default()
+        };
+        let bp = single_step_bp(
+            "explain-full-bp",
+            "researcher",
+            Some(profile),
+            Some(meta),
+            Some(json!({ "work_dir": "/bp-global", "extra": "kept" })),
+        );
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let resp = explain_agent(
+            State(state_with(store)),
+            Path(("explain-full-bp".to_string(), "researcher".to_string())),
+        )
+        .await
+        .expect("explain_agent")
+        .0;
+
+        assert_eq!(resp.blueprint.id, "explain-full-bp");
+        assert!(!resp.blueprint.version.is_empty());
+        assert_eq!(resp.agent.name, "researcher");
+        assert_eq!(resp.agent.kind, AgentKind::RustFn);
+
+        let binding = resp.worker_binding.expect("worker_binding present");
+        assert_eq!(binding.variant, "mse-worker-knowledge");
+        assert!(resp.binding_note.is_none());
+
+        assert_eq!(
+            resp.declared_tools.tools,
+            vec!["Read".to_string(), "Grep".to_string()]
+        );
+        assert!(resp.declared_tools.informational);
+
+        let sp = resp.system_prompt.expect("system_prompt present");
+        assert_eq!(sp.bytes, "Hello {{ name }}, mode={{ mode }}".len());
+        assert_eq!(sp.lines, 1);
+        assert_eq!(
+            sp.template_variables,
+            vec!["mode".to_string(), "name".to_string()]
+        );
+        assert!(sp.template_syntax_error.is_none());
+
+        assert_eq!(resp.effective_ctx.keys["work_dir"].value, json!("/inline"));
+        assert_eq!(
+            resp.effective_ctx.keys["work_dir"].winning_tier,
+            "agent_inline"
+        );
+        assert_eq!(resp.effective_ctx.keys["extra"].value, json!("kept"));
+        assert_eq!(resp.effective_ctx.keys["extra"].winning_tier, "bp_global");
+
+        assert_eq!(resp.output.projection_name, "researcher");
+        assert!(resp.output.naming_warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_without_worker_binding_reports_binding_note() {
+        let profile = AgentProfile {
+            tools: vec!["Read".to_string()],
+            ..Default::default()
+        };
+        let bp = single_step_bp("explain-no-binding-bp", "scout", Some(profile), None, None);
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let resp = explain_agent(
+            State(state_with(store)),
+            Path(("explain-no-binding-bp".to_string(), "scout".to_string())),
+        )
+        .await
+        .expect("explain_agent")
+        .0;
+
+        assert!(resp.worker_binding.is_none());
+        let note = resp.binding_note.expect("binding_note present");
+        assert!(note.contains("no worker_binding declared"));
+        assert!(resp.system_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_agent_name_returns_404_with_available_list() {
+        let bp = single_step_bp("explain-404-agent-bp", "foo", None, None, None);
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let err = explain_agent(
+            State(state_with(store)),
+            Path((
+                "explain-404-agent-bp".to_string(),
+                "no-such-agent".to_string(),
+            )),
+        )
+        .await
+        .expect_err("expected 404");
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_str(&err.1).expect("json body");
+        assert_eq!(body["error"], "agent not found in blueprint");
+        assert_eq!(body["agent"], "no-such-agent");
+        assert_eq!(body["available"], json!(["foo"]));
+    }
+
+    #[tokio::test]
+    async fn unknown_blueprint_id_returns_404_same_as_get_head() {
+        let store = InMemoryBlueprintStore::new();
+
+        let err = explain_agent(
+            State(state_with(store)),
+            Path(("no-such-bp".to_string(), "any-agent".to_string())),
+        )
+        .await
+        .expect_err("expected 404");
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn template_syntax_error_is_reported_without_500() {
+        let profile = AgentProfile {
+            system_prompt: "hello {{ unclosed".to_string(),
+            ..Default::default()
+        };
+        let bp = single_step_bp(
+            "explain-syntax-error-bp",
+            "scout",
+            Some(profile),
+            None,
+            None,
+        );
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let resp = explain_agent(
+            State(state_with(store)),
+            Path(("explain-syntax-error-bp".to_string(), "scout".to_string())),
+        )
+        .await
+        .expect("explain_agent")
+        .0;
+
+        let sp = resp.system_prompt.expect("system_prompt present");
+        assert!(sp.template_variables.is_empty());
+        assert!(sp.template_syntax_error.is_some());
+    }
 }
