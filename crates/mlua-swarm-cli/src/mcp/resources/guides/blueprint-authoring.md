@@ -139,6 +139,93 @@ Key facts:
   artifacts (audits, out-of-band submissions) bypass fold but remain
   reachable via `context.steps`.
 
+## Returning verdicts to drive BP flow (canonical pattern)
+
+A **verdict** is a small scalar (e.g. `"PASS"`, `"BLOCKED"`, `"ALLOW"`) an
+agent emits so that a downstream `branch` or `loop` node can compare it
+via `eq($.<step>, lit("BLOCKED"))` and pick a path. `eq` is a
+**structural** compare — the whole value at `$.<step>` must equal the
+whole `lit(...)` value. That constraint decides how the agent shapes its
+submit body.
+
+Two shapes are canonical; a third is a frequently-attempted anti-pattern.
+
+### Pattern A — plain body carries the verdict scalar
+
+The agent's `mse_worker_submit` body is the verdict literal, nothing
+else:
+
+```
+mse_worker_submit(body="BLOCKED")
+```
+
+- Step OUTPUT is exactly the string `"BLOCKED"` — no `parts` field.
+- BP-side: a downstream `"in": {"op": "path", "at": "$.gate"}` observes
+  the scalar directly, and
+  `{"op": "eq", "lhs": {"op": "path", "at": "$.gate"}, "rhs": {"op": "lit", "value": "BLOCKED"}}`
+  matches.
+- Trade-off: the submit body has room for the verdict only — no
+  human-readable report co-exists with it on that step.
+- When to use: pure gates where the verdict is the whole point. Working
+  example: `mse://blueprints/samples/03-fn-override` — the `mock-gate`
+  agent's system prompt is literally `` Always reply `BLOCKED` ``, and
+  the top-level `branch` fires on `eq($.verdict, lit("BLOCKED"))`.
+
+### Pattern B — named part carries the verdict, plain body carries the report
+
+The agent stages the verdict as a named part first, then finishes the
+attempt with a plain (unnamed) submit whose body is the human-readable
+report:
+
+```
+mse_worker_submit(name="verdict", body="BLOCKED")     # stage the verdict
+mse_worker_submit(body=<full YAML / markdown report>) # finish the attempt
+```
+
+- Step OUTPUT shape becomes
+  `{"out": <the full report>, "parts": {"verdict": "BLOCKED"}}`.
+- BP-side: the verdict is addressed with bracket notation —
+  `{"op": "eq", "lhs": {"op": "path", "at": "$.gate.parts[\"verdict\"]"}, "rhs": {"op": "lit", "value": "BLOCKED"}}`
+  — while the full report stays reachable as `$.gate.out` for
+  downstream consumers (a resolver agent that needs the failure detail,
+  or a report artifact for humans).
+- Trade-off: the agent issues two `mse_worker_submit` calls, and the BP
+  author must know to address the `parts["verdict"]` entry, not the
+  plain step name.
+- When to use: gates whose verdict must drive flow *and* whose full
+  report is a first-class artifact.
+
+### Anti-pattern — full report in the plain body, `eq` against the step name
+
+An agent that submits a full YAML/markdown report as its only submit
+body and expects `eq($.gate, lit("BLOCKED"))` to fire **cannot work**:
+`$.gate` resolves to the whole report string; `lit("BLOCKED")` is the
+four-character literal; they never compare equal. The `branch`'s `else`
+path fires on every dispatch, which reads to a caller like the verdict
+path was silently swallowed even though the agent said `BLOCKED`.
+
+Debug rule: if a gate's `then` path never fires while the agent visibly
+outputs a verdict word, check the submit shape first. It must be a
+scalar (Pattern A) or a named part (Pattern B) — `$.gate` cannot be a
+report body that *contains* the verdict word.
+
+### Cross-links
+
+- Named-parts wire format and OUTPUT shape: § Worker output: `out` vs
+  named parts (above).
+- Working samples that exercise Pattern A end-to-end:
+  `mse://blueprints/samples/02-verdict-loop` (a `loop` that retries
+  while `$.verdict == "BLOCKED"`) and
+  `mse://blueprints/samples/03-fn-override` (a `branch` that hands a
+  BLOCKED gate result to an approver step).
+- Agent-side declaration (which pattern the agent's own Output format
+  section commits to): `mse://guides/agent-md-authoring` § Output
+  contract: inline body vs `@file:` sentinel.
+- The static verifier that surfaces some verdict-related drift
+  (`declared_tools` vs wrapper grants, projection-name/parts-shape
+  changes downstream): `mse://guides/agent-md-authoring` § Verifying
+  how your agent materializes.
+
 ## Expr ops (`flow.ir` `Expr`)
 
 Every expr is tagged with an `op` discriminator:
