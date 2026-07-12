@@ -68,6 +68,10 @@ pub fn build_blueprints_router_with_refs(
             "/v1/blueprints/:id/agents/:agent/explain",
             get(explain_agent),
         )
+        .route(
+            "/v1/blueprints/:id/agents/explain",
+            get(explain_agents_batch),
+        )
         .route("/v1/blueprints/:id/unarchive", post(unarchive_blueprint))
         .route(
             "/v1/blueprints/:id",
@@ -622,6 +626,132 @@ async fn explain_agent(
     }))
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// GET /v1/blueprints/:id/agents/explain (batch summary)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// `worker_binding` field of [`AgentSummary`] — same shape as
+/// [`ExplainWorkerBinding`] (kept as a distinct type so the batch response
+/// schema doesn't couple to the single-agent view's naming).
+#[derive(Debug, Serialize)]
+struct WorkerBindingSummary {
+    /// Worker variant name (`AgentDef.profile.worker_binding`).
+    variant: String,
+}
+
+/// One row of [`BatchExplainAgentsResponse::agents`] — a summary, not the
+/// full [`ExplainAgentResponse`] detail: a whole-Blueprint sweep response
+/// must stay small, so this reports counts/presence rather than the raw
+/// `declared_tools` list or the rendered `system_prompt` template. Drill
+/// down via `GET /v1/blueprints/:id/agents/:agent/explain` for the full
+/// per-agent view.
+#[derive(Debug, Serialize)]
+struct AgentSummary {
+    /// Agent name (`AgentDef.name`).
+    name: String,
+    /// Worker IMPL kind (`AgentDef.kind`, debug-formatted — same
+    /// convention as the `bp_doctor` MCP tool's per-agent `kind` field).
+    kind: String,
+    /// The Blueprint-baked worker binding, if declared. `null` (not
+    /// omitted) when absent — the caller needs to see every agent,
+    /// bound or not.
+    worker_binding: Option<WorkerBindingSummary>,
+    /// `AgentDef.profile.tools.len()`; `0` when `profile` is absent.
+    declared_tools_count: usize,
+    /// UTF-8 byte length of `profile.system_prompt`; `0` when `profile`
+    /// is absent or the template is empty.
+    system_prompt_bytes: usize,
+    /// Number of keys `explain_agent_ctx` resolves for this agent (the
+    /// static 3-tier cascade); `0` when the agent has no static ctx.
+    effective_ctx_key_count: usize,
+    /// The canonical step-projection name
+    /// (`StepNaming::canonical_of_producer`), falling back to the agent
+    /// name on a naming miss — same fail-soft convention as
+    /// [`ExplainOutput::projection_name`], but without a
+    /// `naming_warnings` companion (this is a summary row).
+    projection_name: String,
+}
+
+/// Response body for `GET /v1/blueprints/:id/agents/explain`.
+#[derive(Debug, Serialize)]
+struct BatchExplainAgentsResponse {
+    /// Which Blueprint this sweep was resolved against.
+    blueprint: ExplainBlueprintRef,
+    /// One row per `bp.agents` entry, in Blueprint order.
+    agents: Vec<AgentSummary>,
+}
+
+/// `GET /v1/blueprints/:id/agents/explain` — batch summary sweep across
+/// every agent in the Blueprint. Same read-only, dry-run, unauthenticated
+/// trust tier as [`explain_agent`] / [`get_head`] — nothing here is
+/// resolved beyond the head Blueprint.
+///
+/// 404s only when the Blueprint id itself is not found (same error
+/// mapping as [`get_head`]); a Blueprint with zero agents returns
+/// `agents: []`, not 404 (there is no per-agent path segment to fail to
+/// resolve here). `StepNaming::from_blueprint` failing does not 500 —
+/// every row's `projection_name` falls back to the agent name, mirroring
+/// [`explain_agent`]'s per-agent fail-soft convention (this batch view
+/// just has no `naming_warnings` companion field to report it through).
+async fn explain_agents_batch(
+    State(state): State<BlueprintsState>,
+    Path(id): Path<String>,
+) -> Result<Json<BatchExplainAgentsResponse>, (StatusCode, String)> {
+    let store = state.store;
+    let bp_id = BlueprintId::new(id.clone());
+    let traced = store
+        .read_head(&bp_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("read_head: {e}")))?;
+    let bp = traced.value;
+    let version = format!("{:?}", traced.trace.version);
+
+    // Resolved once for the whole Blueprint (StepNaming::from_blueprint is
+    // a whole-BP operation, not per-agent); a failure fails soft the same
+    // way explain_agent's per-agent lookup does — every row below falls
+    // back to the agent name via `.unwrap_or_else`.
+    let naming = StepNaming::from_blueprint(&bp)
+        .ok()
+        .map(|(naming, _)| naming);
+
+    let agents = bp
+        .agents
+        .iter()
+        .map(|agent_def| {
+            let profile = agent_def.profile.as_ref();
+            let worker_binding = profile
+                .and_then(|p| p.worker_binding.as_ref())
+                .map(|variant| WorkerBindingSummary {
+                    variant: variant.clone(),
+                });
+            let declared_tools_count = profile.map(|p| p.tools.len()).unwrap_or(0);
+            let system_prompt_bytes = profile.map(|p| p.system_prompt.len()).unwrap_or(0);
+            let effective_ctx_key_count = explain_agent_ctx(&bp, &agent_def.name)
+                .map(|keys| keys.len())
+                .unwrap_or(0);
+            let projection_name = naming
+                .as_ref()
+                .and_then(|naming| naming.canonical_of_producer(&agent_def.name))
+                .map(|canonical| canonical.to_string())
+                .unwrap_or_else(|| agent_def.name.clone());
+            AgentSummary {
+                name: agent_def.name.clone(),
+                kind: format!("{:?}", agent_def.kind),
+                worker_binding,
+                declared_tools_count,
+                system_prompt_bytes,
+                effective_ctx_key_count,
+                projection_name,
+            }
+        })
+        .collect();
+
+    Ok(Json(BatchExplainAgentsResponse {
+        blueprint: ExplainBlueprintRef { id, version },
+        agents,
+    }))
+}
+
 #[cfg(test)]
 mod explain_agent_tests {
     use super::*;
@@ -851,5 +981,163 @@ mod explain_agent_tests {
         let sp = resp.system_prompt.expect("system_prompt present");
         assert!(sp.template_variables.is_empty());
         assert!(sp.template_syntax_error.is_some());
+    }
+
+    // ─── GH #47: batch summary sweep (explain_agents_batch) ────────────
+
+    /// A 3-agent Blueprint whose flow only dispatches `bound_agent` — the
+    /// other two are unreferenced by the flow, so `StepNaming` misses them
+    /// (fail-soft fallback to the agent name is exercised for both).
+    fn batch_bp() -> Blueprint {
+        let bound_profile = AgentProfile {
+            system_prompt: "hello world".to_string(),
+            tools: vec!["Read".to_string(), "Grep".to_string()],
+            worker_binding: Some("mse-worker-knowledge".to_string()),
+            ..Default::default()
+        };
+        let bound_meta = AgentMeta {
+            ctx: Some(json!({ "work_dir": "/inline" })),
+            ..Default::default()
+        };
+        Blueprint {
+            schema_version: current_schema_version(),
+            id: "explain-batch-bp".into(),
+            flow: serde_json::from_value(json!({
+                "kind": "step",
+                "ref": "bound_agent",
+                "in": {"op": "path", "at": "$.input"},
+                "out": {"op": "path", "at": "$.out"},
+            }))
+            .expect("flow parse"),
+            agents: vec![
+                agent_def("bound_agent", Some(bound_profile), Some(bound_meta)),
+                agent_def("unbound_agent", None, None),
+                agent_def("orphan_agent", None, None),
+            ],
+            operators: vec![],
+            metas: vec![],
+            hints: CompilerHints::default(),
+            strategy: CompilerStrategy::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: Some(json!({ "work_dir": "/bp-global", "extra": "kept" })),
+            default_context_policy: None,
+            projection_placement: None,
+            audits: vec![],
+            degradation_policy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_agents_batch_reports_a_summary_row_per_agent() {
+        let bp = batch_bp();
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let resp = explain_agents_batch(
+            State(state_with(store)),
+            Path("explain-batch-bp".to_string()),
+        )
+        .await
+        .expect("explain_agents_batch")
+        .0;
+
+        assert_eq!(resp.blueprint.id, "explain-batch-bp");
+        assert!(!resp.blueprint.version.is_empty());
+        assert_eq!(resp.agents.len(), 3);
+
+        let bound = resp
+            .agents
+            .iter()
+            .find(|a| a.name == "bound_agent")
+            .expect("bound_agent row");
+        assert_eq!(bound.kind, format!("{:?}", AgentKind::RustFn));
+        let binding = bound
+            .worker_binding
+            .as_ref()
+            .expect("worker_binding present");
+        assert_eq!(binding.variant, "mse-worker-knowledge");
+        assert_eq!(bound.declared_tools_count, 2);
+        assert_eq!(bound.system_prompt_bytes, "hello world".len());
+        // work_dir (agent_inline override) + extra (bp-global carry) = 2 keys.
+        assert_eq!(bound.effective_ctx_key_count, 2);
+        // Referenced by the flow -> a real (non-fallback) canonical name.
+        assert_eq!(bound.projection_name, "bound_agent");
+
+        let unbound = resp
+            .agents
+            .iter()
+            .find(|a| a.name == "unbound_agent")
+            .expect("unbound_agent row");
+        assert!(unbound.worker_binding.is_none());
+        assert_eq!(unbound.declared_tools_count, 0);
+        assert_eq!(unbound.system_prompt_bytes, 0);
+        // Only the bp-global tier applies (no agent-level meta) = 2 keys.
+        assert_eq!(unbound.effective_ctx_key_count, 2);
+        // Not referenced by the flow -> StepNaming miss -> fallback to name.
+        assert_eq!(unbound.projection_name, "unbound_agent");
+
+        let orphan = resp
+            .agents
+            .iter()
+            .find(|a| a.name == "orphan_agent")
+            .expect("orphan_agent row");
+        assert_eq!(orphan.projection_name, "orphan_agent");
+    }
+
+    #[tokio::test]
+    async fn explain_agents_batch_zero_agents_returns_empty_list_not_404() {
+        let bp = Blueprint {
+            schema_version: current_schema_version(),
+            id: "explain-batch-empty-bp".into(),
+            flow: serde_json::from_value(json!({
+                "kind": "step",
+                "ref": "unused",
+                "in": {"op": "path", "at": "$.input"},
+                "out": {"op": "path", "at": "$.out"},
+            }))
+            .expect("flow parse"),
+            agents: vec![],
+            operators: vec![],
+            metas: vec![],
+            hints: CompilerHints::default(),
+            strategy: CompilerStrategy::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+            projection_placement: None,
+            audits: vec![],
+            degradation_policy: None,
+        };
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let resp = explain_agents_batch(
+            State(state_with(store)),
+            Path("explain-batch-empty-bp".to_string()),
+        )
+        .await
+        .expect("explain_agents_batch")
+        .0;
+
+        assert!(resp.agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explain_agents_batch_unknown_blueprint_id_returns_404_same_as_get_head() {
+        let store = InMemoryBlueprintStore::new();
+
+        let err = explain_agents_batch(State(state_with(store)), Path("no-such-bp".to_string()))
+            .await
+            .expect_err("expected 404");
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 }

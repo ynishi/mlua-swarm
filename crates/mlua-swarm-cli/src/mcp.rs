@@ -361,6 +361,21 @@ struct BpExplainAgentReq {
     wrapper_dir: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct BpExplainAgentsReq {
+    /// Blueprint id (registered on the HTTP server).
+    bp_id: String,
+    /// mse serve bind address (default 127.0.0.1:7777).
+    #[serde(default)]
+    bind: Option<String>,
+    /// Directory holding worker wrapper `.md` files (default
+    /// `.claude/agents`) — same client-side concern as
+    /// `bp_explain_agent`'s `wrapper_dir`; the server never reads wrapper
+    /// files.
+    #[serde(default)]
+    wrapper_dir: Option<String>,
+}
+
 /// Per-tool classification comparing a Blueprint agent's declared
 /// (informational-only) `profile.tools` against the worker wrapper's
 /// actual frontmatter `tools` list. Set comparison — order-independent,
@@ -402,6 +417,91 @@ fn diff_tools(declared: &[String], wrapper: &[String]) -> ToolDrift {
             .map(|s| (*s).clone())
             .collect(),
     }
+}
+
+/// Tools every mse-worker wrapper carries regardless of author intent
+/// (the fetch/submit contract) — every wrapper gets `mse_worker_fetch` /
+/// `mse_worker_submit` whether or not the agent's wrapper author
+/// deliberately reached for them, so surfacing them under
+/// `wrapper_only_meaningful` would just be noise.
+const WRAPPER_ONLY_CONTRACT_TOOLS: &[&str] = &["mse_worker_fetch", "mse_worker_submit"];
+
+/// Builds the [`WRAPPER_ONLY_CONTRACT_TOOLS`] allow-list as a `BTreeSet`,
+/// for [`classify_wrapper_only`]'s `contract` parameter.
+fn wrapper_only_contract_set() -> std::collections::BTreeSet<String> {
+    WRAPPER_ONLY_CONTRACT_TOOLS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Splits a [`ToolDrift::wrapper_only`] list into the mse-worker
+/// fetch/submit `contract` subset and everything else (`meaningful`) — the
+/// contract tools are present on every wrapper regardless of author
+/// intent, so surfacing them as "unexpected" wrapper tools is noise;
+/// `meaningful` is the actionable subset. Pure, unit-testable (mirrors
+/// [`diff_tools`]'s convention). Both outputs sorted + deduped (backed by
+/// `BTreeSet`).
+fn classify_wrapper_only(
+    wrapper_only: &[String],
+    contract: &std::collections::BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    use std::collections::BTreeSet;
+    let wrapper_only_set: BTreeSet<&String> = wrapper_only.iter().collect();
+    let contract_out: Vec<String> = wrapper_only_set
+        .iter()
+        .filter(|s| contract.contains(s.as_str()))
+        .map(|s| (*s).clone())
+        .collect();
+    let meaningful_out: Vec<String> = wrapper_only_set
+        .iter()
+        .filter(|s| !contract.contains(s.as_str()))
+        .map(|s| (*s).clone())
+        .collect();
+    (contract_out, meaningful_out)
+}
+
+/// Reads and parses a worker wrapper `.md` file at
+/// `{wrapper_dir}/{variant}.md` via `agent_md_loader::parse`. Shared by
+/// `bp_explain_agent` (single-agent) and `bp_explain_agents` (batch) — the
+/// wrapper-loading side of the drift check is identical for both; only
+/// what each tool does with the parsed `AgentDef.profile.tools` differs.
+fn load_wrapper_tools(wrapper_dir: &str, variant: &str) -> Result<Vec<String>, String> {
+    let wrapper_path = format!("{wrapper_dir}/{variant}.md");
+    let text =
+        std::fs::read_to_string(&wrapper_path).map_err(|e| format!("read {wrapper_path}: {e}"))?;
+    let def = mlua_swarm::lua::agent_md_loader::parse(
+        &text,
+        &wrapper_path,
+        mlua_swarm::blueprint::AgentKind::Operator,
+    )
+    .map_err(|e| format!("parse {wrapper_path}: {e}"))?;
+    Ok(def.profile.map(|p| p.tools).unwrap_or_default())
+}
+
+/// Serializes a computed [`ToolDrift`] and augments the JSON with the
+/// `wrapper_only` classifier split (`wrapper_only_contract` /
+/// `wrapper_only_meaningful`, via [`classify_wrapper_only`]). `wrapper_only`
+/// (flat) itself is retained unmodified alongside the two new fields for
+/// one release cycle — it may be removed in a later release.
+fn tool_drift_json_with_wrapper_only_split(
+    drift: &ToolDrift,
+    contract: &std::collections::BTreeSet<String>,
+) -> JsonValue {
+    let (wrapper_only_contract, wrapper_only_meaningful) =
+        classify_wrapper_only(&drift.wrapper_only, contract);
+    let mut value = serde_json::to_value(drift).unwrap_or(JsonValue::Null);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "wrapper_only_contract".to_string(),
+            serde_json::json!(wrapper_only_contract),
+        );
+        obj.insert(
+            "wrapper_only_meaningful".to_string(),
+            serde_json::json!(wrapper_only_meaningful),
+        );
+    }
+    value
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1933,33 +2033,24 @@ impl MseServer {
                     .wrapper_dir
                     .clone()
                     .unwrap_or_else(|| DEFAULT_WRAPPER_DIR.to_string());
-                let wrapper_path = format!("{wrapper_dir}/{variant}.md");
-                match std::fs::read_to_string(&wrapper_path) {
-                    Ok(text) => match mlua_swarm::lua::agent_md_loader::parse(
-                        &text,
-                        &wrapper_path,
-                        mlua_swarm::blueprint::AgentKind::Operator,
-                    ) {
-                        Ok(def) => {
-                            let wrapper_tools = def.profile.map(|p| p.tools).unwrap_or_default();
-                            (
-                                Some(diff_tools(&declared_tools, &wrapper_tools)),
-                                false,
-                                None,
-                            )
-                        }
-                        Err(e) => (None, true, Some(format!("parse {wrapper_path}: {e}"))),
-                    },
-                    Err(e) => (None, true, Some(format!("read {wrapper_path}: {e}"))),
+                match load_wrapper_tools(&wrapper_dir, variant) {
+                    Ok(wrapper_tools) => (
+                        Some(diff_tools(&declared_tools, &wrapper_tools)),
+                        false,
+                        None,
+                    ),
+                    Err(e) => (None, true, Some(e)),
                 }
             }
         };
 
         if let Some(obj) = explain.as_object_mut() {
-            obj.insert(
-                "tool_drift".to_string(),
-                serde_json::to_value(&tool_drift).unwrap_or(JsonValue::Null),
-            );
+            let contract = wrapper_only_contract_set();
+            let tool_drift_value = tool_drift
+                .as_ref()
+                .map(|drift| tool_drift_json_with_wrapper_only_split(drift, &contract))
+                .unwrap_or(JsonValue::Null);
+            obj.insert("tool_drift".to_string(), tool_drift_value);
             obj.insert(
                 "wrapper_missing".to_string(),
                 serde_json::json!(wrapper_missing),
@@ -1969,6 +2060,150 @@ impl MseServer {
             }
         }
         json_result(&explain)
+    }
+
+    #[tool(
+        description = "Blueprint-wide sweep of the tool_drift check bp_explain_agent performs one agent at a time. Fetches GET /v1/blueprints/:bp_id/agents/explain (the batch summary route) for the agent/variant list, then GET /v1/blueprints/:bp_id/head once to read each agent's `declared_tools` locally (the batch summary route only carries `declared_tools_count`, not the tool names themselves). For every agent with a `worker_binding`, the worker wrapper `.claude/agents/<variant>.md` (override via `wrapper_dir`) is read and diffed the same way `bp_explain_agent` does, then split via the same `wrapper_only` classifier (`wrapper_only_contract` / `wrapper_only_meaningful`) — the per-row output stays compact (counts, not full lists), since a whole-Blueprint sweep response must stay small; drill down with `bp_explain_agent` for the full tool_drift detail on any one agent. Agents without a `worker_binding` get `variant: null` and every wrapper-side field `null`. A missing or unparsable wrapper file sets `wrapper_missing: true` + `wrapper_error`, with every drift count at 0. 404s exactly like `bp_explain_agent` / `bp_doctor`: unregistered Blueprint id."
+    )]
+    async fn bp_explain_agents(
+        &self,
+        Parameters(req): Parameters<BpExplainAgentsReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let bind = req
+            .bind
+            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
+
+        let batch_url = format!("http://{bind}/v1/blueprints/{}/agents/explain", req.bp_id);
+        let batch_resp =
+            client.get(&batch_url).send().await.map_err(|e| {
+                McpError::internal_error(format!("bp_explain_agents fetch: {e}"), None)
+            })?;
+        let batch_status = batch_resp.status();
+        let batch_body_text = batch_resp.text().await.unwrap_or_default();
+        if !batch_status.is_success() {
+            return json_result(&serde_json::json!({
+                "bp_id": req.bp_id,
+                "bind": bind,
+                "http_status": batch_status.as_u16(),
+                "error": batch_body_text,
+            }));
+        }
+        let batch: JsonValue = serde_json::from_str(&batch_body_text).map_err(|e| {
+            McpError::internal_error(format!("bp_explain_agents batch decode: {e}"), None)
+        })?;
+
+        let head_url = format!("http://{bind}/v1/blueprints/{}/head", req.bp_id);
+        let head_resp = client.get(&head_url).send().await.map_err(|e| {
+            McpError::internal_error(format!("bp_explain_agents head fetch: {e}"), None)
+        })?;
+        let head_status = head_resp.status();
+        if !head_status.is_success() {
+            let body = head_resp.text().await.unwrap_or_default();
+            return json_result(&serde_json::json!({
+                "bp_id": req.bp_id,
+                "bind": bind,
+                "http_status": head_status.as_u16(),
+                "error": body,
+            }));
+        }
+        let head: JsonValue = head_resp.json().await.map_err(|e| {
+            McpError::internal_error(format!("bp_explain_agents head decode: {e}"), None)
+        })?;
+        let bp_value = head.get("blueprint").cloned().ok_or_else(|| {
+            McpError::internal_error("bp_explain_agents: response missing `blueprint`", None)
+        })?;
+        let bp: Blueprint = serde_json::from_value(bp_value).map_err(|e| {
+            McpError::internal_error(format!("bp_explain_agents bp parse: {e}"), None)
+        })?;
+
+        let wrapper_dir = req
+            .wrapper_dir
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WRAPPER_DIR.to_string());
+        let contract = wrapper_only_contract_set();
+
+        let empty_agents: Vec<JsonValue> = Vec::new();
+        let batch_agents = batch
+            .get("agents")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&empty_agents);
+
+        let mut rows = Vec::with_capacity(batch_agents.len());
+        for row in batch_agents {
+            let name = row
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let variant = row
+                .get("worker_binding")
+                .and_then(|v| v.get("variant"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+
+            let Some(variant) = variant else {
+                rows.push(serde_json::json!({
+                    "name": name,
+                    "variant": JsonValue::Null,
+                    "wrapper_missing": JsonValue::Null,
+                    "wrapper_error": JsonValue::Null,
+                    "declared_only_count": JsonValue::Null,
+                    "wrapper_only_contract_count": JsonValue::Null,
+                    "wrapper_only_meaningful_count": JsonValue::Null,
+                }));
+                continue;
+            };
+
+            let declared_tools: Vec<String> = bp
+                .agents
+                .iter()
+                .find(|a| a.name == name)
+                .and_then(|a| a.profile.as_ref())
+                .map(|p| p.tools.clone())
+                .unwrap_or_default();
+
+            let (
+                declared_only_count,
+                wrapper_only_contract_count,
+                wrapper_only_meaningful_count,
+                wrapper_missing,
+                wrapper_error,
+            ) = match load_wrapper_tools(&wrapper_dir, &variant) {
+                Ok(wrapper_tools) => {
+                    let drift = diff_tools(&declared_tools, &wrapper_tools);
+                    let (wrapper_only_contract, wrapper_only_meaningful) =
+                        classify_wrapper_only(&drift.wrapper_only, &contract);
+                    (
+                        drift.declared_only.len(),
+                        wrapper_only_contract.len(),
+                        wrapper_only_meaningful.len(),
+                        false,
+                        None,
+                    )
+                }
+                Err(e) => (0, 0, 0, true, Some(e)),
+            };
+
+            rows.push(serde_json::json!({
+                "name": name,
+                "variant": variant,
+                "wrapper_missing": wrapper_missing,
+                "wrapper_error": wrapper_error,
+                "declared_only_count": declared_only_count,
+                "wrapper_only_contract_count": wrapper_only_contract_count,
+                "wrapper_only_meaningful_count": wrapper_only_meaningful_count,
+            }));
+        }
+
+        let blueprint_ref = batch.get("blueprint").cloned().unwrap_or(JsonValue::Null);
+        json_result(&serde_json::json!({
+            "blueprint": blueprint_ref,
+            "agents": rows,
+        }))
     }
 
     #[tool(
@@ -3625,6 +3860,61 @@ mod tests {
         assert_eq!(drift.matched, strs(&["Read"]));
         assert_eq!(drift.declared_only, strs(&["Edit"]));
         assert_eq!(drift.wrapper_only, strs(&["read"]));
+    }
+
+    // ─── GH #48: classify_wrapper_only (wrapper_only 2-tier split) ─────────
+
+    #[test]
+    fn classify_wrapper_only_empty_yields_both_empty() {
+        let contract = wrapper_only_contract_set();
+        let (contract_out, meaningful_out) = classify_wrapper_only(&[], &contract);
+        assert!(contract_out.is_empty());
+        assert!(meaningful_out.is_empty());
+    }
+
+    #[test]
+    fn classify_wrapper_only_only_contract_tools() {
+        let contract = wrapper_only_contract_set();
+        let wrapper_only = strs(&["mse_worker_fetch", "mse_worker_submit"]);
+        let (contract_out, meaningful_out) = classify_wrapper_only(&wrapper_only, &contract);
+        assert_eq!(
+            contract_out,
+            strs(&["mse_worker_fetch", "mse_worker_submit"])
+        );
+        assert!(meaningful_out.is_empty());
+    }
+
+    #[test]
+    fn classify_wrapper_only_only_meaningful_tools() {
+        let contract = wrapper_only_contract_set();
+        let wrapper_only = strs(&["Bash", "Read"]);
+        let (contract_out, meaningful_out) = classify_wrapper_only(&wrapper_only, &contract);
+        assert!(contract_out.is_empty());
+        assert_eq!(meaningful_out, strs(&["Bash", "Read"]));
+    }
+
+    #[test]
+    fn classify_wrapper_only_mixed_splits_contract_from_meaningful() {
+        let contract = wrapper_only_contract_set();
+        let wrapper_only = strs(&["mse_worker_fetch", "Bash", "mse_worker_submit", "Grep"]);
+        let (contract_out, meaningful_out) = classify_wrapper_only(&wrapper_only, &contract);
+        assert_eq!(
+            contract_out,
+            strs(&["mse_worker_fetch", "mse_worker_submit"])
+        );
+        assert_eq!(meaningful_out, strs(&["Bash", "Grep"]));
+    }
+
+    #[test]
+    fn classify_wrapper_only_is_case_sensitive_and_dedups_carried_through() {
+        // Same case-sensitivity + dedup contract as `diff_tools` — the
+        // wrapper_only slice already came out of a `BTreeSet` diff, but
+        // this asserts the split preserves that on its own output too.
+        let contract = wrapper_only_contract_set();
+        let wrapper_only = strs(&["Read", "read", "Read"]);
+        let (contract_out, meaningful_out) = classify_wrapper_only(&wrapper_only, &contract);
+        assert!(contract_out.is_empty());
+        assert_eq!(meaningful_out, strs(&["Read", "read"]));
     }
 
     // ─── GH #34: mse_doctor audit_findings surfacing (subtask-2) ───────────

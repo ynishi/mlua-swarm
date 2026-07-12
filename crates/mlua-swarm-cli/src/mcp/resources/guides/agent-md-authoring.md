@@ -168,8 +168,16 @@ dispatched):
   itself: when the agent has a `worker_binding`, it reads the worker
   wrapper `.claude/agents/<variant>.md` (override with `wrapper_dir`,
   default `.claude/agents`) and diffs its frontmatter `tools` against
-  `declared_tools.tools`, returned as
-  `tool_drift: {matched, declared_only, wrapper_only}`.
+  `declared_tools.tools`, returned as `tool_drift: {matched,
+  declared_only, wrapper_only, wrapper_only_contract,
+  wrapper_only_meaningful}`. `wrapper_only_contract` is the mse-worker
+  fetch/submit tools (`mse_worker_fetch` / `mse_worker_submit`) every
+  wrapper carries regardless of author intent — noise, not signal.
+  `wrapper_only_meaningful` is everything else in `wrapper_only`: tools
+  the wrapper actually grants that the agent.md never declared.
+  `wrapper_only` (flat, unsplit) is retained for one release cycle for
+  backward compat and may be removed after that; `declared_only` stays
+  the primary drift signal either way (see point 1 below).
 
 The response covers `blueprint` (id/version), `agent` (name/kind),
 `worker_binding`/`binding_note`, `declared_tools`, `system_prompt`
@@ -208,6 +216,39 @@ most when reading it:
 requires walking the `mlua-flow-ir` `flow` tree and is out of scope for
 the current implementation; cross-reference `output.projection_name`
 against the Blueprint's `flow` manually until that lands.
+
+### Sweeping a whole Blueprint (`bp_explain_agents`)
+
+Checking one agent at a time does not scale once a Blueprint has more
+than a handful of agents. `bp_explain_agents {bp_id, bind?,
+wrapper_dir?}` sweeps every agent in one call and reports a compact
+per-agent row — counts, not full lists, since a whole-Blueprint response
+has to stay small:
+
+```json
+{
+  "blueprint": { "id": "...", "version": "..." },
+  "agents": [
+    {
+      "name": "...",
+      "variant": "...",
+      "wrapper_missing": false,
+      "wrapper_error": null,
+      "declared_only_count": 2,
+      "wrapper_only_contract_count": 2,
+      "wrapper_only_meaningful_count": 1
+    }
+  ]
+}
+```
+
+Agents without a `worker_binding` get `variant: null` and every
+wrapper-side field `null` — there is nothing to diff. A missing or
+unparsable wrapper file sets `wrapper_missing: true` + `wrapper_error`,
+with every count at `0`. Once a row's `declared_only_count` or
+`wrapper_only_meaningful_count` is non-zero, drill down with
+`bp_explain_agent {bp_id, agent}` for the full `tool_drift` detail
+(which tools, not just how many).
 
 ## Quick self-check before you commit an agent.md
 
