@@ -423,8 +423,12 @@ fn diff_tools(declared: &[String], wrapper: &[String]) -> ToolDrift {
 /// (the fetch/submit contract) — every wrapper gets `mse_worker_fetch` /
 /// `mse_worker_submit` whether or not the agent's wrapper author
 /// deliberately reached for them, so surfacing them under
-/// `wrapper_only_meaningful` would just be noise.
-const WRAPPER_ONLY_CONTRACT_TOOLS: &[&str] = &["mse_worker_fetch", "mse_worker_submit"];
+/// `wrapper_only_meaningful` would just be noise. Wrappers list these in
+/// their frontmatter as the full MCP tool identifiers (as reported by
+/// the client that grants them), which is what the drift comparison sees
+/// and what this allow-list must therefore match.
+const WRAPPER_ONLY_CONTRACT_TOOLS: &[&str] =
+    &["mcp__mse__mse_worker_fetch", "mcp__mse__mse_worker_submit"];
 
 /// Builds the [`WRAPPER_ONLY_CONTRACT_TOOLS`] allow-list as a `BTreeSet`,
 /// for [`classify_wrapper_only`]'s `contract` parameter.
@@ -3875,11 +3879,11 @@ mod tests {
     #[test]
     fn classify_wrapper_only_only_contract_tools() {
         let contract = wrapper_only_contract_set();
-        let wrapper_only = strs(&["mse_worker_fetch", "mse_worker_submit"]);
+        let wrapper_only = strs(&["mcp__mse__mse_worker_fetch", "mcp__mse__mse_worker_submit"]);
         let (contract_out, meaningful_out) = classify_wrapper_only(&wrapper_only, &contract);
         assert_eq!(
             contract_out,
-            strs(&["mse_worker_fetch", "mse_worker_submit"])
+            strs(&["mcp__mse__mse_worker_fetch", "mcp__mse__mse_worker_submit"])
         );
         assert!(meaningful_out.is_empty());
     }
@@ -3896,13 +3900,30 @@ mod tests {
     #[test]
     fn classify_wrapper_only_mixed_splits_contract_from_meaningful() {
         let contract = wrapper_only_contract_set();
-        let wrapper_only = strs(&["mse_worker_fetch", "Bash", "mse_worker_submit", "Grep"]);
+        let wrapper_only = strs(&[
+            "mcp__mse__mse_worker_fetch",
+            "Bash",
+            "mcp__mse__mse_worker_submit",
+            "Grep",
+        ]);
         let (contract_out, meaningful_out) = classify_wrapper_only(&wrapper_only, &contract);
         assert_eq!(
             contract_out,
-            strs(&["mse_worker_fetch", "mse_worker_submit"])
+            strs(&["mcp__mse__mse_worker_fetch", "mcp__mse__mse_worker_submit"])
         );
         assert_eq!(meaningful_out, strs(&["Bash", "Grep"]));
+    }
+
+    #[test]
+    fn classify_wrapper_only_short_names_do_not_match_contract() {
+        // Regression guard: wrappers list fetch/submit as full MCP tool
+        // identifiers (`mcp__mse__mse_worker_*`). Short forms must not
+        // match the allow-list, or the noise-reduction split flips.
+        let contract = wrapper_only_contract_set();
+        let wrapper_only = strs(&["mse_worker_fetch", "mse_worker_submit"]);
+        let (contract_out, meaningful_out) = classify_wrapper_only(&wrapper_only, &contract);
+        assert!(contract_out.is_empty());
+        assert_eq!(meaningful_out, strs(&["mse_worker_fetch", "mse_worker_submit"]));
     }
 
     #[test]
