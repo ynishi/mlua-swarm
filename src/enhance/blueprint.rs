@@ -361,6 +361,8 @@ mod tests {
                     ..Default::default()
                 }),
                 meta: None,
+                runner: None,
+                runner_ref: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -379,6 +381,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 

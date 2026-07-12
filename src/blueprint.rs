@@ -49,10 +49,10 @@ use std::sync::Arc;
 /// `mlua_swarm_schema` directly.
 pub use mlua_swarm_schema::OperatorKind as SchemaOperatorKind;
 pub use mlua_swarm_schema::{
-    current_schema_version, default_global_agent_kind, AgentDef, AgentKind, AgentMeta,
-    AgentProfile, AuditDef, AuditMode, Blueprint, BlueprintMetadata, BlueprintOrigin,
-    CompilerHints, CompilerStrategy, MetaDef, OperatorDef, ProjectionPlacementSpec, SpawnerHints,
-    CURRENT_SCHEMA_VERSION,
+    current_schema_version, default_global_agent_kind, resolve_runner, AgentDef, AgentKind,
+    AgentMeta, AgentProfile, AuditDef, AuditMode, Blueprint, BlueprintMetadata, BlueprintOrigin,
+    CompilerHints, CompilerStrategy, MetaDef, OperatorDef, ProjectionPlacementSpec, Runner,
+    RunnerDef, RunnerResolveError, SpawnerHints, WorkerModel, CURRENT_SCHEMA_VERSION,
 };
 
 /// Bridges `mlua_flow_ir::AsyncDispatcher` to the engine's
@@ -631,6 +631,8 @@ mod tests {
             spec: json!({ "fn_id": "echo" }),
             profile: None,
             meta: None,
+            runner: None,
+            runner_ref: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 

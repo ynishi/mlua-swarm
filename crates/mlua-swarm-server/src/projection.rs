@@ -1201,6 +1201,8 @@ mod tests {
                 spec: json!({"fn_id": mlua_swarm::worker::baseline::AG_IDENTITY}),
                 profile: None,
                 meta: None,
+                runner: None,
+                runner_ref: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -1216,6 +1218,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 
@@ -1289,6 +1293,8 @@ mod tests {
                     projection_name: Some(projection_name.to_string()),
                     ..Default::default()
                 }),
+                runner: None,
+                runner_ref: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -1304,6 +1310,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 
@@ -1685,6 +1693,8 @@ mod tests {
                         projection_name: Some("step-b".to_string()),
                         ..Default::default()
                     }),
+                    runner: None,
+                    runner_ref: None,
                 },
                 AgentDef {
                     name: "step-b".into(),
@@ -1692,6 +1702,8 @@ mod tests {
                     spec: json!({"fn_id": "step-b"}),
                     profile: None,
                     meta: None,
+                    runner: None,
+                    runner_ref: None,
                 },
             ],
             operators: vec![],
@@ -1708,6 +1720,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         };
 
         let req = TaskLaunchRequest {
@@ -2306,6 +2320,8 @@ mod tests {
                     spec: json!({"fn_id": "step1"}),
                     profile: None,
                     meta: None,
+                    runner: None,
+                    runner_ref: None,
                 },
                 AgentDef {
                     name: "step2".into(),
@@ -2313,6 +2329,8 @@ mod tests {
                     spec: json!({"fn_id": "step2"}),
                     profile: None,
                     meta: None,
+                    runner: None,
+                    runner_ref: None,
                 },
             ],
             operators: vec![],
@@ -2329,6 +2347,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         };
 
         let req = TaskLaunchRequest {

@@ -359,6 +359,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 
@@ -389,6 +391,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 

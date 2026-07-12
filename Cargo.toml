@@ -83,6 +83,10 @@ description = "Swarm engine host built on mlua — long-running stateful runtime
 keywords = ["swarm", "lua", "mcp", "flow-ir", "agent"]
 categories = ["asynchronous", "development-tools"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 mlua-swarm-schema.workspace = true
 mlua-flow-ir.workspace = true

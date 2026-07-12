@@ -359,6 +359,8 @@ mod tests {
                 projection_name: projection_name.map(str::to_string),
                 ..Default::default()
             }),
+            runner: None,
+            runner_ref: None,
         }
     }
 
@@ -382,6 +384,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 

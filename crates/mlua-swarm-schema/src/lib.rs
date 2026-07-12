@@ -52,6 +52,8 @@
 //!         spec: json!({"fn_id": "hello_world"}),
 //!         profile: None,
 //!         meta: None,
+//!         runner: None,
+//!         runner_ref: None,
 //!     }],
 //!     operators: vec![],
 //!     metas: vec![],
@@ -67,6 +69,8 @@
 //!     projection_placement: None,
 //!     audits: vec![],
 //!     degradation_policy: None,
+//!     runners: vec![],
+//!     default_runner: None,
 //! };
 //!
 //! assert_eq!(bp.id.as_str(), "hello");
@@ -105,6 +109,8 @@
 //!     projection_placement: None,
 //!     audits: vec![],
 //!     degradation_policy: None,
+//!     runners: vec![],
+//!     default_runner: None,
 //! };
 //!
 //! let json = serde_json::to_string(&bp).unwrap();
@@ -385,6 +391,24 @@ pub struct Blueprint {
     /// unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degradation_policy: Option<DegradationPolicy>,
+    /// GH #46 M2 — named registry of [`RunnerDef`] entries (Tier 1 of the
+    /// 3-tier Worker model: Runner / Agent / Context). Referenced by
+    /// `AgentDef.runner_ref` and [`Self::default_runner`] by name.
+    /// Same registry shape as [`Self::metas`] (GH #21 Phase 2). `[]` (the
+    /// default) = no Runner registry declared — every pre-#46 Blueprint
+    /// is unaffected, byte-for-byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runners: Vec<RunnerDef>,
+    /// GH #46 M2 — the "BP Global" tier of the [`resolve_runner`] cascade:
+    /// a [`RunnerDef::name`] reference into [`Self::runners`] (inline
+    /// `Runner` values are not accepted here — registry names only,
+    /// mirroring [`Self::default_agent_ctx`]'s design). Ranks BELOW an
+    /// agent's own inline `runner` / `runner_ref` / legacy
+    /// `profile.worker_binding` declaration (see [`resolve_runner`]'s
+    /// cascade doc for the full precedence). `None` = no BP-wide default
+    /// declared — every pre-#46 Blueprint is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_runner: Option<String>,
 }
 
 /// GH #32 — Blueprint-declared policy for worker-reported degradations. See
@@ -592,6 +616,18 @@ pub struct AgentDef {
     /// Agent-level metadata (description / version / tags).
     #[serde(default)]
     pub meta: Option<AgentMeta>,
+    /// GH #46 M2 — inline [`Runner`] declaration: the highest-priority
+    /// tier of the [`resolve_runner`] cascade. `None` = this agent
+    /// declares no inline Runner (falls through to [`Self::runner_ref`],
+    /// then the legacy `profile.worker_binding` fallback, then
+    /// `Blueprint.default_runner`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<Runner>,
+    /// GH #46 M2 — a [`RunnerDef::name`] reference into
+    /// `Blueprint.runners` (second-priority tier of [`resolve_runner`]).
+    /// `None` = this agent declares no Runner registry reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_ref: Option<String>,
 }
 
 /// Agent persona information. Orthogonal to the backend kind (Shell / InProc / Operator).
@@ -683,6 +719,187 @@ pub enum AgentKind {
     Subprocess,
     /// Interactive Operator role (= MainAI / Human delegation, `spec.operator_ref`).
     Operator,
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Runner / RunnerDef / WorkerModel / resolve_runner (GH #46 Milestone 2)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The execution shell an agent's Worker IMPL runs inside — holding tool
+/// grant, model selection, and runtime capabilities. Tier 1 of the GH #46
+/// 3-tier Worker model (Runner / Agent / Context).
+///
+/// Runner here is broader than the ADK / OpenAI Agents SDK Runner (a loop
+/// driver): it is the execution shell holding tool grant, model
+/// selection, and runtime capabilities. Loop driving itself is the
+/// backend's job (Claude Code harness / AgentBlock runtime).
+///
+/// Resolved per-agent by [`resolve_runner`]'s 5-step cascade; wiring the
+/// resolved value into the launch path is Milestone 3 — this Milestone
+/// only declares the shape and the pure resolver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Runner {
+    /// WS backend: Claude Code subagent wrapper. `variant` is the
+    /// wrapper's subagent_type; `tools` mirrors the wrapper frontmatter =
+    /// enforced grant.
+    WsClaudeCode {
+        /// The wrapper's `subagent_type` (= `WorkerBinding.variant` in the
+        /// `mlua-swarm` core crate).
+        variant: String,
+        /// Declared (informational) tool list — mirrors the wrapper
+        /// frontmatter; the actual grant is enforced by the wrapper file
+        /// itself, not by this list.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
+    },
+    /// In-process backend: agent-block runtime. `tools` is the effective
+    /// (enforced) tool set for the in-process registry.
+    AgentBlockInProcess {
+        /// Effective (enforced) tool set passed to the agent-block
+        /// runtime's registry — unlike `WsClaudeCode::tools`, this list is
+        /// not merely informational.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
+    },
+}
+
+/// One [`Blueprint::runners`] registry entry — a named [`Runner`]
+/// declaration referenced by `AgentDef.runner_ref` /
+/// [`Blueprint::default_runner`]. Same registry shape as [`MetaDef`] (GH
+/// #21 Phase 2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerDef {
+    /// Registry key, referenced by `AgentDef.runner_ref` /
+    /// `Blueprint.default_runner`.
+    pub name: String,
+    /// The declared Runner.
+    pub runner: Runner,
+}
+
+/// Canonical GH #46 Worker unit: a resolved [`Runner`] paired with the
+/// [`AgentDef`] it backs. The Milestone 4 adapter is the consumer that
+/// turns this into a runtime spawn; this crate only declares the shape
+/// (no execution logic lives here — see the crate doc's IN-immutability
+/// discipline).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerModel {
+    /// The resolved Runner.
+    pub runner: Runner,
+    /// The agent this Runner backs.
+    pub agent: AgentDef,
+}
+
+/// Everything [`resolve_runner`] can fail with: an `AgentDef.runner_ref`
+/// / `Blueprint.default_runner` reference that names no entry in
+/// `Blueprint.runners`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RunnerResolveError {
+    /// `AgentDef.runner_ref` names a [`RunnerDef::name`] absent from
+    /// `Blueprint.runners`.
+    #[error(
+        "agent '{agent}' runner_ref '{ref_name}' does not match any RunnerDef.name in \
+         Blueprint.runners (defined: {available:?})"
+    )]
+    UnknownRunnerRef {
+        /// The agent whose `runner_ref` didn't resolve.
+        agent: String,
+        /// The `runner_ref` value that was looked up.
+        ref_name: String,
+        /// The `RunnerDef.name`s that *are* declared, for the error message.
+        available: Vec<String>,
+    },
+    /// `Blueprint.default_runner` names a [`RunnerDef::name`] absent from
+    /// `Blueprint.runners`.
+    #[error(
+        "default_runner '{ref_name}' does not match any RunnerDef.name in Blueprint.runners \
+         (defined: {available:?})"
+    )]
+    UnknownDefaultRunner {
+        /// The `default_runner` value that was looked up.
+        ref_name: String,
+        /// The `RunnerDef.name`s that *are* declared, for the error message.
+        available: Vec<String>,
+    },
+}
+
+/// Resolve `agent`'s effective [`Runner`] against `bp`, in cascade order
+/// (highest priority first):
+///
+/// 1. `agent.runner` (inline declaration) — wins unconditionally.
+/// 2. `agent.runner_ref`, resolved against `bp.runners` (an unresolved
+///    name is [`RunnerResolveError::UnknownRunnerRef`]).
+/// 3. Legacy fallback (agent-level): `agent.profile.worker_binding =
+///    Some(variant)` becomes `Runner::WsClaudeCode { variant,
+///    tools: profile.tools.clone() }` — the same synthesis
+///    `crate::service::task_launch::derive_worker_bindings` (in the
+///    `mlua-swarm` core crate) performs at launch time today.
+/// 4. `bp.default_runner`, resolved against `bp.runners` (an unresolved
+///    name is [`RunnerResolveError::UnknownDefaultRunner`]).
+/// 5. `Ok(None)` — no Runner declared through any tier.
+///
+/// **Legacy (agent-level) beats `default_runner` (BP-global)**: tier 3
+/// outranks tier 4, the same "agent-level wins over BP-global" rule the
+/// ctx cascade (`AgentInline > MetaRef > BpGlobal`, see
+/// `mlua-swarm`'s `core::explain::CtxTier`) already follows.
+///
+/// Pure and read-only: this Milestone does not wire the result into the
+/// launch / compile path (Milestone 3 scope) — it only declares the
+/// resolver.
+pub fn resolve_runner(
+    bp: &Blueprint,
+    agent: &AgentDef,
+) -> Result<Option<Runner>, RunnerResolveError> {
+    // 1. inline — wins unconditionally.
+    if let Some(runner) = &agent.runner {
+        return Ok(Some(runner.clone()));
+    }
+
+    // 2. runner_ref → bp.runners lookup.
+    if let Some(ref_name) = &agent.runner_ref {
+        return match bp.runners.iter().find(|def| &def.name == ref_name) {
+            Some(def) => Ok(Some(def.runner.clone())),
+            None => Err(RunnerResolveError::UnknownRunnerRef {
+                agent: agent.name.clone(),
+                ref_name: ref_name.clone(),
+                available: bp.runners.iter().map(|d| d.name.clone()).collect(),
+            }),
+        };
+    }
+
+    // 3. legacy fallback (agent-level `profile.worker_binding`) — outranks
+    // `bp.default_runner` (tier 4).
+    if let Some(variant) = agent
+        .profile
+        .as_ref()
+        .and_then(|p| p.worker_binding.as_ref())
+    {
+        let tools = agent
+            .profile
+            .as_ref()
+            .map(|p| p.tools.clone())
+            .unwrap_or_default();
+        return Ok(Some(Runner::WsClaudeCode {
+            variant: variant.clone(),
+            tools,
+        }));
+    }
+
+    // 4. bp.default_runner → bp.runners lookup.
+    if let Some(ref_name) = &bp.default_runner {
+        return match bp.runners.iter().find(|def| &def.name == ref_name) {
+            Some(def) => Ok(Some(def.runner.clone())),
+            None => Err(RunnerResolveError::UnknownDefaultRunner {
+                ref_name: ref_name.clone(),
+                available: bp.runners.iter().map(|d| d.name.clone()).collect(),
+            }),
+        };
+    }
+
+    // 5. nothing declared through any tier.
+    Ok(None)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -988,6 +1205,8 @@ mod tests {
             "default_context_policy",
             "projection_placement",
             "audits",
+            "runners",
+            "default_runner",
         ] {
             assert!(props.contains_key(key), "missing property: {key}");
         }
@@ -1050,6 +1269,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 
@@ -1619,6 +1840,378 @@ mod tests {
         assert!(
             err.to_string().contains("unknown variant"),
             "expected an unknown-variant rejection, got: {err}"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GH #46 Milestone 2: `Runner`, `RunnerDef`, `WorkerModel`,
+    // `Blueprint.runners` / `default_runner`, `AgentDef.runner` /
+    // `runner_ref`, `resolve_runner`
+    // ──────────────────────────────────────────────────────────────
+
+    fn agent_with_runner(
+        name: &str,
+        profile: Option<AgentProfile>,
+        runner: Option<Runner>,
+        runner_ref: Option<String>,
+    ) -> AgentDef {
+        AgentDef {
+            name: name.to_string(),
+            kind: AgentKind::RustFn,
+            spec: serde_json::json!({ "fn_id": name }),
+            profile,
+            meta: None,
+            runner,
+            runner_ref,
+        }
+    }
+
+    fn ws_runner(variant: &str, tools: Vec<&str>) -> Runner {
+        Runner::WsClaudeCode {
+            variant: variant.to_string(),
+            tools: tools.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    fn agent_block_runner(tools: Vec<&str>) -> Runner {
+        Runner::AgentBlockInProcess {
+            tools: tools.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    // ─── round-trip byte-compat ─────────────────────────────────────
+
+    #[test]
+    fn blueprint_without_runners_or_default_runner_deserializes_to_defaults() {
+        let json = serde_json::json!({
+            "schema_version": current_schema_version(),
+            "id": "no-runners-ut",
+            "flow": { "kind": "seq", "children": [] },
+        });
+        let bp: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert!(bp.runners.is_empty());
+        assert_eq!(bp.default_runner, None);
+    }
+
+    #[test]
+    fn blueprint_runners_omitted_when_empty() {
+        let bp = minimal_bp(None);
+        let json = serde_json::to_value(&bp).expect("serializes");
+        assert!(
+            json.as_object().unwrap().get("runners").is_none(),
+            "runners key must be absent when empty: {json}"
+        );
+        let back: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert!(back.runners.is_empty());
+        assert_eq!(bp, back);
+    }
+
+    #[test]
+    fn blueprint_runners_roundtrips_when_non_empty() {
+        let mut bp = minimal_bp(None);
+        bp.runners = vec![RunnerDef {
+            name: "claude-worker".to_string(),
+            runner: ws_runner("mse-worker-coder", vec!["Read", "Grep"]),
+        }];
+        let json = serde_json::to_string(&bp).expect("serializes");
+        let back: Blueprint = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(bp, back);
+        assert_eq!(back.runners.len(), 1);
+        assert_eq!(back.runners[0].name, "claude-worker");
+    }
+
+    #[test]
+    fn blueprint_default_runner_roundtrips_when_some() {
+        let mut bp = minimal_bp(None);
+        bp.default_runner = Some("claude-worker".to_string());
+        let json = serde_json::to_value(&bp).expect("serializes");
+        assert_eq!(json["default_runner"], "claude-worker");
+        let back: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, bp);
+    }
+
+    #[test]
+    fn blueprint_default_runner_omitted_when_none() {
+        let bp = minimal_bp(None);
+        let json = serde_json::to_value(&bp).expect("serializes");
+        assert!(
+            json.as_object().unwrap().get("default_runner").is_none(),
+            "default_runner key must be absent when None: {json}"
+        );
+        let back: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, bp);
+    }
+
+    #[test]
+    fn blueprint_json_schema_exports_runners_and_default_runner() {
+        let schema = schemars::schema_for!(Blueprint);
+        let v = serde_json::to_value(&schema).expect("schema serializes");
+        assert!(
+            v["properties"]["runners"].is_object(),
+            "runners must appear in the exported schema: {v}"
+        );
+        assert!(
+            v["properties"]["default_runner"].is_object(),
+            "default_runner must appear in the exported schema: {v}"
+        );
+        let dump = v.to_string();
+        assert!(dump.contains("RunnerDef"), "RunnerDef definition in schema");
+        assert!(dump.contains("Runner"), "Runner definition in schema");
+    }
+
+    #[test]
+    fn agent_def_runner_and_runner_ref_omitted_when_none() {
+        let agent = agent_with_runner("scout", None, None, None);
+        let json = serde_json::to_value(&agent).expect("serializes");
+        let obj = json.as_object().unwrap();
+        assert!(
+            obj.get("runner").is_none(),
+            "runner key must be absent when None: {json}"
+        );
+        assert!(
+            obj.get("runner_ref").is_none(),
+            "runner_ref key must be absent when None: {json}"
+        );
+        let back: AgentDef = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, agent);
+    }
+
+    #[test]
+    fn agent_def_runner_inline_roundtrips_when_some() {
+        let agent = agent_with_runner("coder", None, Some(agent_block_runner(vec!["Bash"])), None);
+        let json = serde_json::to_string(&agent).expect("serializes");
+        let back: AgentDef = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, agent);
+    }
+
+    #[test]
+    fn agent_def_runner_ref_roundtrips_when_some() {
+        let agent = agent_with_runner("coder", None, None, Some("claude-worker".to_string()));
+        let json = serde_json::to_value(&agent).expect("serializes");
+        assert_eq!(json["runner_ref"], "claude-worker");
+        let back: AgentDef = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, agent);
+    }
+
+    #[test]
+    fn agent_def_json_schema_exports_runner_and_runner_ref() {
+        let schema = schemars::schema_for!(AgentDef);
+        let v = serde_json::to_value(&schema).expect("schema serializes");
+        let props = v["properties"].as_object().expect("object schema");
+        for key in ["runner", "runner_ref"] {
+            assert!(props.contains_key(key), "missing property: {key}");
+        }
+    }
+
+    #[test]
+    fn runner_ws_claude_code_roundtrips_through_json_and_tags_backend() {
+        let runner = ws_runner("mse-worker-coder", vec!["Read", "Grep"]);
+        let json = serde_json::to_value(&runner).expect("serializes");
+        assert_eq!(json["backend"], "ws_claude_code");
+        assert_eq!(json["variant"], "mse-worker-coder");
+        assert_eq!(json["tools"], serde_json::json!(["Read", "Grep"]));
+        let back: Runner = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, runner);
+    }
+
+    #[test]
+    fn runner_agent_block_in_process_roundtrips_through_json_and_tags_backend() {
+        let runner = agent_block_runner(vec!["Bash"]);
+        let json = serde_json::to_value(&runner).expect("serializes");
+        assert_eq!(json["backend"], "agent_block_in_process");
+        assert_eq!(json["tools"], serde_json::json!(["Bash"]));
+        let back: Runner = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, runner);
+    }
+
+    #[test]
+    fn runner_tools_omitted_when_empty() {
+        let runner = ws_runner("mse-worker-coder", vec![]);
+        let json = serde_json::to_value(&runner).expect("serializes");
+        assert!(
+            json.as_object().unwrap().get("tools").is_none(),
+            "tools key must be absent when empty: {json}"
+        );
+        let back: Runner = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, runner);
+    }
+
+    #[test]
+    fn runner_rejects_unknown_field() {
+        let json = serde_json::json!({
+            "backend": "ws_claude_code",
+            "variant": "x",
+            "not_a_real_field": true,
+        });
+        let err = serde_json::from_value::<Runner>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("not_a_real_field")
+                || err.to_string().contains("unknown field"),
+            "expected an unknown-field rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn runner_def_roundtrips_through_json() {
+        let def = RunnerDef {
+            name: "claude-worker".to_string(),
+            runner: ws_runner("mse-worker-coder", vec!["Read"]),
+        };
+        let json = serde_json::to_value(&def).expect("serializes");
+        let back: RunnerDef = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, def);
+    }
+
+    #[test]
+    fn worker_model_roundtrips_through_json() {
+        let model = WorkerModel {
+            runner: agent_block_runner(vec!["Bash"]),
+            agent: agent_with_runner("coder", None, None, None),
+        };
+        let json = serde_json::to_value(&model).expect("serializes");
+        let back: WorkerModel = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, model);
+    }
+
+    // ─── resolve_runner cascade precedence ─────────────────────────
+
+    #[test]
+    fn resolve_runner_inline_wins_over_everything() {
+        let inline = agent_block_runner(vec!["Bash"]);
+        let profile = AgentProfile {
+            worker_binding: Some("legacy-variant".to_string()),
+            tools: vec!["Read".to_string()],
+            ..Default::default()
+        };
+        let agent = agent_with_runner(
+            "coder",
+            Some(profile),
+            Some(inline.clone()),
+            Some("registry-entry".to_string()),
+        );
+        let mut bp = minimal_bp(None);
+        bp.default_runner = Some("registry-entry".to_string());
+        bp.runners = vec![RunnerDef {
+            name: "registry-entry".to_string(),
+            runner: ws_runner("other-variant", vec![]),
+        }];
+        bp.agents = vec![agent.clone()];
+
+        let resolved = resolve_runner(&bp, &agent).expect("resolves");
+        assert_eq!(resolved, Some(inline));
+    }
+
+    #[test]
+    fn resolve_runner_runner_ref_wins_over_legacy_fallback() {
+        let profile = AgentProfile {
+            worker_binding: Some("legacy-variant".to_string()),
+            tools: vec!["Read".to_string()],
+            ..Default::default()
+        };
+        let registry_runner = ws_runner("registry-variant", vec!["Grep"]);
+        let agent = agent_with_runner(
+            "coder",
+            Some(profile),
+            None,
+            Some("registry-entry".to_string()),
+        );
+        let mut bp = minimal_bp(None);
+        bp.runners = vec![RunnerDef {
+            name: "registry-entry".to_string(),
+            runner: registry_runner.clone(),
+        }];
+        bp.agents = vec![agent.clone()];
+
+        let resolved = resolve_runner(&bp, &agent).expect("resolves");
+        assert_eq!(resolved, Some(registry_runner));
+    }
+
+    #[test]
+    fn resolve_runner_legacy_fallback_wins_over_default_runner() {
+        let profile = AgentProfile {
+            worker_binding: Some("legacy-variant".to_string()),
+            tools: vec!["Read".to_string(), "Grep".to_string()],
+            ..Default::default()
+        };
+        let agent = agent_with_runner("coder", Some(profile), None, None);
+        let mut bp = minimal_bp(None);
+        bp.default_runner = Some("registry-entry".to_string());
+        bp.runners = vec![RunnerDef {
+            name: "registry-entry".to_string(),
+            runner: agent_block_runner(vec!["Bash"]),
+        }];
+        bp.agents = vec![agent.clone()];
+
+        let resolved = resolve_runner(&bp, &agent).expect("resolves");
+        assert_eq!(
+            resolved,
+            Some(ws_runner("legacy-variant", vec!["Read", "Grep"]))
+        );
+    }
+
+    #[test]
+    fn resolve_runner_default_runner_alone_when_no_agent_level_declaration() {
+        let agent = agent_with_runner("coder", None, None, None);
+        let mut bp = minimal_bp(None);
+        bp.default_runner = Some("registry-entry".to_string());
+        bp.runners = vec![RunnerDef {
+            name: "registry-entry".to_string(),
+            runner: agent_block_runner(vec!["Bash"]),
+        }];
+        bp.agents = vec![agent.clone()];
+
+        let resolved = resolve_runner(&bp, &agent).expect("resolves");
+        assert_eq!(resolved, Some(agent_block_runner(vec!["Bash"])));
+    }
+
+    #[test]
+    fn resolve_runner_none_when_nothing_declared_through_any_tier() {
+        let agent = agent_with_runner("coder", None, None, None);
+        let bp = minimal_bp(None);
+
+        let resolved = resolve_runner(&bp, &agent).expect("resolves");
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_runner_unknown_runner_ref_errs() {
+        let agent = agent_with_runner("coder", None, None, Some("no-such-entry".to_string()));
+        let mut bp = minimal_bp(None);
+        bp.runners = vec![RunnerDef {
+            name: "registry-entry".to_string(),
+            runner: agent_block_runner(vec![]),
+        }];
+        bp.agents = vec![agent.clone()];
+
+        let err = resolve_runner(&bp, &agent).expect_err("unresolved runner_ref");
+        assert_eq!(
+            err,
+            RunnerResolveError::UnknownRunnerRef {
+                agent: "coder".to_string(),
+                ref_name: "no-such-entry".to_string(),
+                available: vec!["registry-entry".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_runner_unknown_default_runner_errs() {
+        let agent = agent_with_runner("coder", None, None, None);
+        let mut bp = minimal_bp(None);
+        bp.default_runner = Some("no-such-entry".to_string());
+        bp.runners = vec![RunnerDef {
+            name: "registry-entry".to_string(),
+            runner: agent_block_runner(vec![]),
+        }];
+        bp.agents = vec![agent.clone()];
+
+        let err = resolve_runner(&bp, &agent).expect_err("unresolved default_runner");
+        assert_eq!(
+            err,
+            RunnerResolveError::UnknownDefaultRunner {
+                ref_name: "no-such-entry".to_string(),
+                available: vec!["registry-entry".to_string()],
+            }
         );
     }
 }

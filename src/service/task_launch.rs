@@ -680,8 +680,8 @@ mod tests {
     use super::*;
     use crate::blueprint::compiler::{RustFnInProcessSpawnerFactory, SpawnerRegistry};
     use crate::blueprint::{
-        current_schema_version, AgentDef, AgentKind, AgentMeta, BlueprintMetadata, CompilerHints,
-        CompilerStrategy, MetaDef,
+        current_schema_version, resolve_runner, AgentDef, AgentKind, AgentMeta, AgentProfile,
+        BlueprintMetadata, CompilerHints, CompilerStrategy, MetaDef, Runner,
     };
     use crate::core::config::EngineCfg;
     use crate::worker::adapter::{WorkerError, WorkerResult};
@@ -709,6 +709,8 @@ mod tests {
             spec: json!({ "fn_id": fn_id }),
             profile: None,
             meta: Some(AgentMeta::default()),
+            runner: None,
+            runner_ref: None,
         }
     }
 
@@ -740,6 +742,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 
@@ -1379,6 +1383,8 @@ mod tests {
             spec: json!({ "fn_id": fn_id }),
             profile: None,
             meta: Some(meta),
+            runner: None,
+            runner_ref: None,
         }
     }
 
@@ -1576,5 +1582,76 @@ mod tests {
             Some(&json!({ "work_dir": "/inline-only" })),
             "an unresolved meta_ref must never panic; the agent's own inline ctx still applies"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #46 Milestone 2 Done Criteria #3 (semantics-match): `resolve_runner`
+    // ──────────────────────────────────────────────────────────────────
+
+    /// `resolve_runner` (in `mlua-swarm-schema`) must synthesize the exact
+    /// same `(variant, tools)` pair `derive_worker_bindings` does today for
+    /// every agent whose Runner comes solely from the legacy
+    /// `AgentProfile.worker_binding` fallback (tier 3 of the cascade) — a
+    /// machine-checked guard against the two paths silently drifting apart
+    /// once a future change touches one but forgets the other, mirroring
+    /// `crate::core::explain`'s
+    /// `explain_agent_ctx_matches_derive_agent_ctx_semantics` drift guard.
+    /// This is a read-only cross-check: it exercises the schema crate's
+    /// pure resolver against real Blueprints, without touching the launch
+    /// path itself (Milestone 3 scope).
+    #[test]
+    fn resolve_runner_legacy_fallback_matches_derive_worker_bindings_semantics() {
+        fn legacy_agent(name: &str, variant: &str, tools: Vec<&str>) -> AgentDef {
+            AgentDef {
+                name: name.to_string(),
+                kind: AgentKind::Operator,
+                spec: json!({}),
+                profile: Some(AgentProfile {
+                    worker_binding: Some(variant.to_string()),
+                    tools: tools.into_iter().map(str::to_string).collect(),
+                    ..Default::default()
+                }),
+                meta: None,
+                runner: None,
+                runner_ref: None,
+            }
+        }
+
+        let blueprint = bp(
+            step("planner", path("$.in"), path("$.out")),
+            vec![
+                legacy_agent("planner", "mse-worker-planner", vec!["Read", "Grep"]),
+                legacy_agent("coder", "mse-worker-coder", vec![]),
+                agent("no-binding", "echo"),
+            ],
+        );
+
+        let derived = derive_worker_bindings(&blueprint);
+
+        for agent_def in &blueprint.agents {
+            let resolved = resolve_runner(&blueprint, agent_def).expect("no unresolved refs");
+            match derived.get(&agent_def.name) {
+                Some(binding) => {
+                    assert_eq!(
+                        resolved,
+                        Some(Runner::WsClaudeCode {
+                            variant: binding.variant.clone(),
+                            tools: binding.tools.clone(),
+                        }),
+                        "resolve_runner must synthesize the same WsClaudeCode Runner \
+                         derive_worker_bindings produces for agent '{}'",
+                        agent_def.name
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        resolved, None,
+                        "agent '{}' has no derive_worker_bindings entry, so resolve_runner \
+                         must resolve to None too (no other tier declared)",
+                        agent_def.name
+                    );
+                }
+            }
+        }
     }
 }

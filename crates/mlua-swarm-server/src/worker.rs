@@ -1460,6 +1460,8 @@ mod tests {
                     projection_name: Some("plan-out".to_string()),
                     ..Default::default()
                 }),
+                runner: None,
+                runner_ref: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -1475,6 +1477,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 

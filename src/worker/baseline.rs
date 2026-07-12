@@ -84,6 +84,8 @@ mod tests {
             spec: json!({ "fn_id": AG_IDENTITY }),
             profile: None,
             meta: None,
+            runner: None,
+            runner_ref: None,
         };
         factory
             .build(&agent_def, None)

@@ -157,6 +157,8 @@ mod tests {
             spec: json!({ "fn_id": name }),
             profile: None,
             meta,
+            runner: None,
+            runner_ref: None,
         }
     }
 
@@ -184,6 +186,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 

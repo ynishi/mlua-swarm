@@ -240,6 +240,55 @@ The same rule applies to the more general `$file` ref (`{"$file": "path"}`),
 which substitutes a referenced file's raw string contents anywhere in the
 JSON tree (e.g. externalizing a large prompt out of a `Step.in` literal).
 
+### Runners (GH #46): `Blueprint.runners` / `AgentDef.runner` / `runner_ref`
+
+A `Runner` declares the execution shell an agent's Worker IMPL dispatches
+into — tool grant, model selection, and runtime capabilities for the
+backend it targets. Two variants exist today: `ws_claude_code` (Claude
+Code subagent wrapper; `variant` = the wrapper's `subagent_type`, `tools`
+mirrors the wrapper frontmatter) and `agent_block_in_process`
+(agent-block in-process runtime; `tools` is the effective, enforced tool
+set). `AgentDef.kind = agent_block` pairs with an `agent_block_in_process`
+Runner; every other `AgentDef.kind` pairs with `ws_claude_code`.
+
+Runners are declared through a named, BP-level registry
+(`Blueprint.runners: [{ "name": ..., "runner": {...} }]`) — the same
+registry shape as `Blueprint.metas` — and resolved per-agent through a
+5-tier cascade (highest priority first):
+
+1. `AgentDef.runner` — an inline `Runner` object on the agent itself.
+2. `AgentDef.runner_ref` — a name looked up in `Blueprint.runners`.
+3. Legacy fallback: `profile.worker_binding` synthesizes a
+   `ws_claude_code` Runner from `{ variant: worker_binding, tools:
+   profile.tools }` — **deprecated, kept for one release cycle** while
+   Blueprints migrate onto `runner` / `runner_ref`.
+4. `Blueprint.default_runner` — a BP-wide registry name, used only when
+   no tier above (1–3) applies to this agent.
+5. No Runner declared through any tier — the agent has none.
+
+Note tier 3 outranks tier 4: an agent's own `profile.worker_binding`
+still wins over the Blueprint's `default_runner`, mirroring the
+`AgentInline > MetaRef > BpGlobal` precedence the ctx-supply cascade
+already follows (agent-level declarations always beat BP-global ones).
+
+```jsonc
+{
+  "runners": [
+    { "name": "claude-worker", "runner": {
+        "backend": "ws_claude_code", "variant": "mse-worker-coder", "tools": ["Read", "Edit"]
+    } }
+  ],
+  "default_runner": "claude-worker",
+  "agents": [
+    { "name": "coder", "kind": "operator", "spec": { "operator_ref": "role-a" }, "runner_ref": "claude-worker" }
+  ]
+}
+```
+
+This Milestone (M2) only adds the schema, registry, and resolver — wiring
+the resolved Runner into the launch path is a later Milestone; today's
+launch path still reads `profile.worker_binding` directly.
+
 ## Versioning
 
 `metadata.version_label` is an optional free-form SemVer string (e.g.

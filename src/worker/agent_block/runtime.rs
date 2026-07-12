@@ -749,6 +749,8 @@ mod tests {
                 ..Default::default()
             }),
             meta: None,
+            runner: None,
+            runner_ref: None,
         };
         let _spawner = factory.build(&ad, None).expect("factory build");
         // = ScriptSource::Inline path (self-hosted invoker, mcp_servers embed);
@@ -773,6 +775,8 @@ mod tests {
                 ..Default::default()
             }),
             meta: None,
+            runner: None,
+            runner_ref: None,
         };
         let _spawner = factory.build(&ad, None).expect("factory build");
         // = ScriptSource::Path path; caller-provided script; host_handler single sink.

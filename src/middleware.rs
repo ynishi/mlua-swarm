@@ -1224,6 +1224,8 @@ mod after_run_audit_tests {
             spec: serde_json::json!({ "fn_id": fn_id }),
             profile: None,
             meta: None,
+            runner: None,
+            runner_ref: None,
         }
     }
 
@@ -1254,6 +1256,8 @@ mod after_run_audit_tests {
             projection_placement: None,
             audits,
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 

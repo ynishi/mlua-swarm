@@ -581,6 +581,8 @@ mod tests {
                 spec: serde_json::json!({"fn_id": mlua_swarm::worker::baseline::AG_IDENTITY}),
                 profile: None,
                 meta: None,
+                runner: None,
+                runner_ref: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -596,6 +598,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 
@@ -1172,6 +1176,8 @@ mod tests {
                 spec: serde_json::json!({"fn_id": mlua_swarm::worker::baseline::AG_IDENTITY}),
                 profile: None,
                 meta: None,
+                runner: None,
+                runner_ref: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -1187,6 +1193,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 

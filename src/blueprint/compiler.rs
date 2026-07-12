@@ -1296,6 +1296,8 @@ mod operator_spawner_factory_worker_binding_tests {
             spec: serde_json::json!({ "operator_ref": "op1" }),
             profile,
             meta: None,
+            runner: None,
+            runner_ref: None,
         }
     }
 
@@ -1390,6 +1392,8 @@ mod lua_inline_source_tests {
             spec,
             profile: None,
             meta: None,
+            runner: None,
+            runner_ref: None,
         }
     }
 
@@ -1507,6 +1511,8 @@ mod meta_ref_validation_tests {
             spec: serde_json::json!({ "fn_id": "echo" }),
             profile: None,
             meta: None,
+            runner: None,
+            runner_ref: None,
         }
     }
 
@@ -1540,6 +1546,8 @@ mod meta_ref_validation_tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 
@@ -1680,6 +1688,8 @@ mod audit_agent_validation_tests {
             spec: serde_json::json!({ "fn_id": "echo" }),
             profile: None,
             meta: None,
+            runner: None,
+            runner_ref: None,
         }
     }
 
@@ -1711,6 +1721,8 @@ mod audit_agent_validation_tests {
             projection_placement: None,
             audits,
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 
@@ -1795,6 +1807,8 @@ mod projection_placement_compile_tests {
                 spec: serde_json::json!({ "fn_id": "echo" }),
                 profile: None,
                 meta: None,
+                runner: None,
+                runner_ref: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -1810,6 +1824,8 @@ mod projection_placement_compile_tests {
             projection_placement,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 

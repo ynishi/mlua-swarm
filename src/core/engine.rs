@@ -3207,6 +3207,8 @@ mod submit_time_projection_sink_tests {
                     projection_name: Some(canonical.to_string()),
                     ..Default::default()
                 }),
+                runner: None,
+                runner_ref: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -3222,6 +3224,8 @@ mod submit_time_projection_sink_tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         };
         let (naming, warnings) = StepNaming::from_blueprint(&bp).expect("no collision");
         assert!(warnings.is_empty(), "single-step fixture has no collisions");

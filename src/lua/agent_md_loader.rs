@@ -223,6 +223,13 @@ pub fn parse(text: &str, source_label: &str, kind: AgentKind) -> Result<AgentDef
         spec: Value::Null,
         profile: Some(profile),
         meta: None,
+        // GH #46 M2: `agent.md` frontmatter parsing for `runner` /
+        // `runner_ref` is not part of this Milestone (schema + resolver
+        // + validation only); the legacy `profile.worker_binding` path
+        // above remains the sole source until a later Milestone wires
+        // frontmatter authoring for the new tier.
+        runner: None,
+        runner_ref: None,
     })
 }
 

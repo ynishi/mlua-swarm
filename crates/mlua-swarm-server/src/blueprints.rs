@@ -17,6 +17,7 @@ use mlua_swarm::blueprint::{default_global_agent_kind, AgentKind, Blueprint};
 use mlua_swarm::core::explain::{explain_agent_ctx, CtxTier};
 use mlua_swarm::core::step_naming::StepNaming;
 use mlua_swarm::operator::render::template_variables;
+use mlua_swarm_schema::{resolve_runner, Runner};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -445,6 +446,55 @@ struct ExplainOutput {
     parts_note: String,
 }
 
+/// `runner` field of [`ExplainAgentResponse`] (GH #46 Milestone 2) — the
+/// Runner-tier doctor diagnostics for this agent. Read-only and purely
+/// observational: nothing here gates compilation or dispatch (Milestone 3
+/// wires the resolved Runner into the launch path; this endpoint stays a
+/// diagnostic view), the same "surface it, never block"
+/// BLOCK-disabled-by-default convention `bp_doctor`'s agent-md size check
+/// already follows.
+#[derive(Debug, Serialize)]
+struct ExplainRunner {
+    /// The Runner this agent resolves to via `resolve_runner`'s 5-tier
+    /// cascade, when resolution succeeds. `None` when no tier declares a
+    /// Runner (byte-compat: an agent with no `runner` / `runner_ref` /
+    /// `profile.worker_binding` / `Blueprint.default_runner` resolves to
+    /// `None` here, mirroring [`ExplainAgentResponse::worker_binding`]).
+    resolved: Option<Runner>,
+    /// Error-level finding: `Some(msg)` when `resolve_runner` returned an
+    /// unresolved `runner_ref` / `default_runner` reference
+    /// (`RunnerResolveError`, rendered via its `Display`).
+    error: Option<String>,
+    /// Warn-level finding: `Some(msg)` when the resolved Runner's backend
+    /// disagrees with `AgentDef.kind` (`agent_block_in_process` paired
+    /// with a non-`agent_block` kind, or `ws_claude_code` paired with
+    /// `agent_block`). `None` when the pairing is consistent, or when
+    /// [`Self::resolved`] is `None`.
+    warning: Option<String>,
+}
+
+/// GH #46 M2 doctor check: does the resolved Runner's backend agree with
+/// `AgentDef.kind` about which backend actually executes this agent? Pure
+/// and read-only, never gates compile / dispatch (see [`ExplainRunner`]'s
+/// doc).
+fn runner_kind_mismatch_warning(
+    runner: &Runner,
+    kind: &AgentKind,
+    agent_name: &str,
+) -> Option<String> {
+    match (runner, kind) {
+        (Runner::AgentBlockInProcess { .. }, AgentKind::AgentBlock) => None,
+        (Runner::AgentBlockInProcess { .. }, other) => Some(format!(
+            "agent '{agent_name}' resolves to Runner::AgentBlockInProcess but AgentDef.kind = \
+             {other:?} (expected AgentBlock)"
+        )),
+        (Runner::WsClaudeCode { .. }, AgentKind::AgentBlock) => Some(format!(
+            "agent '{agent_name}' resolves to Runner::WsClaudeCode but AgentDef.kind = AgentBlock"
+        )),
+        (Runner::WsClaudeCode { .. }, _) => None,
+    }
+}
+
 /// Response body for `GET /v1/blueprints/:id/agents/:agent/explain`.
 #[derive(Debug, Serialize)]
 struct ExplainAgentResponse {
@@ -456,6 +506,8 @@ struct ExplainAgentResponse {
     worker_binding: Option<ExplainWorkerBinding>,
     /// `Some(reason)` when [`Self::worker_binding`] is `None`.
     binding_note: Option<String>,
+    /// GH #46 M2 — Runner-tier doctor diagnostics (see [`ExplainRunner`]).
+    runner: ExplainRunner,
     /// The agent's declared (informational-only) tool list.
     declared_tools: ExplainDeclaredTools,
     /// The rendered-template diagnostics, when `profile.system_prompt` is
@@ -563,6 +615,28 @@ async fn explain_agent(
             .to_string(),
     };
 
+    // GH #46 M2 doctor checks: unresolved runner_ref / default_runner is
+    // an error-level finding; a resolved-but-mismatched backend/kind pair
+    // is a warn-level finding. Both are purely observational (see
+    // `ExplainRunner`'s doc) — this never gates compile / dispatch.
+    let runner = match resolve_runner(&bp, agent_def) {
+        Ok(resolved) => {
+            let warning = resolved
+                .as_ref()
+                .and_then(|r| runner_kind_mismatch_warning(r, &agent_def.kind, &agent_def.name));
+            ExplainRunner {
+                resolved,
+                error: None,
+                warning,
+            }
+        }
+        Err(e) => ExplainRunner {
+            resolved: None,
+            error: Some(e.to_string()),
+            warning: None,
+        },
+    };
+
     let system_prompt = profile
         .filter(|p| !p.system_prompt.is_empty())
         .map(|p| explain_system_prompt(&p.system_prompt));
@@ -619,6 +693,7 @@ async fn explain_agent(
         },
         worker_binding,
         binding_note,
+        runner,
         declared_tools,
         system_prompt,
         effective_ctx,
@@ -769,6 +844,8 @@ mod explain_agent_tests {
             spec: json!({ "fn_id": name }),
             profile,
             meta,
+            runner: None,
+            runner_ref: None,
         }
     }
 
@@ -807,6 +884,8 @@ mod explain_agent_tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 
@@ -983,6 +1062,107 @@ mod explain_agent_tests {
         assert!(sp.template_syntax_error.is_some());
     }
 
+    // ─── GH #46 M2: `runner` doctor checks (unknown ref error / backend↔kind mismatch warn) ───
+
+    #[tokio::test]
+    async fn runner_resolves_from_legacy_worker_binding_when_nothing_else_declared() {
+        let profile = AgentProfile {
+            worker_binding: Some("mse-worker-knowledge".to_string()),
+            tools: vec!["Read".to_string()],
+            ..Default::default()
+        };
+        let bp = single_step_bp(
+            "explain-runner-legacy-bp",
+            "scout",
+            Some(profile),
+            None,
+            None,
+        );
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let resp = explain_agent(
+            State(state_with(store)),
+            Path(("explain-runner-legacy-bp".to_string(), "scout".to_string())),
+        )
+        .await
+        .expect("explain_agent")
+        .0;
+
+        assert_eq!(
+            resp.runner.resolved,
+            Some(mlua_swarm_schema::Runner::WsClaudeCode {
+                variant: "mse-worker-knowledge".to_string(),
+                tools: vec!["Read".to_string()],
+            })
+        );
+        assert!(resp.runner.error.is_none());
+        assert!(resp.runner.warning.is_none());
+    }
+
+    #[tokio::test]
+    async fn runner_reports_unresolved_runner_ref_as_error_level_finding() {
+        let mut bp = single_step_bp("explain-runner-unresolved-bp", "scout", None, None, None);
+        bp.agents[0].runner_ref = Some("no-such-entry".to_string());
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let resp = explain_agent(
+            State(state_with(store)),
+            Path((
+                "explain-runner-unresolved-bp".to_string(),
+                "scout".to_string(),
+            )),
+        )
+        .await
+        .expect("explain_agent")
+        .0;
+
+        assert!(resp.runner.resolved.is_none());
+        let error = resp.runner.error.expect("error-level finding present");
+        assert!(
+            error.contains("no-such-entry"),
+            "error must name the unresolved runner_ref: {error}"
+        );
+        assert!(resp.runner.warning.is_none());
+    }
+
+    #[tokio::test]
+    async fn runner_reports_backend_kind_mismatch_as_warn_level_finding() {
+        // `AgentDef.kind = RustFn` (via `single_step_bp`'s `agent_def` helper)
+        // paired with an `agent_block_in_process` Runner is the documented
+        // mismatch (Design §6: "backend ↔ kind mismatch").
+        let mut bp = single_step_bp("explain-runner-mismatch-bp", "scout", None, None, None);
+        bp.runners = vec![mlua_swarm_schema::RunnerDef {
+            name: "in-process".to_string(),
+            runner: mlua_swarm_schema::Runner::AgentBlockInProcess {
+                tools: vec!["Bash".to_string()],
+            },
+        }];
+        bp.agents[0].runner_ref = Some("in-process".to_string());
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let resp = explain_agent(
+            State(state_with(store)),
+            Path((
+                "explain-runner-mismatch-bp".to_string(),
+                "scout".to_string(),
+            )),
+        )
+        .await
+        .expect("explain_agent")
+        .0;
+
+        assert!(resp.runner.resolved.is_some());
+        assert!(resp.runner.error.is_none());
+        let warning = resp.runner.warning.expect("warn-level finding present");
+        assert!(
+            warning.contains("AgentBlockInProcess") && warning.contains("RustFn"),
+            "warning must name both the resolved backend and the mismatched kind: {warning}"
+        );
+    }
+
     // ─── GH #47: batch summary sweep (explain_agents_batch) ────────────
 
     /// A 3-agent Blueprint whose flow only dispatches `bound_agent` — the
@@ -1028,6 +1208,8 @@ mod explain_agent_tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 
@@ -1115,6 +1297,8 @@ mod explain_agent_tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         };
         let store = InMemoryBlueprintStore::new();
         seed(&store, &bp).await;

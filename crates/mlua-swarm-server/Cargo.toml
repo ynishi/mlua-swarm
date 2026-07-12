@@ -12,6 +12,10 @@ description = "HTTP + WebSocket server for mlua-swarm (task API, Blueprint store
 keywords = ["swarm", "lua", "mcp", "http", "websocket"]
 categories = ["asynchronous", "web-programming::websocket"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 mlua-swarm.workspace = true
 mlua-swarm-schema.workspace = true

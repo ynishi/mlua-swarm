@@ -2665,6 +2665,8 @@ mod tests {
                 spec: serde_json::json!({"fn_id": AG_IDENTITY}),
                 profile: None,
                 meta: Some(AgentMeta::default()),
+                runner: None,
+                runner_ref: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -2687,6 +2689,8 @@ mod tests {
             projection_placement: None,
             audits: vec![],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         }
     }
 
@@ -4137,6 +4141,8 @@ mod tests {
                     spec: serde_json::json!({"fn_id": "echo"}),
                     profile: None,
                     meta: Some(AgentMeta::default()),
+                    runner: None,
+                    runner_ref: None,
                 },
                 AgentDef {
                     name: "auditor".into(),
@@ -4144,6 +4150,8 @@ mod tests {
                     spec: serde_json::json!({"fn_id": "audit-fn"}),
                     profile: None,
                     meta: Some(AgentMeta::default()),
+                    runner: None,
+                    runner_ref: None,
                 },
             ],
             operators: vec![],
@@ -4164,6 +4172,8 @@ mod tests {
                 mode: AuditMode::Sync,
             }],
             degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
         };
 
         let client = reqwest::Client::new();
