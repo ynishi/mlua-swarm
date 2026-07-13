@@ -30,6 +30,7 @@ use mlua_swarm::core::state::{CapTokenRecord, TaskSpec, TaskState};
 use mlua_swarm::{CapToken, Role, StepId};
 use mlua_swarm_schema::{VerdictChannel, VerdictContract};
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// Seeds a `Pending` task bound to `agent`, mints a short worker handle
 /// for it, and returns the handle.
@@ -74,6 +75,47 @@ async fn seed_task_with_handle(engine: &Engine, task_id: &StepId, agent: &str) -
         .await
         .expect("seed_task_with_handle");
     handle
+}
+
+/// GH #51 — seeds a `Pending` task bound to `agent` and mints + registers
+/// a properly HMAC-signed `Role::Worker` `CapToken` for it, returning the
+/// token itself (not a handle). `POST /v1/worker/result`'s
+/// `decode_worker_bearer` requires a full encoded `CapToken` — unlike
+/// `worker_submit`/`worker_artifact`'s short-handle Bearer support (what
+/// [`seed_task_with_handle`] mints), so this is a distinct helper rather
+/// than a variant of that one.
+async fn seed_task_with_token(engine: &Engine, task_id: &StepId, agent: &str) -> CapToken {
+    let task_id_for_state = task_id.clone();
+    let agent_for_state = agent.to_string();
+    engine
+        .with_state("test.seed_task_with_token", move |s| {
+            let task = TaskState::new(
+                task_id_for_state.clone(),
+                TaskSpec {
+                    agent: agent_for_state,
+                    initial_directive: serde_json::json!("x"),
+                    step_ctx: None,
+                },
+            );
+            s.tasks.insert(task_id_for_state.clone(), task);
+        })
+        .await
+        .expect("seed_task_with_token");
+    let token = engine.signer().session(
+        agent.to_string(),
+        Role::Worker,
+        vec!["*".to_string()],
+        Duration::from_secs(600),
+    );
+    let fp = token.fingerprint();
+    let record = CapTokenRecord::from_worker_token(token.clone(), task_id.clone());
+    engine
+        .with_state("test.register_token", move |s| {
+            s.tokens.insert(fp, record);
+        })
+        .await
+        .expect("register token");
+    token
 }
 
 /// Starts a real HTTP server for `engine` on an ephemeral port and
@@ -233,6 +275,170 @@ async fn worker_submit_without_a_declared_contract_is_unaffected() {
         .post(format!("{base_url}/v1/worker/submit"))
         .header("Authorization", format!("Bearer {handle}"))
         .body("anything at all, no contract to violate")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+}
+
+// ─── GH #51 — completion-time verdict-contract enforcement (follow-up to
+// the above GH #50 submit-time cases): part-presence at completion, and
+// gate coverage on `POST /v1/worker/result` (route 2 of 3) ────────────────
+
+/// Route 1 (`POST /v1/worker/submit`), part-presence at completion: a
+/// `channel: "part"` contract agent completes via a plain submit WITHOUT
+/// ever staging a `"verdict"` part — rejected with HTTP 422 naming the
+/// missing part, before the pre-GH-#51 bypass this closes (the old
+/// submit-time gate only checked `channel: "body"`, never part
+/// PRESENCE).
+#[tokio::test]
+async fn worker_submit_rejects_missing_verdict_part_when_channel_is_part() {
+    let engine = Engine::new(EngineCfg::default());
+    engine.register_verdict_contracts(HashMap::from([(
+        "gate".to_string(),
+        part_contract(&["PASS", "BLOCKED"]),
+    )]));
+    let task_id = StepId::new();
+    let handle = seed_task_with_handle(&engine, &task_id, "gate").await;
+    let base_url = spawn_server(engine).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base_url}/v1/worker/submit"))
+        .header("Authorization", format!("Bearer {handle}"))
+        .body("a full report, never staged as a verdict part")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    let error = body["error"].as_str().expect("error string");
+    assert!(
+        error.contains("verdict"),
+        "error should name the missing part: {error}"
+    );
+}
+
+/// Route 1 — `ok=false` bypasses the completion-time check entirely,
+/// regardless of channel or membership. A `channel: "body"` contract
+/// declaring `["PASS", "BLOCKED"]` would reject `"UNKNOWN"` under
+/// `ok=true` (Case 1 above); with `ok=false` the same value completes.
+#[tokio::test]
+async fn worker_submit_ok_false_bypasses_the_gate_regardless_of_value() {
+    let engine = Engine::new(EngineCfg::default());
+    engine.register_verdict_contracts(HashMap::from([(
+        "gate".to_string(),
+        body_contract(&["PASS", "BLOCKED"]),
+    )]));
+    let task_id = StepId::new();
+    let handle = seed_task_with_handle(&engine, &task_id, "gate").await;
+    let base_url = spawn_server(engine).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base_url}/v1/worker/submit?ok=false"))
+        .header("Authorization", format!("Bearer {handle}"))
+        .body("UNKNOWN")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+}
+
+/// Route 2 (`POST /v1/worker/result`), part-presence at completion: this
+/// route called no gate at all pre-GH-#51 — a `channel: "part"` contract
+/// agent completing here without ever staging `"verdict"` is now
+/// rejected with HTTP 422 naming the missing part.
+#[tokio::test]
+async fn worker_result_rejects_missing_verdict_part_when_channel_is_part() {
+    let engine = Engine::new(EngineCfg::default());
+    engine.register_verdict_contracts(HashMap::from([(
+        "gate".to_string(),
+        part_contract(&["PASS", "BLOCKED"]),
+    )]));
+    let task_id = StepId::new();
+    let token = seed_task_with_token(&engine, &task_id, "gate").await;
+    let base_url = spawn_server(engine).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base_url}/v1/worker/result"))
+        .header("Authorization", format!("Bearer {}", token.encode()))
+        .json(&serde_json::json!({
+            "task_id": task_id.as_str(),
+            "value": "a full report, never staged as a verdict part",
+            "ok": true,
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    let error = body["error"].as_str().expect("error string");
+    assert!(
+        error.contains("verdict"),
+        "error should name the missing part: {error}"
+    );
+}
+
+/// Route 2 — a `channel: "body"` contract's completing value is NOT a
+/// member of `values`: this route called no gate at all pre-GH-#51 —
+/// closes the gap this subtask's acceptance criteria describes for
+/// routes 2 and 3.
+#[tokio::test]
+async fn worker_result_rejects_body_value_outside_contract() {
+    let engine = Engine::new(EngineCfg::default());
+    engine.register_verdict_contracts(HashMap::from([(
+        "gate".to_string(),
+        body_contract(&["PASS", "BLOCKED"]),
+    )]));
+    let task_id = StepId::new();
+    let token = seed_task_with_token(&engine, &task_id, "gate").await;
+    let base_url = spawn_server(engine).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base_url}/v1/worker/result"))
+        .header("Authorization", format!("Bearer {}", token.encode()))
+        .json(&serde_json::json!({
+            "task_id": task_id.as_str(),
+            "value": "UNKNOWN",
+            "ok": true,
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    let error = body["error"].as_str().expect("error string");
+    assert!(
+        error.contains("PASS") && error.contains("BLOCKED"),
+        "error should echo declared values: {error}"
+    );
+}
+
+/// Route 2 — `ok=false` bypasses the completion-time check entirely,
+/// regardless of channel or membership.
+#[tokio::test]
+async fn worker_result_ok_false_bypasses_the_gate_regardless_of_value() {
+    let engine = Engine::new(EngineCfg::default());
+    engine.register_verdict_contracts(HashMap::from([(
+        "gate".to_string(),
+        body_contract(&["PASS", "BLOCKED"]),
+    )]));
+    let task_id = StepId::new();
+    let token = seed_task_with_token(&engine, &task_id, "gate").await;
+    let base_url = spawn_server(engine).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base_url}/v1/worker/result"))
+        .header("Authorization", format!("Bearer {}", token.encode()))
+        .json(&serde_json::json!({
+            "task_id": task_id.as_str(),
+            "value": "UNKNOWN",
+            "ok": false,
+        }))
         .send()
         .await
         .expect("request");

@@ -108,4 +108,32 @@ pub enum EngineError {
     /// write, both via `tokio::fs`).
     #[error("system_ref store write failed: {0}")]
     SystemRefWrite(#[from] std::io::Error),
+
+    /// GH #51 — completion-time verdict-contract enforcement: a
+    /// `channel: "body"` contract's completing value (or a `channel:
+    /// "part"` contract's staged `"verdict"` artifact value) is not a
+    /// member of the declared `values` set. Raised by the shared
+    /// completion-check embedded inside `Engine::submit_worker_result_trusted`
+    /// / `Engine::submit_output` — the single choke point every
+    /// completion route passes through.
+    #[error(
+        "verdict contract violation: {value:?} is not a member of the declared values {allowed:?}"
+    )]
+    VerdictValueRejected {
+        /// The value that failed membership.
+        value: String,
+        /// The contract's declared token set.
+        allowed: Vec<String>,
+    },
+
+    /// GH #51 — completion-time verdict-contract enforcement: a
+    /// `channel: "part"` contract's attempt completed without ever
+    /// staging a `"verdict"` artifact (presence, not just membership, is
+    /// checked at completion — the staging-time check only covers
+    /// membership for parts that WERE staged).
+    #[error("verdict contract violation: no staged \"verdict\" part found for this attempt; declared values {allowed:?}")]
+    VerdictPartMissing {
+        /// The contract's declared token set.
+        allowed: Vec<String>,
+    },
 }
