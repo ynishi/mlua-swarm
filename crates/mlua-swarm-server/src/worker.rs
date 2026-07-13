@@ -72,7 +72,7 @@ use axum::{
 use mlua_swarm::core::agent_context::StepPointer;
 use mlua_swarm::core::step_naming::StepNaming;
 use mlua_swarm::store::run::{DegradationEntry, RunStatus, RunStoreError};
-use mlua_swarm::{CapToken, ContentRef, OutputEvent, RunId, StepId, WorkerPayload};
+use mlua_swarm::{CapToken, ContentRef, EngineError, OutputEvent, RunId, StepId, WorkerPayload};
 use mlua_swarm_schema::{ContextPolicy, VerdictChannel};
 use serde::Deserialize;
 use serde_json::Value;
@@ -302,11 +302,17 @@ pub async fn worker_result(
         },
         ok: req.ok,
     };
-    state
-        .engine
-        .submit_output(&token, &task_id, attempt, event)
-        .await
-        .map_err(|e| ApiError::engine(format!("submit_output: {e}")))?;
+    // GH #51: completion-time verdict-contract enforcement now runs
+    // inside `Engine::submit_output` itself (see
+    // `map_completion_result`'s doc) — this route previously called no
+    // gate at all.
+    map_completion_result(
+        state
+            .engine
+            .submit_output(&token, &task_id, attempt, event)
+            .await,
+        "submit_output",
+    )?;
     state
         .engine
         .post_result(&token, &task_id, req.value)
@@ -513,6 +519,34 @@ async fn check_verdict_contract(
     )))
 }
 
+/// GH #51 — maps the 2 completion-time verdict-contract `EngineError`
+/// variants (raised by the embedded choke point inside
+/// `Engine::submit_worker_result_trusted` / `Engine::submit_output`) to
+/// their `422` HTTP shape; every other `EngineError` variant falls back
+/// to the pre-existing generic `500` `ApiError::engine` wrapping,
+/// unchanged. Shared by [`worker_submit`] and [`worker_result`] — both
+/// routes surface the SAME embedded engine-side check, so their
+/// HTTP-layer error translation is identical too (this is HTTP
+/// status-code translation, not the verdict-contract logic itself, which
+/// stays the single engine-side choke point per GH #51's "not duplicated
+/// into each route handler" constraint).
+///
+/// `context` labels the wrapped `EngineError`'s `Display` text for the
+/// fallback `500` case only, matching the pre-existing
+/// `format!("<call>: {e}")` style each call site used before this
+/// helper.
+fn map_completion_result<T>(result: Result<T, EngineError>, context: &str) -> Result<T, ApiError> {
+    result.map_err(|e| match e {
+        EngineError::VerdictValueRejected { value, allowed } => ApiError::unprocessable(format!(
+            "verdict contract violation: {value:?} is not a member of the declared values {allowed:?}"
+        )),
+        EngineError::VerdictPartMissing { allowed } => ApiError::unprocessable(format!(
+            "verdict contract violation: no staged \"verdict\" part found for this attempt; declared values {allowed:?}"
+        )),
+        other => ApiError::engine(format!("{context}: {other}")),
+    })
+}
+
 /// `POST /v1/worker/submit`. Bearer = encoded `CapToken`. Body = raw text/octet.
 ///
 /// Simplification-axis endpoint for SubAgents. Removes the JSON construction,
@@ -588,11 +622,14 @@ pub async fn worker_submit(
     // GH #42: `@file:<abs-path>` sentinel — pass through unchanged when
     // absent (byte-for-byte compat with pre-#42 callers).
     let body_str = resolve_file_sentinel(&state, &task_id, attempt, body_str).await?;
-    // GH #50: submit-time verdict contract gate (Enforcement Point 2) —
-    // rejects a `channel: "body"` contract violation with 422 before the
-    // value reaches `submit_worker_result_trusted`. See
-    // `check_verdict_contract`'s doc for the opt-in no-op cases.
-    check_verdict_contract(&state, &task_id, VerdictChannel::Body, &body_str).await?;
+    // GH #51: the `channel: "body"` submit-time check formerly performed
+    // here (`check_verdict_contract(&state, &task_id, VerdictChannel::Body,
+    // ..)`) is now performed inside `Engine::submit_worker_result_trusted`
+    // itself — the single completion-time choke point shared by all 3
+    // completion routes (see `map_completion_result`'s doc). No separate
+    // call is needed here; `check_verdict_contract` remains in use by
+    // `worker_artifact`'s staging-time `name == "verdict"` early
+    // validation, unchanged.
     let value = Value::String(body_str);
 
     // The handle path = trusted internal API (= the server-minted handle is validated
@@ -601,11 +638,13 @@ pub async fn worker_submit(
     // `?ok=false` in the query signals failure (= `DispatchOutcome::Blocked`,
     // the flow.ir Try catch path).
     let ok = q.ok.unwrap_or(true);
-    state
-        .engine
-        .submit_worker_result_trusted(&task_id, attempt, value, ok)
-        .await
-        .map_err(|e| ApiError::engine(format!("submit_worker_result_trusted: {e}")))?;
+    map_completion_result(
+        state
+            .engine
+            .submit_worker_result_trusted(&task_id, attempt, value, ok)
+            .await,
+        "submit_worker_result_trusted",
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 

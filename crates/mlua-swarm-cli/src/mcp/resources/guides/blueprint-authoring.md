@@ -276,33 +276,61 @@ that declared **no** `verdict` field, nothing is rejected — at most a
 what keeps every pre-existing Blueprint, and every Blueprint whose
 authors haven't opted in yet, compiling unchanged.
 
-**Submit time (server, fail-loud producer gate).** When a
-contract-bearing agent submits, the server validates the value before
-it can reach the flow ctx:
+**Completion time (server, fail-loud producer gate — all 3 completion
+routes).** A contract-bearing agent's attempt can complete through 3
+different routes: `POST /v1/worker/submit`, the older
+`POST /v1/worker/result`, or the WS Operator fallback (a worker
+process that never POSTs at all). GH #50 originally gated only the
+first of these, and only for `channel: "body"`; GH #51 closes the
+remaining gaps by moving the check to the single choke point every
+route funnels through — `Engine::submit_worker_result_trusted` /
+`Engine::submit_output`, embedded immediately before the value is
+written to `output_tail`, not re-implemented per route handler:
 
-- `POST /v1/worker/submit` (`channel: "body"`) — the trimmed final
-  body must be a member of `values`.
-- `POST /v1/worker/artifact?name=verdict` (`channel: "part"`) — same
-  check, but only for the literal `name=verdict` part; every other
-  named part is unaffected.
+- `channel: "body"` — the completing value must be a member of
+  `values`.
+- `channel: "part"` — a staged `"verdict"` artifact must exist for the
+  attempt (**presence**, not just membership — a worker that never
+  calls `POST /v1/worker/artifact?name=verdict` at all is now rejected,
+  the gap GH #51 exists to close) AND its value must be a member of
+  `values`.
+- `ok=false` completions are exempt on every route, identically — a
+  transport-level failure (`DispatchOutcome::Blocked`, the flow.ir Try
+  path) is not a verdict and is never validated against the contract.
+- An agent that declared no contract, or declared a contract for the
+  other channel, sees this gate as a no-op — behavior unchanged from
+  before GH #50/#51.
 
-A violation is rejected with HTTP 422, echoing the declared `values`
-in the response body, **before** `submit_worker_result_trusted` /
-`stage_worker_artifact_trusted` runs — a rejected value never lands in
-the flow ctx. When the agent declared no contract, or declared a
-contract for the other channel, or the value is already a member of
-`values`, this gate is a no-op and behavior is unchanged from before
-GH #50.
+A violation is rejected **before** the value reaches `output_tail` / the
+flow ctx: `POST /v1/worker/submit` and `POST /v1/worker/result` both
+surface HTTP 422, echoing the declared `values` (`channel: "body"`
+violations) or naming the missing `"verdict"` part (`channel: "part"`
+violations). The WS Operator route has no HTTP response to return a 422
+on — a rejected completion there simply never writes its `Final`; the
+attempt's `output_tail` has no `Final` and the downstream dispatch path
+naturally treats it as incomplete (a `tracing::warn!` is logged
+server-side). No new WS protocol message is introduced for this — the
+deliberate "zero flow-ir changes" design choice, not a gap left to
+fill.
 
-Together, the two boundaries turn both halves of the silent
-never-match anti-pattern above into loud failures: an authoring
-mistake (`cond` addressing the wrong channel, or comparing against a
-token the agent will never emit) stops at register time; a worker that
-emits a full report where a token was expected stops at submit time.
-Neither boundary touches `flow.ir` itself — no new `Expr` forms, no
-eval hooks, no `FlowNode` rewriting; `Blueprint.flow` stays exactly
-what the author wrote, and the contract lives entirely in the
-Blueprint/schema/compiler/server layers described here.
+The staging-time check at `POST /v1/worker/artifact?name=verdict`
+(`channel: "part"` membership only, not presence) still runs — it gives
+the worker the fastest possible feedback the moment it stages a bad
+token. The completion-time check above is the backstop that guarantees
+enforcement no matter which of the 3 routes an agent's attempt actually
+completes through.
+
+Together, the register-time and completion-time boundaries turn both
+halves of the silent never-match anti-pattern above into loud
+failures: an authoring mistake (`cond` addressing the wrong channel, or
+comparing against a token the agent will never emit) stops at register
+time; a worker that emits a full report where a token was expected, or
+skips staging the verdict part entirely, stops at completion time on
+every route it could have completed through. Neither boundary touches
+`flow.ir` itself — no new `Expr` forms, no eval hooks, no `FlowNode`
+rewriting; `Blueprint.flow` stays exactly what the author wrote, and
+the contract lives entirely in the Blueprint/schema/compiler/server
+layers described here.
 
 ### Cross-links
 

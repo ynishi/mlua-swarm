@@ -131,6 +131,28 @@ fn content_ref_to_value(content: crate::worker::output::ContentRef) -> Value {
     }
 }
 
+/// GH #51 — reduces a [`content_ref_to_value`] result down to the `String`
+/// shape the completion-time verdict-contract check compares against a
+/// declared `VerdictContract.values` token set. A `Value::String` unwraps
+/// to its raw contents (no surrounding JSON quotes) — this mirrors the
+/// pre-GH-#51 `check_verdict_contract` (`mlua-swarm-server`'s
+/// `worker.rs`), which always compared the raw submitted body string
+/// directly, never a JSON-stringified copy. Any OTHER `Value` shape
+/// (`Number` / `Object` / `Array` / `Bool` / `Null` — i.e. a `channel:
+/// "body"` contract whose completing value is not a string at all, or a
+/// `FileRef` content whose `content_ref_to_value` projection is an
+/// object) falls back to `Value::to_string()`'s JSON-encoded form: it can
+/// never collide with a plain declared token like `"PASS"`, so it
+/// naturally fails membership — consistent with the "non-string values
+/// under a body contract are violations" rule (issue #51's Proposal).
+fn content_ref_to_comparable_string(content: crate::worker::output::ContentRef) -> String {
+    let value = content_ref_to_value(content);
+    match value {
+        Value::String(s) => s,
+        other => other.to_string(),
+    }
+}
+
 /// [`Engine::dispatch_attempt_with`]'s Final-pull assembly (GH #36 ST1:
 /// named multi-part worker output), factored out as a pure function of the
 /// output-event tail so it is unit-testable without a live `Engine` /
@@ -397,6 +419,94 @@ impl Engine {
             .cloned()
     }
 
+    /// GH #51 — the value of the LAST staged `"verdict"` `Artifact` for
+    /// `(task_id, attempt)`, if any. Mirrors [`fold_final_and_parts`]'s
+    /// reverse-scan-of-`output_tail` pattern (last-write-wins per name,
+    /// same as that fold and [`Self::stage_worker_artifact_trusted`]'s
+    /// doc), narrowed to the single literal artifact name
+    /// `channel: "part"` contracts address (Pattern B — see
+    /// `blueprint-authoring.md`'s "Returning verdicts to drive BP flow").
+    ///
+    /// Infallible accessor: `None` is the normal "nothing staged yet"
+    /// case, not an error — the caller
+    /// ([`Self::verdict_contract_completion_check`]) is what converts
+    /// `None` into `Err(EngineError::VerdictPartMissing)`.
+    pub(crate) async fn staged_verdict_value_for(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+    ) -> Option<String> {
+        let tail = self.output_tail(task_id, attempt).await;
+        tail.iter().rev().find_map(|ev| match ev {
+            crate::worker::output::OutputEvent::Artifact { name, content } if name == "verdict" => {
+                Some(content_ref_to_comparable_string(content.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    /// GH #51 — the single completion-time verdict-contract choke point,
+    /// embedded inside BOTH [`Self::submit_worker_result_trusted`] and
+    /// [`Self::submit_output`] (the two engine-side writes every HTTP/WS
+    /// completion route ultimately passes through). Not duplicated per
+    /// route handler — a future 4th completion route is gated for free
+    /// as long as it funnels through one of those two functions.
+    ///
+    /// `ok=false` is exempt on every route (this single early-return IS
+    /// the exemption, reused identically by both embedding sites — see
+    /// issue #51's "ok=false completions are exempt" acceptance
+    /// criterion). An agent with no declared contract, or a contract for
+    /// the OTHER channel, is untouched (`Ok(())`) — same opt-in,
+    /// byte-for-byte-preserving posture as
+    /// [`Self::verdict_contract_for_task`]'s doc.
+    ///
+    /// - `channel: "body"` — `value` (the completing `Final`'s content,
+    ///   already reduced to a comparable string by the caller via
+    ///   [`content_ref_to_comparable_string`]) must be a member of
+    ///   `contract.values`.
+    /// - `channel: "part"` — [`Self::staged_verdict_value_for`] must find
+    ///   a staged `"verdict"` artifact for this attempt (presence,
+    ///   defense in depth over the staging-time membership check) AND its
+    ///   value must be a member of `contract.values`.
+    async fn verdict_contract_completion_check(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+        ok: bool,
+        value: &str,
+    ) -> Result<(), EngineError> {
+        if !ok {
+            return Ok(());
+        }
+        let Some(contract) = self.verdict_contract_for_task(task_id).await else {
+            return Ok(());
+        };
+        match contract.channel {
+            mlua_swarm_schema::VerdictChannel::Body => {
+                if contract.values.iter().any(|v| v == value) {
+                    Ok(())
+                } else {
+                    Err(EngineError::VerdictValueRejected {
+                        value: value.to_string(),
+                        allowed: contract.values.clone(),
+                    })
+                }
+            }
+            mlua_swarm_schema::VerdictChannel::Part => {
+                match self.staged_verdict_value_for(task_id, attempt).await {
+                    None => Err(EngineError::VerdictPartMissing {
+                        allowed: contract.values.clone(),
+                    }),
+                    Some(staged) if contract.values.iter().any(|v| v == &staged) => Ok(()),
+                    Some(staged) => Err(EngineError::VerdictValueRejected {
+                        value: staged,
+                        allowed: contract.values.clone(),
+                    }),
+                }
+            }
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // §7 with_state — single Mutex + R1-R4 (try_lock + bounded retry + max-hold panic)
     // ═══════════════════════════════════════════════════════════════════════
@@ -576,6 +686,22 @@ impl Engine {
         value: Value,
         ok: bool,
     ) -> Result<(), EngineError> {
+        // GH #51 — completion-time verdict-contract enforcement, embedded
+        // choke point 1 of 2 (see `Self::verdict_contract_completion_check`'s
+        // doc). This path always submits a `Final` by construction (there
+        // is no other event kind on `/v1/worker/submit`), so the check
+        // always applies — unlike `submit_output` below, no `if let
+        // OutputEvent::Final { .. }` guard is needed here since there is
+        // no other `OutputEvent` variant this function could be asked to
+        // write. Runs BEFORE the `output_tail` write immediately below:
+        // on `Err`, this returns immediately and neither `with_state` call
+        // in this function executes.
+        let comparable_value =
+            content_ref_to_comparable_string(crate::worker::output::ContentRef::Inline {
+                value: value.clone(),
+            });
+        self.verdict_contract_completion_check(task_id, attempt, ok, &comparable_value)
+            .await?;
         let task_id_for_apply = task_id.clone();
         let value_for_event = value.clone();
         self.with_state("submit_worker_result_trusted.output", move |s| {
@@ -1921,6 +2047,22 @@ impl Engine {
     ) -> Result<(), EngineError> {
         self.verify_token_for_task(token, crate::types::Verb::EmitOutput, task_id)
             .await?;
+        // GH #51 — completion-time verdict-contract enforcement, embedded
+        // choke point 2 of 2 (see `Self::verdict_contract_completion_check`'s
+        // doc). Guarded to `Final` only — the ONLY `OutputEvent` variant a
+        // verdict contract's completion can meaningfully address; this
+        // guard is defensive (this function is empirically called with
+        // `Final` only today, both from `worker.rs`'s `worker_result` and
+        // from `operator.rs`'s WS fallback) but costs nothing and protects
+        // against a future non-`Final` caller. Runs BEFORE the
+        // `output_tail` write immediately below: on `Err`, this returns
+        // immediately and the write never happens — a rejected value
+        // never reaches `output_tail` / the flow ctx.
+        if let crate::worker::output::OutputEvent::Final { content, ok } = &event {
+            let comparable_value = content_ref_to_comparable_string(content.clone());
+            self.verdict_contract_completion_check(task_id, attempt, *ok, &comparable_value)
+                .await?;
+        }
         let task_id_for_apply = task_id.clone();
         let event_clone = event.clone();
         self.with_state("submit_output", move |s| {
@@ -4068,5 +4210,275 @@ mod verdict_contract_registry_tests {
             engine.verdict_contract_for_task(&task_id).await,
             Some(contract)
         );
+    }
+}
+
+// ─── GH #51: completion-time verdict-contract enforcement — the shared
+// `Engine::verdict_contract_completion_check` choke point embedded inside
+// `submit_worker_result_trusted` / `submit_output`, exercised here at the
+// `submit_output` level (the WS Operator fallback route's own unit-test
+// coverage — see `crates/mlua-swarm-server/tests/verdict_contract.rs` for
+// the HTTP-round-trip coverage of the other 2 routes) ───────────────────
+#[cfg(test)]
+mod verdict_contract_completion_tests {
+    use super::*;
+
+    /// Seeds a `Pending` task bound to `agent` and mints a bound
+    /// `Role::Worker` token for it — the same mint-and-register pattern
+    /// `initial_directive_value_passthrough_tests::mint_worker_token`
+    /// uses (duplicated here: that helper is private to its own sibling
+    /// `#[cfg(test)]` module, not reachable via `super::*` from this one).
+    async fn seeded_task_with_worker_token(agent: &str) -> (Engine, CapToken, StepId) {
+        let engine = Engine::new(EngineCfg::default());
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let task_id = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: agent.to_string(),
+                    initial_directive: serde_json::json!("x"),
+                    step_ctx: None,
+                },
+            )
+            .await
+            .expect("start_task");
+        let worker_token = engine.signer().session(
+            format!("worker-of-{task_id}"),
+            Role::Worker,
+            vec!["*".into()],
+            Duration::from_secs(600),
+        );
+        let fp = worker_token.fingerprint();
+        let record = CapTokenRecord::from_worker_token(worker_token.clone(), task_id.clone());
+        engine
+            .with_state("test.mint_worker", move |s| {
+                s.tokens.insert(fp, record);
+            })
+            .await
+            .expect("mint worker token");
+        (engine, worker_token, task_id)
+    }
+
+    fn body_contract(values: &[&str]) -> mlua_swarm_schema::VerdictContract {
+        mlua_swarm_schema::VerdictContract {
+            channel: mlua_swarm_schema::VerdictChannel::Body,
+            values: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    fn part_contract(values: &[&str]) -> mlua_swarm_schema::VerdictContract {
+        mlua_swarm_schema::VerdictContract {
+            channel: mlua_swarm_schema::VerdictChannel::Part,
+            values: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    fn final_event(value: Value, ok: bool) -> crate::worker::output::OutputEvent {
+        crate::worker::output::OutputEvent::Final {
+            content: crate::worker::output::ContentRef::Inline { value },
+            ok,
+        }
+    }
+
+    /// Route 3 (WS Operator fallback, `submit_output` level) — a
+    /// `channel: "part"` contract's attempt completes via a plain
+    /// `Final` without ever staging a `"verdict"` artifact: rejected
+    /// with `EngineError::VerdictPartMissing`, and nothing lands on
+    /// `output_tail` — the rejected value never reaches the flow ctx.
+    #[tokio::test]
+    async fn submit_output_rejects_missing_verdict_part() {
+        let (engine, token, task_id) = seeded_task_with_worker_token("gate").await;
+        engine.register_verdict_contracts(HashMap::from([(
+            "gate".to_string(),
+            part_contract(&["PASS", "BLOCKED"]),
+        )]));
+
+        let err = engine
+            .submit_output(
+                &token,
+                &task_id,
+                1,
+                final_event(serde_json::json!("anything"), true),
+            )
+            .await
+            .expect_err("missing staged verdict part must be rejected");
+        assert!(
+            matches!(err, EngineError::VerdictPartMissing { .. }),
+            "unexpected error variant: {err:?}"
+        );
+
+        let tail = engine.output_tail(&task_id, 1).await;
+        assert!(
+            !tail
+                .iter()
+                .any(|ev| matches!(ev, crate::worker::output::OutputEvent::Final { .. })),
+            "a rejected completion must not write a Final onto output_tail"
+        );
+    }
+
+    /// Route 3 — a `channel: "part"` contract completes normally when the
+    /// worker DID stage a matching `"verdict"` artifact first (defense in
+    /// depth: presence AND membership both hold).
+    #[tokio::test]
+    async fn submit_output_accepts_when_verdict_part_is_staged_and_a_member() {
+        let (engine, token, task_id) = seeded_task_with_worker_token("gate").await;
+        engine.register_verdict_contracts(HashMap::from([(
+            "gate".to_string(),
+            part_contract(&["PASS", "BLOCKED"]),
+        )]));
+        engine
+            .stage_worker_artifact_trusted(
+                &task_id,
+                1,
+                "verdict".to_string(),
+                serde_json::json!("PASS"),
+            )
+            .await
+            .expect("stage verdict part");
+
+        engine
+            .submit_output(
+                &token,
+                &task_id,
+                1,
+                final_event(serde_json::json!("full report"), true),
+            )
+            .await
+            .expect("staged + member verdict part must be accepted");
+
+        let tail = engine.output_tail(&task_id, 1).await;
+        assert!(
+            tail.iter()
+                .any(|ev| matches!(ev, crate::worker::output::OutputEvent::Final { .. })),
+            "an accepted completion must write its Final onto output_tail"
+        );
+    }
+
+    /// Route 3 — a `channel: "body"` contract's completing value is NOT a
+    /// member of `values`: rejected with
+    /// `EngineError::VerdictValueRejected`, no `Final` written.
+    #[tokio::test]
+    async fn submit_output_rejects_body_value_outside_contract() {
+        let (engine, token, task_id) = seeded_task_with_worker_token("gate").await;
+        engine.register_verdict_contracts(HashMap::from([(
+            "gate".to_string(),
+            body_contract(&["PASS", "BLOCKED"]),
+        )]));
+
+        let err = engine
+            .submit_output(
+                &token,
+                &task_id,
+                1,
+                final_event(serde_json::json!("UNKNOWN"), true),
+            )
+            .await
+            .expect_err("out-of-contract body value must be rejected");
+        match err {
+            EngineError::VerdictValueRejected { value, allowed } => {
+                assert_eq!(value, "UNKNOWN");
+                assert_eq!(allowed, vec!["PASS".to_string(), "BLOCKED".to_string()]);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        let tail = engine.output_tail(&task_id, 1).await;
+        assert!(
+            !tail
+                .iter()
+                .any(|ev| matches!(ev, crate::worker::output::OutputEvent::Final { .. })),
+            "a rejected completion must not write a Final onto output_tail"
+        );
+    }
+
+    /// `ok=false` bypasses the completion-time check entirely, regardless
+    /// of channel or membership — the exemption acceptance criterion,
+    /// exercised at the `submit_output` choke point.
+    #[tokio::test]
+    async fn submit_output_ok_false_bypasses_the_check() {
+        let (engine, token, task_id) = seeded_task_with_worker_token("gate").await;
+        engine.register_verdict_contracts(HashMap::from([(
+            "gate".to_string(),
+            body_contract(&["PASS", "BLOCKED"]),
+        )]));
+
+        engine
+            .submit_output(
+                &token,
+                &task_id,
+                1,
+                final_event(serde_json::json!("UNKNOWN"), false),
+            )
+            .await
+            .expect("ok=false must bypass the verdict contract check entirely");
+
+        let tail = engine.output_tail(&task_id, 1).await;
+        assert!(
+            tail.iter()
+                .any(|ev| matches!(ev, crate::worker::output::OutputEvent::Final { .. })),
+            "an ok=false completion is exempt, not rejected — its Final must still land"
+        );
+    }
+
+    /// `staged_verdict_value_for` mirrors `fold_final_and_parts`'s
+    /// last-write-wins semantics: staging `"verdict"` twice within the
+    /// same attempt returns the LAST value, not the first.
+    #[tokio::test]
+    async fn staged_verdict_value_for_is_last_write_wins() {
+        let (engine, _token, task_id) = seeded_task_with_worker_token("gate").await;
+        engine
+            .stage_worker_artifact_trusted(
+                &task_id,
+                1,
+                "verdict".to_string(),
+                serde_json::json!("PASS"),
+            )
+            .await
+            .expect("stage first verdict part");
+        engine
+            .stage_worker_artifact_trusted(
+                &task_id,
+                1,
+                "verdict".to_string(),
+                serde_json::json!("BLOCKED"),
+            )
+            .await
+            .expect("stage second verdict part");
+
+        assert_eq!(
+            engine.staged_verdict_value_for(&task_id, 1).await,
+            Some("BLOCKED".to_string())
+        );
+    }
+
+    /// `staged_verdict_value_for` ignores artifacts staged under any name
+    /// OTHER than the literal `"verdict"` — mirrors `channel: "part"`
+    /// contracts only ever addressing that one part.
+    #[tokio::test]
+    async fn staged_verdict_value_for_ignores_other_artifact_names() {
+        let (engine, _token, task_id) = seeded_task_with_worker_token("gate").await;
+        engine
+            .stage_worker_artifact_trusted(
+                &task_id,
+                1,
+                "notes".to_string(),
+                serde_json::json!("irrelevant"),
+            )
+            .await
+            .expect("stage unrelated part");
+
+        assert_eq!(engine.staged_verdict_value_for(&task_id, 1).await, None);
+    }
+
+    /// `staged_verdict_value_for` → `None` when nothing was ever staged —
+    /// the normal case the completion check turns into
+    /// `EngineError::VerdictPartMissing`.
+    #[tokio::test]
+    async fn staged_verdict_value_for_returns_none_when_nothing_staged() {
+        let (engine, _token, task_id) = seeded_task_with_worker_token("gate").await;
+        assert_eq!(engine.staged_verdict_value_for(&task_id, 1).await, None);
     }
 }

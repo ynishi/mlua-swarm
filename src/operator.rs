@@ -249,9 +249,29 @@ impl SpawnerAdapter for OperatorSpawner {
                         },
                         ok: wr.ok,
                     };
-                    let _ = engine_clone
+                    // GH #51: `submit_output` now embeds the
+                    // completion-time verdict-contract check (see
+                    // `Engine::verdict_contract_completion_check`'s doc)
+                    // — this fallback emit is gated by it exactly like
+                    // the HTTP routes are, with zero new WS protocol
+                    // surface. On rejection the `Final` is simply never
+                    // written: `output_tail` stays without one, and the
+                    // downstream `dispatch_attempt_with` Final-pull
+                    // naturally treats the attempt as incomplete — no new
+                    // reject-back-to-client message is synthesized (the
+                    // deliberate "Zero flow-ir changes" design choice, not
+                    // a gap to fill).
+                    if let Err(e) = engine_clone
                         .submit_output(&token_clone, &task_id_clone, attempt, ev)
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            step_id = %task_id_clone,
+                            attempt,
+                            error = %e,
+                            "operator fallback Final rejected by verdict-contract completion gate"
+                        );
+                    }
                 }
             }
             let signal: Result<(), WorkerError> = result.map(|_| ());
