@@ -510,6 +510,16 @@ impl TaskLaunchService {
         // concentrated inside `service::linker::link` — Service
         // scatter is intentionally prevented.
         let compiled = self.compiler.compile(&input.blueprint)?;
+        // GH #50 (Subtask 2 follow-up): merge this Blueprint's compiled
+        // `AgentDef.verdict` contracts into the engine's runtime registry —
+        // see `Engine::register_verdict_contracts`'s doc for the additive
+        // (last-write-wins per agent name) semantics. This is the ONLY
+        // production call site; every other consumer
+        // (`Engine::verdict_contract_for_task`, and through it
+        // `mlua-swarm-server`'s `worker_submit` / `worker_artifact`
+        // submit-time gate) reads from what this line populates.
+        self.engine
+            .register_verdict_contracts(compiled.router.verdict_contracts.clone());
         let spawner = linker::link(
             compiled.router.clone(),
             &input.blueprint.spawner_hints.layers,
@@ -711,6 +721,7 @@ mod tests {
             meta: Some(AgentMeta::default()),
             runner: None,
             runner_ref: None,
+            verdict: None,
         }
     }
 
@@ -1072,6 +1083,79 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
+    // GH #50 (Subtask 2 follow-up): `TaskLaunchService::launch`'s
+    // `compiler.compile` → `engine.register_verdict_contracts(...)` call
+    // site — task_launch-level end-to-end (compile → register →
+    // `Engine::verdict_contract_for_task` resolves it). The full HTTP
+    // submit-time-422 round trip is covered separately: handler-level in
+    // `crates/mlua-swarm-server/src/worker.rs`'s own `#[cfg(test)] mod
+    // tests` GH #50 section (which seeds `Engine::register_verdict_contracts`
+    // directly, bypassing this launch path since `mlua-swarm-server`
+    // cannot depend on this crate's private test helpers) and
+    // process-boundary-HTTP in
+    // `crates/mlua-swarm-server/tests/verdict_contract.rs`. This test is
+    // the missing link between those two: it exercises the REAL
+    // `TaskLaunchService::launch` call site (not a hand-rolled duplicate
+    // of its two lines) end-to-end through a real `Compiler::compile`,
+    // proving the production wiring this follow-up added actually
+    // populates the registry `Engine::verdict_contract_for_task` reads.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn launch_registers_the_blueprints_verdict_contracts_into_the_engine() {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("gate", |inv| async move {
+            Ok(WorkerResult {
+                value: json!(inv.prompt),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let mut gate_agent = agent("gate", "gate");
+        gate_agent.verdict = Some(mlua_swarm_schema::VerdictContract {
+            channel: mlua_swarm_schema::VerdictChannel::Body,
+            values: vec!["PASS".to_string(), "BLOCKED".to_string()],
+        });
+        let flow = step("gate", path("$.input"), path("$.out"));
+        let blueprint = bp(flow, vec![gate_agent]);
+
+        let out = svc
+            .launch(launch_input(blueprint, json!({ "input": "PASS" })))
+            .await
+            .expect("launch ok");
+        assert_eq!(out.final_ctx["out"], json!("PASS"));
+
+        // `EngineDispatcher::dispatch` calls `engine.start_task` for every
+        // dispatched Step (`TaskSpec.agent = ref_`) — this single-Step
+        // Blueprint against a fresh per-test `Engine` (`build_service`)
+        // leaves exactly one entry in `EngineState.tasks`.
+        let task_id = svc
+            .engine()
+            .with_state("test.find_dispatched_task_id", |s| {
+                s.tasks.keys().next().cloned()
+            })
+            .await
+            .expect("with_state")
+            .expect("launch must have dispatched exactly one Step (one TaskState)");
+
+        let contract = svc
+            .engine()
+            .verdict_contract_for_task(&task_id)
+            .await
+            .expect(
+                "TaskLaunchService::launch must have merged this Blueprint's compiled \
+                 verdict_contracts into the engine's runtime registry \
+                 (Engine::register_verdict_contracts, called right after \
+                 compiler.compile succeeds) — verdict_contract_for_task resolving None \
+                 here means that production wiring regressed",
+            );
+        assert_eq!(contract.channel, mlua_swarm_schema::VerdictChannel::Body);
+        assert_eq!(
+            contract.values,
+            vec!["PASS".to_string(), "BLOCKED".to_string()]
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
     // issue #13 run_id propagation (`TaskLaunchInput.run_ctx`)
     // ──────────────────────────────────────────────────────────────────
 
@@ -1385,6 +1469,7 @@ mod tests {
             meta: Some(meta),
             runner: None,
             runner_ref: None,
+            verdict: None,
         }
     }
 
@@ -1614,6 +1699,7 @@ mod tests {
                 meta: None,
                 runner: None,
                 runner_ref: None,
+                verdict: None,
             }
         }
 

@@ -1226,6 +1226,7 @@ mod after_run_audit_tests {
             meta: None,
             runner: None,
             runner_ref: None,
+            verdict: None,
         }
     }
 

@@ -633,6 +633,7 @@ mod tests {
             meta: None,
             runner: None,
             runner_ref: None,
+            verdict: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 

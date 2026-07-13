@@ -74,6 +74,19 @@ struct EngineInner {
     /// then only ever briefly read (clone the `Option<Arc<..>>`, never held
     /// across an `.await`) from the async submit path.
     data_store: std::sync::RwLock<Option<Arc<dyn crate::store::output::OutputStore>>>,
+    /// GH #50 (Subtask 2 — runtime plumbing): agent name → declared
+    /// [`mlua_swarm_schema::VerdictContract`], the Engine-side registry
+    /// [`Self::verdict_contract_for_task`] resolves against. Populated via
+    /// [`Self::register_verdict_contracts`] — same sync-`RwLock`,
+    /// set-outside-the-lock idiom as `data_store` above. Empty by default
+    /// (every pre-GH-#50 `Engine`), which is exactly the opt-in "no
+    /// contract declared" state `verdict_contract_for_task` treats as
+    /// `None`. Populated from a live `Compiler::compile`'s
+    /// `CompiledAgentTable.verdict_contracts` output by
+    /// `TaskLaunchService::launch`, immediately after `compiler.compile`
+    /// succeeds — see [`Self::register_verdict_contracts`]'s doc for the
+    /// overwrite semantics of that merge.
+    verdict_contracts: std::sync::RwLock<HashMap<String, mlua_swarm_schema::VerdictContract>>,
 }
 
 /// Renders a `TaskSpec.initial_directive` / `EngineState.prompts`
@@ -203,6 +216,7 @@ impl Engine {
                 operators: tokio::sync::RwLock::new(HashMap::new()),
                 layer_registry,
                 data_store: std::sync::RwLock::new(None),
+                verdict_contracts: std::sync::RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -227,6 +241,7 @@ impl Engine {
             operators: tokio::sync::RwLock::new(HashMap::new()),
             layer_registry: self.inner.layer_registry.clone(),
             data_store: std::sync::RwLock::new(None),
+            verdict_contracts: std::sync::RwLock::new(HashMap::new()),
         });
         Self { inner }
     }
@@ -301,6 +316,85 @@ impl Engine {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// GH #50 (Subtask 2): merges `contracts` (agent name → declared
+    /// [`mlua_swarm_schema::VerdictContract`]) into the engine's runtime
+    /// verdict-contract registry, later resolved per-task by
+    /// [`Self::verdict_contract_for_task`]. Same sync-write idiom as
+    /// [`Self::set_output_store`] — a plain `std::sync::RwLock` write, so
+    /// this can be called from a non-`async` context. Production call
+    /// site: `TaskLaunchService::launch`, immediately after a successful
+    /// `Compiler::compile`, passing `compiled.router.verdict_contracts.clone()`.
+    ///
+    /// # Overwrite semantics (explicit — read before adding a second call site)
+    ///
+    /// The registry is a single flat `HashMap` **keyed by agent name only**
+    /// (`String`), with process-wide (not per-task, not per-Blueprint,
+    /// not per-launch) scope. Registration is additive via
+    /// `HashMap::extend`: an entry for an agent name NOT already present is
+    /// added; an entry for an agent name ALREADY present is REPLACED
+    /// (last write wins) by the incoming one. Concretely: launching a
+    /// second Blueprint that also declares a `verdict` contract for an
+    /// agent named `"gate"` OVERWRITES whatever contract a first, still
+    /// in-flight, launch registered for an agent of that same name — even
+    /// if the two Blueprints intend it as two semantically different
+    /// agents that merely share a name, and even while the first launch's
+    /// tasks are still running. This is a **known limitation** of the v1
+    /// design; a per-task (or per-`RunId` / per-Blueprint) scoped registry
+    /// is a possible follow-up if two concurrently in-flight Blueprints
+    /// declaring conflicting contracts under the same agent name turns out
+    /// to matter in practice. Calling this with an empty map (or not at
+    /// all — the default) is a no-op, preserving pre-GH-#50 behavior
+    /// exactly (opt-in).
+    pub fn register_verdict_contracts(
+        &self,
+        contracts: HashMap<String, mlua_swarm_schema::VerdictContract>,
+    ) {
+        let mut guard = self
+            .inner
+            .verdict_contracts
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.extend(contracts);
+    }
+
+    /// GH #50 (Subtask 2): the declared
+    /// [`mlua_swarm_schema::VerdictContract`] for the agent currently
+    /// running `task_id`, if any. Resolves `task_id` → `TaskState.spec.agent`
+    /// (via `EngineState.tasks`, the same lookup [`Self::task_attempt`]
+    /// performs) and looks that agent name up in the registry
+    /// [`Self::register_verdict_contracts`] populates.
+    ///
+    /// `None` in both of these cases — deliberately collapsed to the same
+    /// value, mirroring [`Self::agent_context_for`]'s `Result`-into-`Option`
+    /// pattern (`.ok().flatten()`; a lookup failure here is never itself an
+    /// error worth surfacing to a caller):
+    /// - `task_id` is unknown (no `TaskState` for it).
+    /// - `task_id` resolves to a known agent, but that agent declared no
+    ///   `verdict` contract (the opt-in default).
+    ///
+    /// Callers (`mlua-swarm-server`'s `worker_submit` / `worker_artifact`)
+    /// treat every `None` identically: skip the submit-time verdict gate
+    /// entirely, preserving pre-GH-#50 behavior byte-for-byte.
+    pub async fn verdict_contract_for_task(
+        &self,
+        task_id: &StepId,
+    ) -> Option<mlua_swarm_schema::VerdictContract> {
+        let tid = task_id.clone();
+        let agent = self
+            .with_state("verdict_contract_for_task", move |s| {
+                s.tasks.get(&tid).map(|t| t.spec.agent.clone())
+            })
+            .await
+            .ok()
+            .flatten()?;
+        self.inner
+            .verdict_contracts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&agent)
+            .cloned()
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -3209,6 +3303,7 @@ mod submit_time_projection_sink_tests {
                 }),
                 runner: None,
                 runner_ref: None,
+                verdict: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -3874,6 +3969,104 @@ mod named_multi_part_worker_output_tests {
                 .await
                 .is_empty(),
             "attempt 2's allowlist must not see attempt 1's staged name"
+        );
+    }
+}
+
+// ─── GH #50 (Subtask 2): `Engine::register_verdict_contracts` /
+// `Engine::verdict_contract_for_task` ────────────────────────────────────
+#[cfg(test)]
+mod verdict_contract_registry_tests {
+    use super::*;
+
+    async fn seeded_engine(agent: &str) -> (Engine, StepId) {
+        let engine = Engine::new(EngineCfg::default());
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let task_id = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: agent.to_string(),
+                    initial_directive: serde_json::json!("x"),
+                    step_ctx: None,
+                },
+            )
+            .await
+            .expect("start_task");
+        (engine, task_id)
+    }
+
+    /// An agent with no registered contract at all → `None` (the opt-in
+    /// default; every pre-GH-#50 `Engine`).
+    #[tokio::test]
+    async fn returns_none_when_no_contract_registered_for_the_agent() {
+        let (engine, task_id) = seeded_engine("gate").await;
+        assert_eq!(engine.verdict_contract_for_task(&task_id).await, None);
+    }
+
+    /// A registered contract for the running task's agent is returned
+    /// verbatim.
+    #[tokio::test]
+    async fn returns_the_registered_contract_for_the_running_agent() {
+        let (engine, task_id) = seeded_engine("gate").await;
+        let contract = mlua_swarm_schema::VerdictContract {
+            channel: mlua_swarm_schema::VerdictChannel::Body,
+            values: vec!["PASS".to_string(), "BLOCKED".to_string()],
+        };
+        engine.register_verdict_contracts(HashMap::from([("gate".to_string(), contract.clone())]));
+        assert_eq!(
+            engine.verdict_contract_for_task(&task_id).await,
+            Some(contract)
+        );
+    }
+
+    /// A registered contract for a DIFFERENT agent name never leaks onto
+    /// an unrelated task.
+    #[tokio::test]
+    async fn does_not_leak_a_contract_registered_for_a_different_agent() {
+        let (engine, task_id) = seeded_engine("gate").await;
+        engine.register_verdict_contracts(HashMap::from([(
+            "other-agent".to_string(),
+            mlua_swarm_schema::VerdictContract {
+                channel: mlua_swarm_schema::VerdictChannel::Body,
+                values: vec!["PASS".to_string()],
+            },
+        )]));
+        assert_eq!(engine.verdict_contract_for_task(&task_id).await, None);
+    }
+
+    /// An unknown `task_id` → `None`, not a panic / error.
+    #[tokio::test]
+    async fn returns_none_for_an_unknown_task_id() {
+        let engine = Engine::new(EngineCfg::default());
+        let unknown = StepId::new();
+        assert_eq!(engine.verdict_contract_for_task(&unknown).await, None);
+    }
+
+    /// `register_verdict_contracts` is additive (`HashMap::extend`): a
+    /// second call registering a DIFFERENT agent does not clobber the
+    /// first call's entry.
+    #[tokio::test]
+    async fn register_verdict_contracts_is_additive_across_calls() {
+        let (engine, task_id) = seeded_engine("gate").await;
+        let contract = mlua_swarm_schema::VerdictContract {
+            channel: mlua_swarm_schema::VerdictChannel::Part,
+            values: vec!["ALLOW".to_string()],
+        };
+        engine.register_verdict_contracts(HashMap::from([("gate".to_string(), contract.clone())]));
+        engine.register_verdict_contracts(HashMap::from([(
+            "unrelated-agent".to_string(),
+            mlua_swarm_schema::VerdictContract {
+                channel: mlua_swarm_schema::VerdictChannel::Body,
+                values: vec!["X".to_string()],
+            },
+        )]));
+        assert_eq!(
+            engine.verdict_contract_for_task(&task_id).await,
+            Some(contract)
         );
     }
 }

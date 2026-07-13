@@ -54,6 +54,7 @@
 //!         meta: None,
 //!         runner: None,
 //!         runner_ref: None,
+//!         verdict: None,
 //!     }],
 //!     operators: vec![],
 //!     metas: vec![],
@@ -628,6 +629,18 @@ pub struct AgentDef {
     /// `None` = this agent declares no Runner registry reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_ref: Option<String>,
+    /// GH #50 — opt-in declaration of which OUTPUT channel this agent's
+    /// verdict token lives on, and the closed set of tokens it may emit
+    /// through that channel (see [`VerdictContract`]). Consumed by the
+    /// `mlua-swarm` core crate's `Compiler::compile` to lint
+    /// `Branch`/`Loop` `Eq`/`Ne`/`In` conds against this agent's output at
+    /// register time; a follow-up submit-time producer gate is a separate
+    /// enforcement point. `None` (the default) — this agent declares no
+    /// contract; a cond comparing its output to a literal is unchanged (at
+    /// most a `tracing::warn!`, never rejected) — every pre-GH-#50
+    /// Blueprint is unaffected, byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<VerdictContract>,
 }
 
 /// Agent persona information. Orthogonal to the backend kind (Shell / InProc / Operator).
@@ -719,6 +732,49 @@ pub enum AgentKind {
     Subprocess,
     /// Interactive Operator role (= MainAI / Human delegation, `spec.operator_ref`).
     Operator,
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// VerdictContract / VerdictChannel (GH #50 — opt-in cond↔output-shape lint)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Opt-in per-agent declaration of the step OUTPUT shape a downstream
+/// `Branch`/`Loop` `cond` is allowed to structurally compare against — see
+/// the `blueprint-authoring.md` guide's "Returning verdicts to drive BP
+/// flow" section for the Pattern A/B shapes this mirrors. Consumed by the
+/// `mlua-swarm` core crate's `Compiler::compile` (a register-time,
+/// read-only lint over `Branch`/`Loop` `Eq`/`Ne`/`In` conds — no `flow`
+/// rewriting, no new `Expr` forms) and, as a follow-up, by the server's
+/// submit-time producer gate. `None` on [`AgentDef::verdict`] (the
+/// default) means neither enforcement point runs for that agent — the
+/// pre-GH-#50 behavior, byte-for-byte.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VerdictContract {
+    /// Which OUTPUT channel carries the verdict token — see
+    /// [`VerdictChannel`].
+    pub channel: VerdictChannel,
+    /// Closed set of the verdict tokens this agent may emit through the
+    /// declared `channel` (e.g. `["PASS", "BLOCKED"]`). A `Branch`/`Loop`
+    /// cond's `Lit` operand(s) compared against this agent's declared
+    /// channel must be members of this set.
+    pub values: Vec<String>,
+}
+
+/// Which step OUTPUT channel a [`VerdictContract`] addresses — the two
+/// canonical submit shapes documented in the `blueprint-authoring.md`
+/// guide's "Returning verdicts to drive BP flow" section.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum VerdictChannel {
+    /// Pattern A — the plain step OUTPUT body IS the verdict scalar; a cond
+    /// addresses it as the bare step output (`$.<step>`).
+    Body,
+    /// Pattern B — the verdict is staged as the named part `"verdict"`
+    /// alongside a separate plain-body report; a cond addresses it as
+    /// `$.<step>.parts.verdict` (equivalently `$.<step>.parts["verdict"]`
+    /// — both forms normalize to the same canonical [`Path`](mlua_flow_ir::Path) `Display`).
+    Part,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1863,6 +1919,7 @@ mod tests {
             meta: None,
             runner,
             runner_ref,
+            verdict: None,
         }
     }
 
@@ -2212,6 +2269,71 @@ mod tests {
                 ref_name: "no-such-entry".to_string(),
                 available: vec!["registry-entry".to_string()],
             }
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GH #50: `AgentDef.verdict` / `VerdictContract` / `VerdictChannel`
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn verdict_contract_roundtrips_body_channel() {
+        let json = serde_json::json!({"channel": "body", "values": ["PASS", "BLOCKED"]});
+        let contract: VerdictContract = serde_json::from_value(json.clone()).expect("deserializes");
+        assert_eq!(contract.channel, VerdictChannel::Body);
+        assert_eq!(
+            contract.values,
+            vec!["PASS".to_string(), "BLOCKED".to_string()]
+        );
+        assert_eq!(serde_json::to_value(&contract).expect("serializes"), json);
+    }
+
+    #[test]
+    fn verdict_contract_roundtrips_part_channel() {
+        let json = serde_json::json!({"channel": "part", "values": ["ALLOW"]});
+        let contract: VerdictContract = serde_json::from_value(json.clone()).expect("deserializes");
+        assert_eq!(contract.channel, VerdictChannel::Part);
+        assert_eq!(serde_json::to_value(&contract).expect("serializes"), json);
+    }
+
+    #[test]
+    fn agent_def_verdict_omitted_when_none() {
+        let agent = agent_with_runner("gate", None, None, None);
+        let json = serde_json::to_value(&agent).expect("serializes");
+        assert!(
+            json.as_object().unwrap().get("verdict").is_none(),
+            "verdict key must be absent when None: {json}"
+        );
+        let back: AgentDef = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.verdict, None);
+    }
+
+    #[test]
+    fn agent_def_verdict_roundtrips_when_some() {
+        let mut agent = agent_with_runner("gate", None, None, None);
+        agent.verdict = Some(VerdictContract {
+            channel: VerdictChannel::Body,
+            values: vec!["PASS".to_string(), "BLOCKED".to_string()],
+        });
+        let json = serde_json::to_value(&agent).expect("serializes");
+        let back: AgentDef = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.verdict, agent.verdict);
+    }
+
+    /// Acceptance criterion #2: the `02-verdict-loop.json` sample (no
+    /// `verdict` field on any of its agents) must still deserialize
+    /// unchanged under the new `#[serde(deny_unknown_fields)]`-constrained
+    /// `AgentDef` — `verdict` is `#[serde(default)]`, so its absence is not
+    /// an error.
+    #[test]
+    fn existing_verdict_loop_sample_deserializes_with_verdict_omitted() {
+        const SAMPLE: &str =
+            include_str!("../../mlua-swarm-cli/src/mcp/resources/samples/02-verdict-loop.json");
+        let bp: Blueprint = serde_json::from_str(SAMPLE).expect("sample deserializes");
+        assert_eq!(bp.agents.len(), 6);
+        assert!(
+            bp.agents.iter().all(|a| a.verdict.is_none()),
+            "no agent in the sample declares a verdict contract"
         );
     }
 }

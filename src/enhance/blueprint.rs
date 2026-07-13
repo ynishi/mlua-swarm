@@ -363,6 +363,7 @@ mod tests {
                 meta: None,
                 runner: None,
                 runner_ref: None,
+                verdict: None,
             }],
             operators: vec![],
             metas: vec![],

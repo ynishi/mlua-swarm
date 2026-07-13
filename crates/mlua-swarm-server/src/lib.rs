@@ -1337,6 +1337,17 @@ impl ApiError {
             message: m,
         }
     }
+    /// Builds a `422 Unprocessable Entity` with the given message (GH #50
+    /// — a `worker_submit` / `worker_artifact` value violates the
+    /// dispatching agent's declared `VerdictContract`: rejected before it
+    /// reaches `submit_worker_result_trusted` / `stage_worker_artifact_trusted`,
+    /// i.e. before it can land in the flow ctx).
+    pub fn unprocessable(m: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: m.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
