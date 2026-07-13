@@ -2667,6 +2667,7 @@ mod tests {
                 meta: Some(AgentMeta::default()),
                 runner: None,
                 runner_ref: None,
+                verdict: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -3927,7 +3928,10 @@ mod tests {
         let wrapper_only = strs(&["mse_worker_fetch", "mse_worker_submit"]);
         let (contract_out, meaningful_out) = classify_wrapper_only(&wrapper_only, &contract);
         assert!(contract_out.is_empty());
-        assert_eq!(meaningful_out, strs(&["mse_worker_fetch", "mse_worker_submit"]));
+        assert_eq!(
+            meaningful_out,
+            strs(&["mse_worker_fetch", "mse_worker_submit"])
+        );
     }
 
     #[test]
@@ -4143,6 +4147,7 @@ mod tests {
                     meta: Some(AgentMeta::default()),
                     runner: None,
                     runner_ref: None,
+                    verdict: None,
                 },
                 AgentDef {
                     name: "auditor".into(),
@@ -4152,6 +4157,7 @@ mod tests {
                     meta: Some(AgentMeta::default()),
                     runner: None,
                     runner_ref: None,
+                    verdict: None,
                 },
             ],
             operators: vec![],

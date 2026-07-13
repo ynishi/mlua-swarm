@@ -73,7 +73,7 @@ use mlua_swarm::core::agent_context::StepPointer;
 use mlua_swarm::core::step_naming::StepNaming;
 use mlua_swarm::store::run::{DegradationEntry, RunStatus, RunStoreError};
 use mlua_swarm::{CapToken, ContentRef, OutputEvent, RunId, StepId, WorkerPayload};
-use mlua_swarm_schema::ContextPolicy;
+use mlua_swarm_schema::{ContextPolicy, VerdictChannel};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -472,6 +472,47 @@ async fn resolve_file_sentinel(
     Ok(String::from_utf8_lossy(&bytes).trim_end().to_string())
 }
 
+/// GH #50 (Subtask 2) — submit-time verdict contract gate, shared by
+/// [`worker_submit`] (`channel = Body`) and [`worker_artifact`]
+/// (`channel = Part`, only when `name == "verdict"`). Enforcement Point 2
+/// (the submit-time complement to `Compiler::compile`'s register-time lint
+/// in `mlua_swarm::blueprint::compiler`, Enforcement Point 1) — called
+/// after the final value string is resolved and BEFORE it is handed to
+/// `submit_worker_result_trusted` / `stage_worker_artifact_trusted`, so a
+/// rejected value never reaches the flow ctx.
+///
+/// No-op (`Ok(())`) in every case that must preserve pre-GH-#50 behavior
+/// byte-for-byte:
+/// - the dispatching agent declared no `VerdictContract` at all (opt-in).
+/// - the agent's declared contract addresses the OTHER channel — a
+///   channel/shape mismatch is the compile-time lint's job (Enforcement
+///   Point 1); this gate only validates value membership for the channel
+///   it was called for.
+/// - `value` IS a member of the contract's declared `values`.
+///
+/// `Err(ApiError::unprocessable(..))` (HTTP 422) otherwise, echoing the
+/// expected token set.
+async fn check_verdict_contract(
+    state: &AppState,
+    task_id: &StepId,
+    channel: VerdictChannel,
+    value: &str,
+) -> Result<(), ApiError> {
+    let Some(contract) = state.engine.verdict_contract_for_task(task_id).await else {
+        return Ok(());
+    };
+    if contract.channel != channel {
+        return Ok(());
+    }
+    if contract.values.iter().any(|v| v == value) {
+        return Ok(());
+    }
+    Err(ApiError::unprocessable(format!(
+        "verdict contract violation: {value:?} is not a member of the declared values {:?}",
+        contract.values
+    )))
+}
+
 /// `POST /v1/worker/submit`. Bearer = encoded `CapToken`. Body = raw text/octet.
 ///
 /// Simplification-axis endpoint for SubAgents. Removes the JSON construction,
@@ -547,6 +588,11 @@ pub async fn worker_submit(
     // GH #42: `@file:<abs-path>` sentinel — pass through unchanged when
     // absent (byte-for-byte compat with pre-#42 callers).
     let body_str = resolve_file_sentinel(&state, &task_id, attempt, body_str).await?;
+    // GH #50: submit-time verdict contract gate (Enforcement Point 2) —
+    // rejects a `channel: "body"` contract violation with 422 before the
+    // value reaches `submit_worker_result_trusted`. See
+    // `check_verdict_contract`'s doc for the opt-in no-op cases.
+    check_verdict_contract(&state, &task_id, VerdictChannel::Body, &body_str).await?;
     let value = Value::String(body_str);
 
     // The handle path = trusted internal API (= the server-minted handle is validated
@@ -635,6 +681,14 @@ pub async fn worker_artifact(
     let body_str = String::from_utf8_lossy(&body).trim_end().to_string();
     // GH #42: same `@file:<abs-path>` sentinel as `worker_submit`.
     let body_str = resolve_file_sentinel(&state, &task_id, attempt, body_str).await?;
+    // GH #50: submit-time verdict contract gate (Enforcement Point 2),
+    // ONLY for the literal `"verdict"` part name (Pattern B's staging
+    // channel — see `blueprint-authoring.md`'s "Returning verdicts to
+    // drive BP flow" section). Every other part name skips the gate
+    // entirely, unchanged from pre-GH-#50 behavior.
+    if name == "verdict" {
+        check_verdict_contract(&state, &task_id, VerdictChannel::Part, &body_str).await?;
+    }
     let value = Value::String(body_str);
 
     state
@@ -1462,6 +1516,7 @@ mod tests {
                 }),
                 runner: None,
                 runner_ref: None,
+                verdict: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -2509,7 +2564,14 @@ mod tests {
         let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        seed_work_dir(&state, &task_id, 1, tmp.path().to_str().expect("utf-8"), None).await;
+        seed_work_dir(
+            &state,
+            &task_id,
+            1,
+            tmp.path().to_str().expect("utf-8"),
+            None,
+        )
+        .await;
 
         let payload_path = tmp.path().join("out.md");
         tokio::fs::write(&payload_path, b"resolvable body")
@@ -2570,5 +2632,162 @@ mod tests {
             .expect_err("non-true opt-in value must reject sentinel");
             assert_eq!(err.status, StatusCode::BAD_REQUEST, "value: {allow:?}");
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #50 (Subtask 2) — submit-time verdict contract gate, handler-
+    // level unit coverage. The full process-boundary HTTP round trip
+    // (Acceptance Criterion #7) lives in
+    // `crates/mlua-swarm-server/tests/verdict_contract.rs`; these are the
+    // fast in-process counterpart exercising `worker_submit` /
+    // `worker_artifact` directly, same convention as the sentinel tests
+    // above.
+    // ──────────────────────────────────────────────────────────────────
+
+    fn body_verdict_contract(values: &[&str]) -> mlua_swarm_schema::VerdictContract {
+        mlua_swarm_schema::VerdictContract {
+            channel: VerdictChannel::Body,
+            values: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    fn part_verdict_contract(values: &[&str]) -> mlua_swarm_schema::VerdictContract {
+        mlua_swarm_schema::VerdictContract {
+            channel: VerdictChannel::Part,
+            values: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    /// A `channel: "body"` contract rejects a `worker_submit` body outside
+    /// its declared `values` with `422`, echoing the expected token set.
+    #[tokio::test]
+    async fn worker_submit_rejects_body_outside_contract_values_with_422() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "gate", 1, None).await;
+        state.engine.register_verdict_contracts(HashMap::from([(
+            "gate".to_string(),
+            body_verdict_contract(&["PASS", "BLOCKED"]),
+        )]));
+
+        let err = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery { ok: None }),
+            axum::body::Bytes::from("UNKNOWN"),
+        )
+        .await
+        .expect_err("value outside declared values must reject");
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            err.message.contains("PASS") && err.message.contains("BLOCKED"),
+            "rejection must echo the declared values, got: {}",
+            err.message
+        );
+    }
+
+    /// The same contract accepts a body that IS a member of `values` —
+    /// `204`, unaffected submit.
+    #[tokio::test]
+    async fn worker_submit_accepts_body_inside_contract_values() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "gate", 1, None).await;
+        state.engine.register_verdict_contracts(HashMap::from([(
+            "gate".to_string(),
+            body_verdict_contract(&["PASS", "BLOCKED"]),
+        )]));
+
+        let status = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery { ok: None }),
+            axum::body::Bytes::from("PASS"),
+        )
+        .await
+        .expect("value inside declared values must succeed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// Opt-in regression guard: an agent with NO declared verdict contract
+    /// is entirely unaffected — `worker_submit` still returns `204` for an
+    /// arbitrary body, exactly the pre-GH-#50 behavior.
+    #[tokio::test]
+    async fn worker_submit_without_a_declared_contract_is_unaffected() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        // No `register_verdict_contracts` call — the agent declared no contract.
+        let handle = seed_task_with_handle(&state, &task_id, "undeclared-agent", 1, None).await;
+
+        let status = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery { ok: None }),
+            axum::body::Bytes::from("anything at all, no contract to violate"),
+        )
+        .await
+        .expect("no contract declared must never reject");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// A `channel: "part"` contract rejects a `worker_artifact?name=verdict`
+    /// value outside `values` with `422`.
+    #[tokio::test]
+    async fn worker_artifact_verdict_part_rejects_value_outside_contract_with_422() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "gate", 1, None).await;
+        state.engine.register_verdict_contracts(HashMap::from([(
+            "gate".to_string(),
+            part_verdict_contract(&["PASS", "BLOCKED"]),
+        )]));
+
+        let err = worker_artifact(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(ArtifactQuery {
+                name: "verdict".to_string(),
+            }),
+            axum::body::Bytes::from("UNKNOWN"),
+        )
+        .await
+        .expect_err("value outside declared values must reject");
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A part named anything OTHER than `"verdict"` skips the gate
+    /// entirely, even with a `channel: "part"` contract declared — `204`,
+    /// existing pre-GH-#50 behavior unchanged.
+    #[tokio::test]
+    async fn worker_artifact_non_verdict_part_skips_the_gate() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "gate", 1, None).await;
+        state.engine.register_verdict_contracts(HashMap::from([(
+            "gate".to_string(),
+            part_verdict_contract(&["PASS", "BLOCKED"]),
+        )]));
+
+        let status = worker_artifact(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(ArtifactQuery {
+                name: "notes".to_string(),
+            }),
+            axum::body::Bytes::from("anything at all"),
+        )
+        .await
+        .expect("non-verdict part name must never be gated");
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 }

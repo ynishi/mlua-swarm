@@ -209,6 +209,101 @@ outputs a verdict word, check the submit shape first. It must be a
 scalar (Pattern A) or a named part (Pattern B) — `$.gate` cannot be a
 report body that *contains* the verdict word.
 
+### Enforcing verdict contracts (opt-in)
+
+Pattern A/B above are conventions — until an agent opts in, nothing
+checks that its submit shape actually matches how a downstream `cond`
+addresses it. `AgentDef.verdict` is an **optional** field that turns
+that convention into two machine checks. It is strictly additive: an
+agent that declares no `verdict` behaves exactly as before, byte for
+byte, at both boundaries described below. The working sample
+`mse://blueprints/samples/02-verdict-loop` is a live example of this —
+its `mock-gate` agent declares no `verdict` field and continues to
+register and run unchanged; Pattern A's convention alone is still
+enough for it.
+
+Declare a contract on the agent whose output a `cond` will compare:
+
+```jsonc
+// channel: "body" — Pattern A, the plain step OUTPUT IS the verdict
+"agents": [{
+  "name": "gate",
+  "verdict": {
+    "channel": "body",
+    "values": ["PASS", "BLOCKED"]
+  }
+}]
+```
+
+```jsonc
+// channel: "part" — Pattern B, the verdict is staged as the named part
+"agents": [{
+  "name": "gate",
+  "verdict": {
+    "channel": "part",
+    "values": ["PASS", "BLOCKED"]
+  }
+}]
+```
+
+`channel: "part"` addresses one literal part name only —
+`mse_worker_submit(name="verdict", body=...)` / `$.gate.parts["verdict"]`
+— the way Pattern B is documented above. `values` is a closed set of
+tokens; a comparison against anything outside it is a violation.
+
+**Register time (compile, read-only lint).** `Compiler::compile` walks
+every `Branch`/`Loop` `cond`'s `Eq`/`Ne`/`In` comparisons of a step
+output `Path` against a literal, resolves the `Path` back to its
+producing agent, and — only for agents that declared a `verdict` —
+checks two things:
+
+- The `Path` addresses the channel the agent declared (bare `$.<step>`
+  for `channel: "body"`, `$.<step>.parts.verdict` /
+  `$.<step>.parts["verdict"]` for `channel: "part"`). A mismatch fails
+  the compile with `CompileError::VerdictChannelMismatch`, naming the
+  step, the declared channel, and the channel the `cond` actually
+  addressed.
+- Every literal compared against that `Path` (including every entry of
+  an `In` haystack) is a member of the declared `values`. A literal
+  outside the set fails the compile with
+  `CompileError::VerdictValueNotInContract`, naming the offending
+  literal and the declared set.
+
+Compile fails on the **first** violation found (same posture as the
+compiler's other static checks). If the `cond` references an agent
+that declared **no** `verdict` field, nothing is rejected — at most a
+`tracing::warn!` is emitted, and compilation still succeeds. This is
+what keeps every pre-existing Blueprint, and every Blueprint whose
+authors haven't opted in yet, compiling unchanged.
+
+**Submit time (server, fail-loud producer gate).** When a
+contract-bearing agent submits, the server validates the value before
+it can reach the flow ctx:
+
+- `POST /v1/worker/submit` (`channel: "body"`) — the trimmed final
+  body must be a member of `values`.
+- `POST /v1/worker/artifact?name=verdict` (`channel: "part"`) — same
+  check, but only for the literal `name=verdict` part; every other
+  named part is unaffected.
+
+A violation is rejected with HTTP 422, echoing the declared `values`
+in the response body, **before** `submit_worker_result_trusted` /
+`stage_worker_artifact_trusted` runs — a rejected value never lands in
+the flow ctx. When the agent declared no contract, or declared a
+contract for the other channel, or the value is already a member of
+`values`, this gate is a no-op and behavior is unchanged from before
+GH #50.
+
+Together, the two boundaries turn both halves of the silent
+never-match anti-pattern above into loud failures: an authoring
+mistake (`cond` addressing the wrong channel, or comparing against a
+token the agent will never emit) stops at register time; a worker that
+emits a full report where a token was expected stops at submit time.
+Neither boundary touches `flow.ir` itself — no new `Expr` forms, no
+eval hooks, no `FlowNode` rewriting; `Blueprint.flow` stays exactly
+what the author wrote, and the contract lives entirely in the
+Blueprint/schema/compiler/server layers described here.
+
 ### Cross-links
 
 - Named-parts wire format and OUTPUT shape: § Worker output: `out` vs

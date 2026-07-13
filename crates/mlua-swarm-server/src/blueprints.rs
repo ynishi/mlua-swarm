@@ -846,6 +846,7 @@ mod explain_agent_tests {
             meta,
             runner: None,
             runner_ref: None,
+            verdict: None,
         }
     }
 

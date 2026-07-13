@@ -230,6 +230,11 @@ pub fn parse(text: &str, source_label: &str, kind: AgentKind) -> Result<AgentDef
         // frontmatter authoring for the new tier.
         runner: None,
         runner_ref: None,
+        // GH #50: `agent.md` frontmatter authoring for `verdict` is not
+        // part of this scope either — Blueprint JSON authors declare it
+        // directly (`agents[N].verdict`) until a later follow-up wires
+        // frontmatter authoring for it too.
+        verdict: None,
     })
 }
 

@@ -38,7 +38,8 @@ use crate::worker::adapter::{InProcSpawner, SpawnError, SpawnerAdapter, WorkerFn
 use crate::worker::process_spawner::{ProcessSpawner, StreamMode};
 use crate::worker::Worker;
 use async_trait::async_trait;
-use mlua_flow_ir::{Expr, Node as FlowNode};
+use mlua_flow_ir::{Expr, Node as FlowNode, Path};
+use mlua_swarm_schema::{VerdictChannel, VerdictContract};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -123,6 +124,55 @@ pub enum CompileError {
         /// The `AgentDef.name`s that *are* declared, for the error
         /// message.
         defined: Vec<String>,
+    },
+    /// GH #50: a `Branch`/`Loop` `cond` compares a contract-bearing
+    /// agent's output using the wrong OUTPUT channel — e.g. the agent
+    /// declares `channel: "part"` (verdict staged as the named part
+    /// `"verdict"`, addressed `$.<step>.parts.verdict`) but the cond
+    /// addresses the bare step output (`$.<step>`) instead, or vice
+    /// versa. See the `blueprint-authoring.md` guide's "Returning
+    /// verdicts to drive BP flow" section for Pattern A (`channel:
+    /// "body"`) vs Pattern B (`channel: "part"`).
+    #[error(
+        "agent '{agent}' declares verdict channel '{expected_channel}' but {where_} \
+         addresses it as '{actual_shape}' output — see the \"Returning verdicts to drive \
+         BP flow\" guide's Pattern A (channel: \"body\") / Pattern B (channel: \"part\")"
+    )]
+    VerdictChannelMismatch {
+        /// Human-readable description of where the offending cond was
+        /// found (e.g. `"Branch cond"` / `"Loop cond"`).
+        where_: String,
+        /// The agent whose declared `verdict.channel` didn't match.
+        agent: String,
+        /// The agent's declared channel (`"body"` or `"part"`).
+        expected_channel: String,
+        /// The channel shape the cond's `Path` actually addressed
+        /// (`"body"` or `"part"`).
+        actual_shape: String,
+    },
+    /// GH #50: a `Branch`/`Loop` `cond`'s `Lit` operand (or, for `In`, one
+    /// of the `Lit` haystack's array elements) is not a member of a
+    /// contract-bearing agent's declared `verdict.values` closed token
+    /// set.
+    #[error(
+        "agent '{agent}' verdict Lit '{value}' at {where_} is not a member of the declared \
+         values {values:?}"
+    )]
+    VerdictValueNotInContract {
+        /// Human-readable description of where the offending cond was
+        /// found (e.g. `"Branch cond"` / `"Loop cond"`).
+        where_: String,
+        /// The agent whose declared `verdict.values` didn't contain
+        /// `value`.
+        agent: String,
+        /// The offending `Lit` value, rendered as a string (the raw JSON
+        /// representation when it is not itself a JSON string — a
+        /// non-string `Lit` can never be a member of `values: Vec<String>`
+        /// either way).
+        value: String,
+        /// The agent's declared `verdict.values` closed token set, for the
+        /// error message.
+        values: Vec<String>,
     },
 }
 
@@ -270,6 +320,12 @@ impl Compiler {
     pub fn compile(&self, bp: &Blueprint) -> Result<CompiledBlueprint, CompileError> {
         let mut routes: HashMap<String, Arc<dyn SpawnerAdapter>> = HashMap::new();
         let mut seen: HashMap<String, ()> = HashMap::new();
+        // GH #50: `AgentDef.name` → declared `VerdictContract`, collected
+        // alongside `routes` below (every `verdict: Some(...)` agent, kind
+        // resolution notwithstanding). Consumed by the cond↔output-shape
+        // lint right after the loop, and carried into
+        // `CompiledAgentTable.verdict_contracts`.
+        let mut verdict_contracts: HashMap<String, VerdictContract> = HashMap::new();
 
         // Design-time validation (OperatorDef as a first-class value):
         // every `kind = Operator` agent's `spec.operator_ref` must point at
@@ -347,6 +403,15 @@ impl Compiler {
             }
             seen.insert(ad.name.clone(), ());
 
+            // GH #50: contract registration is orthogonal to spawner
+            // resolution (an agent may declare `verdict` regardless of
+            // whether its `kind` resolves), so it happens unconditionally
+            // here, before the kind-resolution branch below that may
+            // `continue`.
+            if let Some(contract) = &ad.verdict {
+                verdict_contracts.insert(ad.name.clone(), contract.clone());
+            }
+
             let factory = match self.registry.factories.get(&ad.kind) {
                 Some(f) => f.clone(),
                 None => {
@@ -367,6 +432,15 @@ impl Compiler {
             let spawner = factory.build(ad, hint)?;
             routes.insert(ad.name.clone(), spawner);
         }
+
+        // GH #50: `Branch`/`Loop` cond↔output-shape lint. A contract-
+        // bearing agent's output must be compared the way its declared
+        // `verdict.channel` requires and its `Lit` value(s) must be
+        // members of its declared `verdict.values`; an agent referenced by
+        // a cond but declaring no contract only gets a `tracing::warn!`
+        // (opt-in, back-compat — see `AgentDef::verdict`'s doc). Read-only
+        // inspection of `bp.flow` — no rewriting, no new `Expr` forms.
+        verify_verdict_conds(&bp.flow, &verdict_contracts)?;
 
         if bp.strategy.strict_refs {
             verify_refs(&bp.flow, &routes, self.default_spawner.is_some())?;
@@ -403,6 +477,7 @@ impl Compiler {
         let router = Arc::new(CompiledAgentTable {
             routes,
             default: self.default_spawner.clone(),
+            verdict_contracts,
         });
         Ok(CompiledBlueprint {
             router,
@@ -504,6 +579,241 @@ fn static_step_meta_ref(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+// ─── GH #50: verdict contract cond↔output-shape lint ───────────────────────
+
+/// GH #50: `Blueprint.agents[].verdict` cond↔output-shape lint, run from
+/// `Compiler::compile` after the routing table is built. Two-pass, same
+/// shape as [`collect_step_meta_refs`]'s best-effort static walk: Pass 1
+/// ([`collect_step_outputs`]) builds `Step.out` `Path` string → producing
+/// `Step.ref_`; Pass 2 ([`collect_verdict_conds`]) walks every
+/// `Branch`/`Loop` `cond` and resolves each `Eq`/`Ne`/`In` `Path`+`Lit`
+/// comparison back through the Pass 1 map. Collects every violation before
+/// returning, then surfaces the first one (mirrors the other
+/// `Compiler::compile` validation blocks' `Result::Err`-via-`?` pattern).
+fn verify_verdict_conds(
+    flow: &FlowNode,
+    verdict_contracts: &HashMap<String, VerdictContract>,
+) -> Result<(), CompileError> {
+    let mut step_outputs: HashMap<String, String> = HashMap::new();
+    collect_step_outputs(flow, &mut step_outputs);
+
+    let mut errors: Vec<CompileError> = Vec::new();
+    collect_verdict_conds(flow, &step_outputs, verdict_contracts, &mut errors);
+    match errors.into_iter().next() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Pass 1 of [`verify_verdict_conds`]: `Step.out` `Path` (rendered via its
+/// canonical `Display` string) → the producing `Step.ref_` — mirrors
+/// [`collect_refs`]'s `Step.ref_` ↔ `AgentDef.name` correspondence (a
+/// `Step.ref_` directly indexes `Blueprint.agents[].name`, per
+/// `verify_refs`). Only `Step` nodes produce agent output; `Fanout`'s
+/// joined-array `out` and `Assign`'s computed `at` are not attributed to
+/// any single agent and are not inserted here.
+fn collect_step_outputs(node: &FlowNode, out: &mut HashMap<String, String>) {
+    match node {
+        FlowNode::Step {
+            ref_,
+            out: out_expr,
+            ..
+        } => {
+            if let Expr::Path { at } = out_expr {
+                out.insert(at.to_string(), ref_.clone());
+            }
+        }
+        FlowNode::Seq { children } => {
+            for c in children {
+                collect_step_outputs(c, out);
+            }
+        }
+        FlowNode::Branch { then_, else_, .. } => {
+            collect_step_outputs(then_, out);
+            collect_step_outputs(else_, out);
+        }
+        FlowNode::Fanout { body, .. } => collect_step_outputs(body, out),
+        FlowNode::Loop { body, .. } => collect_step_outputs(body, out),
+        FlowNode::Try { body, catch, .. } => {
+            collect_step_outputs(body, out);
+            collect_step_outputs(catch, out);
+        }
+        FlowNode::Assign { .. } => {} // The Assign node produces no agent output.
+    }
+}
+
+/// Pass 2 of [`verify_verdict_conds`]: recurse through the flow the same
+/// way [`collect_refs`] does, and for every `Branch`/`Loop` node lint its
+/// own `cond` field via [`lint_cond_expr`] (in addition to recursing into
+/// `then_`/`else_`/`body`).
+fn collect_verdict_conds(
+    node: &FlowNode,
+    step_outputs: &HashMap<String, String>,
+    verdict_contracts: &HashMap<String, VerdictContract>,
+    errors: &mut Vec<CompileError>,
+) {
+    match node {
+        FlowNode::Branch { cond, then_, else_ } => {
+            lint_cond_expr(cond, "Branch cond", step_outputs, verdict_contracts, errors);
+            collect_verdict_conds(then_, step_outputs, verdict_contracts, errors);
+            collect_verdict_conds(else_, step_outputs, verdict_contracts, errors);
+        }
+        FlowNode::Loop { cond, body, .. } => {
+            lint_cond_expr(cond, "Loop cond", step_outputs, verdict_contracts, errors);
+            collect_verdict_conds(body, step_outputs, verdict_contracts, errors);
+        }
+        FlowNode::Seq { children } => {
+            for c in children {
+                collect_verdict_conds(c, step_outputs, verdict_contracts, errors);
+            }
+        }
+        FlowNode::Fanout { body, .. } => {
+            collect_verdict_conds(body, step_outputs, verdict_contracts, errors)
+        }
+        FlowNode::Try { body, catch, .. } => {
+            collect_verdict_conds(body, step_outputs, verdict_contracts, errors);
+            collect_verdict_conds(catch, step_outputs, verdict_contracts, errors);
+        }
+        FlowNode::Step { .. } | FlowNode::Assign { .. } => {}
+    }
+}
+
+/// Lint one `cond` `Expr` tree for [`collect_verdict_conds`]: recurses into
+/// `And`/`Or`/`Not` (the only boolean combinators a verdict comparison can
+/// be nested under) and, for every `Eq`/`Ne` leaf whose operands are a
+/// `Path` + `Lit` pair (either order — see [`path_lit_operands`]), or every
+/// `In` leaf whose `needle` is a `Path` and `haystack` is a `Lit` JSON
+/// array, resolves + validates via [`resolve_and_check`]. Any other `Expr`
+/// shape (arithmetic, `Exists`, `CallExtern`, a non-`Path`/`Lit` `Eq`/`Ne`
+/// pair, ...) is not a verdict comparison and is skipped.
+fn lint_cond_expr(
+    expr: &Expr,
+    where_: &str,
+    step_outputs: &HashMap<String, String>,
+    verdict_contracts: &HashMap<String, VerdictContract>,
+    errors: &mut Vec<CompileError>,
+) {
+    match expr {
+        Expr::Eq { lhs, rhs } | Expr::Ne { lhs, rhs } => {
+            if let Some((path, lit)) = path_lit_operands(lhs, rhs) {
+                resolve_and_check(
+                    path,
+                    &[lit],
+                    where_,
+                    step_outputs,
+                    verdict_contracts,
+                    errors,
+                );
+            }
+        }
+        Expr::In { needle, haystack } => {
+            if let (
+                Expr::Path { at },
+                Expr::Lit {
+                    value: Value::Array(items),
+                },
+            ) = (needle.as_ref(), haystack.as_ref())
+            {
+                let lits: Vec<&Value> = items.iter().collect();
+                resolve_and_check(at, &lits, where_, step_outputs, verdict_contracts, errors);
+            }
+        }
+        Expr::And { args } | Expr::Or { args } => {
+            for a in args {
+                lint_cond_expr(a, where_, step_outputs, verdict_contracts, errors);
+            }
+        }
+        Expr::Not { arg } => lint_cond_expr(arg, where_, step_outputs, verdict_contracts, errors),
+        _ => {}
+    }
+}
+
+/// Extract a `(Path, Lit value)` pair out of an `Eq`/`Ne`'s two operands,
+/// regardless of which side the `Path` is on. `None` when the pairing is
+/// not exactly one `Path` + one `Lit` (e.g. both are `Path`, or either is a
+/// compound expr) — those are not statically resolvable to a single
+/// literal token and are left for `EngineDispatcher`'s runtime eval.
+fn path_lit_operands<'a>(lhs: &'a Expr, rhs: &'a Expr) -> Option<(&'a Path, &'a Value)> {
+    match (lhs, rhs) {
+        (Expr::Path { at }, Expr::Lit { value }) => Some((at, value)),
+        (Expr::Lit { value }, Expr::Path { at }) => Some((at, value)),
+        _ => None,
+    }
+}
+
+/// Resolve `path` back to a producing step — either as the bare step
+/// output (`channel: Body`) or, via the literal `.parts.verdict` suffix
+/// (`channel: Part` — the "verdict" part name is a literal, per the
+/// "Returning verdicts to drive BP flow" guide's Pattern B), as that
+/// step's staged verdict part. A `path` that resolves to neither shape
+/// against any known step output is skipped silently (best-effort static
+/// lint only, same posture as [`collect_step_meta_refs`]).
+///
+/// When the resolved agent declares a [`VerdictContract`], validates the
+/// resolved channel against it first (a mismatch short-circuits — the
+/// value comparison is moot once the channel itself is wrong) and then
+/// every entry of `lits` against `contract.values`, pushing at most one
+/// `CompileError` per violation. When the resolved agent declares no
+/// contract, emits a `tracing::warn!` only (GH #50's opt-in requirement).
+fn resolve_and_check(
+    path: &Path,
+    lits: &[&Value],
+    where_: &str,
+    step_outputs: &HashMap<String, String>,
+    verdict_contracts: &HashMap<String, VerdictContract>,
+    errors: &mut Vec<CompileError>,
+) {
+    let path_str = path.to_string();
+    let (agent, actual_shape) = if let Some(agent) = step_outputs.get(&path_str) {
+        (agent, "body")
+    } else if let Some(stripped) = path_str.strip_suffix(".parts.verdict") {
+        match step_outputs.get(stripped) {
+            Some(agent) => (agent, "part"),
+            None => return,
+        }
+    } else {
+        return;
+    };
+
+    let Some(contract) = verdict_contracts.get(agent) else {
+        tracing::warn!(
+            agent = %agent,
+            where_ = %where_,
+            "cond references agent output but no verdict contract declared"
+        );
+        return;
+    };
+
+    let expected_channel = match contract.channel {
+        VerdictChannel::Body => "body",
+        VerdictChannel::Part => "part",
+    };
+    if expected_channel != actual_shape {
+        errors.push(CompileError::VerdictChannelMismatch {
+            where_: where_.to_string(),
+            agent: agent.clone(),
+            expected_channel: expected_channel.to_string(),
+            actual_shape: actual_shape.to_string(),
+        });
+        return;
+    }
+
+    for lit in lits {
+        let value_str = lit
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| lit.to_string());
+        if !contract.values.iter().any(|v| v == &value_str) {
+            errors.push(CompileError::VerdictValueNotInContract {
+                where_: where_.to_string(),
+                agent: agent.clone(),
+                value: value_str,
+                values: contract.values.clone(),
+            });
+        }
+    }
+}
+
 // ─── CompiledAgentTable ───────────────────────────────────────────────────────
 
 /// The compile result: an `agent name → SpawnerAdapter` lookup table.
@@ -519,6 +829,10 @@ fn static_step_meta_ref(value: &Value) -> Option<String> {
 pub struct CompiledAgentTable {
     pub(crate) routes: HashMap<String, Arc<dyn SpawnerAdapter>>,
     pub(crate) default: Option<Arc<dyn SpawnerAdapter>>,
+    /// GH #50: `AgentDef.name` → declared `VerdictContract`, for every
+    /// agent that declared one (built by `Compiler::compile`, alongside
+    /// `routes`). Backs the submit-time enforcement point (a follow-up).
+    pub(crate) verdict_contracts: HashMap<String, VerdictContract>,
 }
 
 impl CompiledAgentTable {
@@ -530,6 +844,12 @@ impl CompiledAgentTable {
     /// List every resolved agent name.
     pub fn routed_agents(&self) -> Vec<String> {
         self.routes.keys().cloned().collect()
+    }
+    /// GH #50: the declared [`VerdictContract`] for `agent`, if any —
+    /// `None` both when `agent` is unresolved and when it resolved but
+    /// declared no contract (opt-in; see `AgentDef::verdict`'s doc).
+    pub fn verdict_contract_for(&self, agent: &str) -> Option<&VerdictContract> {
+        self.verdict_contracts.get(agent)
     }
 }
 
@@ -1298,6 +1618,7 @@ mod operator_spawner_factory_worker_binding_tests {
             meta: None,
             runner: None,
             runner_ref: None,
+            verdict: None,
         }
     }
 
@@ -1394,6 +1715,7 @@ mod lua_inline_source_tests {
             meta: None,
             runner: None,
             runner_ref: None,
+            verdict: None,
         }
     }
 
@@ -1513,6 +1835,7 @@ mod meta_ref_validation_tests {
             meta: None,
             runner: None,
             runner_ref: None,
+            verdict: None,
         }
     }
 
@@ -1690,6 +2013,7 @@ mod audit_agent_validation_tests {
             meta: None,
             runner: None,
             runner_ref: None,
+            verdict: None,
         }
     }
 
@@ -1809,6 +2133,7 @@ mod projection_placement_compile_tests {
                 meta: None,
                 runner: None,
                 runner_ref: None,
+                verdict: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -1890,5 +2215,301 @@ mod projection_placement_compile_tests {
             }
             Ok(_) => panic!("expected compile-time rejection for an invalid root literal"),
         }
+    }
+}
+
+// ─── GH #50: `Blueprint.agents[].verdict` cond↔output-shape lint ──────────
+#[cfg(test)]
+mod verdict_contract_lint_tests {
+    use super::*;
+    use crate::worker::adapter::WorkerResult;
+
+    fn registry_with_echo() -> SpawnerRegistry {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: Value::String(inv.prompt),
+                ok: true,
+            })
+        });
+        let mut reg = SpawnerRegistry::new();
+        reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(factory));
+        reg
+    }
+
+    fn gate_agent(verdict: Option<VerdictContract>) -> AgentDef {
+        AgentDef {
+            name: "gate".to_string(),
+            kind: AgentKind::RustFn,
+            spec: serde_json::json!({ "fn_id": "echo" }),
+            profile: None,
+            meta: None,
+            runner: None,
+            runner_ref: None,
+            verdict,
+        }
+    }
+
+    fn minimal_bp(agent: AgentDef, flow: FlowNode) -> Blueprint {
+        Blueprint {
+            schema_version: crate::blueprint::current_schema_version(),
+            id: "verdict-contract-ut".into(),
+            flow,
+            agents: vec![agent],
+            operators: vec![],
+            metas: vec![],
+            hints: Default::default(),
+            strategy: Default::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+            projection_placement: None,
+            audits: vec![],
+            degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
+        }
+    }
+
+    fn step(ref_: &str, out_path: &str) -> FlowNode {
+        FlowNode::Step {
+            ref_: ref_.to_string(),
+            in_: Expr::Lit { value: Value::Null },
+            out: Expr::Path {
+                at: out_path.parse().expect("literal test path"),
+            },
+        }
+    }
+
+    fn noop() -> FlowNode {
+        FlowNode::Seq { children: vec![] }
+    }
+
+    fn eq_cond(path: &str, lit: &str) -> Expr {
+        Expr::Eq {
+            lhs: Box::new(Expr::Path {
+                at: path.parse().expect("literal test path"),
+            }),
+            rhs: Box::new(Expr::Lit {
+                value: Value::String(lit.to_string()),
+            }),
+        }
+    }
+
+    fn branch(cond: Expr, then_: FlowNode, else_: FlowNode) -> FlowNode {
+        FlowNode::Branch {
+            cond,
+            then_: Box::new(then_),
+            else_: Box::new(else_),
+        }
+    }
+
+    fn body_contract(values: &[&str]) -> VerdictContract {
+        VerdictContract {
+            channel: VerdictChannel::Body,
+            values: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    fn part_contract(values: &[&str]) -> VerdictContract {
+        VerdictContract {
+            channel: VerdictChannel::Part,
+            values: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn contract_with_correct_body_channel_and_value_compiles() {
+        let agent = gate_agent(Some(body_contract(&["PASS", "BLOCKED"])));
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.verdict"),
+                branch(eq_cond("$.verdict", "BLOCKED"), noop(), noop()),
+            ],
+        };
+        let bp = minimal_bp(agent, flow);
+        assert!(
+            Compiler::new(registry_with_echo()).compile(&bp).is_ok(),
+            "a cond addressing the bare step output must match a channel: \"body\" contract"
+        );
+    }
+
+    #[test]
+    fn contract_with_correct_part_channel_and_value_compiles() {
+        let agent = gate_agent(Some(part_contract(&["PASS", "BLOCKED"])));
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.gate"),
+                branch(eq_cond("$.gate.parts.verdict", "BLOCKED"), noop(), noop()),
+            ],
+        };
+        let bp = minimal_bp(agent, flow);
+        assert!(
+            Compiler::new(registry_with_echo()).compile(&bp).is_ok(),
+            "a cond addressing '<step>.parts.verdict' must match a channel: \"part\" contract"
+        );
+    }
+
+    #[test]
+    fn body_channel_contract_rejects_cond_addressing_parts_verdict() {
+        // Pattern A declared (channel: "body") but the cond addresses the
+        // Pattern B shape ('$.gate.parts.verdict') instead of the bare
+        // step output — GH #50 register-time enforcement point 1.
+        let agent = gate_agent(Some(body_contract(&["PASS", "BLOCKED"])));
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.gate"),
+                branch(eq_cond("$.gate.parts.verdict", "BLOCKED"), noop(), noop()),
+            ],
+        };
+        let bp = minimal_bp(agent, flow);
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::VerdictChannelMismatch {
+                where_,
+                agent,
+                expected_channel,
+                actual_shape,
+            }) => {
+                assert_eq!(agent, "gate");
+                assert_eq!(expected_channel, "body");
+                assert_eq!(actual_shape, "part");
+                assert!(where_.contains("Branch cond"), "where_: {where_}");
+            }
+            Err(other) => {
+                panic!("expected VerdictChannelMismatch, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!("expected compile-time rejection for the wrong channel shape"),
+        }
+    }
+
+    #[test]
+    fn part_channel_contract_rejects_cond_addressing_bare_output() {
+        // Inverse of the previous case: channel: "part" declared, but the
+        // cond addresses the bare step output.
+        let agent = gate_agent(Some(part_contract(&["PASS", "BLOCKED"])));
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.verdict"),
+                branch(eq_cond("$.verdict", "BLOCKED"), noop(), noop()),
+            ],
+        };
+        let bp = minimal_bp(agent, flow);
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::VerdictChannelMismatch {
+                agent,
+                expected_channel,
+                actual_shape,
+                ..
+            }) => {
+                assert_eq!(agent, "gate");
+                assert_eq!(expected_channel, "part");
+                assert_eq!(actual_shape, "body");
+            }
+            Err(other) => {
+                panic!("expected VerdictChannelMismatch, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!("expected compile-time rejection for the wrong channel shape"),
+        }
+    }
+
+    #[test]
+    fn contract_rejects_lit_outside_declared_values() {
+        let agent = gate_agent(Some(body_contract(&["PASS", "BLOCKED"])));
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.verdict"),
+                branch(eq_cond("$.verdict", "UNKNOWN"), noop(), noop()),
+            ],
+        };
+        let bp = minimal_bp(agent, flow);
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::VerdictValueNotInContract {
+                agent,
+                value,
+                values,
+                ..
+            }) => {
+                assert_eq!(agent, "gate");
+                assert_eq!(value, "UNKNOWN");
+                assert_eq!(values, vec!["PASS".to_string(), "BLOCKED".to_string()]);
+            }
+            Err(other) => {
+                panic!("expected VerdictValueNotInContract, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!("expected compile-time rejection for a Lit outside declared values"),
+        }
+    }
+
+    #[test]
+    fn undeclared_agent_referenced_by_cond_compiles_with_warning_only() {
+        let agent = gate_agent(None);
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.verdict"),
+                branch(eq_cond("$.verdict", "BLOCKED"), noop(), noop()),
+            ],
+        };
+        let bp = minimal_bp(agent, flow);
+        assert!(
+            Compiler::new(registry_with_echo()).compile(&bp).is_ok(),
+            "an undeclared verdict contract must never reject compile (opt-in, back-compat)"
+        );
+    }
+
+    #[test]
+    fn in_expr_with_lit_haystack_members_compiles() {
+        let agent = gate_agent(Some(body_contract(&["PASS", "BLOCKED"])));
+        let cond = Expr::In {
+            needle: Box::new(Expr::Path {
+                at: "$.verdict".parse().expect("literal test path"),
+            }),
+            haystack: Box::new(Expr::Lit {
+                value: serde_json::json!(["PASS", "BLOCKED"]),
+            }),
+        };
+        let flow = FlowNode::Seq {
+            children: vec![step("gate", "$.verdict"), branch(cond, noop(), noop())],
+        };
+        let bp = minimal_bp(agent, flow);
+        assert!(
+            Compiler::new(registry_with_echo()).compile(&bp).is_ok(),
+            "an `In` haystack whose every Lit is a declared value must compile"
+        );
+    }
+
+    /// Acceptance criterion #7 (5th case): a Blueprint shaped like the
+    /// existing `02-verdict-loop.json` sample — a `Loop` retrying while
+    /// `$.verdict == "BLOCKED"` plus a `Branch` on `$.verdict == "PASS"` —
+    /// but with `verdict` omitted on every agent must compile unchanged
+    /// (at most `tracing::warn!`) and leave `CompiledAgentTable.
+    /// verdict_contracts` empty.
+    #[test]
+    fn verdict_omitted_blueprint_compiles_unchanged_with_empty_contracts() {
+        let agent = gate_agent(None);
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.verdict"),
+                FlowNode::Loop {
+                    counter: Expr::Path {
+                        at: "$.n".parse().expect("literal test path"),
+                    },
+                    cond: eq_cond("$.verdict", "BLOCKED"),
+                    body: Box::new(step("gate", "$.verdict")),
+                    max: 3,
+                },
+                branch(eq_cond("$.verdict", "PASS"), noop(), noop()),
+            ],
+        };
+        let bp = minimal_bp(agent, flow);
+        let compiled = Compiler::new(registry_with_echo())
+            .compile(&bp)
+            .expect("a verdict-omitted Blueprint must compile unchanged");
+        assert!(
+            compiled.router.verdict_contracts.is_empty(),
+            "no agent declared a verdict contract"
+        );
     }
 }

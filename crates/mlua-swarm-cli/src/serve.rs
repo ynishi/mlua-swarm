@@ -544,6 +544,7 @@ fn seed_blueprint(id: &str) -> Blueprint {
             meta: None,
             runner: None,
             runner_ref: None,
+            verdict: None,
         }],
         operators: vec![],
         metas: vec![],
