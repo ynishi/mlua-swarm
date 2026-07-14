@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/ynishi/mlua-swarm/compare/v0.9.2...v0.10.0) - 2026-07-14
+
+### Added
+
+- *(cli)* flow/bp Lua authoring DSL + `mse bp build` subcommand
+- verdict contract enforcement completeness — completion-time check on all submit routes (GH #51)
+- verdict contract — per-agent verdict declaration enforced at compile and submit (GH #50)
+- WorkerModel schema — Runner enum, runners registry, resolve cascade (GH #46 Milestone 2)
+
+### Other
+
+- Merge branch 'origin/main' into main
+- Merge branch 'topic/verdict-enforcement-completeness' into main
+- *(bp)* document canonical verdict-return patterns for BP flow
+
 ## [0.9.2](https://github.com/ynishi/mlua-swarm/compare/v0.9.1...v0.9.2) - 2026-07-12
 
 ### Added
