@@ -527,3 +527,4 @@ Blueprint is under Enhance management.
 - Verifying an `AgentDef`'s materialized tools/ctx/output before a run
   (`bp_explain_agent`): `mse://guides/agent-md-authoring` §
   Verifying how your agent materializes.
+- The DSL surface for authoring Blueprints directly in Lua (Expr method chains, Node builders, bp_dsl pipeline sugar): mse://guides/dsl-authoring, with two DSL samples: mse://blueprints/samples/06-dsl-verdict-loop and mse://blueprints/samples/07-dsl-pipeline.

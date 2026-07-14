@@ -8,7 +8,16 @@
 //! automatically. The one exception is `mse://api/blueprint-schema`,
 //! whose body is generated at `read_resource` time from the same
 //! `schemars`-derived [`Blueprint`] schema the `bp_schema` tool returns
-//! (see [`blueprint_schema_value`]).
+//! (see [`blueprint_schema_value`]). One more exception: the `.bp.lua`
+//! DSL sample `mse://blueprints/samples/06-dsl-verdict-loop`
+//! `include_str!`s directly from `tests/fixtures/` rather than
+//! duplicating into `src/mcp/resources/samples/` — it is the exact same
+//! file `dsl_json_equivalence_verdict_loop.rs` already build-tests via
+//! `dsl::build_bp_from_script`, so a single source of truth guarantees
+//! the bundled sample can never silently diverge from what CI proves
+//! compiles. (`07-dsl-pipeline` lives in `src/mcp/resources/samples/`
+//! like the JSON samples and is build-tested by
+//! `bp_lua_sample_bodies_build_via_dsl`.)
 //!
 //! ## URI scheme
 //!
@@ -30,11 +39,14 @@
 //! | `mse://guides/id-lifecycle`                  | Canonical ID inventory + lifecycle (issue #11).     |
 //! | `mse://guides/operator-execution-model`      | 3-hop execution model for `AgentKind::Operator` (WS thin-path). |
 //! | `mse://guides/agent-md-authoring`            | SubAgent (agent.md) canonical shape, size targets, fetch-vs-embed policy. |
+//! | `mse://guides/dsl-authoring`                 | flow_dsl/bp_dsl authoring DSL: Expr/Node builders, pipeline conventions, JSON→DSL migration SOP. |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
 //! | `mse://blueprints/samples/04-after-run-audit-operator` | GH #34 operator-backed after-run audit sample. |
 //! | `mse://blueprints/samples/05-after-run-audit-agent-block` | GH #34 agent-block-backed after-run audit sample. |
+//! | `mse://blueprints/samples/06-dsl-verdict-loop` | Sample `.bp.lua` — flow_dsl verdict-loop reproduction. |
+//! | `mse://blueprints/samples/07-dsl-pipeline`   | Sample `.bp.lua` — bp_dsl verdict-gated pipeline.   |
 //! | `mse://api/blueprint-schema`                 | Live Blueprint JSON Schema (generated per read).    |
 //! | `mse://api/http-endpoints`                   | Live HTTP wire-body JSON Schemas, keyed by endpoint (issue #19 ST5). |
 //! | `mse://api/mcp-tools`                        | Live schemars-generated MCP tool inputSchemas keyed by tool name (GH #24 sibling). |
@@ -83,6 +95,7 @@ const ID_LIFECYCLE_BODY: &str = include_str!("./resources/guides/id-lifecycle.md
 const OPERATOR_EXECUTION_MODEL_BODY: &str =
     include_str!("./resources/guides/operator-execution-model.md");
 const AGENT_MD_AUTHORING_BODY: &str = include_str!("./resources/guides/agent-md-authoring.md");
+const DSL_AUTHORING_GUIDE_BODY: &str = include_str!("./resources/guides/dsl-authoring.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -92,6 +105,10 @@ const SAMPLE_04_AFTER_RUN_AUDIT_OPERATOR_BODY: &str =
     include_str!("./resources/samples/04-after-run-audit-operator.json");
 const SAMPLE_05_AFTER_RUN_AUDIT_AGENT_BLOCK_BODY: &str =
     include_str!("./resources/samples/05-after-run-audit-agent-block.json");
+const SAMPLE_06_DSL_VERDICT_LOOP_BODY: &str =
+    include_str!("../../tests/fixtures/verdict_loop.bp.lua");
+const SAMPLE_07_DSL_PIPELINE_BODY: &str =
+    include_str!("./resources/samples/07-dsl-pipeline.bp.lua");
 
 /// Static resource catalogue. Order is the order `list_resources` reports.
 pub const RESOURCES: &[ResourceEntry] = &[
@@ -138,6 +155,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         body: ResourceBody::Static(AGENT_MD_AUTHORING_BODY),
     },
     ResourceEntry {
+        uri: "mse://guides/dsl-authoring",
+        title: "mse — Blueprint DSL (flow_dsl / bp_dsl) authoring guide",
+        description: "flow_dsl Expr/Node builders, bp_dsl pipeline conventions (default in/out, verdict gate, retry expansion), and a JSON→DSL migration SOP.",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(DSL_AUTHORING_GUIDE_BODY),
+    },
+    ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",
         title: "Sample Blueprint — pure ctx eval",
         description: "Zero-spawn pure ctx evaluation using Assign + And + Gt + Lt + Lit primitives.",
@@ -171,6 +195,20 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "GH #34: an agent_block-kind `auditor` declared in `audits` runs in-process after the `worker` step settles, with no operator round-trip.",
         mime_type: "application/json",
         body: ResourceBody::Static(SAMPLE_05_AFTER_RUN_AUDIT_AGENT_BLOCK_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://blueprints/samples/06-dsl-verdict-loop",
+        title: "Sample .bp.lua — verdict loop (flow_dsl)",
+        description: "Hand-written flow_dsl reproduction of mse://blueprints/samples/02-verdict-loop (loop/branch shape not expressible via bp_dsl's B.pipeline sugar).",
+        mime_type: "text/x-lua",
+        body: ResourceBody::Static(SAMPLE_06_DSL_VERDICT_LOOP_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://blueprints/samples/07-dsl-pipeline",
+        title: "Sample .bp.lua — verdict-gated pipeline (bp_dsl)",
+        description: "B.pipeline{}-built three-stage pipeline: default in/out wiring derived from stage ids, automatic verdict gates, and a bounded fix-and-regate retry loop.",
+        mime_type: "text/x-lua",
+        body: ResourceBody::Static(SAMPLE_07_DSL_PIPELINE_BODY),
     },
     ResourceEntry {
         uri: "mse://api/blueprint-schema",
@@ -465,6 +503,24 @@ mod tests {
                 !bp.id.as_str().is_empty(),
                 "{uri}: sample Blueprint must carry a non-empty id"
             );
+        }
+    }
+
+    #[test]
+    fn bp_lua_sample_bodies_build_via_dsl() {
+        // Guards the shipped `.bp.lua` samples against DSL-surface drift:
+        // every sample must actually compile via `dsl::build_bp_from_script`,
+        // not merely exist as static text (crux: "bundled samples build
+        // drift" — samples that only exist as uncompiled text are not
+        // acceptable).
+        for uri in [
+            "mse://blueprints/samples/06-dsl-verdict-loop",
+            "mse://blueprints/samples/07-dsl-pipeline",
+        ] {
+            let entry = find_by_uri(uri).unwrap_or_else(|| panic!("sample must exist: {uri}"));
+            let body = body_for(entry).expect("sample body must generate");
+            mlua_swarm_cli::dsl::build_bp_from_script(&body)
+                .unwrap_or_else(|e| panic!("{uri}: does not build via dsl::build_bp_from_script: {e}"));
         }
     }
 
