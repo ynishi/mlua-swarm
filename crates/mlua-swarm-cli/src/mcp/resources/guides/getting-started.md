@@ -104,6 +104,8 @@ directly, e.g. `mse://guides/blueprint-authoring` or
 - Sample Blueprints ready to adapt: `mse://blueprints/samples/01-pure-ctx-eval`,
   `mse://blueprints/samples/02-verdict-loop`, `mse://blueprints/samples/03-fn-override`.
 - Full Blueprint authoring reference: `mse://guides/blueprint-authoring`.
+- Authoring a Blueprint's `flow` directly in Lua instead of hand-written JSON
+  (`mse bp build`): `mse://guides/dsl-authoring`.
 - The live Blueprint JSON Schema (always in sync with the running binary):
   `mse://api/blueprint-schema`.
 - All `mse mcp` tools grouped by family: `mse://guides/mcp-tool-reference`.
