@@ -26,6 +26,7 @@ mlua-swarm-server.workspace = true
 mlua-swarm-schema.workspace = true
 rusqlite-isle.workspace = true
 mlua-flow-ir.workspace = true
+mlua.workspace = true
 
 anyhow.workspace = true
 tokio.workspace = true
@@ -47,3 +48,8 @@ sha2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_cmd = "2"
+predicates = "3"
