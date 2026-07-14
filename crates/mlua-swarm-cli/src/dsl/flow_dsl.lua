@@ -43,10 +43,22 @@ end
 
 --- `F.raw(t)` — treat an arbitrary raw AST table as an Expr wrapper
 --- passthrough (no validation; `t` is emitted verbatim as this Expr's
---- AST). This is the escape hatch for ops with no dedicated builder
---- (e.g. `call_extern`).
+--- AST). This is the general escape hatch for ops with no dedicated
+--- builder.
 function M.raw(t)
   return wrap(t)
+end
+
+--- `F.call_extern(name, args)` — a `call_extern` Expr: `name` is the
+--- extern registry key (wire field `ref`); `args` is a Lua list of
+--- Expr wrappers or raw values (auto-`lit`, same convention as
+--- `F.all`/`F.any`), evaluated before the extern call.
+function M.call_extern(name, args)
+  local wire_args = {}
+  for i, v in ipairs(args or {}) do
+    wire_args[i] = M.unwrap(v)
+  end
+  return wrap({ op = "call_extern", ["ref"] = name, args = wire_args })
 end
 
 --- `F.p(path_str)` — a `path` Expr, e.g. `F.p"$.x"`.
@@ -148,6 +160,27 @@ function M.any(list)
     args[i] = M.unwrap(v)
   end
   return wrap({ op = "or", args = args })
+end
+
+-- ── Empty-object marker ──────────────────────────────────────────────────
+
+--- Marker key used by `F.obj()` below. Lua's table type cannot itself
+--- distinguish an empty array from an empty object, and
+--- `build_bp_from_script` (`crates/mlua-swarm-cli/src/dsl/mod.rs`)
+--- converts every zero-length Lua table to a JSON array — so a
+--- one-key table carrying this marker is used as a stand-in wherever a
+--- field must serialize as an empty JSON *object* instead, and
+--- `build_bp_from_script` replaces every occurrence of this exact
+--- single-key shape with a genuine empty JSON object as a post-pass over
+--- the converted value. `M.EMPTY_OBJECT_MARKER_KEY` is exposed so the
+--- Rust side can reference the same literal rather than duplicating it.
+M.EMPTY_OBJECT_MARKER_KEY = "__mse_empty_object__"
+
+--- `F.obj()` — a marker value that serializes to an empty JSON object
+--- (`{}`). See `M.EMPTY_OBJECT_MARKER_KEY`'s doc comment for why this
+--- indirection is needed instead of a bare `{}` Lua table literal.
+function M.obj()
+  return { [M.EMPTY_OBJECT_MARKER_KEY] = true }
 end
 
 -- ── Node builders (plain tables, no metatable) ──────────────────────────

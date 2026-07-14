@@ -1,9 +1,8 @@
-//! Golden test: reproduce
-//! `mse://blueprints/samples/02-verdict-loop` verbatim from a `.bp.lua` DSL
-//! script (`tests/fixtures/verdict_loop.bp.lua`) and assert the two
-//! `serde_json::Value`s are equal. `serde_json::Value` equality ignores
-//! object key order, so this is a structural AST-shape check, not a
-//! byte-for-byte text diff.
+//! JSON-equivalence test: a `.bp.lua` DSL script
+//! (`tests/fixtures/verdict_loop.bp.lua`) must build to exactly the same
+//! Blueprint value as `mse://blueprints/samples/02-verdict-loop`.
+//! `serde_json::Value` equality ignores object key order, so this is a
+//! structural AST-shape check, not a byte-for-byte text diff.
 
 use mlua_swarm_cli::dsl;
 
@@ -19,7 +18,7 @@ fn dsl_reproduces_verdict_loop_sample_verbatim() {
 
     assert_eq!(
         actual, expected,
-        "DSL-built Blueprint diverges from the golden sample \
+        "DSL-built Blueprint diverges from the bundled sample \
          (mse://blueprints/samples/02-verdict-loop)"
     );
 }

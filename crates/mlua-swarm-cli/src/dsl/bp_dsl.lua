@@ -84,6 +84,12 @@ local function default_out_path(stage_id)
   return "$." .. stage_id
 end
 
+-- A stage's default retry-loop counter path (used when the stage's own
+-- `retry.counter` is nil).
+local function default_counter_path(stage_id)
+  return "$." .. stage_id .. "_n"
+end
+
 -- The verdict-gate condition for one stage: `eq(<out>.parts["verdict"],
 -- lit(v))` for a single halt_on value, or an N-ary `or` of that shape
 -- across every halt_on value when there's more than one.
@@ -167,14 +173,15 @@ end
 ---
 --- ## Retry
 ---
---- `retry = { max = N, fix = <stage record> }` on a stage record expands
---- to 3 parts, in order: (1) the stage's own `step` Node; (2)
---- `loop_{counter = "$.{id}_n", cond = <lt(counter, max) AND <the gate
---- cond above>>, max = max + 1, body = seq{fix step, stage step
---- re-run}}`; (3) the ordinary verdict gate (evaluated once more, after
---- the loop settles — or spliced in directly if `gate = false`). The
---- `fix` stage record goes through the same default in/out wiring as any
---- other stage.
+--- `retry = { max = N, fix = <stage record>, counter = "$.path" }` on a
+--- stage record expands to 3 parts, in order: (1) the stage's own `step`
+--- Node; (2) `loop_{counter = <counter path>, cond = <lt(counter, max)
+--- AND <the gate cond above>>, max = max + 1, body = seq{fix step, stage
+--- step re-run}}`; (3) the ordinary verdict gate (evaluated once more,
+--- after the loop settles — or spliced in directly if `gate = false`).
+--- `counter` is optional; when omitted the loop counter path defaults to
+--- `"$.{stage_id}_n"`. The `fix` stage record goes through the same
+--- default in/out wiring as any other stage.
 ---
 --- ## `B.from`
 ---
@@ -223,7 +230,7 @@ function M.pipeline(spec)
     if rec.retry ~= nil then
       local fix_step = build_step(rec.retry.fix, outs)
       local max = rec.retry.max
-      local counter_path = "$." .. rec.id .. "_n"
+      local counter_path = rec.retry.counter or default_counter_path(rec.id)
       local loop_cond = F.p(counter_path):lt(max):And(gate_cond(rec._out, this_halt_on))
       children[#children + 1] = F.loop_({
         counter = F.p(counter_path),

@@ -56,10 +56,7 @@ fn every_expr_op_round_trips_through_flow_dsl() {
         ("mod", "F.lit(5) % F.lit(2)"),
         ("len", r#"F.lit("hi"):len()"#),
         ("in", "F.lit({1, 2, 3}):contains(F.lit(1))"),
-        (
-            "call_extern",
-            r#"F.raw({ op = "call_extern", ["ref"] = "math.sqrt", args = { F.unwrap(F.lit(9)) } })"#,
-        ),
+        ("call_extern", r#"F.call_extern("math.sqrt", { F.lit(9) })"#),
     ];
 
     assert_eq!(cases.len(), 20, "the guide documents exactly 20 Expr ops");
@@ -79,6 +76,38 @@ fn eq_op_emits_the_documented_field_names() {
             "op": "eq",
             "lhs": {"op": "lit", "value": 1},
             "rhs": {"op": "lit", "value": 1},
+        })
+    );
+}
+
+#[test]
+fn call_extern_emits_the_documented_field_names() {
+    // Spot-check `F.call_extern`'s exact shape: `ref` for the extern
+    // registry key (not the Rust-side field name `ref_`) and `args` as a
+    // plain unwrapped-Expr list.
+    let value = build_expr(r#"F.call_extern("math.sqrt", { F.lit(9) })"#);
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "op": "call_extern",
+            "ref": "math.sqrt",
+            "args": [{"op": "lit", "value": 9}],
+        })
+    );
+}
+
+#[test]
+fn call_extern_accepts_raw_values_alongside_expr_wrappers() {
+    // Every other N-ary builder (`F.all`/`F.any`) auto-`lit`s raw Lua
+    // values via `F.unwrap`; `F.call_extern`'s `args` list follows the
+    // same convention.
+    let value = build_expr(r#"F.call_extern("math.pow", { 2, F.lit(3) })"#);
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "op": "call_extern",
+            "ref": "math.pow",
+            "args": [{"op": "lit", "value": 2}, {"op": "lit", "value": 3}],
         })
     );
 }

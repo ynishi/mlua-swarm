@@ -1,0 +1,493 @@
+{
+  "agents": [
+    {
+      "$agent_md": "prepare.md",
+      "spec": {
+        "operator_ref": "main-ai"
+      }
+    },
+    {
+      "$agent_md": "setup.md",
+      "spec": {
+        "operator_ref": "main-ai"
+      }
+    },
+    {
+      "$agent_md": "gather.md",
+      "spec": {
+        "operator_ref": "main-ai"
+      }
+    },
+    {
+      "$agent_md": "implement.md",
+      "spec": {
+        "operator_ref": "main-ai"
+      }
+    },
+    {
+      "$agent_md": "polish.md",
+      "spec": {
+        "operator_ref": "main-ai"
+      }
+    },
+    {
+      "$agent_md": "review.md",
+      "spec": {
+        "operator_ref": "main-ai"
+      },
+      "verdict": {
+        "channel": "part",
+        "values": [
+          "PASS",
+          "BLOCKED"
+        ]
+      }
+    },
+    {
+      "$agent_md": "record.md",
+      "spec": {
+        "operator_ref": "main-ai"
+      }
+    },
+    {
+      "$agent_md": "merge.md",
+      "spec": {
+        "operator_ref": "main-ai"
+      }
+    },
+    {
+      "$agent_md": "fixer.md",
+      "spec": {
+        "operator_ref": "main-ai"
+      }
+    }
+  ],
+  "flow": {
+    "children": [
+      {
+        "in": {
+          "at": "$.d.prep",
+          "op": "path"
+        },
+        "kind": "step",
+        "out": {
+          "at": "$.prepared",
+          "op": "path"
+        },
+        "ref": "prepare"
+      },
+      {
+        "cond": {
+          "lhs": {
+            "at": "$.prepared.parts[\"verdict\"]",
+            "op": "path"
+          },
+          "op": "eq",
+          "rhs": {
+            "op": "lit",
+            "value": "BLOCKED"
+          }
+        },
+        "else": {
+          "children": [
+            {
+              "in": {
+                "at": "$.d.setup_dir",
+                "op": "path"
+              },
+              "kind": "step",
+              "out": {
+                "at": "$.workspace",
+                "op": "path"
+              },
+              "ref": "setup"
+            },
+            {
+              "cond": {
+                "lhs": {
+                  "at": "$.workspace.parts[\"verdict\"]",
+                  "op": "path"
+                },
+                "op": "eq",
+                "rhs": {
+                  "op": "lit",
+                  "value": "BLOCKED"
+                }
+              },
+              "else": {
+                "children": [
+                  {
+                    "in": {
+                      "at": "$.d.gather_ctx",
+                      "op": "path"
+                    },
+                    "kind": "step",
+                    "out": {
+                      "at": "$.context",
+                      "op": "path"
+                    },
+                    "ref": "gather"
+                  },
+                  {
+                    "cond": {
+                      "lhs": {
+                        "at": "$.context.parts[\"verdict\"]",
+                        "op": "path"
+                      },
+                      "op": "eq",
+                      "rhs": {
+                        "op": "lit",
+                        "value": "BLOCKED"
+                      }
+                    },
+                    "else": {
+                      "children": [
+                        {
+                          "in": {
+                            "at": "$.d.impl",
+                            "op": "path"
+                          },
+                          "kind": "step",
+                          "out": {
+                            "at": "$.implemented",
+                            "op": "path"
+                          },
+                          "ref": "implement"
+                        },
+                        {
+                          "cond": {
+                            "lhs": {
+                              "at": "$.implemented.parts[\"verdict\"]",
+                              "op": "path"
+                            },
+                            "op": "eq",
+                            "rhs": {
+                              "op": "lit",
+                              "value": "BLOCKED"
+                            }
+                          },
+                          "else": {
+                            "children": [
+                              {
+                                "in": {
+                                  "at": "$.d.polish_rules",
+                                  "op": "path"
+                                },
+                                "kind": "step",
+                                "out": {
+                                  "at": "$.polished",
+                                  "op": "path"
+                                },
+                                "ref": "polish"
+                              },
+                              {
+                                "cond": {
+                                  "lhs": {
+                                    "at": "$.polished.parts[\"verdict\"]",
+                                    "op": "path"
+                                  },
+                                  "op": "eq",
+                                  "rhs": {
+                                    "op": "lit",
+                                    "value": "BLOCKED"
+                                  }
+                                },
+                                "else": {
+                                  "children": [
+                                    {
+                                      "in": {
+                                        "at": "$.d.review",
+                                        "op": "path"
+                                      },
+                                      "kind": "step",
+                                      "out": {
+                                        "at": "$.review_verdict",
+                                        "op": "path"
+                                      },
+                                      "ref": "review"
+                                    },
+                                    {
+                                      "body": {
+                                        "children": [
+                                          {
+                                            "in": {
+                                              "at": "$.review_verdict",
+                                              "op": "path"
+                                            },
+                                            "kind": "step",
+                                            "out": {
+                                              "at": "$.fix",
+                                              "op": "path"
+                                            },
+                                            "ref": "fixer"
+                                          },
+                                          {
+                                            "in": {
+                                              "at": "$.d.review",
+                                              "op": "path"
+                                            },
+                                            "kind": "step",
+                                            "out": {
+                                              "at": "$.review_verdict",
+                                              "op": "path"
+                                            },
+                                            "ref": "review"
+                                          }
+                                        ],
+                                        "kind": "seq"
+                                      },
+                                      "cond": {
+                                        "args": [
+                                          {
+                                            "lhs": {
+                                              "at": "$.rv_n",
+                                              "op": "path"
+                                            },
+                                            "op": "lt",
+                                            "rhs": {
+                                              "op": "lit",
+                                              "value": 2
+                                            }
+                                          },
+                                          {
+                                            "lhs": {
+                                              "at": "$.review_verdict.parts[\"verdict\"]",
+                                              "op": "path"
+                                            },
+                                            "op": "eq",
+                                            "rhs": {
+                                              "op": "lit",
+                                              "value": "BLOCKED"
+                                            }
+                                          }
+                                        ],
+                                        "op": "and"
+                                      },
+                                      "counter": {
+                                        "at": "$.rv_n",
+                                        "op": "path"
+                                      },
+                                      "kind": "loop",
+                                      "max": 3
+                                    },
+                                    {
+                                      "cond": {
+                                        "lhs": {
+                                          "at": "$.review_verdict.parts[\"verdict\"]",
+                                          "op": "path"
+                                        },
+                                        "op": "eq",
+                                        "rhs": {
+                                          "op": "lit",
+                                          "value": "BLOCKED"
+                                        }
+                                      },
+                                      "else": {
+                                        "children": [
+                                          {
+                                            "in": {
+                                              "at": "$.d.record",
+                                              "op": "path"
+                                            },
+                                            "kind": "step",
+                                            "out": {
+                                              "at": "$.recorded",
+                                              "op": "path"
+                                            },
+                                            "ref": "record"
+                                          },
+                                          {
+                                            "cond": {
+                                              "lhs": {
+                                                "at": "$.recorded.parts[\"verdict\"]",
+                                                "op": "path"
+                                              },
+                                              "op": "eq",
+                                              "rhs": {
+                                                "op": "lit",
+                                                "value": "BLOCKED"
+                                              }
+                                            },
+                                            "else": {
+                                              "children": [
+                                                {
+                                                  "in": {
+                                                    "at": "$.d.merge_target",
+                                                    "op": "path"
+                                                  },
+                                                  "kind": "step",
+                                                  "out": {
+                                                    "at": "$.merged",
+                                                    "op": "path"
+                                                  },
+                                                  "ref": "merge"
+                                                },
+                                                {
+                                                  "cond": {
+                                                    "lhs": {
+                                                      "at": "$.merged.parts[\"verdict\"]",
+                                                      "op": "path"
+                                                    },
+                                                    "op": "eq",
+                                                    "rhs": {
+                                                      "op": "lit",
+                                                      "value": "BLOCKED"
+                                                    }
+                                                  },
+                                                  "else": {
+                                                    "at": {
+                                                      "at": "$.pipeline_complete",
+                                                      "op": "path"
+                                                    },
+                                                    "kind": "assign",
+                                                    "value": {
+                                                      "op": "lit",
+                                                      "value": true
+                                                    }
+                                                  },
+                                                  "kind": "branch",
+                                                  "then": {
+                                                    "at": {
+                                                      "at": "$.halted_at",
+                                                      "op": "path"
+                                                    },
+                                                    "kind": "assign",
+                                                    "value": {
+                                                      "op": "lit",
+                                                      "value": "merge"
+                                                    }
+                                                  }
+                                                }
+                                              ],
+                                              "kind": "seq"
+                                            },
+                                            "kind": "branch",
+                                            "then": {
+                                              "at": {
+                                                "at": "$.halted_at",
+                                                "op": "path"
+                                              },
+                                              "kind": "assign",
+                                              "value": {
+                                                "op": "lit",
+                                                "value": "record"
+                                              }
+                                            }
+                                          }
+                                        ],
+                                        "kind": "seq"
+                                      },
+                                      "kind": "branch",
+                                      "then": {
+                                        "at": {
+                                          "at": "$.halted_at",
+                                          "op": "path"
+                                        },
+                                        "kind": "assign",
+                                        "value": {
+                                          "op": "lit",
+                                          "value": "review"
+                                        }
+                                      }
+                                    }
+                                  ],
+                                  "kind": "seq"
+                                },
+                                "kind": "branch",
+                                "then": {
+                                  "at": {
+                                    "at": "$.halted_at",
+                                    "op": "path"
+                                  },
+                                  "kind": "assign",
+                                  "value": {
+                                    "op": "lit",
+                                    "value": "polish"
+                                  }
+                                }
+                              }
+                            ],
+                            "kind": "seq"
+                          },
+                          "kind": "branch",
+                          "then": {
+                            "at": {
+                              "at": "$.halted_at",
+                              "op": "path"
+                            },
+                            "kind": "assign",
+                            "value": {
+                              "op": "lit",
+                              "value": "implement"
+                            }
+                          }
+                        }
+                      ],
+                      "kind": "seq"
+                    },
+                    "kind": "branch",
+                    "then": {
+                      "at": {
+                        "at": "$.halted_at",
+                        "op": "path"
+                      },
+                      "kind": "assign",
+                      "value": {
+                        "op": "lit",
+                        "value": "gather"
+                      }
+                    }
+                  }
+                ],
+                "kind": "seq"
+              },
+              "kind": "branch",
+              "then": {
+                "at": {
+                  "at": "$.halted_at",
+                  "op": "path"
+                },
+                "kind": "assign",
+                "value": {
+                  "op": "lit",
+                  "value": "setup"
+                }
+              }
+            }
+          ],
+          "kind": "seq"
+        },
+        "kind": "branch",
+        "then": {
+          "at": {
+            "at": "$.halted_at",
+            "op": "path"
+          },
+          "kind": "assign",
+          "value": {
+            "op": "lit",
+            "value": "prepare"
+          }
+        }
+      }
+    ],
+    "kind": "seq"
+  },
+  "id": "sample-pipeline",
+  "metadata": {
+    "default_run_ttl_secs": 5400,
+    "description": "Nine verdict-gated stages in sequence with a bounded fix-and-regate retry loop around the review stage. Callers seed per-stage directives under init_ctx.d and the retry counter rv_n=0. The review agent declares a verdict contract (channel=part, values=[PASS, BLOCKED]) so compile-time cond lint and submit-time gating protect the loop shape."
+  },
+  "operators": [
+    {
+      "display_name": "Main operator",
+      "kind": "main_ai",
+      "name": "main-ai",
+      "spec": {}
+    }
+  ],
+  "strategy": {
+    "strict_kind": true,
+    "strict_refs": true
+  }
+}

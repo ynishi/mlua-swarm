@@ -1,7 +1,8 @@
 -- Reproduces mse://blueprints/samples/02-verdict-loop verbatim, using
 -- flow_dsl directly (this sample's loop/branch shape is hand-written, not
--- bp_dsl's opinionated gate/retry sugar shape — see dsl_golden_verdict_loop.rs
--- for why this fixture goes through F, not B.pipeline).
+-- bp_dsl's opinionated gate/retry sugar shape — see
+-- dsl_json_equivalence_verdict_loop.rs for why this fixture goes through F,
+-- not B.pipeline).
 
 local F = require("flow_dsl")
 

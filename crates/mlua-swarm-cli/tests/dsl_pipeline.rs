@@ -237,6 +237,56 @@ fn retry_expands_to_step_loop_gate() {
     serde_json::from_value::<mlua_flow_ir::Node>(value).expect("must be a valid flow.ir Node");
 }
 
+/// `retry.counter` overrides the loop's counter path (the default is
+/// `"$.{stage_id}_n"` — see `retry_expands_to_step_loop_gate` above for
+/// that default case); every other retry-expansion detail (loop `max`,
+/// `cond` shape, body order) is unaffected by the override.
+#[test]
+fn retry_counter_override_changes_loop_counter_path() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "resolver" {
+            agent = "mock-resolver",
+            retry = {
+              max = 3,
+              counter = "$.custom_counter",
+              fix = B.stage "resolver_fix" { agent = "mock-fix" },
+            },
+          },
+          halt_on = { "BLOCKED" },
+          halted_at = "$.halted_at",
+        }
+        "#,
+    );
+    let loop_node = &value["children"][1];
+    assert_eq!(loop_node["kind"], serde_json::json!("loop"));
+    assert_eq!(
+        loop_node["counter"],
+        serde_json::json!({"op": "path", "at": "$.custom_counter"})
+    );
+    let cond_args = loop_node["cond"]["args"].as_array().expect("and args");
+    assert_eq!(
+        cond_args[0]["lhs"],
+        serde_json::json!({"op": "path", "at": "$.custom_counter"}),
+        "the lt-comparison in cond must also read the overridden counter path"
+    );
+
+    serde_json::from_value::<mlua_flow_ir::Node>(value).expect("must be a valid flow.ir Node");
+}
+
+/// `F.obj()` emits a genuine empty JSON object wherever it's substituted
+/// for a raw Lua table field, exercised here through the same
+/// `dsl::build_bp_from_script` entry point `B.pipeline` results flow
+/// through (this module's helper preloads both `flow_dsl` and `bp_dsl`,
+/// even though `F.obj()` itself has no dependency on `bp_dsl`).
+#[test]
+fn f_obj_emits_an_empty_json_object() {
+    let value = build_pipeline(r#"return { spec = F.obj() }"#);
+    assert_eq!(value["spec"], serde_json::json!({}));
+    assert!(value["spec"].is_object());
+}
+
 /// eval smoke: a small flow_dsl-built flow (`assign` +
 /// `branch`, no `step`/dispatch involved) runs end-to-end through
 /// mlua-flow-ir's Lua `flow.eval` binding — no server, no HTTP, nothing but

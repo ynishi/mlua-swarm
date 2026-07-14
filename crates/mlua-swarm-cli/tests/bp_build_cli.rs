@@ -11,7 +11,7 @@ fn bp_build_writes_parseable_json_with_top_level_keys() {
 
     Command::cargo_bin("mse")
         .expect("mse binary")
-        .args(["bp", "build", "tests/fixtures/phase_b.bp.lua", "-o"])
+        .args(["bp", "build", "tests/fixtures/pipeline.bp.lua", "-o"])
         .arg(&out_path)
         .assert()
         .success();
