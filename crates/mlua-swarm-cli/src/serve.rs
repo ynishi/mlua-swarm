@@ -143,11 +143,28 @@ pub struct Args {
     /// `true`.
     #[arg(long)]
     ephemeral: bool,
+    /// Server-wide `CheckPolicy` for submit-time projection sinks
+    /// (issue #0486d79d). One of `silent` / `warn` / `strict`
+    /// (snake_case). Overrides the config file's `check_policy`. When
+    /// omitted (and absent from the config file), falls back to `warn`
+    /// (byte-identical to the pre-`CheckPolicy` fail-open behaviour).
+    /// `strict` returns `EngineError::CheckPolicyStrict` from the sink
+    /// so a caller can fail-loud instead of proceeding with a
+    /// partially-realized submission. Per-task
+    /// `TaskSpec.check_policy` (set via caller code) wins over this
+    /// server-wide value.
+    #[arg(long)]
+    check_policy: Option<String>,
 }
 
 fn parse_agent_kind_cli(s: &str) -> Result<mlua_swarm::blueprint::AgentKind, String> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|e| format!("invalid --default-agent-kind {s:?}: {e}"))
+}
+
+fn parse_check_policy_cli(s: &str) -> Result<mlua_swarm::core::config::CheckPolicy, String> {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .map_err(|e| format!("invalid --check-policy {s:?}: {e}"))
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
@@ -177,6 +194,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         default_agent_kind: args.default_agent_kind.clone(),
         token_secret: args.token_secret.clone(),
         sync_timeout_secs: args.sync_timeout_secs,
+        check_policy: args
+            .check_policy
+            .as_ref()
+            .map(|s| parse_check_policy_cli(s).unwrap_or_else(|e| panic!("mse serve: {e}"))),
     };
     let cfg = mlua_swarm_server::config::resolve(cli_overrides, file_config)
         .unwrap_or_else(|e| panic!("mse serve: config resolve failed: {e}"));
@@ -191,6 +212,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         if let Some(hex_secret) = &cfg.token_secret {
             c.token_secret = hex::decode(hex_secret).expect("token-secret must be hex");
         }
+        c.check_policy = cfg.check_policy;
         c
     };
     // Engine stateless-executor refactor:
@@ -407,6 +429,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             .map(|p| p.display().to_string()),
         enhance_flow_enabled: cfg.enable_enhance_flow,
         seed_blueprint_id: cfg.seed_blueprint_id.clone(),
+        check_policy: cfg.check_policy,
     };
 
     app = app
