@@ -9,6 +9,7 @@ use super::semver_resolve::SemverResolveError;
 use super::Application;
 use crate::blueprint::store::{BlueprintId, BlueprintStore, BlueprintStoreError, BlueprintVersion};
 use crate::blueprint::Blueprint;
+use crate::core::config::CheckPolicy;
 use crate::core::ctx::OperatorKind;
 use crate::service::{
     TaskInputSpec, TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService,
@@ -111,6 +112,13 @@ pub struct TaskApplicationInput {
     /// `None` — no Task-level context is layered on the spawner stack
     /// (default; keeps the wire body opt-in).
     pub task_input: Option<TaskInputSpec>,
+    /// The "launch request" tier (tier 1) of the
+    /// `check_policy` cascade, threaded straight down to
+    /// [`TaskLaunchInput::check_policy`]. `None` (the default via
+    /// [`Self::automate`]) leaves this tier unspecified — the Blueprint tier
+    /// / server-wide default decide. Wired from the `POST /v1/tasks`
+    /// request body's top-level `check_policy` field.
+    pub check_policy: Option<CheckPolicy>,
 }
 
 impl TaskApplicationInput {
@@ -140,6 +148,7 @@ impl TaskApplicationInput {
             operator_backend_id: None,
             operator_kind_overrides: HashMap::new(),
             task_input: None,
+            check_policy: None,
         }
     }
 }
@@ -288,6 +297,7 @@ impl TaskApplication {
                 init_ctx: input.init_ctx,
                 run_ctx,
                 task_input: input.task_input,
+                check_policy: input.check_policy,
             })
             .await?;
         Ok(TaskApplicationOutput {
@@ -361,6 +371,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -393,6 +404,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -460,6 +472,7 @@ mod tests {
             operator_backend_id: None,
             operator_kind_overrides: HashMap::new(),
             task_input: None,
+            check_policy: None,
         };
         assert!(matches!(input.operator_kind, Some(OperatorKind::MainAi)));
         assert_eq!(input.bridge_id.as_deref(), Some("br-x"));

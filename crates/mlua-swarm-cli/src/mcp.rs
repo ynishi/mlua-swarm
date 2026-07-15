@@ -1389,6 +1389,9 @@ impl MseServer {
             operator_backend_id: None,
             operator_kind_overrides,
             task_input: None,
+            // Local MCP run path does not expose a check_policy override;
+            // `None` preserves the server-wide default (backward compat).
+            check_policy: None,
         };
 
         // Trace this kick in the local run store (in-memory; issue #13).
@@ -2692,6 +2695,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -4181,6 +4185,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         };
 
         let client = reqwest::Client::new();

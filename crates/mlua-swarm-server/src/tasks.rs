@@ -391,6 +391,10 @@ pub async fn task_rekick(
         operator_backend_id: None,
         operator_kind_overrides: HashMap::new(),
         task_input: task_input_spec,
+        // This legacy `POST /v1/tasks/:id/runs`-style path does not carry a
+        // per-request check_policy override; `None` preserves the
+        // server-wide default (backward compat).
+        check_policy: None,
     };
     let run_ctx = RunContext {
         run_id: run_id.clone(),
@@ -601,6 +605,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -642,6 +647,7 @@ mod tests {
             timeout_secs: None,
             goal: Some(goal.to_string()),
             detach: false,
+            check_policy: None,
         }
     }
 
@@ -776,6 +782,7 @@ mod tests {
             timeout_secs,
             goal: Some("operator delegate test goal".to_string()),
             detach: false,
+            check_policy: None,
         }
     }
 
@@ -1197,6 +1204,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -1218,6 +1226,7 @@ mod tests {
             timeout_secs: None,
             goal: Some("st4 rekick goal".to_string()),
             detach: false,
+            check_policy: None,
         }
     }
 
@@ -1420,6 +1429,7 @@ mod tests {
             timeout_secs: None,
             goal: Some(goal.to_string()),
             detach: false,
+            check_policy: None,
         }
     }
 

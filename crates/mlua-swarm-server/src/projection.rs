@@ -1221,6 +1221,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -1266,6 +1267,7 @@ mod tests {
             timeout_secs: None,
             goal: Some("projection test goal".to_string()),
             detach: false,
+            check_policy: None,
         }
     }
 
@@ -1314,6 +1316,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -1332,6 +1335,7 @@ mod tests {
             timeout_secs: None,
             goal: Some("projection test goal (declared name)".to_string()),
             detach: false,
+            check_policy: None,
         }
     }
 
@@ -1561,6 +1565,7 @@ mod tests {
             timeout_secs: None,
             goal: Some("projection placement test goal".to_string()),
             detach: false,
+            check_policy: None,
         };
         let posted = crate::tasks_start(State(state.clone()), Json(req))
             .await
@@ -1726,6 +1731,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         };
 
         let req = TaskLaunchRequest {
@@ -1742,6 +1748,7 @@ mod tests {
             timeout_secs: None,
             goal: None,
             detach: false,
+            check_policy: None,
         };
 
         // `TaskLaunchResponse` (the `Ok` side) does not implement `Debug`,
@@ -2355,6 +2362,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         };
 
         let req = TaskLaunchRequest {
@@ -2371,6 +2379,7 @@ mod tests {
             timeout_secs: None,
             goal: None,
             detach: false,
+            check_policy: None,
         };
 
         let state_bg = state.clone();
