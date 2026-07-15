@@ -1692,6 +1692,7 @@ mod tests {
                         agent: agent.clone(),
                         initial_directive: json!("x"),
                         step_ctx: None,
+                        check_policy: None,
                     },
                 );
                 task.attempt = attempt;
@@ -1865,6 +1866,7 @@ mod tests {
                                 agent: "coder".to_string(),
                                 initial_directive: json!("x"),
                                 step_ctx: None,
+                                check_policy: None,
                             },
                         ),
                     );

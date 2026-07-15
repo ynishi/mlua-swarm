@@ -136,4 +136,25 @@ pub enum EngineError {
         /// The contract's declared token set.
         allowed: Vec<String>,
     },
+
+    /// A submit-time projection sink hit a fail-open condition (missing
+    /// `work_dir`/`project_root`, `OutputStore` write error, adapter
+    /// materialize error, state lookup error) while
+    /// [`crate::core::config::CheckPolicy::Strict`] was in effect. The
+    /// caller has opted into fail-loud behaviour, so instead of
+    /// warn-and-continue the shared helper
+    /// [`crate::core::engine::apply_check_policy`] returns this variant
+    /// and the completion route surfaces it as a step / launch error.
+    /// See the `CheckPolicy` doc for the intentional "state dirty on
+    /// fail" semantics — the `OutputStore` may already have appended
+    /// when a downstream branch (file materialize / adapter) triggers
+    /// this error.
+    #[error("check policy strict: {context}: {message}")]
+    CheckPolicyStrict {
+        /// Short identifier of the call site (e.g., `"submit-time projection sink: file materialize"`).
+        context: String,
+        /// The call site's existing warn-log message (preserved verbatim
+        /// for log parse compatibility across `Warn` and `Strict` modes).
+        message: String,
+    },
 }

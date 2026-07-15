@@ -3317,6 +3317,7 @@ mod tests {
                         agent: agent.clone(),
                         initial_directive: serde_json::json!("x"),
                         step_ctx: None,
+                        check_policy: None,
                     },
                 );
                 task.attempt = attempt;
