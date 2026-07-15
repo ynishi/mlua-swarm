@@ -303,6 +303,14 @@ pub enum TaskLaunchError {
     /// error, or a sub-flow raised.
     #[error("flow eval: {0}")]
     FlowEval(String),
+    /// Pre-dispatch validation failed: the launch was rejected before any
+    /// step was dispatched. Raised when the effective check_policy
+    /// (launch request > blueprint > server config) is Strict and the
+    /// launch supplied neither project_root nor work_dir — a strict task
+    /// would deterministically fail at its first submit-time file
+    /// materialize, so the launch fails fast instead.
+    #[error("pre-dispatch: {0}")]
+    PreDispatch(String),
 }
 
 /// Canonical bag of Task-level fields (`project_root` / `work_dir` /
@@ -401,12 +409,26 @@ pub struct TaskLaunchInput {
     pub run_ctx: Option<RunContext>,
     /// The "launch request" tier (tier 1, highest
     /// priority) of the `check_policy` cascade
-    /// (`launch request > blueprint > server config`). [`Self::launch`]
+    /// (`launch request > blueprint > server config`).
+    /// [`TaskLaunchService::launch`]
     /// collapses `check_policy.or(blueprint.check_policy)` exactly once and
     /// threads the result into every spawned step's `TaskSpec.check_policy`.
     /// `None` (the default via [`Self::automate`]) leaves this tier
     /// unspecified so the Blueprint tier / server-wide default decide —
     /// backward-compat with every pre-cascade caller.
+    ///
+    /// [`TaskLaunchService::launch`] also collapses this same cascade one
+    /// step further
+    /// (adding the server-wide `EngineCfg.check_policy` tier) into a
+    /// pre-dispatch guard: when the resulting effective policy is
+    /// [`CheckPolicy::Strict`] and neither [`Self::task_input`]'s
+    /// `project_root` nor `work_dir` is set, the launch is rejected with
+    /// `TaskLaunchError::PreDispatch` before any step is dispatched — a
+    /// strict task with no resolvable root would deterministically fail
+    /// at its first submit-time file materialize anyway. Setting this
+    /// field to `Some(CheckPolicy::Warn)` on the launch-request tier is
+    /// the escape hatch: it outranks a Blueprint- or server-declared
+    /// Strict and lets the guard pass.
     pub check_policy: Option<CheckPolicy>,
 }
 
@@ -660,6 +682,36 @@ impl TaskLaunchService {
         // resolved value is threaded (via `with_check_policy`) into EVERY
         // spawned step's `TaskSpec`, not just the first.
         let resolved_check_policy = input.check_policy.or(input.blueprint.check_policy);
+        // Pre-dispatch guard: collapse the same cascade one step further
+        // (adding the server tier, `EngineCfg.check_policy`, via
+        // `self.engine.cfg()`) into a SEPARATE local used only for this
+        // check — `resolved_check_policy` above (the Option stamped onto
+        // every dispatched step's `TaskSpec`) is left untouched, so the
+        // "TaskSpec = None -> engine falls back to server default at the
+        // submit-time sink" contract (cascade test case 4) keeps holding.
+        // When the effective policy is Strict and the launch supplied
+        // neither `project_root` nor `work_dir`, a strict task would
+        // deterministically fail at its first submit-time file
+        // materialize — fail the launch fast instead of dispatching a
+        // step that can only ever hit that wall. `check_policy: "warn"` on
+        // the launch-request tier is the escape hatch (it wins the
+        // cascade before this fallback ever applies).
+        let effective_check_policy =
+            resolved_check_policy.unwrap_or(self.engine.cfg().check_policy);
+        if effective_check_policy == CheckPolicy::Strict {
+            let roots_missing = input
+                .task_input
+                .as_ref()
+                .map(|t| t.project_root.is_none() && t.work_dir.is_none())
+                .unwrap_or(true);
+            if roots_missing {
+                return Err(TaskLaunchError::PreDispatch(
+                    "check_policy=strict requires project_root or work_dir, but the launch \
+                     supplied neither"
+                        .to_string(),
+                ));
+            }
+        }
         let dispatcher =
             EngineDispatcher::with_spawner(self.engine.clone(), token.clone(), spawner);
         let dispatcher = dispatcher.with_check_policy(resolved_check_policy);
@@ -750,6 +802,20 @@ mod tests {
 
     fn build_service(factory: RustFnInProcessSpawnerFactory) -> TaskLaunchService {
         let engine = Engine::new(EngineCfg::default());
+        let mut reg = SpawnerRegistry::new();
+        reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(factory));
+        let compiler = Compiler::new(reg);
+        TaskLaunchService::new(engine, compiler)
+    }
+
+    /// Same as [`build_service`] but with a caller-supplied [`EngineCfg`] —
+    /// used by the pre-dispatch guard's server-tier test (T4), which needs
+    /// a non-default `EngineCfg.check_policy`.
+    fn build_service_with_cfg(
+        factory: RustFnInProcessSpawnerFactory,
+        cfg: EngineCfg,
+    ) -> TaskLaunchService {
+        let engine = Engine::new(cfg);
         let mut reg = SpawnerRegistry::new();
         reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(factory));
         let compiler = Compiler::new(reg);
@@ -913,6 +979,15 @@ mod tests {
     /// launch may complete (Silent / Warn / None → fail-open) — the in-process
     /// RustFn worker fire-and-forgets its submit — so the task and its
     /// resolved spec exist regardless of the launch outcome.
+    ///
+    /// `task_input` carries a `work_dir` unconditionally (a dummy path, not
+    /// resolved on disk) so the pre-dispatch guard (a strict effective
+    /// policy with no roots supplied rejects before dispatch) never fires
+    /// here — this helper's whole point is "reach dispatch and read back
+    /// the stamp", so every case (including the two whose
+    /// `bp_policy`/`launch_policy` alone resolve to Strict) must dispatch
+    /// uniformly. The guard's own rejection behavior is proven separately
+    /// (T3/T4 and `strict_blueprint_without_roots_is_rejected_pre_dispatch`).
     async fn dispatched_check_policy(
         launch_policy: Option<CheckPolicy>,
         bp_policy: Option<CheckPolicy>,
@@ -931,6 +1006,11 @@ mod tests {
         blueprint.check_policy = bp_policy;
         let mut input = launch_input(blueprint, json!({ "input": "hi" }));
         input.check_policy = launch_policy;
+        input.task_input = Some(TaskInputSpec {
+            project_root: None,
+            work_dir: Some("/dispatched-check-policy-test-root".to_string()),
+            task_metadata: None,
+        });
         let _ = svc.launch(input).await;
         svc.engine()
             .with_state("test.read_dispatched_check_policy", |s| {
@@ -982,18 +1062,23 @@ mod tests {
         assert_eq!(dispatched_check_policy(None, None).await, None);
     }
 
-    /// T3 (Crux 4): a Blueprint that declares `check_policy: "strict"` must
-    /// reach the submit-time projection sink end-to-end. The launch cascade
-    /// stamps every dispatched step's `TaskSpec` with the resolved Strict;
-    /// a submit on that dispatched task with no resolved
-    /// `work_dir`/`project_root` then surfaces
-    /// `EngineError::CheckPolicyStrict`. Proves the resolved value reaches the
-    /// spawned step's spec (not dropped after the first step) AND drives the
-    /// fail-loud reaction over the default (Warn) server policy.
+    /// Repurposed 2026-07-16 for the pre-dispatch guard's new contract
+    /// (the launch-time validation stage of the check_policy cascade
+    /// work). This test used
+    /// to prove a strict + no-roots launch dispatched a step that then hit
+    /// `EngineError::CheckPolicyStrict` at submit time — exactly the path
+    /// the pre-dispatch guard now forecloses (a strict launch with no
+    /// resolvable root is rejected BEFORE dispatch instead, see
+    /// [`TaskLaunchService::launch`]'s guard). The two sub-assertions this
+    /// test used to make are independently covered elsewhere: the
+    /// cascade-resolved Strict reaching the dispatched `TaskSpec` is
+    /// covered by the `cascade_*` tests above; the submit-time sink
+    /// surfacing `CheckPolicyStrict` on an unresolved root is covered by
+    /// `crate::core::engine::tests::submit_output_final_check_policy_strict_surfaces_error_when_root_unresolved`
+    /// (seeds the task directly at the engine layer, bypassing `launch`).
+    /// This test now asserts the NEW contract directly.
     #[tokio::test]
-    async fn strict_blueprint_reaches_submit_time_sink_end_to_end() {
-        use crate::core::state::CapTokenRecord;
-
+    async fn strict_blueprint_without_roots_is_rejected_pre_dispatch() {
         let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
             Ok(WorkerResult {
                 value: json!({ "echoed": inv.prompt }),
@@ -1007,77 +1092,47 @@ mod tests {
         );
         blueprint.check_policy = Some(CheckPolicy::Strict);
         // No task_input → no work_dir/project_root ever resolves.
-        let _ = svc
+        let err = svc
             .launch(launch_input(blueprint, json!({ "input": "hi" })))
-            .await;
-
-        let engine = svc.engine();
-        let (task_id, stamped) = engine
-            .with_state("test.find_echo_task", |s| {
-                s.tasks
-                    .iter()
-                    .find(|(_, t)| t.spec.agent == "echo")
-                    .map(|(id, t)| (id.clone(), t.spec.check_policy))
-            })
             .await
-            .expect("with_state")
-            .expect("echo task must exist");
-        assert_eq!(
-            stamped,
-            Some(CheckPolicy::Strict),
-            "the cascade-resolved Strict must be stamped on the dispatched TaskSpec"
-        );
-
-        // Mint a worker token for that dispatched task and submit a Final
-        // through the engine's submit-time sink — the fail-open condition
-        // (unresolved root) surfaces as CheckPolicyStrict because the task's
-        // spec carries Strict.
-        let worker_token = engine.signer().session(
-            format!("worker-of-{task_id}"),
-            Role::Worker,
-            vec!["*".into()],
-            Duration::from_secs(600),
-        );
-        let fp = worker_token.fingerprint();
-        let record = CapTokenRecord::from_worker_token(worker_token.clone(), task_id.clone());
-        engine
-            .with_state("test.mint_worker", move |s| {
-                s.tokens.insert(fp, record);
-            })
-            .await
-            .expect("mint worker token");
-
-        let err = engine
-            .submit_output(
-                &worker_token,
-                &task_id,
-                1,
-                crate::worker::output::OutputEvent::Final {
-                    content: crate::worker::output::ContentRef::Inline { value: json!("hi") },
-                    ok: true,
-                },
-            )
-            .await
-            .expect_err("strict spec + unresolved root must surface an error at submit");
+            .expect_err("strict check_policy + no roots must be rejected before dispatch");
         match err {
-            EngineError::CheckPolicyStrict { context, message } => {
+            TaskLaunchError::PreDispatch(message) => {
                 assert!(
-                    context.contains("file materialize"),
-                    "context must identify the sink call site: {context}"
-                );
-                assert!(
-                    message.contains("no work_dir/project_root resolved"),
-                    "message must preserve the fail-open warn literal: {message}"
+                    message.contains("strict"),
+                    "message must identify the strict-requires-roots condition: {message}"
                 );
             }
-            other => panic!("expected EngineError::CheckPolicyStrict, got {other:?}"),
+            other => panic!("expected TaskLaunchError::PreDispatch, got {other:?}"),
         }
+
+        // No step was ever dispatched — the guard fires after
+        // `engine.attach_with_ids` (the token mint) but before the
+        // dispatcher is ever built / `eval_async_externs` runs.
+        let dispatched = svc
+            .engine()
+            .with_state("test.no_echo_task_dispatched", |s| {
+                s.tasks.values().any(|t| t.spec.agent == "echo")
+            })
+            .await
+            .expect("with_state");
+        assert!(
+            !dispatched,
+            "the pre-dispatch guard must reject before any step is dispatched"
+        );
     }
 
-    /// T4: backward compat — with NO check_policy anywhere (BP tier + launch
-    /// tier both `None`), the launch resolves to the server default (Warn)
-    /// and completes fail-open exactly as before this change (the warn-mode
-    /// materialize skip never turns a successful submit into a failure).
+    /// T4 (cascade backward-compat): backward compat — with NO check_policy
+    /// anywhere (BP tier + launch tier both `None`), the launch resolves to
+    /// the server default (Warn) and completes fail-open exactly as before
+    /// this change (the warn-mode materialize skip never turns a
+    /// successful submit into a failure).
+    ///
+    /// This is ALSO the pre-dispatch guard's backward-compat case (T5):
+    /// `task_input` is `None` via [`launch_input`]/[`TaskLaunchInput::automate`],
+    /// so the guard's effective policy resolves to `Warn` (server default,
+    /// [`EngineCfg::default`]) and never fires — the guard changes nothing
+    /// about this pre-existing default-path behavior.
     #[tokio::test]
     async fn launch_without_any_check_policy_completes_fail_open() {
         let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
@@ -1096,6 +1151,158 @@ mod tests {
             .launch(launch_input(blueprint, json!({ "input": "hi" })))
             .await
             .expect("warn-mode fail-open must let the launch complete");
+        assert_eq!(out.final_ctx["out"]["echoed"], "hi");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // pre-dispatch validation guard:
+    // `TaskLaunchService::launch` rejects BEFORE dispatch when the
+    // effective check_policy is Strict and neither `project_root` nor
+    // `work_dir` is supplied. T3/T4/T6 live here (T1/T2 are
+    // handler-level, in `mlua-swarm-server`'s `projection.rs`; T5 is the
+    // `launch_without_any_check_policy_completes_fail_open` test above;
+    // the guard-rejection end-to-end case is
+    // `strict_blueprint_without_roots_is_rejected_pre_dispatch` above,
+    // Option A's repurpose of the former stage-1 T3).
+    // ──────────────────────────────────────────────────────────────────
+
+    /// T3 (Crux 3, escape hatch): a Blueprint declaring `check_policy:
+    /// strict` is overridden by the launch-request tier's `check_policy:
+    /// Some(Warn)` — tier 1 wins the cascade before the guard's
+    /// effective-policy fallback ever applies, so the guard passes and the
+    /// launch dispatches normally even though `task_input` is `None` (no
+    /// project_root/work_dir at all). Regression guard against a future
+    /// "the guard judges by the BP tier alone, not the effective/cascaded
+    /// value" narrowing.
+    #[tokio::test]
+    async fn strict_blueprint_with_launch_warn_override_bypasses_pre_dispatch_guard() {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "echoed": inv.prompt }),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let mut blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        blueprint.check_policy = Some(CheckPolicy::Strict);
+        let mut input = launch_input(blueprint, json!({ "input": "hi" }));
+        input.check_policy = Some(CheckPolicy::Warn);
+        assert!(input.task_input.is_none(), "no roots supplied at all");
+        let out = svc
+            .launch(input)
+            .await
+            .expect("launch-tier warn override must bypass the pre-dispatch guard");
+        assert_eq!(out.final_ctx["out"]["echoed"], "hi");
+    }
+
+    /// T4 (Crux 2, server tier): with BOTH the launch- and Blueprint-tier
+    /// `check_policy` unset, the server-wide `EngineCfg.check_policy` (the
+    /// third cascade tier, read via `self.engine.cfg()`) alone must drive
+    /// the guard — proof the guard does not stop at the "BP/launch 2-tier"
+    /// shortcut Crux 2 forbids.
+    #[tokio::test]
+    async fn server_tier_strict_alone_triggers_pre_dispatch_guard() {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "echoed": inv.prompt }),
+                ok: true,
+            })
+        });
+        let svc = build_service_with_cfg(
+            factory,
+            EngineCfg {
+                check_policy: CheckPolicy::Strict,
+                ..EngineCfg::default()
+            },
+        );
+        let blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        assert_eq!(blueprint.check_policy, None, "BP tier must be unset");
+        let input = launch_input(blueprint, json!({ "input": "hi" }));
+        assert!(input.check_policy.is_none(), "launch tier must be unset");
+        assert!(input.task_input.is_none(), "no roots supplied");
+        let err = svc.launch(input).await.expect_err(
+            "server-tier Strict alone (BP/launch tiers both unset) must trigger the guard",
+        );
+        match err {
+            TaskLaunchError::PreDispatch(message) => {
+                assert!(
+                    message.contains("strict"),
+                    "expected the strict-requires-roots message, got: {message}"
+                );
+            }
+            other => panic!("expected TaskLaunchError::PreDispatch, got {other:?}"),
+        }
+    }
+
+    /// T6 (guard condition, branch 2 of 3): `task_input: Some(_)` with
+    /// BOTH `project_root` and `work_dir` absent is still `roots_missing`
+    /// — the outer `Some` alone must not short-circuit the check (branch 1,
+    /// `task_input: None`, is covered by
+    /// `strict_blueprint_without_roots_is_rejected_pre_dispatch` above).
+    #[tokio::test]
+    async fn pre_dispatch_guard_rejects_when_task_input_present_but_roots_both_none() {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "echoed": inv.prompt }),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let mut blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        blueprint.check_policy = Some(CheckPolicy::Strict);
+        let mut input = launch_input(blueprint, json!({ "input": "hi" }));
+        input.task_input = Some(TaskInputSpec {
+            project_root: None,
+            work_dir: None,
+            task_metadata: Some(json!({ "unrelated": true })),
+        });
+        let err = svc
+            .launch(input)
+            .await
+            .expect_err("Some(TaskInputSpec) with both roots None must still be roots_missing");
+        assert!(
+            matches!(err, TaskLaunchError::PreDispatch(_)),
+            "expected TaskLaunchError::PreDispatch, got {err:?}"
+        );
+    }
+
+    /// T6 (guard condition, branch 3 of 3): `work_dir: Some(_)` alone
+    /// (with `project_root: None`) is NOT `roots_missing` — either root
+    /// being present is sufficient, so the guard passes and the launch
+    /// dispatches normally.
+    #[tokio::test]
+    async fn pre_dispatch_guard_passes_when_work_dir_present_and_project_root_absent() {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "echoed": inv.prompt }),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let mut blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        blueprint.check_policy = Some(CheckPolicy::Strict);
+        let mut input = launch_input(blueprint, json!({ "input": "hi" }));
+        input.task_input = Some(TaskInputSpec {
+            project_root: None,
+            work_dir: Some("/repo/work".to_string()),
+            task_metadata: None,
+        });
+        let out = svc
+            .launch(input)
+            .await
+            .expect("work_dir alone must satisfy the guard's roots_missing check");
         assert_eq!(out.final_ctx["out"]["echoed"], "hi");
     }
 
