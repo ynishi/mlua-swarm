@@ -22,6 +22,7 @@
 use crate::blueprint::compiler::{CompileError, Compiler};
 use crate::blueprint::{AuditDef, Blueprint, EngineDispatcher};
 use crate::core::agent_context::ContextPolicy;
+use crate::core::config::CheckPolicy;
 use crate::core::ctx::OperatorKind;
 use crate::core::engine::Engine;
 use crate::core::errors::EngineError;
@@ -398,6 +399,15 @@ pub struct TaskLaunchInput {
     /// [`Self::automate`]) preserves the pre-existing behavior — no run
     /// tracing.
     pub run_ctx: Option<RunContext>,
+    /// The "launch request" tier (tier 1, highest
+    /// priority) of the `check_policy` cascade
+    /// (`launch request > blueprint > server config`). [`Self::launch`]
+    /// collapses `check_policy.or(blueprint.check_policy)` exactly once and
+    /// threads the result into every spawned step's `TaskSpec.check_policy`.
+    /// `None` (the default via [`Self::automate`]) leaves this tier
+    /// unspecified so the Blueprint tier / server-wide default decide —
+    /// backward-compat with every pre-cascade caller.
+    pub check_policy: Option<CheckPolicy>,
 }
 
 impl TaskLaunchInput {
@@ -430,6 +440,7 @@ impl TaskLaunchInput {
             init_ctx,
             task_input: None,
             run_ctx: None,
+            check_policy: None,
         }
     }
 }
@@ -638,8 +649,20 @@ impl TaskLaunchService {
                 bp_global_kind,
             )
             .await?;
+        // Collapse the `check_policy` cascade EXACTLY ONCE
+        // here: `launch request > blueprint > server config` (highest to
+        // lowest priority). `input.check_policy` is the launch-request tier;
+        // `input.blueprint.check_policy` is the Blueprint tier; a `None`
+        // result leaves the engine's submit-time sink to fall back to the
+        // server-wide `EngineCfg.check_policy` (tier 3) on its own — the
+        // engine's existing `task_policy.unwrap_or(server_policy)` resolution
+        // is deliberately NOT duplicated here (no double resolution). The
+        // resolved value is threaded (via `with_check_policy`) into EVERY
+        // spawned step's `TaskSpec`, not just the first.
+        let resolved_check_policy = input.check_policy.or(input.blueprint.check_policy);
         let dispatcher =
             EngineDispatcher::with_spawner(self.engine.clone(), token.clone(), spawner);
+        let dispatcher = dispatcher.with_check_policy(resolved_check_policy);
         let dispatcher = match input.run_ctx {
             Some(run_ctx) => dispatcher.with_run(run_ctx),
             None => dispatcher,
@@ -755,6 +778,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -875,6 +899,203 @@ mod tests {
             .launch(launch_input(blueprint, json!({ "input": "hi" })))
             .await
             .expect("launch ok");
+        assert_eq!(out.final_ctx["out"]["echoed"], "hi");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // check_policy cascade (launch > blueprint > server)
+    // T2 (cascade 4-case) / T3 (end-to-end strict) / T4 (backward compat)
+    // ──────────────────────────────────────────────────────────────
+
+    /// Launch a single-echo Blueprint with the given launch- and
+    /// Blueprint-tier `check_policy`, then read back the `check_policy` that
+    /// the dispatcher stamped onto the dispatched step's `TaskSpec`. The
+    /// launch may complete (Silent / Warn / None → fail-open) — the in-process
+    /// RustFn worker fire-and-forgets its submit — so the task and its
+    /// resolved spec exist regardless of the launch outcome.
+    async fn dispatched_check_policy(
+        launch_policy: Option<CheckPolicy>,
+        bp_policy: Option<CheckPolicy>,
+    ) -> Option<CheckPolicy> {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "echoed": inv.prompt }),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let mut blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        blueprint.check_policy = bp_policy;
+        let mut input = launch_input(blueprint, json!({ "input": "hi" }));
+        input.check_policy = launch_policy;
+        let _ = svc.launch(input).await;
+        svc.engine()
+            .with_state("test.read_dispatched_check_policy", |s| {
+                s.tasks
+                    .values()
+                    .find(|t| t.spec.agent == "echo")
+                    .and_then(|t| t.spec.check_policy)
+            })
+            .await
+            .expect("with_state")
+    }
+
+    /// T2 case 1: launch `Some(Silent)` + BP `Some(Strict)` → TaskSpec
+    /// `Some(Silent)` (the launch-request tier outranks the Blueprint tier).
+    #[tokio::test]
+    async fn cascade_launch_tier_wins_over_blueprint_tier() {
+        assert_eq!(
+            dispatched_check_policy(Some(CheckPolicy::Silent), Some(CheckPolicy::Strict)).await,
+            Some(CheckPolicy::Silent),
+        );
+    }
+
+    /// T2 case 2: launch `None` + BP `Some(Strict)` → TaskSpec `Some(Strict)`
+    /// (the Blueprint tier takes effect when the launch tier is unset).
+    #[tokio::test]
+    async fn cascade_blueprint_tier_used_when_launch_absent() {
+        assert_eq!(
+            dispatched_check_policy(None, Some(CheckPolicy::Strict)).await,
+            Some(CheckPolicy::Strict),
+        );
+    }
+
+    /// T2 case 3: launch `Some(Strict)` + BP `None` → TaskSpec `Some(Strict)`
+    /// (the launch tier alone resolves when the Blueprint tier is unset).
+    #[tokio::test]
+    async fn cascade_launch_tier_alone_when_blueprint_absent() {
+        assert_eq!(
+            dispatched_check_policy(Some(CheckPolicy::Strict), None).await,
+            Some(CheckPolicy::Strict),
+        );
+    }
+
+    /// T2 case 4: launch `None` + BP `None` → TaskSpec `None`. NOT omitted as
+    /// "trivial": this is the backward-compat proof — the server-fallback
+    /// path (`EngineCfg.check_policy` decides at the submit-time sink) is
+    /// preserved byte-for-byte because the carrier stays `None`.
+    #[tokio::test]
+    async fn cascade_both_none_preserves_server_fallback() {
+        assert_eq!(dispatched_check_policy(None, None).await, None);
+    }
+
+    /// T3 (Crux 4): a Blueprint that declares `check_policy: "strict"` must
+    /// reach the submit-time projection sink end-to-end. The launch cascade
+    /// stamps every dispatched step's `TaskSpec` with the resolved Strict;
+    /// a submit on that dispatched task with no resolved
+    /// `work_dir`/`project_root` then surfaces
+    /// `EngineError::CheckPolicyStrict`. Proves the resolved value reaches the
+    /// spawned step's spec (not dropped after the first step) AND drives the
+    /// fail-loud reaction over the default (Warn) server policy.
+    #[tokio::test]
+    async fn strict_blueprint_reaches_submit_time_sink_end_to_end() {
+        use crate::core::state::CapTokenRecord;
+
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "echoed": inv.prompt }),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let mut blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        blueprint.check_policy = Some(CheckPolicy::Strict);
+        // No task_input → no work_dir/project_root ever resolves.
+        let _ = svc
+            .launch(launch_input(blueprint, json!({ "input": "hi" })))
+            .await;
+
+        let engine = svc.engine();
+        let (task_id, stamped) = engine
+            .with_state("test.find_echo_task", |s| {
+                s.tasks
+                    .iter()
+                    .find(|(_, t)| t.spec.agent == "echo")
+                    .map(|(id, t)| (id.clone(), t.spec.check_policy))
+            })
+            .await
+            .expect("with_state")
+            .expect("echo task must exist");
+        assert_eq!(
+            stamped,
+            Some(CheckPolicy::Strict),
+            "the cascade-resolved Strict must be stamped on the dispatched TaskSpec"
+        );
+
+        // Mint a worker token for that dispatched task and submit a Final
+        // through the engine's submit-time sink — the fail-open condition
+        // (unresolved root) surfaces as CheckPolicyStrict because the task's
+        // spec carries Strict.
+        let worker_token = engine.signer().session(
+            format!("worker-of-{task_id}"),
+            Role::Worker,
+            vec!["*".into()],
+            Duration::from_secs(600),
+        );
+        let fp = worker_token.fingerprint();
+        let record = CapTokenRecord::from_worker_token(worker_token.clone(), task_id.clone());
+        engine
+            .with_state("test.mint_worker", move |s| {
+                s.tokens.insert(fp, record);
+            })
+            .await
+            .expect("mint worker token");
+
+        let err = engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                crate::worker::output::OutputEvent::Final {
+                    content: crate::worker::output::ContentRef::Inline { value: json!("hi") },
+                    ok: true,
+                },
+            )
+            .await
+            .expect_err("strict spec + unresolved root must surface an error at submit");
+        match err {
+            EngineError::CheckPolicyStrict { context, message } => {
+                assert!(
+                    context.contains("file materialize"),
+                    "context must identify the sink call site: {context}"
+                );
+                assert!(
+                    message.contains("no work_dir/project_root resolved"),
+                    "message must preserve the fail-open warn literal: {message}"
+                );
+            }
+            other => panic!("expected EngineError::CheckPolicyStrict, got {other:?}"),
+        }
+    }
+
+    /// T4: backward compat — with NO check_policy anywhere (BP tier + launch
+    /// tier both `None`), the launch resolves to the server default (Warn)
+    /// and completes fail-open exactly as before this change (the warn-mode
+    /// materialize skip never turns a successful submit into a failure).
+    #[tokio::test]
+    async fn launch_without_any_check_policy_completes_fail_open() {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "echoed": inv.prompt }),
+                ok: true,
+            })
+        });
+        let svc = build_service(factory);
+        let blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        assert_eq!(blueprint.check_policy, None, "BP tier must be unset");
+        let out = svc
+            .launch(launch_input(blueprint, json!({ "input": "hi" })))
+            .await
+            .expect("warn-mode fail-open must let the launch complete");
         assert_eq!(out.final_ctx["out"]["echoed"], "hi");
     }
 

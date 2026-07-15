@@ -519,8 +519,9 @@ mod tests {
         ] {
             let entry = find_by_uri(uri).unwrap_or_else(|| panic!("sample must exist: {uri}"));
             let body = body_for(entry).expect("sample body must generate");
-            mlua_swarm_cli::dsl::build_bp_from_script(&body)
-                .unwrap_or_else(|e| panic!("{uri}: does not build via dsl::build_bp_from_script: {e}"));
+            mlua_swarm_cli::dsl::build_bp_from_script(&body).unwrap_or_else(|e| {
+                panic!("{uri}: does not build via dsl::build_bp_from_script: {e}")
+            });
         }
     }
 

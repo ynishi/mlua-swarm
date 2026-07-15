@@ -72,6 +72,7 @@
 //!     degradation_policy: None,
 //!     runners: vec![],
 //!     default_runner: None,
+//!     check_policy: None,
 //! };
 //!
 //! assert_eq!(bp.id.as_str(), "hello");
@@ -112,6 +113,7 @@
 //!     degradation_policy: None,
 //!     runners: vec![],
 //!     default_runner: None,
+//!     check_policy: None,
 //! };
 //!
 //! let json = serde_json::to_string(&bp).unwrap();
@@ -410,6 +412,68 @@ pub struct Blueprint {
     /// declared — every pre-#46 Blueprint is unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_runner: Option<String>,
+    /// "Blueprint" tier (tier 2) of the `check_policy`
+    /// cascade: `launch request > blueprint > server config` (highest to
+    /// lowest priority). The launch entry point resolves
+    /// `launch.check_policy.or(blueprint.check_policy)` exactly once and
+    /// threads the result into every spawned step's `TaskSpec.check_policy`;
+    /// `None` here (the default) is a no declaration — resolution falls
+    /// through to the launch-request tier and, absent that, to the
+    /// server-wide `EngineCfg.check_policy` default. Every pre-cascade
+    /// Blueprint is unaffected, byte-for-byte. See [`CheckPolicy`] for the
+    /// three fail-open reaction modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_policy: Option<CheckPolicy>,
+}
+
+/// How a submit-time projection sink reacts when a fail-open condition
+/// is encountered.
+///
+/// This is the Swarm IF SoT type for the `check_policy` axis; the
+/// `mlua-swarm` core crate re-exports it as `crate::core::config::CheckPolicy`
+/// so every existing path (`EngineCfg.check_policy`, `TaskSpec.check_policy`,
+/// `apply_check_policy`) keeps its old type path unchanged.
+///
+/// Fail-open conditions include: `work_dir` / `project_root` unresolved,
+/// `OutputStore` write error, `FileProjectionAdapter::materialize_submission`
+/// error, and state lookup error. Each call site inside the engine's
+/// `materialize_final_submission` / `materialize_artifact_submission`
+/// currently logs a `tracing::warn!` and returns without materializing the
+/// file / dual-write; `CheckPolicy` is the first-class knob that lets a
+/// caller opt into a different reaction without changing that behaviour by
+/// default.
+///
+/// The three modes are (a) [`CheckPolicy::Silent`] — no log, no error,
+/// operation continues; (b) [`CheckPolicy::Warn`] — log warn (existing
+/// message literal preserved), no error, operation continues (the
+/// default = pre-existing behaviour); (c) [`CheckPolicy::Strict`] — log
+/// the same warn AND return `EngineError::CheckPolicyStrict` (in the core
+/// crate) so the caller can fail the step / launch fast. When Strict
+/// returns an error, the underlying `OutputStore` may already have
+/// appended (dual-write side-effect is not rolled back) — this "state
+/// dirty on fail" semantics is intentional: the append happens **before**
+/// the fail-open branch runs, so Strict surfaces the mismatch instead of
+/// hiding it.
+///
+/// The wire form is snake_case (`"silent"` / `"warn"` / `"strict"`); the
+/// default is [`CheckPolicy::Warn`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckPolicy {
+    /// Skip both the log warn and the error path — completely silent.
+    /// The operation continues (fail-open is still in effect).
+    Silent,
+    /// Log a `tracing::warn!` with the call site's existing message and
+    /// continue (fail-open). Default — byte-identical to the
+    /// pre-`CheckPolicy` behaviour of every submit-time projection sink
+    /// code path.
+    #[default]
+    Warn,
+    /// Log the same warn AND return `EngineError::CheckPolicyStrict` (the
+    /// core crate's error variant). A caller that has opted in can fail the
+    /// step / launch fast instead of proceeding with a partially-realized
+    /// submission.
+    Strict,
 }
 
 /// GH #32 — Blueprint-declared policy for worker-reported degradations. See
@@ -1263,6 +1327,7 @@ mod tests {
             "audits",
             "runners",
             "default_runner",
+            "check_policy",
         ] {
             assert!(props.contains_key(key), "missing property: {key}");
         }
@@ -1327,6 +1392,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -2334,6 +2400,94 @@ mod tests {
         assert!(
             bp.agents.iter().all(|a| a.verdict.is_none()),
             "no agent in the sample declares a verdict contract"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // CheckPolicy enum relocation + Blueprint.check_policy
+    // (T1: schema round-trip / omit→None / invalid→error)
+    // ──────────────────────────────────────────────────────────────
+
+    /// The wire form is snake_case and byte-identical to the pre-relocation
+    /// enum (`"silent"` / `"warn"` / `"strict"`), round-tripping in both
+    /// directions — the relocation must not change the serde surface.
+    #[test]
+    fn check_policy_wire_form_round_trips() {
+        for (variant, wire) in [
+            (CheckPolicy::Silent, "silent"),
+            (CheckPolicy::Warn, "warn"),
+            (CheckPolicy::Strict, "strict"),
+        ] {
+            let json = serde_json::to_value(variant).expect("serializes");
+            assert_eq!(json, serde_json::json!(wire), "wire form for {variant:?}");
+            let back: CheckPolicy = serde_json::from_value(json).expect("deserializes");
+            assert_eq!(back, variant, "round-trip for {variant:?}");
+        }
+    }
+
+    /// The default is `Warn` (preserves the pre-CheckPolicy fail-open
+    /// behaviour of every submit-time projection sink).
+    #[test]
+    fn check_policy_default_is_warn() {
+        assert_eq!(CheckPolicy::default(), CheckPolicy::Warn);
+    }
+
+    /// A Blueprint that declares `check_policy: "strict"` parses to
+    /// `Some(Strict)` and re-serializes with the same snake_case literal.
+    #[test]
+    fn blueprint_check_policy_strict_round_trips() {
+        let json = serde_json::json!({
+            "schema_version": current_schema_version(),
+            "id": "check-policy-strict-ut",
+            "flow": { "kind": "seq", "children": [] },
+            "check_policy": "strict",
+        });
+        let bp: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(bp.check_policy, Some(CheckPolicy::Strict));
+        let re = serde_json::to_string(&bp).expect("serializes");
+        assert!(
+            re.contains("\"check_policy\":\"strict\""),
+            "re-serialized BP must preserve the snake_case wire literal: {re}"
+        );
+    }
+
+    /// An omitted `check_policy` parses to `None` and is skipped on
+    /// serialize (backward-compat with every pre-cascade Blueprint).
+    #[test]
+    fn blueprint_check_policy_omitted_is_none() {
+        let json = serde_json::json!({
+            "schema_version": current_schema_version(),
+            "id": "check-policy-omitted-ut",
+            "flow": { "kind": "seq", "children": [] },
+        });
+        let bp: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(bp.check_policy, None);
+
+        let out = serde_json::to_value(&bp).expect("serializes");
+        assert!(
+            out.as_object().unwrap().get("check_policy").is_none(),
+            "check_policy key must be absent when None: {out}"
+        );
+    }
+
+    /// An invalid `check_policy` value is a hard parse error (not silently
+    /// dropped) — the enum is closed to the three snake_case variants. This
+    /// also confirms `deny_unknown_fields` is not the gate here: the field
+    /// IS known, only its value is invalid.
+    #[test]
+    fn blueprint_check_policy_invalid_value_errors() {
+        let json = serde_json::json!({
+            "schema_version": current_schema_version(),
+            "id": "check-policy-invalid-ut",
+            "flow": { "kind": "seq", "children": [] },
+            "check_policy": "loud",
+        });
+        let err = serde_json::from_value::<Blueprint>(json)
+            .expect_err("an unknown check_policy value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("check_policy") || msg.contains("loud") || msg.contains("variant"),
+            "error should point at the bad check_policy value: {msg}"
         );
     }
 }

@@ -2132,7 +2132,7 @@ impl Engine {
                 (producer_agent, task_policy, view)
             })
             .await;
-        // Per-task `TaskSpec.check_policy` (issue #0486d79d ST1c) wins
+        // Per-task `TaskSpec.check_policy` (ST1c) wins
         // over the server-wide `EngineCfg.check_policy` when set — a
         // per-run override forwarded from the launch entry point (see
         // `TaskLaunchRequest.check_policy` /
@@ -3677,6 +3677,7 @@ mod submit_time_projection_sink_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         };
         let (naming, warnings) = StepNaming::from_blueprint(&bp).expect("no collision");
         assert!(warnings.is_empty(), "single-step fixture has no collisions");
@@ -3751,7 +3752,7 @@ mod submit_time_projection_sink_tests {
         );
     }
 
-    /// Regression for issue #0486d79d: the default
+    /// Regression for the check_policy cascade: the default
     /// [`crate::core::config::CheckPolicy::Warn`] preserves the
     /// pre-`CheckPolicy` fail-open semantics — a submit whose root is
     /// unresolved still succeeds. Byte-compat with
@@ -3777,7 +3778,7 @@ mod submit_time_projection_sink_tests {
         );
     }
 
-    /// Regression for issue #0486d79d:
+    /// Regression for the check_policy cascade:
     /// [`crate::core::config::CheckPolicy::Strict`] surfaces the "no
     /// work_dir/project_root resolved" fail-open condition as an
     /// [`EngineError::CheckPolicyStrict`], letting a caller who has
@@ -3816,7 +3817,7 @@ mod submit_time_projection_sink_tests {
         }
     }
 
-    /// Regression for issue #0486d79d:
+    /// Regression for the check_policy cascade:
     /// [`crate::core::config::CheckPolicy::Silent`] returns `Ok(())` (
     /// like `Warn`) without surfacing an error. The log-suppression side
     /// of `Silent` (no `tracing::warn!`) is enforced at the call site

@@ -143,8 +143,8 @@ pub struct Args {
     /// `true`.
     #[arg(long)]
     ephemeral: bool,
-    /// Server-wide `CheckPolicy` for submit-time projection sinks
-    /// (issue #0486d79d). One of `silent` / `warn` / `strict`
+    /// Server-wide `CheckPolicy` for submit-time projection sinks.
+    /// One of `silent` / `warn` / `strict`
     /// (snake_case). Overrides the config file's `check_policy`. When
     /// omitted (and absent from the config file), falls back to `warn`
     /// (byte-identical to the pre-`CheckPolicy` fail-open behaviour).
@@ -592,6 +592,7 @@ fn seed_blueprint(id: &str) -> Blueprint {
         degradation_policy: None,
         runners: vec![],
         default_runner: None,
+        check_policy: None,
     }
 }
 

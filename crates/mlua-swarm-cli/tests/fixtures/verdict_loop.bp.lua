@@ -27,6 +27,10 @@ local flow = F.seq({
 
 return {
   id = "sample-verdict-loop",
+  -- Top-level check_policy passes straight through the bp_dsl Lua->JSON
+  -- table conversion (build_bp_from_script); this fixture proves the
+  -- passthrough by matching the JSON sample's `"check_policy": "strict"`.
+  check_policy = "strict",
   flow = flow,
   agents = {
     {
@@ -74,6 +78,6 @@ return {
   },
   strategy = { strict_refs = true, strict_kind = true },
   metadata = {
-    description = "Verdict retry loop with a self-managed counter. Seed with init_ctx={\"verdict\":\"BLOCKED\"}. All operator agents point at the \"main-ai\" logical role; join with mse_operator_join(roles=[\"main-ai\"]) before dispatch.",
+    description = "Verdict retry loop with a self-managed counter. Seed with init_ctx={\"verdict\":\"BLOCKED\"}. All operator agents point at the \"main-ai\" logical role; join with mse_operator_join(roles=[\"main-ai\"]) before dispatch. Declares check_policy=\"strict\" at the top level (cascade tier 2: launch request > blueprint > server config), so submit-time projection fail-open conditions surface as errors.",
   },
 }

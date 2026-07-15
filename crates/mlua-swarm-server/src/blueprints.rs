@@ -887,6 +887,7 @@ mod explain_agent_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -1211,6 +1212,7 @@ mod explain_agent_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -1300,6 +1302,7 @@ mod explain_agent_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         };
         let store = InMemoryBlueprintStore::new();
         seed(&store, &bp).await;

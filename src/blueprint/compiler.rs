@@ -1871,6 +1871,7 @@ mod meta_ref_validation_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -2047,6 +2048,7 @@ mod audit_agent_validation_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -2151,6 +2153,7 @@ mod projection_placement_compile_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 
@@ -2271,6 +2274,7 @@ mod verdict_contract_lint_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            check_policy: None,
         }
     }
 

@@ -24,6 +24,7 @@
 //! has been moved into the IF crate to support extension discipline,
 //! versioning, and external consumers.
 
+use crate::core::config::CheckPolicy;
 use crate::core::engine::Engine;
 use crate::core::projection_placement::ProjectionPlacement;
 use crate::core::state::{DispatchOutcome, TaskSpec};
@@ -101,6 +102,14 @@ pub struct EngineDispatcher {
     step_metas: HashMap<String, Value>,
     step_naming: Option<Arc<StepNaming>>,
     projection_placement: Option<Arc<ProjectionPlacement>>,
+    /// The resolved `check_policy` cascade value
+    /// (`launch request > blueprint > server config`, collapsed exactly once
+    /// in `TaskLaunchService::launch`). Threaded into EVERY spawned step's
+    /// `TaskSpec.check_policy` by [`Self::dispatch`]. `None` (the default via
+    /// [`Self::with_spawner`]) preserves pre-cascade behavior byte-for-byte
+    /// — the engine's submit-time sink then falls back to
+    /// `EngineCfg.check_policy` (the server-wide default).
+    check_policy: Option<CheckPolicy>,
 }
 
 impl EngineDispatcher {
@@ -122,6 +131,7 @@ impl EngineDispatcher {
             step_metas: HashMap::new(),
             step_naming: None,
             projection_placement: None,
+            check_policy: None,
         }
     }
 
@@ -168,6 +178,20 @@ impl EngineDispatcher {
         projection_placement: Arc<ProjectionPlacement>,
     ) -> Self {
         self.projection_placement = Some(projection_placement);
+        self
+    }
+
+    /// Attach the resolved `check_policy` cascade value
+    /// (`launch request > blueprint > server config`, collapsed exactly once
+    /// by `TaskLaunchService::launch`). Every step [`Self::dispatch`] spawns
+    /// gets this value stamped onto its `TaskSpec.check_policy`, so a
+    /// Blueprint- or launch-declared policy reaches the engine's submit-time
+    /// sink for ALL steps (not just the first). `None` (the default via
+    /// [`Self::with_spawner`]) is a no-op — the sink then falls back to
+    /// `EngineCfg.check_policy` (server-wide default), byte-for-byte the
+    /// pre-cascade behavior.
+    pub fn with_check_policy(mut self, check_policy: Option<CheckPolicy>) -> Self {
+        self.check_policy = check_policy;
         self
     }
 }
@@ -328,7 +352,11 @@ impl AsyncDispatcher for EngineDispatcher {
                     agent: ref_.to_string(),
                     initial_directive,
                     step_ctx,
-                    check_policy: None,
+                    // The resolved cascade value (collapsed
+                    // once in `TaskLaunchService::launch`), threaded onto
+                    // every spawned step's spec. `None` falls back to
+                    // `EngineCfg.check_policy` at the submit-time sink.
+                    check_policy: self.check_policy,
                 },
             )
             .await

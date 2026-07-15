@@ -109,6 +109,7 @@ use axum::{
 };
 use mlua_swarm::application::{BlueprintRef, TaskApplication};
 use mlua_swarm::blueprint::store::BlueprintStore;
+use mlua_swarm::core::config::CheckPolicy;
 use mlua_swarm::service::TaskLaunchService;
 use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStore};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
@@ -665,6 +666,16 @@ pub struct TaskLaunchRequest {
     /// stores an empty string — the flow-eval path itself never reads it.
     #[serde(default)]
     goal: Option<String>,
+    /// The "launch request" tier (tier 1, highest
+    /// priority) of the `check_policy` cascade
+    /// (`launch request > blueprint > server config`). `None` (the default;
+    /// existing clients are unaffected) leaves the tier unspecified so the
+    /// Blueprint-declared `check_policy` and, failing that, the server-wide
+    /// `EngineCfg.check_policy` default decide. Wire form is snake_case
+    /// (`"silent"` / `"warn"` / `"strict"`). Threaded verbatim into
+    /// `TaskApplicationInput.check_policy`.
+    #[serde(default)]
+    check_policy: Option<CheckPolicy>,
     /// GH #37: opt into the detached (asynchronous) launch. `false` (the
     /// default; existing clients are unaffected) keeps the synchronous
     /// launch: the handler drives the flow eval inline and returns the
@@ -1052,6 +1063,10 @@ async fn run_flow_form(
         operator_backend_id: op_req.operator_backend_id,
         operator_kind_overrides,
         task_input: task_input_spec,
+        // The request-body top-level `check_policy` (tier 1)
+        // flows straight into the cascade resolved once in
+        // `TaskLaunchService::launch`.
+        check_policy: req.check_policy,
     };
 
     // GH #37 detached launch: the eval driver runs in its own spawned
@@ -1445,6 +1460,38 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
+    // `TaskLaunchRequest.check_policy` wire field (T5)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// T5: a `POST /v1/tasks` body carrying a top-level `check_policy`
+    /// deserializes into `TaskLaunchRequest.check_policy` using the
+    /// snake_case wire form.
+    #[test]
+    fn task_launch_request_parses_check_policy_wire_field() {
+        let body = json!({
+            "blueprint": { "kind": "id", "id": "some-bp" },
+            "init_ctx": {},
+            "check_policy": "silent",
+        });
+        let req: TaskLaunchRequest =
+            serde_json::from_value(body).expect("request must deserialize");
+        assert_eq!(req.check_policy, Some(CheckPolicy::Silent));
+    }
+
+    /// A body that omits `check_policy` leaves the field `None` (existing
+    /// clients are unaffected — `#[serde(default)]`).
+    #[test]
+    fn task_launch_request_check_policy_defaults_to_none_when_omitted() {
+        let body = json!({
+            "blueprint": { "kind": "id", "id": "some-bp" },
+            "init_ctx": {},
+        });
+        let req: TaskLaunchRequest =
+            serde_json::from_value(body).expect("request must deserialize");
+        assert_eq!(req.check_policy, None);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
     // issue #19 ST2: `build_task_input_spec_from_request` direct resolver
     // ──────────────────────────────────────────────────────────────────
 
@@ -1469,6 +1516,7 @@ mod tests {
             timeout_secs: None,
             goal: None,
             detach: false,
+            check_policy: None,
         }
     }
 

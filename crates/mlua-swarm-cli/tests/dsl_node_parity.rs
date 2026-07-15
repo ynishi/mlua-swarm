@@ -55,7 +55,10 @@ fn every_node_builder_round_trips_through_flow_dsl() {
             "loop",
             r#"F.loop_({ counter = F.p("$.n"), cond = F.lit(true), max = 3, body = F.seq({}) })"#,
         ),
-        ("assign", r#"F.assign({ at = F.p("$.x"), value = F.lit(1) })"#),
+        (
+            "assign",
+            r#"F.assign({ at = F.p("$.x"), value = F.lit(1) })"#,
+        ),
         (
             "try",
             r#"F.try_({ body = F.seq({}), catch = F.seq({}), err_at = F.p("$.err") })"#,
