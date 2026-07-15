@@ -48,6 +48,70 @@ pub struct EngineCfg {
     /// instead of inline (`WorkerPayload.system`). See
     /// [`SystemRefConfig`].
     pub system_ref: SystemRefConfig,
+    /// Policy that governs how submit-time projection sinks react when a
+    /// fail-open condition is encountered (missing `work_dir`/
+    /// `project_root`, `OutputStore` write error, adapter materialize
+    /// error, state lookup error). Default [`CheckPolicy::Warn`]
+    /// preserves the pre-existing warn-and-continue behaviour of every
+    /// call site — see [`CheckPolicy`] for the semantics of the other
+    /// two modes and [`apply_check_policy`](crate::core::engine::apply_check_policy)
+    /// for the shared decision helper. Per-run override is threaded via
+    /// `POST /v1/tasks` (subtask-1c).
+    pub check_policy: CheckPolicy,
+}
+
+/// How a submit-time projection sink reacts when a fail-open condition
+/// is encountered.
+///
+/// Fail-open conditions include: `work_dir` / `project_root` unresolved,
+/// `OutputStore` write error, `FileProjectionAdapter::materialize_submission`
+/// error, and state lookup error. Each call site inside
+/// `Engine::materialize_final_submission` /
+/// `Engine::materialize_artifact_submission` currently logs a
+/// `tracing::warn!` and returns without materializing the file /
+/// dual-write; `CheckPolicy` is the first-class knob that lets a caller
+/// opt into a different reaction without changing that behaviour by
+/// default.
+///
+/// The three modes are (a) [`CheckPolicy::Silent`] — no log, no error,
+/// operation continues; (b) [`CheckPolicy::Warn`] — log warn (existing
+/// message literal preserved), no error, operation continues (the
+/// default = pre-existing behaviour); (c) [`CheckPolicy::Strict`] — log
+/// the same warn AND return
+/// [`EngineError::CheckPolicyStrict`](crate::core::errors::EngineError::CheckPolicyStrict)
+/// so the caller can fail the step / launch fast. When Strict returns
+/// an error, the underlying `OutputStore` may already have appended
+/// (dual-write side-effect is not rolled back) — this "state dirty on
+/// fail" semantics is intentional: the append happens **before** the
+/// fail-open branch runs, so Strict surfaces the mismatch instead of
+/// hiding it.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckPolicy {
+    /// Skip both the log warn and the error path — completely silent.
+    /// The operation continues (fail-open is still in effect).
+    Silent,
+    /// Log a `tracing::warn!` with the call site's existing message and
+    /// continue (fail-open). Default — byte-identical to the
+    /// pre-`CheckPolicy` behaviour of every submit-time projection sink
+    /// code path.
+    #[default]
+    Warn,
+    /// Log the same warn AND return
+    /// [`EngineError::CheckPolicyStrict`](crate::core::errors::EngineError::CheckPolicyStrict).
+    /// A caller that has opted in can fail the step / launch fast
+    /// instead of proceeding with a partially-realized submission.
+    Strict,
 }
 
 impl EngineCfg {
@@ -92,6 +156,7 @@ impl Default for EngineCfg {
             long_hold: LongHoldConfig::default(),
             max_spawn_depth: 4,
             system_ref: SystemRefConfig::default(),
+            check_policy: CheckPolicy::default(),
         }
     }
 }

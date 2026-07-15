@@ -858,6 +858,7 @@ async fn run_one_audit(
         agent: audit_agent.to_string(),
         initial_directive: directive,
         step_ctx: None,
+        check_policy: None,
     };
     let audit_task_id = match engine.start_task(token, spec).await {
         Ok(tid) => tid,
@@ -1081,6 +1082,7 @@ mod operator_delegate_worker_binding_tests {
                     agent: "planner".to_string(),
                     initial_directive: "do the thing".into(),
                     step_ctx: None,
+                    check_policy: None,
                 },
             )
             .await
@@ -1309,6 +1311,7 @@ mod after_run_audit_tests {
                     agent: agent_name.to_string(),
                     initial_directive: serde_json::json!("go"),
                     step_ctx: None,
+                    check_policy: None,
                 },
             )
             .await

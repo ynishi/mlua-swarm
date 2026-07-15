@@ -91,6 +91,17 @@ pub struct TaskSpec {
     /// `crate::middleware::agent_context::AgentContextMiddleware`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_ctx: Option<Value>,
+    /// Per-run override for
+    /// [`crate::core::config::CheckPolicy`] — governs how submit-time
+    /// projection sinks (`Engine::materialize_final_submission` /
+    /// `Engine::materialize_artifact_submission`) react to fail-open
+    /// conditions for THIS task. `None` (the default; backward-compat
+    /// with pre-`CheckPolicy` `TaskSpec`s deserialised without the
+    /// field) falls back to `EngineCfg.check_policy` (server-wide
+    /// default). `Some(policy)` overrides for this task only — see the
+    /// `CheckPolicy` doc for the semantics of the three modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_policy: Option<crate::core::config::CheckPolicy>,
 }
 
 /// The full mutable record of one task: its static `spec`, current

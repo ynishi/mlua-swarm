@@ -252,6 +252,38 @@ Declare either or both on `Blueprint.projection_placement`:
 See `crate::core::projection_placement`'s module doc for the resolver's
 full API and the "3 path" convergence this collapses.
 
+#### Fail-open discipline and `CheckPolicy`
+
+The submit-time projection sink is fail-open by default: an unresolved
+root, a Data-plane `OutputStore` write error, an
+`AgentContextView` state lookup error, or a
+`FileProjectionAdapter::materialize_submission` error all only log a
+`tracing::warn!` and let the submit itself succeed. That default
+preserves Invariant 1 (a submit that reached the domain-plane append
+never gets turned into a step failure by the projection half) but
+silently hides a partially-realized submission from a caller that would
+prefer to fail loudly.
+
+`EngineCfg.check_policy: CheckPolicy` selects one of three modes,
+server-wide (per-run override plumbing is a follow-up):
+
+- `Warn` (default) — log the warn, continue. Byte-identical to the
+  pre-`CheckPolicy` behaviour every existing caller relies on.
+- `Silent` — skip the warn, continue. Useful for a caller that has
+  already verified upstream invariants and wants the fail-open branch
+  to run without log noise.
+- `Strict` — log the warn AND return `EngineError::CheckPolicyStrict`,
+  so the caller can fail the step / launch fast. When Strict returns
+  an error, the underlying `OutputStore` may already have appended (the
+  domain-plane / data-plane append happens before the fail-open
+  branch runs) — this "state dirty on fail" is intentional, surfacing
+  the mismatch instead of hiding it.
+
+A launch whose Blueprint materializes files must always seed
+`init_ctx.project_root` (or `work_dir`) so the resolver above yields a
+usable root; under `Strict`, omitting both is what surfaces as a step
+error, not a silent skip.
+
 ### Per-Step meta: `$step_meta` envelope, and the dedicated-agent pattern
 
 Besides the `$step_meta` envelope (the Step tier row above, detailed

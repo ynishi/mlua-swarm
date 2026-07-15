@@ -328,6 +328,7 @@ impl AsyncDispatcher for EngineDispatcher {
                     agent: ref_.to_string(),
                     initial_directive,
                     step_ctx,
+                    check_policy: None,
                 },
             )
             .await

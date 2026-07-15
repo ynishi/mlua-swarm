@@ -47,6 +47,7 @@ async fn seed_task_with_handle(engine: &Engine, task_id: &StepId, agent: &str) -
                     agent: agent.clone(),
                     initial_directive: serde_json::json!("x"),
                     step_ctx: None,
+                    check_policy: None,
                 },
             );
             s.tasks.insert(task_id.clone(), task);
@@ -95,6 +96,7 @@ async fn seed_task_with_token(engine: &Engine, task_id: &StepId, agent: &str) ->
                     agent: agent_for_state,
                     initial_directive: serde_json::json!("x"),
                     step_ctx: None,
+                    check_policy: None,
                 },
             );
             s.tasks.insert(task_id_for_state.clone(), task);

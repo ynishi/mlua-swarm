@@ -739,7 +739,7 @@ impl Engine {
         // into a failure).
         let content = crate::worker::output::ContentRef::Inline { value };
         self.materialize_final_submission(task_id, attempt, &content, ok)
-            .await;
+            .await?;
         Ok(())
     }
 
@@ -794,7 +794,7 @@ impl Engine {
         })
         .await?;
         self.materialize_artifact_submission(task_id, attempt, &name, &content)
-            .await;
+            .await?;
         Ok(())
     }
 
@@ -2080,11 +2080,11 @@ impl Engine {
         match &event {
             crate::worker::output::OutputEvent::Final { content, ok } => {
                 self.materialize_final_submission(task_id, attempt, content, *ok)
-                    .await;
+                    .await?;
             }
             crate::worker::output::OutputEvent::Artifact { name, content } => {
                 self.materialize_artifact_submission(task_id, attempt, name, content)
-                    .await;
+                    .await?;
             }
             _ => {}
         }
@@ -2117,37 +2117,57 @@ impl Engine {
         attempt: u32,
         content: &crate::worker::output::ContentRef,
         ok: bool,
-    ) {
+    ) -> Result<(), EngineError> {
+        let server_policy = self.cfg().check_policy;
         let task_id_for_lookup = task_id.clone();
         let lookup = self
             .with_state("materialize_final_submission.lookup", move |s| {
-                let producer_agent = s
-                    .tasks
-                    .get(&task_id_for_lookup)
-                    .map(|t| t.spec.agent.clone());
+                let entry = s.tasks.get(&task_id_for_lookup);
+                let producer_agent = entry.map(|t| t.spec.agent.clone());
+                let task_policy = entry.and_then(|t| t.spec.check_policy);
                 let view = s
                     .agent_ctx
                     .get(&(task_id_for_lookup.clone(), attempt))
                     .map(|e| e.view.clone());
-                (producer_agent, view)
+                (producer_agent, task_policy, view)
             })
             .await;
-        let (producer_agent, view) = match lookup {
+        // Per-task `TaskSpec.check_policy` (issue #0486d79d ST1c) wins
+        // over the server-wide `EngineCfg.check_policy` when set — a
+        // per-run override forwarded from the launch entry point (see
+        // `TaskLaunchRequest.check_policy` /
+        // `TaskLaunchInput.check_policy`). `None` leaves the server
+        // default in effect (backward compat).
+        let policy = lookup
+            .as_ref()
+            .ok()
+            .and_then(|(_, tp, _)| *tp)
+            .unwrap_or(server_policy);
+        let (producer_agent, view) = match lookup.map(|(pa, _, view)| (pa, view)) {
             Ok(pair) => pair,
             Err(err) => {
-                tracing::warn!(
-                    %task_id,
-                    error = %err,
-                    "submit-time projection sink: state lookup failed; skipping (fail-open)"
-                );
-                return;
+                if !matches!(policy, crate::core::config::CheckPolicy::Silent) {
+                    tracing::warn!(
+                        %task_id,
+                        error = %err,
+                        "submit-time projection sink: state lookup failed; skipping (fail-open)"
+                    );
+                }
+                apply_check_policy(
+                    policy,
+                    "submit-time projection sink: state lookup",
+                    "state lookup failed; skipping (fail-open)",
+                )?;
+                return Ok(());
             }
         };
         let Some(producer_agent) = producer_agent else {
             // Defensive only: `task_id` is always a just-looked-up task at
             // every real call site. No task, no addressable producer name
-            // — nothing to project.
-            return;
+            // — nothing to project. Not gated by `CheckPolicy` — a missing
+            // task is an intentional early-exit path, not a fail-open
+            // condition to surface.
+            return Ok(());
         };
         let placement = self
             .projection_placement_for(task_id)
@@ -2191,25 +2211,39 @@ impl Engine {
                 )
                 .await
             {
-                tracing::warn!(
-                    %task_id,
-                    agent = %producer_agent,
-                    canonical = %canonical_agent,
-                    error = %err,
-                    "submit-time projection sink: OutputStore dual-write failed (fail-open)"
-                );
+                if !matches!(policy, crate::core::config::CheckPolicy::Silent) {
+                    tracing::warn!(
+                        %task_id,
+                        agent = %producer_agent,
+                        canonical = %canonical_agent,
+                        error = %err,
+                        "submit-time projection sink: OutputStore dual-write failed (fail-open)"
+                    );
+                }
+                apply_check_policy(
+                    policy,
+                    "submit-time projection sink: OutputStore dual-write",
+                    "OutputStore dual-write failed (fail-open)",
+                )?;
             }
         }
 
         // (b) File materialize, when a root resolved.
         let Some(root) = root else {
-            tracing::warn!(
-                %task_id,
-                agent = %producer_agent,
-                canonical = %canonical_agent,
-                "submit-time projection sink: no work_dir/project_root resolved; skipping file materialize (fail-open)"
-            );
-            return;
+            if !matches!(policy, crate::core::config::CheckPolicy::Silent) {
+                tracing::warn!(
+                    %task_id,
+                    agent = %producer_agent,
+                    canonical = %canonical_agent,
+                    "submit-time projection sink: no work_dir/project_root resolved; skipping file materialize (fail-open)"
+                );
+            }
+            apply_check_policy(
+                policy,
+                "submit-time projection sink: file materialize",
+                "no work_dir/project_root resolved; skipping file materialize (fail-open)",
+            )?;
+            return Ok(());
         };
         let value = match content {
             crate::worker::output::ContentRef::Inline { value } => value.clone(),
@@ -2234,14 +2268,22 @@ impl Engine {
             (*placement).clone(),
         );
         if let Err(err) = adapter.materialize_submission(&key, &value, attempt, ok) {
-            tracing::warn!(
-                %task_id,
-                agent = %producer_agent,
-                canonical = %canonical_agent,
-                error = %err,
-                "submit-time projection sink: file materialize failed (fail-open)"
-            );
+            if !matches!(policy, crate::core::config::CheckPolicy::Silent) {
+                tracing::warn!(
+                    %task_id,
+                    agent = %producer_agent,
+                    canonical = %canonical_agent,
+                    error = %err,
+                    "submit-time projection sink: file materialize failed (fail-open)"
+                );
+            }
+            apply_check_policy(
+                policy,
+                "submit-time projection sink: file materialize",
+                "file materialize failed (fail-open)",
+            )?;
         }
+        Ok(())
     }
 
     /// Submit-time projection sink for `OutputEvent::Artifact` (GH #34
@@ -2268,9 +2310,27 @@ impl Engine {
         attempt: u32,
         name: &str,
         content: &crate::worker::output::ContentRef,
-    ) {
+    ) -> Result<(), EngineError> {
+        // Per-task `TaskSpec.check_policy` override — sibling of the
+        // resolution in `materialize_final_submission`. Silent per-task
+        // lookup failure (`with_state` error) falls back to the
+        // server-wide default; this sink never surfaces a lookup error
+        // as a step failure (unlike the sink itself, which does under
+        // `Strict`).
+        let server_policy = self.cfg().check_policy;
+        let task_id_for_lookup = task_id.clone();
+        let task_policy = self
+            .with_state("materialize_artifact_submission.policy_lookup", move |s| {
+                s.tasks
+                    .get(&task_id_for_lookup)
+                    .and_then(|t| t.spec.check_policy)
+            })
+            .await
+            .ok()
+            .flatten();
+        let policy = task_policy.unwrap_or(server_policy);
         let Some(store) = self.output_store_backend() else {
-            return;
+            return Ok(());
         };
         if let Err(err) = store
             .append(
@@ -2285,13 +2345,21 @@ impl Engine {
             )
             .await
         {
-            tracing::warn!(
-                %task_id,
-                artifact = %name,
-                error = %err,
-                "submit-time projection sink: OutputStore dual-write failed for Artifact (fail-open)"
-            );
+            if !matches!(policy, crate::core::config::CheckPolicy::Silent) {
+                tracing::warn!(
+                    %task_id,
+                    artifact = %name,
+                    error = %err,
+                    "submit-time projection sink: OutputStore dual-write failed for Artifact (fail-open)"
+                );
+            }
+            apply_check_policy(
+                policy,
+                "submit-time projection sink: Artifact OutputStore dual-write",
+                "OutputStore dual-write failed for Artifact (fail-open)",
+            )?;
         }
+        Ok(())
     }
 
     /// Snapshot the entire output tail for a given `(task_id, attempt)`.
@@ -2661,6 +2729,98 @@ impl Engine {
     }
 }
 
+/// Decide what a submit-time projection sink should do at a fail-open
+/// branch given the configured [`crate::core::config::CheckPolicy`].
+///
+/// Returns `Ok(())` under [`CheckPolicy::Silent`] and
+/// [`CheckPolicy::Warn`] — the caller continues with fail-open. Returns
+/// [`EngineError::CheckPolicyStrict`] under [`CheckPolicy::Strict`],
+/// carrying the caller-supplied `context` (call-site identifier) and
+/// `message` (the pre-existing warn-log message literal, preserved
+/// verbatim for log parse compatibility).
+///
+/// This helper deliberately does **not** call `tracing::warn!` itself —
+/// the caller is responsible for firing the existing warn! (with its
+/// full structured-field payload — `%task_id`, `agent`, `canonical`,
+/// `error`, etc.) under `Warn` mode, and for skipping the warn! under
+/// `Silent` mode. Keeping the warn! at the call site preserves the
+/// exact structured-field shape every existing log-parse consumer sees;
+/// forwarding it through the helper would either drop those fields or
+/// require a macro (deferred, see subtask-1b).
+///
+/// Design intent: the fail-open discipline of every submit-time
+/// projection sink is byte-identical to the pre-`CheckPolicy` behaviour
+/// under the default [`CheckPolicy::Warn`]. `Silent` is a per-run opt-in
+/// to suppress noise (e.g., a caller that has already verified upstream
+/// invariants); `Strict` is a per-run opt-in to fail loudly (e.g., a
+/// caller that requires all parts to materialize). See
+/// [`crate::core::config::CheckPolicy`] for the "state dirty on fail"
+/// semantics of `Strict`.
+pub(crate) fn apply_check_policy(
+    policy: crate::core::config::CheckPolicy,
+    context: &str,
+    message: &str,
+) -> Result<(), EngineError> {
+    match policy {
+        crate::core::config::CheckPolicy::Silent | crate::core::config::CheckPolicy::Warn => Ok(()),
+        crate::core::config::CheckPolicy::Strict => Err(EngineError::CheckPolicyStrict {
+            context: context.to_string(),
+            message: message.to_string(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod check_policy_helper_tests {
+    use super::apply_check_policy;
+    use crate::core::config::CheckPolicy;
+    use crate::core::errors::EngineError;
+
+    /// `Silent` returns `Ok(())` without producing an error. Log
+    /// suppression (the "no `tracing::warn!`" half of the semantics) is
+    /// enforced at the call site, not inside the helper — see the
+    /// helper's doc comment for why.
+    #[test]
+    fn silent_returns_ok() {
+        let result = apply_check_policy(CheckPolicy::Silent, "call/site", "sink message");
+        assert!(matches!(result, Ok(())));
+    }
+
+    /// `Warn` (the default) returns `Ok(())` — the caller continues
+    /// with fail-open, having already fired its own `tracing::warn!`
+    /// with the full structured-field payload.
+    #[test]
+    fn warn_returns_ok() {
+        let result = apply_check_policy(CheckPolicy::Warn, "call/site", "sink message");
+        assert!(matches!(result, Ok(())));
+    }
+
+    /// `Strict` returns
+    /// [`EngineError::CheckPolicyStrict`] with `context` and `message`
+    /// copied verbatim from the caller — the completion route surfaces
+    /// this as a step / launch error so a caller that has opted in can
+    /// fail fast instead of proceeding with a partially-realized
+    /// submission.
+    #[test]
+    fn strict_returns_error_with_context_and_message() {
+        let result = apply_check_policy(
+            CheckPolicy::Strict,
+            "submit-time projection sink: file materialize",
+            "no work_dir/project_root resolved; skipping file materialize (fail-open)",
+        );
+        match result {
+            Err(EngineError::CheckPolicyStrict { context, message }) => {
+                assert_eq!(context, "submit-time projection sink: file materialize");
+                assert_eq!(
+                    message,
+                    "no work_dir/project_root resolved; skipping file materialize (fail-open)"
+                );
+            }
+            other => panic!("expected CheckPolicyStrict, got {:?}", other),
+        }
+    }
+}
+
 // ─── UT: issue #14 — token store keyed by fingerprint, not nonce ────────────
 #[cfg(test)]
 mod token_fingerprint_store_tests {
@@ -2841,6 +3001,7 @@ mod dispatch_attempt_with_run_id_tests {
                     agent: "probe".into(),
                     initial_directive: "hi".into(),
                     step_ctx: None,
+                    check_policy: None,
                 },
             )
             .await
@@ -2923,6 +3084,7 @@ mod dispatch_attempt_with_step_ctx_tests {
                     agent: "probe".into(),
                     initial_directive: "hi".into(),
                     step_ctx: Some(serde_json::json!({ "work_dir": "/step" })),
+                    check_policy: None,
                 },
             )
             .await
@@ -2974,6 +3136,7 @@ mod dispatch_attempt_with_step_ctx_tests {
                     agent: "probe".into(),
                     initial_directive: "hi".into(),
                     step_ctx: None,
+                    check_policy: None,
                 },
             )
             .await
@@ -3009,6 +3172,7 @@ mod initial_directive_value_passthrough_tests {
                     agent: "planner".to_string(),
                     initial_directive,
                     step_ctx: None,
+                    check_policy: None,
                 },
             )
             .await
@@ -3138,6 +3302,7 @@ mod system_ref_threshold_tests {
                     agent: "planner".to_string(),
                     initial_directive: serde_json::json!("do the thing"),
                     step_ctx: None,
+                    check_policy: None,
                 },
             )
             .await
@@ -3305,6 +3470,55 @@ mod submit_time_projection_sink_tests {
                     agent: agent.to_string(),
                     initial_directive: Value::String("go".into()),
                     step_ctx: None,
+                    check_policy: None,
+                },
+            )
+            .await
+            .expect("start_task");
+        let worker_token = engine.signer().session(
+            format!("worker-of-{task_id}"),
+            Role::Worker,
+            vec!["*".into()],
+            Duration::from_secs(600),
+        );
+        let fp = worker_token.fingerprint();
+        let record = CapTokenRecord::from_worker_token(worker_token.clone(), task_id.clone());
+        engine
+            .with_state("test.mint_worker", move |s| {
+                s.tokens.insert(fp, record);
+            })
+            .await
+            .expect("mint worker token");
+        (engine, op_token, task_id, worker_token)
+    }
+
+    /// Sibling of [`seeded_task`] that lets a caller pin the engine's
+    /// `EngineCfg.check_policy` before the engine is constructed — used
+    /// by the `check_policy_*` regression tests below to exercise the
+    /// three [`crate::core::config::CheckPolicy`] modes without touching
+    /// the shared `seeded_task` helper (which every unrelated sink test
+    /// depends on).
+    async fn seeded_task_with_policy(
+        agent: &str,
+        policy: crate::core::config::CheckPolicy,
+    ) -> (Engine, CapToken, StepId, CapToken) {
+        let cfg = EngineCfg {
+            check_policy: policy,
+            ..EngineCfg::default()
+        };
+        let engine = Engine::new(cfg);
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let task_id = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: agent.to_string(),
+                    initial_directive: Value::String("go".into()),
+                    step_ctx: None,
+                    check_policy: None,
                 },
             )
             .await
@@ -3534,6 +3748,99 @@ mod submit_time_projection_sink_tests {
         assert!(
             result.is_ok(),
             "submit must succeed even with no resolvable root (fail-open, Invariant 1)"
+        );
+    }
+
+    /// Regression for issue #0486d79d: the default
+    /// [`crate::core::config::CheckPolicy::Warn`] preserves the
+    /// pre-`CheckPolicy` fail-open semantics — a submit whose root is
+    /// unresolved still succeeds. Byte-compat with
+    /// `submit_output_final_skips_file_when_root_unresolved`; this test
+    /// pins the mode explicitly so a future default change to
+    /// `Strict` (silent breakage) is caught here.
+    #[tokio::test]
+    async fn submit_output_final_check_policy_warn_preserves_fail_open() {
+        let (engine, _op, task_id, worker_token) =
+            seeded_task_with_policy("planner", crate::core::config::CheckPolicy::Warn).await;
+
+        let result = engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!("hi"), true),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "Warn mode preserves fail-open: submit must succeed when root unresolved"
+        );
+    }
+
+    /// Regression for issue #0486d79d:
+    /// [`crate::core::config::CheckPolicy::Strict`] surfaces the "no
+    /// work_dir/project_root resolved" fail-open condition as an
+    /// [`EngineError::CheckPolicyStrict`], letting a caller who has
+    /// opted in fail fast instead of proceeding with a partially-
+    /// realized submission. The error's `context` identifies the call
+    /// site (`"file materialize"`), and `message` preserves the
+    /// pre-`CheckPolicy` warn literal verbatim (log-parse compat).
+    #[tokio::test]
+    async fn submit_output_final_check_policy_strict_surfaces_error_when_root_unresolved() {
+        let (engine, _op, task_id, worker_token) =
+            seeded_task_with_policy("planner", crate::core::config::CheckPolicy::Strict).await;
+
+        let err = engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!("hi"), true),
+            )
+            .await
+            .expect_err("Strict mode must return an error when root unresolved");
+        match err {
+            EngineError::CheckPolicyStrict { context, message } => {
+                assert!(
+                    context.contains("file materialize"),
+                    "context must identify the call site: {context}"
+                );
+                assert!(
+                    message.contains("no work_dir/project_root resolved"),
+                    "message must preserve the warn-log literal for log-parse compat: {message}"
+                );
+            }
+            other => panic!(
+                "expected EngineError::CheckPolicyStrict, got a different variant: {other:?}"
+            ),
+        }
+    }
+
+    /// Regression for issue #0486d79d:
+    /// [`crate::core::config::CheckPolicy::Silent`] returns `Ok(())` (
+    /// like `Warn`) without surfacing an error. The log-suppression side
+    /// of `Silent` (no `tracing::warn!`) is enforced at the call site
+    /// via the `if !matches!(policy, Silent) { warn!(...) }` guard —
+    /// verifying tracing output shape here would couple the test to a
+    /// subscriber setup, so the assertion is limited to the error-
+    /// return semantics (matches the helper unit tests in
+    /// `check_policy_helper_tests`).
+    #[tokio::test]
+    async fn submit_output_final_check_policy_silent_returns_ok_when_root_unresolved() {
+        let (engine, _op, task_id, worker_token) =
+            seeded_task_with_policy("planner", crate::core::config::CheckPolicy::Silent).await;
+
+        let result = engine
+            .submit_output(
+                &worker_token,
+                &task_id,
+                1,
+                final_event(serde_json::json!("hi"), true),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "Silent mode returns Ok(()) at the error surface: submit must succeed"
         );
     }
 
@@ -4134,6 +4441,7 @@ mod verdict_contract_registry_tests {
                     agent: agent.to_string(),
                     initial_directive: serde_json::json!("x"),
                     step_ctx: None,
+                    check_policy: None,
                 },
             )
             .await
@@ -4241,6 +4549,7 @@ mod verdict_contract_completion_tests {
                     agent: agent.to_string(),
                     initial_directive: serde_json::json!("x"),
                     step_ctx: None,
+                    check_policy: None,
                 },
             )
             .await
