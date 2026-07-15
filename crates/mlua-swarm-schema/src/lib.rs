@@ -472,7 +472,13 @@ pub enum CheckPolicy {
     /// Log the same warn AND return `EngineError::CheckPolicyStrict` (the
     /// core crate's error variant). A caller that has opted in can fail the
     /// step / launch fast instead of proceeding with a partially-realized
-    /// submission.
+    /// submission. This mode also drives a launch-time pre-dispatch
+    /// validation in `TaskLaunchService::launch` (the `mlua-swarm` core
+    /// crate): a launch whose effective policy resolves to `Strict` and
+    /// that supplies neither `project_root` nor `work_dir` is rejected
+    /// with `TaskLaunchError::PreDispatch` before any step is dispatched,
+    /// rather than dispatching a step that would deterministically hit
+    /// this same error at its first submit-time file materialize.
     Strict,
 }
 

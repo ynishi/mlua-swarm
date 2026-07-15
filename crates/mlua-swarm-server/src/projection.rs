@@ -1168,7 +1168,7 @@ mod tests {
         current_schema_version, AgentDef, AgentKind, AgentMeta, Blueprint, BlueprintMetadata,
         CompilerHints, CompilerStrategy, ProjectionPlacementSpec,
     };
-    use mlua_swarm::core::config::EngineCfg;
+    use mlua_swarm::core::config::{CheckPolicy, EngineCfg};
     use mlua_swarm::core::engine::Engine;
     use mlua_swarm::store::output::InMemoryOutputStore;
     use mlua_swarm::store::run::InMemoryRunStore;
@@ -1337,6 +1337,85 @@ mod tests {
             detach: false,
             check_policy: None,
         }
+    }
+
+    // ─── pre-dispatch validation guard: handler-
+    // level 400 integration tests T1/T2 (Crux 5 — the acceptance test for
+    // the original bug, "launch すると 400 で拒否") ───
+
+    /// T1/T2 fixture: same shape as [`greeting_blueprint`] but with
+    /// `check_policy: Some(CheckPolicy::Strict)` declared at the Blueprint
+    /// tier — used to exercise `TaskLaunchService::launch`'s pre-dispatch
+    /// guard through the real `tasks_start` handler.
+    fn strict_greeting_blueprint() -> Blueprint {
+        Blueprint {
+            check_policy: Some(CheckPolicy::Strict),
+            ..greeting_blueprint()
+        }
+    }
+
+    fn strict_greeting_task_req(greeting: &str, project_root: Option<&str>) -> TaskLaunchRequest {
+        TaskLaunchRequest {
+            blueprint: BlueprintRef::Inline {
+                value: Box::new(strict_greeting_blueprint()),
+            },
+            init_ctx: json!({ "greeting": greeting }),
+            project_root: project_root.map(String::from),
+            work_dir: None,
+            task_metadata: None,
+            ttl_secs: None,
+            operator: None,
+            operator_sid: None,
+            timeout_secs: None,
+            goal: Some("pre-dispatch guard test goal".to_string()),
+            detach: false,
+            check_policy: None,
+        }
+    }
+
+    /// T1 (Crux 5): a strict-declared Blueprint launched with
+    /// `project_root` / `work_dir` / `task_metadata` all absent is
+    /// rejected BEFORE any step is dispatched — `tasks_start` must surface
+    /// this as `400 Bad Request` with a message that identifies the
+    /// pre-dispatch guard. This is the handler-level acceptance test for
+    /// the original bug ("launch すると 400 で拒否").
+    #[tokio::test]
+    async fn tasks_start_rejects_strict_launch_with_no_roots_as_400() {
+        let state = test_state();
+        // `TaskLaunchReply` (the `Ok` variant) does not derive `Debug`, so
+        // `.expect_err(..)` / `.unwrap_err()` do not typecheck here — match
+        // the `Result` directly instead.
+        let result =
+            crate::tasks_start(State(state), Json(strict_greeting_task_req("hello", None))).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("strict check_policy + no roots must be rejected before dispatch, got Ok")
+            }
+        };
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("pre-dispatch"),
+            "expected a pre-dispatch guard message, got: {}",
+            err.message
+        );
+    }
+
+    /// T2: the same strict-declared Blueprint launched WITH `project_root`
+    /// set passes the pre-dispatch guard and completes normally — the
+    /// existing greeting/echo fixture's happy-path behavior is unaffected
+    /// by the guard when a root is actually supplied.
+    #[tokio::test]
+    async fn tasks_start_strict_launch_with_project_root_succeeds() {
+        let state = test_state();
+        let reply = crate::tasks_start(
+            State(state),
+            Json(strict_greeting_task_req("hello", Some("/repo"))),
+        )
+        .await
+        .expect("strict check_policy + project_root supplied must pass the guard");
+        assert_eq!(reply.1, StatusCode::OK);
+        assert_eq!(reply.0.final_ctx["out"]["echoed"], "hello");
     }
 
     // ─── Test 8: steps collection, GH #23 subtask-3 table-driven addressing ───
