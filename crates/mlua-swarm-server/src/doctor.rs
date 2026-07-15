@@ -28,6 +28,12 @@ pub struct DoctorInfo {
     pub enhance_flow_enabled: bool,
     /// Seed blueprint id (= combined mode default).
     pub seed_blueprint_id: String,
+    /// Server-wide [`mlua_swarm::core::config::CheckPolicy`] resolved
+    /// from CLI flag > config file > built-in default (`Warn`). See
+    /// `mlua_swarm_server::config::ResolvedConfig.check_policy` for the
+    /// full cascade. Serialised as snake_case (`"silent"` / `"warn"` /
+    /// `"strict"`).
+    pub check_policy: mlua_swarm::core::config::CheckPolicy,
 }
 
 #[derive(Clone)]

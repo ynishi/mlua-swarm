@@ -10,6 +10,7 @@
 //! plist's `ProgramArguments` stays fixed at `<server-bin> --config <path>`,
 //! so changing settings = editing the file + restarting, not editing the plist.
 
+use mlua_swarm::core::config::CheckPolicy;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -111,6 +112,19 @@ pub struct FileConfig {
     /// omits it. `None` = fall back to the built-in default (3600s / 60 min, see
     /// [`ResolvedConfig`]'s `Default` impl).
     pub sync_timeout_secs: Option<u64>,
+    /// Server-wide [`mlua_swarm::core::config::CheckPolicy`] — governs how
+    /// submit-time projection sinks
+    /// (`Engine::materialize_final_submission` /
+    /// `Engine::materialize_artifact_submission`) react to fail-open
+    /// conditions (missing `work_dir`/`project_root`, `OutputStore` write
+    /// error, adapter materialize error, state lookup error). `None`
+    /// falls back to the built-in default `Warn` (byte-identical to
+    /// pre-`CheckPolicy` behaviour); `"silent"` skips both the log and
+    /// error, `"strict"` returns
+    /// `EngineError::CheckPolicyStrict` so a caller who has opted in can
+    /// fail the step / launch fast. Per-task override
+    /// (`TaskSpec.check_policy`) wins over this server-wide value.
+    pub check_policy: Option<CheckPolicy>,
 }
 
 /// CLI-side overrides. Mirrors [`FileConfig`] field-for-field. Kept as a
@@ -148,6 +162,10 @@ pub struct CliOverrides {
     pub token_secret: Option<String>,
     /// `--sync-timeout-secs` value (mirrors [`FileConfig::sync_timeout_secs`]).
     pub sync_timeout_secs: Option<u64>,
+    /// `--check-policy` value (mirrors [`FileConfig::check_policy`]).
+    /// Parsed at the caller (`serve.rs`) before landing here — invalid
+    /// tokens are rejected before this struct is ever constructed.
+    pub check_policy: Option<CheckPolicy>,
 }
 
 /// Fully resolved config — every field has the built-in default applied.
@@ -194,6 +212,13 @@ pub struct ResolvedConfig {
     /// provides one. A per-request `TaskLaunchRequest.timeout_secs`
     /// override, when present, takes priority over this server-wide value.
     pub sync_timeout_secs: u64,
+    /// Server-wide [`mlua_swarm::core::config::CheckPolicy`]. Always set
+    /// — defaults to `CheckPolicy::Warn` (byte-identical to the
+    /// pre-`CheckPolicy` fail-open behaviour) when neither CLI nor config
+    /// file provides one. Per-task `TaskSpec.check_policy` (set via
+    /// caller code — HTTP request per-launch override wiring is a
+    /// follow-up) takes priority over this server-wide value.
+    pub check_policy: CheckPolicy,
 }
 
 impl Default for ResolvedConfig {
@@ -213,6 +238,7 @@ impl Default for ResolvedConfig {
             default_agent_kind: None,
             token_secret: None,
             sync_timeout_secs: default_sync_timeout_secs(),
+            check_policy: CheckPolicy::default(),
         }
     }
 }
@@ -303,6 +329,10 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .sync_timeout_secs
             .or(file.sync_timeout_secs)
             .unwrap_or_else(default_sync_timeout_secs),
+        check_policy: cli
+            .check_policy
+            .or(file.check_policy)
+            .unwrap_or(default.check_policy),
     })
 }
 
@@ -515,5 +545,67 @@ mod tests {
             resolved.sync_timeout_secs, 45,
             "cli sync_timeout_secs must win over file"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Issue #0486d79d ST1c-2a: `check_policy` resolution cascade
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_check_policy_default_when_cli_and_file_absent() {
+        let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
+        assert_eq!(
+            resolved.check_policy,
+            CheckPolicy::Warn,
+            "default check_policy must preserve pre-CheckPolicy fail-open (Warn)"
+        );
+        assert_eq!(resolved.check_policy, CheckPolicy::default());
+    }
+
+    #[test]
+    fn resolve_check_policy_file_wins_over_default() {
+        let file = FileConfig {
+            check_policy: Some(CheckPolicy::Strict),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file).expect("resolve");
+        assert_eq!(
+            resolved.check_policy,
+            CheckPolicy::Strict,
+            "file check_policy must win over built-in default"
+        );
+    }
+
+    #[test]
+    fn resolve_check_policy_cli_wins_over_file() {
+        let cli = CliOverrides {
+            check_policy: Some(CheckPolicy::Silent),
+            ..Default::default()
+        };
+        let file = FileConfig {
+            check_policy: Some(CheckPolicy::Strict),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).expect("resolve");
+        assert_eq!(
+            resolved.check_policy,
+            CheckPolicy::Silent,
+            "cli check_policy must win over file"
+        );
+    }
+
+    #[test]
+    fn file_config_deserializes_check_policy_snake_case_literals() {
+        let toml_text = "check_policy = \"strict\"\n";
+        let cfg: FileConfig = toml::from_str(toml_text).expect("parse");
+        assert_eq!(cfg.check_policy, Some(CheckPolicy::Strict));
+
+        let toml_text = "check_policy = \"silent\"\n";
+        let cfg: FileConfig = toml::from_str(toml_text).expect("parse");
+        assert_eq!(cfg.check_policy, Some(CheckPolicy::Silent));
+
+        let toml_text = "check_policy = \"warn\"\n";
+        let cfg: FileConfig = toml::from_str(toml_text).expect("parse");
+        assert_eq!(cfg.check_policy, Some(CheckPolicy::Warn));
     }
 }
