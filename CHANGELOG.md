@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/ynishi/mlua-swarm/compare/v0.10.0...v0.11.0) - 2026-07-16
+
+### Added
+
+- *(compiler)* add VerdictValueUnhandled reverse-direction lint (GH #50 follow-up)
+- materialize staged named parts to ctx files at submit time
+- reject strict launches with no resolvable root before dispatch
+- add check_policy 3-tier cascade for pre-dispatch validation
+- *(engine)* add CheckPolicy for submit-time projection sink fail-loud opt-in
+- *(server)* wire CheckPolicy through config file + CLI flag + doctor
+- *(dsl)* authoring enablers + generalized equivalence fixtures (GH #54)
+
+### Other
+
+- document the worker I/O contract (fetch IN, path-free tool-call OUT)
+- fix pre-existing rustfmt drift in cli resources and dsl_node_parity test
+- *(cli)* bundle DSL authoring guide + .bp.lua samples as MCP resources
+
 ## [0.10.0](https://github.com/ynishi/mlua-swarm/compare/v0.9.2...v0.10.0) - 2026-07-14
 
 ### Added
