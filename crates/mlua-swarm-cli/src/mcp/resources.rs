@@ -40,6 +40,7 @@
 //! | `mse://guides/operator-execution-model`      | 3-hop execution model for `AgentKind::Operator` (WS thin-path). |
 //! | `mse://guides/agent-md-authoring`            | SubAgent (agent.md) canonical shape, size targets, fetch-vs-embed policy. |
 //! | `mse://guides/dsl-authoring`                 | flow_dsl/bp_dsl authoring DSL: Expr/Node builders, pipeline conventions, JSON→DSL migration SOP. |
+//! | `mse://guides/worker-io-contract`            | Worker I/O contract: fetch-based IN, path-free tool-call OUT, server-side file materialization. |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
@@ -96,6 +97,7 @@ const OPERATOR_EXECUTION_MODEL_BODY: &str =
     include_str!("./resources/guides/operator-execution-model.md");
 const AGENT_MD_AUTHORING_BODY: &str = include_str!("./resources/guides/agent-md-authoring.md");
 const DSL_AUTHORING_GUIDE_BODY: &str = include_str!("./resources/guides/dsl-authoring.md");
+const WORKER_IO_CONTRACT_BODY: &str = include_str!("./resources/guides/worker-io-contract.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -160,6 +162,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "flow_dsl Expr/Node builders, bp_dsl pipeline conventions (default in/out, verdict gate, retry expansion), and a JSON→DSL migration SOP.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(DSL_AUTHORING_GUIDE_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/worker-io-contract",
+        title: "mse — Worker I/O contract",
+        description: "Why worker IN is one authenticated prompt fetch and OUT is path-free tool calls (submit / artifact?name=), with the server-side projection sink materializing the next step's IN files. Design rationale + authoring checklist.",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(WORKER_IO_CONTRACT_BODY),
     },
     ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",
