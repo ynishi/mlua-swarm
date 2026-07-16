@@ -17,6 +17,7 @@
 //!   relationally.
 //! - Other persistent backends (Git / mini-app / …) are future carries.
 
+use crate::store::replay::{ReplayCursor, ReplayStore};
 use crate::types::{RunId, StepId, TaskId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -168,6 +169,48 @@ pub struct RunContext {
     pub run_id: RunId,
     /// Where to append [`StepEntry`] rows as steps are dispatched.
     pub run_store: Arc<dyn RunStore>,
+    /// Optional [`ReplayStore`] the engine will append a Ctx-snapshot +
+    /// step-output row to after every completed step (see
+    /// [`crate::store::replay`] for the primitive). `None` (the default)
+    /// disables logging entirely — pre-replay callers keep their behavior
+    /// byte-for-byte.
+    pub replay_store: Option<Arc<dyn ReplayStore>>,
+    /// Optional [`ReplayCursor`] the engine consults BEFORE dispatching
+    /// each step. When present and the cursor has a matching row for
+    /// `(step_ref, input_hash, occurrence)`, the engine returns the
+    /// stored `DispatchOutcome::Pass(value)` verbatim and skips the
+    /// Adapter spawn — this is the replay-hit path. `None` (the default)
+    /// disables replay entirely.
+    pub replay_cursor: Option<Arc<Mutex<ReplayCursor>>>,
+}
+
+impl RunContext {
+    /// Construct a `RunContext` with just the RunStore wired — the same
+    /// shape all pre-replay callers use (`replay_store` / `replay_cursor`
+    /// both `None`). Preserved as a convenience so a caller that never
+    /// opts into replay can keep constructing `RunContext` positionally.
+    pub fn new(run_id: RunId, run_store: Arc<dyn RunStore>) -> Self {
+        Self {
+            run_id,
+            run_store,
+            replay_store: None,
+            replay_cursor: None,
+        }
+    }
+
+    /// Builder-style setter: attach a [`ReplayStore`] to log every
+    /// completed step's Ctx snapshot + output into.
+    pub fn with_replay_store(mut self, store: Arc<dyn ReplayStore>) -> Self {
+        self.replay_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter: attach a [`ReplayCursor`] the dispatcher
+    /// consults for a hit before dispatching each step.
+    pub fn with_replay_cursor(mut self, cursor: Arc<Mutex<ReplayCursor>>) -> Self {
+        self.replay_cursor = Some(cursor);
+        self
+    }
 }
 
 impl std::fmt::Debug for RunContext {
@@ -180,6 +223,11 @@ impl std::fmt::Debug for RunContext {
         f.debug_struct("RunContext")
             .field("run_id", &self.run_id)
             .field("run_store", &self.run_store.name())
+            .field(
+                "replay_store",
+                &self.replay_store.as_ref().map(|s| s.name()),
+            )
+            .field("replay_cursor", &self.replay_cursor.is_some())
             .finish()
     }
 }

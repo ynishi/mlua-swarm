@@ -1413,10 +1413,7 @@ impl MseServer {
             })
             .await
         {
-            Ok(()) => Some(RunContext {
-                run_id: run_id_typed.clone(),
-                run_store: run_store.clone(),
-            }),
+            Ok(()) => Some(RunContext::new(run_id_typed.clone(), run_store.clone())),
             // A trace-store failure must not block the run itself.
             Err(_) => None,
         };

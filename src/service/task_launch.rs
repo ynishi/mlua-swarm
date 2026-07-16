@@ -1636,10 +1636,7 @@ mod tests {
             .expect("seed RunRecord");
 
         let mut input = launch_input(blueprint, json!({ "in": "hi" }));
-        input.run_ctx = Some(RunContext {
-            run_id: run_id.clone(),
-            run_store: run_store.clone(),
-        });
+        input.run_ctx = Some(RunContext::new(run_id.clone(), run_store.clone()));
 
         let out = svc.launch(input).await.expect("launch ok");
         assert_eq!(out.final_ctx["s2"], "HI!");

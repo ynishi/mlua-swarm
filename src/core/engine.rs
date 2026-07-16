@@ -16,6 +16,8 @@ use crate::core::state::{
     CapTokenRecord, DispatchOutcome, EngineState, Event, EventStream, OperatorSession, ResumeKey,
     ResumePending, TaskSpec, TaskState, TaskStatus,
 };
+use crate::store::replay::{hash_input_value, ReplayEntry};
+use crate::store::run::RunContext;
 use crate::types::{
     default_role_verb_table, now_unix, CapToken, Role, RoleVerbGate, RunId, SessionId, StepId,
     TokenSigner, Verb,
@@ -1566,6 +1568,267 @@ impl Engine {
         });
 
         // Wake any callers waiting in poll_task.
+        self.wake_task(&task_id).await?;
+
+        Ok(outcome)
+    }
+
+    /// Dispatch a single attempt, opt-in to the replay-log Core primitive
+    /// ([`crate::store::replay`]) via `run_ctx`.
+    ///
+    /// This is the [`Self::dispatch_attempt_with`] sibling used by callers
+    /// that carry a `RunContext` with `replay_store` / `replay_cursor`
+    /// populated. Behavior versus the plain `dispatch_attempt_with`:
+    ///
+    /// - **`run_ctx.replay_cursor` is `Some` AND the cursor has a matching
+    ///   `(step_ref, input_hash, occurrence)` row** — the stored value is
+    ///   returned verbatim as `DispatchOutcome::Pass(v)`; the `Adapter`
+    ///   (spawner + worker) is never touched. The task's `attempt` is
+    ///   still bumped and `TaskStatus` set to `Pass`, so downstream state
+    ///   (`task.last_result`, `TaskAttemptCompleted` / `TaskPass` events,
+    ///   `wake_task`) fires the same way an ordinary Pass would.
+    /// - **Miss (or `replay_cursor: None`)** — the ordinary spawn path
+    ///   runs. When `run_ctx.replay_store` is `Some` AND the outcome is
+    ///   `Pass`, one `ReplayEntry` is appended carrying the whole `Ctx`
+    ///   snapshot (with `operator` dropped by `#[serde(skip)]`) plus the
+    ///   `step_output` value. `Blocked` / `Err` outcomes are never
+    ///   logged — a partial-failure row would poison the replay path
+    ///   after a subsequent successful retry.
+    ///
+    /// `run_ctx: None` collapses to the same behavior as
+    /// `dispatch_attempt_with(token, task_id, spawner, None)` — no run
+    /// tracing, no replay.
+    pub async fn dispatch_attempt_with_run_ctx(
+        &self,
+        token: &CapToken,
+        task_id: &StepId,
+        spawner: &Arc<dyn SpawnerAdapter>,
+        run_ctx: Option<&RunContext>,
+    ) -> Result<DispatchOutcome, EngineError> {
+        self.verify_token(token, Verb::DispatchAttempt).await?;
+        let task_id = task_id.clone();
+
+        // 1) Under the lock: prep (bump attempt, snapshot agent/directive).
+        let fp = token.fingerprint();
+        let tid_for_prep = task_id.clone();
+        let (attempt, agent, session_snapshot, step_ctx, initial_directive) = self
+            .with_state("dispatch_run_ctx.prep", move |s| {
+                let task = s
+                    .tasks
+                    .get_mut(&tid_for_prep)
+                    .ok_or_else(|| EngineError::TaskNotFound(tid_for_prep.to_string()))?;
+                task.attempt += 1;
+                task.status = TaskStatus::Running;
+                task.updated_at = now_unix();
+                let attempt = task.attempt;
+                let initial = task.spec.initial_directive.clone();
+                s.prompts
+                    .entry((tid_for_prep.clone(), attempt))
+                    .or_insert(initial.clone());
+                let task = s
+                    .tasks
+                    .get(&tid_for_prep)
+                    .ok_or_else(|| EngineError::TaskNotFound(tid_for_prep.to_string()))?;
+                let agent = task.spec.agent.clone();
+                let step_ctx = task.spec.step_ctx.clone();
+                let sess_clone = s
+                    .sessions
+                    .values()
+                    .find(|sess| sess.token_fp == fp)
+                    .cloned();
+                Ok::<_, EngineError>((attempt, agent, sess_clone, step_ctx, initial))
+            })
+            .await??;
+
+        let operator_info = match session_snapshot {
+            Some(sess) => self.resolve_operator_info(&sess, &agent).await,
+            None => OperatorInfo::default(),
+        };
+
+        // 2) Compute the replay key from step_ref (= agent) + hashed input.
+        //    Occurrence comes from the cursor's per-key counter (bumped
+        //    once per dispatch, so a loop that re-visits the same step
+        //    with the same input gets 0, 1, 2, … distinct rows).
+        let step_ref = agent.clone();
+        let input_hash = hash_input_value(&initial_directive);
+        let (replay_hit_value, occurrence) = if let Some(rc) = run_ctx {
+            if let Some(cursor) = &rc.replay_cursor {
+                let mut guard = cursor.lock().expect("replay cursor mutex poisoned");
+                let occ = guard.next_occurrence(&step_ref, &input_hash);
+                let hit = guard.find(&step_ref, &input_hash, occ);
+                (hit, occ)
+            } else {
+                (None, 0)
+            }
+        } else {
+            (None, 0)
+        };
+
+        // 3) Build the Ctx that (a) either the spawner will see on a miss,
+        //    or (b) we log alongside the replay row.
+        let mut ctx = Ctx::new(task_id.clone(), attempt, agent.clone());
+        ctx.operator = operator_info;
+        if let Some(rc) = run_ctx {
+            ctx.meta
+                .runtime
+                .insert(RUN_ID_KEY.to_string(), Value::String(rc.run_id.to_string()));
+        }
+        if let Some(step_ctx) = step_ctx {
+            ctx.meta.runtime.insert(STEP_CTX_KEY.to_string(), step_ctx);
+        }
+
+        // 4) Replay-hit shortcut: skip the spawn+join, return stored value.
+        let was_replay_hit = replay_hit_value.is_some();
+        let value_ok: Result<(Value, bool), String> = if let Some(stored) = replay_hit_value {
+            tracing::info!(
+                task_id = %task_id,
+                step_ref = %step_ref,
+                occurrence = occurrence,
+                "replayed from log; worker dispatch skipped"
+            );
+            Ok((stored, true))
+        } else {
+            // 5) Ordinary spawn path — mint a worker token+handle, run the
+            //    spawner, join, and pull the last Final from output_tail.
+            let worker_token = self.inner.signer.session(
+                format!("worker-of-{task_id}"),
+                Role::Worker,
+                vec!["*".into()],
+                Duration::from_secs(1800),
+            );
+            let worker_fp = worker_token.fingerprint();
+            let task_id_for_worker = task_id.clone();
+            let worker_token_for_store = worker_token.clone();
+            self.with_state("dispatch_run_ctx.mint_worker", move |s| {
+                s.tokens.insert(
+                    worker_fp,
+                    CapTokenRecord::from_worker_token(worker_token_for_store, task_id_for_worker),
+                );
+            })
+            .await?;
+            let worker_handle = self.mint_worker_handle(worker_token.fingerprint()).await?;
+            ctx.meta
+                .runtime
+                .insert("worker_handle".to_string(), Value::String(worker_handle));
+
+            let worker = spawner
+                .spawn(self, &ctx, task_id.clone(), attempt, worker_token)
+                .await
+                .map_err(|e| EngineError::DispatchFailed(e.to_string()))?;
+            let signal_result: Result<(), String> = worker.join().await.map_err(|e| e.to_string());
+            match signal_result {
+                Ok(()) => {
+                    let tail = self.output_tail(&task_id, attempt).await;
+                    let staged_names = self.worker_artifact_names_for(&task_id, attempt).await;
+                    fold_final_and_parts(&tail, &staged_names)
+                        .ok_or_else(|| "no Final in output_tail".to_string())
+                }
+                Err(msg) => Err(msg),
+            }
+        };
+
+        // 6) Apply — mirrors `dispatch_attempt_with`'s apply arm exactly
+        //    (task.last_result / status update + TaskAttemptCompleted /
+        //    TaskPass / TaskBlocked events).
+        let outcome = self
+            .with_state("dispatch_run_ctx.apply", |s| {
+                if !s.tasks.contains_key(&task_id) {
+                    return Err(EngineError::TaskNotFound(task_id.to_string()));
+                }
+                match value_ok {
+                    Ok((value, ok)) => {
+                        let pass = ok;
+                        {
+                            let task = s.tasks.get_mut(&task_id).unwrap();
+                            task.last_result = Some(value.clone());
+                            task.updated_at = now_unix();
+                            task.status = if pass {
+                                TaskStatus::Pass
+                            } else {
+                                TaskStatus::Blocked
+                            };
+                        }
+                        s.push_event(Event::TaskAttemptCompleted {
+                            task_id: task_id.clone(),
+                            attempt,
+                            result: value.clone(),
+                        });
+                        if pass {
+                            s.push_event(Event::TaskPass {
+                                task_id: task_id.clone(),
+                                result: value.clone(),
+                            });
+                            Ok::<_, EngineError>(DispatchOutcome::Pass(value))
+                        } else {
+                            s.push_event(Event::TaskBlocked {
+                                task_id: task_id.clone(),
+                                result: value.clone(),
+                            });
+                            Ok(DispatchOutcome::Blocked(value))
+                        }
+                    }
+                    Err(msg) => {
+                        let task = s.tasks.get_mut(&task_id).unwrap();
+                        task.status = TaskStatus::Blocked;
+                        task.updated_at = now_unix();
+                        Err(EngineError::DispatchFailed(msg))
+                    }
+                }
+            })
+            .await??;
+
+        // 7) On MISS + Pass + replay_store present, append a replay row.
+        //    Replay-HIT rows are already logged from the original run and
+        //    must never be double-logged (Core primitive contract). A
+        //    secondary-persistence failure here (`tracing::warn!` +
+        //    swallow) matches the `run_ctx.run_store.append_step_entry`
+        //    convention in `EngineDispatcher::dispatch`: it must not mask
+        //    the primary dispatch outcome the caller already has in hand.
+        if !was_replay_hit {
+            if let (Some(rc), DispatchOutcome::Pass(v)) = (run_ctx, &outcome) {
+                if let Some(store) = &rc.replay_store {
+                    match ReplayEntry::from_completion(
+                        rc.run_id.clone(),
+                        step_ref.clone(),
+                        input_hash.clone(),
+                        occurrence,
+                        &ctx,
+                        v,
+                    ) {
+                        Ok(entry) => {
+                            if let Err(e) = store.append(entry).await {
+                                tracing::warn!(
+                                    run_id = %rc.run_id,
+                                    step_ref = %step_ref,
+                                    occurrence = occurrence,
+                                    error = %e,
+                                    "dispatch_attempt_with_run_ctx: replay_store.append failed"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                run_id = %rc.run_id,
+                                step_ref = %step_ref,
+                                occurrence = occurrence,
+                                error = %e,
+                                "dispatch_attempt_with_run_ctx: ReplayEntry encode failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = self.inner.event_tx.send(Event::TaskAttemptCompleted {
+            task_id: task_id.clone(),
+            attempt,
+            result: match &outcome {
+                DispatchOutcome::Pass(v) | DispatchOutcome::Blocked(v) => v.clone(),
+                _ => Value::Null,
+            },
+        });
+
         self.wake_task(&task_id).await?;
 
         Ok(outcome)

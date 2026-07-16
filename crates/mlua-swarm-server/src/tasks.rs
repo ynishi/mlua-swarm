@@ -396,10 +396,7 @@ pub async fn task_rekick(
         // server-wide default (backward compat).
         check_policy: None,
     };
-    let run_ctx = RunContext {
-        run_id: run_id.clone(),
-        run_store: state.run_store.clone(),
-    };
+    let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone());
 
     // GH #37 detached rekick: same driver-detach semantics as
     // `run_flow_form` — the eval runs in its own spawned task bounded by

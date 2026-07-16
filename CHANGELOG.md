@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(store)* add Ctx-snapshot replay Core primitive (`store::replay` module with `ReplayStore` trait, `InMemoryReplayStore`, `SqliteReplayStore`, and `ReplayCursor`) plus `Engine::dispatch_attempt_with_run_ctx` for deterministic step-level replay of a `Ctx` across a fresh engine
+- *(store)* extend `RunContext` with opt-in `replay_store` / `replay_cursor` fields
+
 ## [0.11.0](https://github.com/ynishi/mlua-swarm/compare/v0.10.0...v0.11.0) - 2026-07-16
 
 ### Added

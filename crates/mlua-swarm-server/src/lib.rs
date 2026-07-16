@@ -1047,10 +1047,7 @@ async fn run_flow_form(
         .await
         .map_err(ApiError::engine)?;
 
-    let run_ctx = RunContext {
-        run_id: run_id.clone(),
-        run_store: state.run_store.clone(),
-    };
+    let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone());
     let input = TaskApplicationInput {
         blueprint,
         operator_id: operator_id.clone(),

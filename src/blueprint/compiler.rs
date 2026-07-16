@@ -1014,9 +1014,7 @@ fn check_unhandled_verdict_values(
             .cloned()
             .unwrap_or_else(|| agent.clone());
         for value in &contract.values {
-            let handled = referenced
-                .map(|set| set.contains(value))
-                .unwrap_or(false);
+            let handled = referenced.map(|set| set.contains(value)).unwrap_or(false);
             if handled {
                 continue;
             }
