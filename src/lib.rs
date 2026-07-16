@@ -54,6 +54,43 @@
 //!   flow.
 //! - [`store`] — persistence traits and default backends for outputs,
 //!   issues, and enhance settings/logs.
+//!
+//! # Worker I/O contract (why IN is a fetch and OUT is a file)
+//!
+//! Every worker step follows one asymmetric I/O shape, and the asymmetry
+//! is deliberate — each side sits where an LLM worker is *reliable*:
+//!
+//! - **IN — one authenticated HTTP fetch.** The worker pulls its prompt
+//!   and context with `GET /v1/worker/prompt` (Bearer = capability
+//!   token). The server assembles the view fresh per attempt (system
+//!   prompt, directive, `AgentContextView`, prior-step pointers), so a
+//!   fetch always returns the current attempt's truth — no stale files
+//!   to pre-write or clean up, and the payload never has to travel
+//!   through the orchestrating operator's own context window (the Spawn
+//!   directive relays only a short handle). The fetch doubles as the
+//!   trust handshake: the capability token scopes *which* task's IN this
+//!   worker may read.
+//! - **OUT — one tool call, never a self-chosen file.** Producing OUT
+//!   happens at the *end* of a worker's run — the point where a
+//!   long-context LLM is least dependable about paths and formats.
+//!   Letting it pick a file name there structurally invites hallucinated
+//!   paths and plausible-looking-but-wrong files. So the exit is pinned
+//!   to calls that carry no path and no format choice: `POST
+//!   /v1/worker/submit` for the final body, `POST
+//!   /v1/worker/artifact?name=<name>` per named part.
+//! - **Files are the server's job.** Turning submitted OUT into the IN
+//!   files the *next* step reads (plain `Read` on a path — the cheapest,
+//!   most reliable worker primitive, with partial reads for free) is
+//!   owned by the submit-time projection sink and
+//!   [`FileProjectionAdapter`](core::projection::FileProjectionAdapter):
+//!   the final body lands as `<ctx-dir>/<step>.md`, each staged part
+//!   lands raw as `<ctx-dir>/<name>`. Placement, naming, and format are
+//!   adapter policy — deliberately *not* baked into worker defaults, so
+//!   workers stay generic and the policy stays swappable
+//!   ([`ProjectionPlacement`]).
+//!
+//! See `mse://guides/worker-io-contract` (an `mse mcp` resource) for the
+//! consumer-side view of the same contract.
 
 #![warn(missing_docs)]
 
