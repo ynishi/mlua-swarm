@@ -31,7 +31,10 @@
 //!   part per POST via `engine.stage_worker_artifact_trusted`. Completing the
 //!   attempt is still `POST /v1/worker/submit` / `/v1/worker/result` — this
 //!   route only stages; the dispatch layer's Final-pull folds every staged
-//!   part into `{"out": <final>, "parts": {<name>: <value>, ...}}`.
+//!   part into `{"out": <final>, "parts": {<name>: <value>, ...}}`. At
+//!   staging time the submit-time projection sink also materializes the part
+//!   raw to `<ctx-dir>/<name>` (the IN file the next Agent step reads;
+//!   fail-open skip when no `work_dir` / `project_root` resolves).
 //! - `GET /v1/worker/prompt/system?task_id=<tid>&attempt=<n>` (GH #31) —
 //!   raw baked `system` bytes for `(task_id, attempt)`, the `Http`-mode
 //!   fetch target for `system_ref.uri`. Same Bearer flow as

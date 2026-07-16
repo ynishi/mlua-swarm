@@ -407,6 +407,68 @@ impl FileProjectionAdapter {
             path: target.to_string_lossy().into_owned(),
         })
     }
+
+    /// Submit-path materialize for a *staged named part* — the file half
+    /// of the `Artifact` staging sink, sibling
+    /// of [`Self::materialize_submission`]. Where `materialize_submission`
+    /// wraps a `Final` OUTPUT in the YAML front-matter + fenced-JSON
+    /// convention [`Self::fetch`] parses back, this writes a part's content
+    /// **raw**, because a part file is not a `fetch`-round-tripped
+    /// projection: it is the literal IN file the *next* Agent step reads. A
+    /// part named `plan.md` is the plan document itself, byte-for-byte, not
+    /// a JSON envelope around it — so a `Value::String` lands as its own
+    /// bytes with no front matter and no fenced wrapper; any other `Value`
+    /// is rendered as pretty JSON (the best faithful text form for a
+    /// non-string part).
+    ///
+    /// `name` is written **verbatim** as the file name — unlike
+    /// [`Self::target_path`]'s `<stem>.md` synthesis, a part's `name`
+    /// already carries its own extension (`plan.md`), so it IS the file
+    /// name. Because `name` is caller-supplied and joined onto the ctx
+    /// directory, it is guarded first: it must be a plain file name — empty,
+    /// `.`, `..`, or any `name` containing `/` or `\` is rejected with
+    /// [`ProjectionError::InvalidKey`], structurally closing every path that
+    /// could escape [`ProjectionPlacement::target_dir`].
+    ///
+    /// A full replace, never append — re-staging the same `name` overwrites
+    /// (idempotent, latest wins — matching the fold's last-write-wins per
+    /// name).
+    pub fn materialize_part(
+        &self,
+        task_id: &str,
+        name: &str,
+        value: &Value,
+    ) -> Result<ProjectionRef, ProjectionError> {
+        if task_id.is_empty() {
+            return Err(ProjectionError::InvalidKey(
+                "task_id must not be empty".to_string(),
+            ));
+        }
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            return Err(ProjectionError::InvalidKey(format!(
+                "part name must be a plain file name (no '/', '\\', '.', or '..'): {name:?}"
+            )));
+        }
+        let target = self.placement.target_dir(&self.root, task_id).join(name);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let body: Vec<u8> = match value {
+            Value::String(s) => s.as_bytes().to_vec(),
+            other => serde_json::to_string_pretty(other)
+                .map_err(|err| ProjectionError::Serialize(err.to_string()))?
+                .into_bytes(),
+        };
+        fs::write(&target, body)?;
+        Ok(ProjectionRef::File {
+            path: target.to_string_lossy().into_owned(),
+        })
+    }
 }
 
 /// Front matter for a submit-time materialized projection file
@@ -833,5 +895,114 @@ mod tests {
             .materialize_submission(&k, &json!("x"), 1, true)
             .unwrap_err();
         assert!(matches!(err, ProjectionError::InvalidKey(_)));
+    }
+
+    // ─── staged named parts: FileProjectionAdapter::materialize_part ───
+
+    #[test]
+    fn materialize_part_writes_raw_string_content() {
+        let dir = TempDir::new().unwrap();
+        let adapter = FileProjectionAdapter::new(dir.path());
+
+        let reference = adapter
+            .materialize_part("T-1", "plan.md", &json!("# The Plan\n\ndo the thing\n"))
+            .unwrap();
+        let path = match &reference {
+            ProjectionRef::File { path } => path.clone(),
+            other => panic!("expected File ref, got {other:?}"),
+        };
+        let body = std::fs::read_to_string(path).unwrap();
+        // Raw content — no YAML front matter, no ```json fence.
+        assert_eq!(body, "# The Plan\n\ndo the thing\n");
+        assert!(!body.contains("---"), "no front matter: {body}");
+        assert!(!body.contains("```json"), "no fenced json: {body}");
+    }
+
+    #[test]
+    fn materialize_part_writes_json_pretty_for_non_string() {
+        let dir = TempDir::new().unwrap();
+        let adapter = FileProjectionAdapter::new(dir.path());
+
+        let reference = adapter
+            .materialize_part("T-1", "meta.json", &json!({"k": "v", "n": 1}))
+            .unwrap();
+        let path = match &reference {
+            ProjectionRef::File { path } => path.clone(),
+            other => panic!("expected File ref, got {other:?}"),
+        };
+        let body = std::fs::read_to_string(path).unwrap();
+        let expected = serde_json::to_string_pretty(&json!({"k": "v", "n": 1})).unwrap();
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn materialize_part_resubmit_overwrites_with_latest() {
+        let dir = TempDir::new().unwrap();
+        let adapter = FileProjectionAdapter::new(dir.path());
+
+        adapter
+            .materialize_part("T-1", "plan.md", &json!("first"))
+            .unwrap();
+        let reference = adapter
+            .materialize_part("T-1", "plan.md", &json!("second"))
+            .unwrap();
+        let path = match &reference {
+            ProjectionRef::File { path } => path.clone(),
+            other => panic!("expected File ref, got {other:?}"),
+        };
+        let body = std::fs::read_to_string(path).unwrap();
+        assert_eq!(body, "second");
+    }
+
+    #[test]
+    fn materialize_part_rejects_traversal_names() {
+        let dir = TempDir::new().unwrap();
+        let adapter = FileProjectionAdapter::new(dir.path());
+
+        for bad in ["../x", "a/b", "a\\b", "..", ""] {
+            let err = adapter
+                .materialize_part("T-1", bad, &json!("x"))
+                .unwrap_err();
+            assert!(
+                matches!(err, ProjectionError::InvalidKey(_)),
+                "expected InvalidKey for name {bad:?}"
+            );
+        }
+        // No file (nor an escaped one) was created — the guard rejects
+        // before any `create_dir_all`, so the ctx dir stays empty/absent.
+        let ctx_dir = ProjectionPlacement::default().target_dir(dir.path(), "T-1");
+        assert!(
+            !ctx_dir.exists() || std::fs::read_dir(&ctx_dir).unwrap().next().is_none(),
+            "no part file may be created for a rejected name"
+        );
+    }
+
+    #[test]
+    fn materialize_part_lands_next_to_submission_file() {
+        let dir = TempDir::new().unwrap();
+        let adapter = FileProjectionAdapter::new(dir.path());
+        let k = key(Some("planner"), None);
+
+        let submission = adapter
+            .materialize_submission(&k, &json!({"plan": "x"}), 1, true)
+            .unwrap();
+        let part = adapter
+            .materialize_part("T-1", "plan.md", &json!("the plan"))
+            .unwrap();
+
+        let submission_path = match submission {
+            ProjectionRef::File { path } => PathBuf::from(path),
+            other => panic!("expected File ref, got {other:?}"),
+        };
+        let part_path = match part {
+            ProjectionRef::File { path } => PathBuf::from(path),
+            other => panic!("expected File ref, got {other:?}"),
+        };
+        assert_eq!(
+            submission_path.parent(),
+            part_path.parent(),
+            "submission ctx/<step>.md and part ctx/<name> must share a directory"
+        );
+        assert_eq!(part_path.file_name().unwrap(), "plan.md");
     }
 }

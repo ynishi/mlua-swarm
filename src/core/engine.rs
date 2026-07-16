@@ -2287,23 +2287,42 @@ impl Engine {
     }
 
     /// Submit-time projection sink for `OutputEvent::Artifact` (GH #34
-    /// subtask-3 gap fix). Data-plane-only sibling of
-    /// [`Self::materialize_final_submission`]: when [`Self::set_output_store`]
-    /// has wired a Data-plane [`crate::store::output::OutputStore`], the
-    /// artifact dual-writes there under its own `name`, verbatim — general
-    /// form, every `Artifact` submitted via [`Self::submit_output`]
-    /// materializes this way, no name-prefix gate (see `submit_output`'s
-    /// doc, "`Artifact` dual-write" section, for the full rationale).
+    /// subtask-3, later extended to drive the file half too). Two halves, the
+    /// [`Self::materialize_final_submission`] mirror for staged named parts:
     ///
-    /// Deliberately does NOT resolve `producer_agent` / `StepNaming` /
-    /// `AgentContextView` / a `root` the way `materialize_final_submission`
-    /// does — an artifact's `name` already IS the Data-plane key (no
-    /// canonicalization needed), and this sink does not drive the
-    /// file-materialize half, so none of that lookup is needed here. Same
-    /// fail-open discipline: an unconfigured `OutputStore`, or the write
-    /// erroring, only logs a `tracing::warn!` and never surfaces to the
-    /// caller (`submit_output` already committed the domain-plane append
-    /// before calling this sink).
+    /// - **Data-plane dual-write** — when [`Self::set_output_store`] has
+    ///   wired a [`crate::store::output::OutputStore`], the artifact
+    ///   dual-writes there under its own `name`, verbatim (general form:
+    ///   every `Artifact` staged via [`Self::submit_output`] /
+    ///   [`Self::stage_worker_artifact_trusted`] materializes this way, no
+    ///   name-prefix gate).
+    /// - **File materialize** — when a `root` resolves off the spawn-time
+    ///   [`crate::core::agent_context::AgentContextView`], the part's
+    ///   content is written raw to `<ctx-dir>/<name>` via
+    ///   [`crate::core::projection::FileProjectionAdapter::materialize_part`].
+    ///   That file is the IN file the *next* Agent step reads: materializing
+    ///   a Step's OUTPUT to disk is the
+    ///   [`crate::core::projection::FileProjectionAdapter`]'s
+    ///   responsibility, and a staged named part is as much an OUTPUT the
+    ///   next step consumes as a `Final` is — so the sink materializes it
+    ///   too, rather than leaving parts Data-plane-only.
+    ///
+    /// Unlike the Final sink, no `StepNaming` canonicalization is applied:
+    /// an artifact's `name` already IS the key both halves address (it
+    /// names the file directly, extension included — `plan.md` — so
+    /// `materialize_part` writes it verbatim, not through the `<stem>.md`
+    /// synthesis the Final sink's canonical-agent path uses).
+    ///
+    /// Fail-open throughout, the same `check_policy` cascade as
+    /// [`Self::materialize_final_submission`]: a per-task lookup error falls
+    /// back to the server default (and a `None` view ⇒ the file half's
+    /// unresolved-root path), an unconfigured `OutputStore` skips the
+    /// dual-write, an unresolved root skips the file half, and a
+    /// dual-write / file-write / name-guard error only `tracing::warn!`s
+    /// (`Silent` suppresses even that) before applying [`apply_check_policy`]
+    /// (`Strict` surfaces an [`EngineError`], `Warn` / `Silent` return
+    /// `Ok(())`) — a staged part never turns a would-have-succeeded submit
+    /// into a failure under the default policy.
     async fn materialize_artifact_submission(
         &self,
         task_id: &StepId,
@@ -2311,52 +2330,122 @@ impl Engine {
         name: &str,
         content: &crate::worker::output::ContentRef,
     ) -> Result<(), EngineError> {
-        // Per-task `TaskSpec.check_policy` override — sibling of the
-        // resolution in `materialize_final_submission`. Silent per-task
-        // lookup failure (`with_state` error) falls back to the
-        // server-wide default; this sink never surfaces a lookup error
-        // as a step failure (unlike the sink itself, which does under
-        // `Strict`).
+        // Per-task `TaskSpec.check_policy` override + the `AgentContextView`
+        // snapshot, resolved in ONE read-only `with_state` (the same lock
+        // the policy lookup already needed — no extra `with_state` for the
+        // view). Silent per-task lookup failure (`with_state` error) falls
+        // back to the server-wide default and a `None` view (⇒ the file
+        // half's own unresolved-root fail-open path); this sink never
+        // surfaces the lookup error itself as a step failure.
         let server_policy = self.cfg().check_policy;
         let task_id_for_lookup = task_id.clone();
-        let task_policy = self
-            .with_state("materialize_artifact_submission.policy_lookup", move |s| {
-                s.tasks
+        let lookup = self
+            .with_state("materialize_artifact_submission.lookup", move |s| {
+                let task_policy = s
+                    .tasks
                     .get(&task_id_for_lookup)
-                    .and_then(|t| t.spec.check_policy)
+                    .and_then(|t| t.spec.check_policy);
+                let view = s
+                    .agent_ctx
+                    .get(&(task_id_for_lookup.clone(), attempt))
+                    .map(|e| e.view.clone());
+                (task_policy, view)
             })
             .await
-            .ok()
-            .flatten();
-        let policy = task_policy.unwrap_or(server_policy);
-        let Some(store) = self.output_store_backend() else {
+            .ok();
+        let policy = lookup
+            .as_ref()
+            .and_then(|(tp, _)| *tp)
+            .unwrap_or(server_policy);
+        let view = lookup.and_then(|(_, view)| view);
+
+        // (a) Data-plane dual-write, when an OutputStore backend is wired —
+        // the artifact's own `name` is its Data-plane key (no
+        // canonicalization, unlike the Final sink's `StepNaming`
+        // resolution).
+        if let Some(store) = self.output_store_backend() {
+            if let Err(err) = store
+                .append(
+                    task_id.as_str(),
+                    attempt,
+                    name,
+                    crate::worker::output::OutputEvent::Artifact {
+                        name: name.to_string(),
+                        content: content.clone(),
+                    },
+                    Vec::new(),
+                )
+                .await
+            {
+                if !matches!(policy, crate::core::config::CheckPolicy::Silent) {
+                    tracing::warn!(
+                        %task_id,
+                        artifact = %name,
+                        error = %err,
+                        "submit-time projection sink: OutputStore dual-write failed for Artifact (fail-open)"
+                    );
+                }
+                apply_check_policy(
+                    policy,
+                    "submit-time projection sink: Artifact OutputStore dual-write",
+                    "OutputStore dual-write failed for Artifact (fail-open)",
+                )?;
+            }
+        }
+
+        // (b) File materialize, when a root resolved — writes the staged
+        // part raw to `<ctx-dir>/<name>`, the IN file the next Agent step
+        // reads (see `FileProjectionAdapter::materialize_part`'s doc for
+        // why raw / why the name is verbatim). A name-guard violation lands
+        // on the same fail-open path as any other write error below.
+        let placement = self
+            .projection_placement_for(task_id)
+            .await
+            .unwrap_or_default();
+        let Some(root) = view.and_then(|v| placement.resolve_root(&v)) else {
+            if !matches!(policy, crate::core::config::CheckPolicy::Silent) {
+                tracing::warn!(
+                    %task_id,
+                    artifact = %name,
+                    "submit-time projection sink: no work_dir/project_root resolved; skipping part file materialize (fail-open)"
+                );
+            }
+            apply_check_policy(
+                policy,
+                "submit-time projection sink: part file materialize",
+                "no work_dir/project_root resolved; skipping part file materialize (fail-open)",
+            )?;
             return Ok(());
         };
-        if let Err(err) = store
-            .append(
-                task_id.as_str(),
-                attempt,
-                name,
-                crate::worker::output::OutputEvent::Artifact {
-                    name: name.to_string(),
-                    content: content.clone(),
-                },
-                Vec::new(),
-            )
-            .await
-        {
+        let value = match content {
+            crate::worker::output::ContentRef::Inline { value } => value.clone(),
+            crate::worker::output::ContentRef::FileRef {
+                path,
+                mime,
+                size_hint,
+            } => serde_json::json!({
+                "file_ref": path.to_string_lossy(),
+                "mime": mime,
+                "size_hint": size_hint,
+            }),
+        };
+        let adapter = crate::core::projection::FileProjectionAdapter::with_placement(
+            root,
+            (*placement).clone(),
+        );
+        if let Err(err) = adapter.materialize_part(task_id.as_str(), name, &value) {
             if !matches!(policy, crate::core::config::CheckPolicy::Silent) {
                 tracing::warn!(
                     %task_id,
                     artifact = %name,
                     error = %err,
-                    "submit-time projection sink: OutputStore dual-write failed for Artifact (fail-open)"
+                    "submit-time projection sink: part file materialize failed (fail-open)"
                 );
             }
             apply_check_policy(
                 policy,
-                "submit-time projection sink: Artifact OutputStore dual-write",
-                "OutputStore dual-write failed for Artifact (fail-open)",
+                "submit-time projection sink: part file materialize",
+                "part file materialize failed (fail-open)",
             )?;
         }
         Ok(())
@@ -4247,6 +4336,139 @@ mod submit_time_projection_sink_tests {
                 .await
                 .is_err(),
             "a different attempt must not resolve the same-named record"
+        );
+    }
+
+    // ─── staged part file materialize ───
+
+    /// Staging a part with a resolved `work_dir` writes
+    /// `<work_dir>/workspace/tasks/<task_id>/ctx/<name>` with the part's
+    /// content RAW (no front matter / fenced wrapper).
+    #[tokio::test]
+    async fn stage_artifact_materializes_part_file_when_work_dir_resolved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (engine, _op, task_id, _worker_token) = seeded_task("planner").await;
+        seed_agent_context(&engine, &task_id, 1, &dir.path().to_string_lossy()).await;
+
+        engine
+            .stage_worker_artifact_trusted(
+                &task_id,
+                1,
+                "plan.md".to_string(),
+                serde_json::json!("# Plan\n\nstep one\n"),
+            )
+            .await
+            .expect("stage artifact");
+
+        let expected_file = dir
+            .path()
+            .join("workspace/tasks")
+            .join(task_id.as_str())
+            .join("ctx/plan.md");
+        assert!(
+            expected_file.exists(),
+            "materialized part file missing at {expected_file:?}"
+        );
+        let body = std::fs::read_to_string(expected_file).unwrap();
+        // Raw — no YAML front matter / fenced-json wrapper.
+        assert_eq!(body, "# Plan\n\nstep one\n");
+    }
+
+    /// No resolvable root + `Warn` — staging still
+    /// succeeds (fail-open), and no part file is written.
+    #[tokio::test]
+    async fn stage_artifact_check_policy_warn_skips_part_file_when_root_unresolved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (engine, _op, task_id, _worker_token) =
+            seeded_task_with_policy("planner", crate::core::config::CheckPolicy::Warn).await;
+        // No seed_agent_context — root unresolved.
+
+        let result = engine
+            .stage_worker_artifact_trusted(
+                &task_id,
+                1,
+                "plan.md".to_string(),
+                serde_json::json!("x"),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "Warn mode preserves fail-open: stage must succeed when root unresolved"
+        );
+        assert!(
+            !dir.path().join("workspace").exists(),
+            "no part file may be materialized when root is unresolved"
+        );
+    }
+
+    /// No resolvable root + `Strict` — staging surfaces
+    /// the fail-open condition as an [`EngineError::CheckPolicyStrict`],
+    /// its message identifying the "part file materialize" call site.
+    #[tokio::test]
+    async fn stage_artifact_check_policy_strict_surfaces_error_when_root_unresolved() {
+        let (engine, _op, task_id, _worker_token) =
+            seeded_task_with_policy("planner", crate::core::config::CheckPolicy::Strict).await;
+
+        let err = engine
+            .stage_worker_artifact_trusted(
+                &task_id,
+                1,
+                "plan.md".to_string(),
+                serde_json::json!("x"),
+            )
+            .await
+            .expect_err("Strict mode must return an error when root unresolved");
+        match err {
+            EngineError::CheckPolicyStrict { context, message } => {
+                assert!(
+                    context.contains("part file materialize"),
+                    "context must identify the call site: {context}"
+                );
+                assert!(
+                    message.contains("part file materialize"),
+                    "message must identify the part-file sink: {message}"
+                );
+                assert!(
+                    message.contains("no work_dir/project_root resolved"),
+                    "message must preserve the warn-log literal: {message}"
+                );
+            }
+            other => panic!(
+                "expected EngineError::CheckPolicyStrict, got a different variant: {other:?}"
+            ),
+        }
+    }
+
+    /// A path-traversal `name` (`../evil.md`) with a
+    /// resolved root — the name guard fails the write, but fail-open keeps
+    /// the stage succeeding, and nothing is written outside the ctx dir.
+    #[tokio::test]
+    async fn stage_artifact_traversal_name_is_fail_open_and_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (engine, _op, task_id, _worker_token) = seeded_task("planner").await;
+        seed_agent_context(&engine, &task_id, 1, &dir.path().to_string_lossy()).await;
+
+        let result = engine
+            .stage_worker_artifact_trusted(
+                &task_id,
+                1,
+                "../evil.md".to_string(),
+                serde_json::json!("pwned"),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "default (Warn) policy is fail-open even on a rejected part name"
+        );
+        // The escaped target (ctx dir's parent) must not have been written.
+        let escaped = dir
+            .path()
+            .join("workspace/tasks")
+            .join(task_id.as_str())
+            .join("evil.md");
+        assert!(
+            !escaped.exists(),
+            "a traversal name must never write outside the ctx dir: {escaped:?}"
         );
     }
 }
