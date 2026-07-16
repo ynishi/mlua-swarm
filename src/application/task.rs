@@ -392,6 +392,7 @@ mod tests {
                 version_label: version_label.map(|s| s.to_string()),
                 project_name_alias: None,
                 default_run_ttl_secs: None,
+                strict_verdict_handling: None,
             },
             spawner_hints: Default::default(),
             default_agent_kind: AgentKind::Operator,

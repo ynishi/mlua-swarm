@@ -580,6 +580,7 @@ fn seed_blueprint(id: &str) -> Blueprint {
             version_label: Some("0.1.0".into()),
             project_name_alias: None,
             default_run_ttl_secs: None,
+            strict_verdict_handling: None,
         },
         spawner_hints: Default::default(),
         default_agent_kind: AgentKind::Operator,

@@ -332,6 +332,61 @@ rewriting; `Blueprint.flow` stays exactly what the author wrote, and
 the contract lives entirely in the Blueprint/schema/compiler/server
 layers described here.
 
+### Declared verdict values must be handled downstream (opt-in strict mode)
+
+The two register-time checks above are the **forward-direction** lint:
+"every `Lit` a `cond` compares against must be a member of the agent's
+declared `verdict.values`" and "every `cond` must address the declared
+channel." The **reverse-direction** lint — "every entry of the declared
+`verdict.values` set must be referenced by at least one downstream
+`Branch`/`Loop` `cond`" — catches the complementary drift where a flow
+author declares a verdict value (e.g. `"BLOCKED"`) but forgets to write
+a branch that handles it.
+
+By default the reverse-direction lint only surfaces
+`tracing::warn!` — the compile still succeeds. This preserves back-
+compat with existing Blueprints that intentionally leave some declared
+values as silent-pass informational tokens (an agent may want to
+document "we may emit `INFO` as well" without demanding every caller
+branch on it).
+
+To promote the warning to a hard `CompileError::VerdictValueUnhandled`,
+opt in via `Blueprint.metadata`:
+
+```json
+{
+  "metadata": {
+    "strict_verdict_handling": true
+  }
+}
+```
+
+Under `strict_verdict_handling: true`, `Compiler::compile` rejects any
+Blueprint where a contract-bearing agent declares a `verdict.values`
+entry that no downstream `Branch`/`Loop` `cond` references. The
+diagnostic names the agent, the unhandled value, the full declared
+`values` set (so the fix is unambiguous — either add a handler branch
+or drop the value from the declaration), and the `Step.ref_` where the
+agent is invoked (best-effort — when the agent is invoked at multiple
+sites, the first-encountered site is reported).
+
+Two ways to satisfy the strict lint:
+
+1. **Add a branch per declared value.** The canonical shape — one
+   `Branch` per value, or one `Branch` per value pair (e.g. `"PASS"` in
+   the `then_`, `"BLOCKED"` in the `else_`).
+2. **Cover the whole set with one `In`.** An `In` cond whose `Lit`
+   haystack lists every declared value counts every entry as handled in
+   one node — useful when the flow author wants a single "any of these
+   verdict values ⇒ proceed" branch.
+
+The forward and reverse lints run in the same walk, so the strict
+setting has no extra runtime cost; either both fire or neither does.
+The setting is a Blueprint-level opt-in (per BP, not per agent), so a
+flow author who wants the strict check on some agents but not others
+can either split those agents into a separate Blueprint or leave the
+setting off and rely on the default `tracing::warn!` output.
+
 ### Cross-links
 
 - Named-parts wire format and OUTPUT shape: § Worker output: `out` vs

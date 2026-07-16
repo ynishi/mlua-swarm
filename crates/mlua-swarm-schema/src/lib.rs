@@ -1272,6 +1272,16 @@ pub struct BlueprintMetadata {
     /// recommended for long chains (14 agents × several minutes = 30-60 min).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_run_ttl_secs: Option<u64>,
+    /// GH #50 follow-up (issue `33bc825b`): promote `VerdictValueUnhandled`
+    /// compile-time lint to a hard error. When `false` (or absent), a
+    /// declared `AgentDef.verdict.values` entry that no downstream cond
+    /// references is only surfaced via `tracing::warn!` (informational);
+    /// when `true`, `Compiler::compile` rejects the Blueprint with
+    /// `CompileError::VerdictValueUnhandled`. Opt-in so existing Blueprints
+    /// that intentionally leave some verdict values as silent-pass
+    /// informational tokens keep compiling unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_verdict_handling: Option<bool>,
 }
 
 /// Provenance record of a Blueprint.

@@ -174,6 +174,37 @@ pub enum CompileError {
         /// error message.
         values: Vec<String>,
     },
+    /// GH #50 follow-up (issue `33bc825b`): a contract-bearing agent
+    /// declares `verdict.values = [...]` but at least one member of that
+    /// closed token set is never referenced by any downstream
+    /// `Branch`/`Loop` `cond` `Lit` — the flow author declared a verdict
+    /// value they never wrote a handler for. Emitted only when the
+    /// Blueprint opts in via
+    /// [`BlueprintMetadata::strict_verdict_handling`]`= Some(true)`; under
+    /// the default (`None`/`Some(false)`) unhandled values surface as
+    /// `tracing::warn!` only and compilation succeeds (back-compat with
+    /// Blueprints that intentionally leave some verdict values as
+    /// silent-pass informational tokens).
+    #[error(
+        "agent '{agent}' declares verdict value '{value}' but no downstream Branch/Loop \
+         cond references it (declared: {declared_values:?}, at step '{step_ref}') — either \
+         handle the value downstream or drop it from `verdict.values`"
+    )]
+    VerdictValueUnhandled {
+        /// The agent whose declared `verdict.values` entry lacks a
+        /// downstream handler.
+        agent: String,
+        /// The declared value that has no downstream `cond` reference.
+        value: String,
+        /// The agent's full declared `verdict.values` closed token set,
+        /// for the error message.
+        declared_values: Vec<String>,
+        /// The `Step.ref_` where this agent is invoked. When the same
+        /// agent is invoked at multiple sites, the first one encountered
+        /// during flow walk is reported (best-effort — the diagnostic
+        /// still identifies the offending agent uniquely).
+        step_ref: String,
+    },
 }
 
 // ─── SpawnerFactory + Registry ───────────────────────────────────────────
@@ -440,7 +471,17 @@ impl Compiler {
         // a cond but declaring no contract only gets a `tracing::warn!`
         // (opt-in, back-compat — see `AgentDef::verdict`'s doc). Read-only
         // inspection of `bp.flow` — no rewriting, no new `Expr` forms.
-        verify_verdict_conds(&bp.flow, &verdict_contracts)?;
+        //
+        // GH #50 follow-up (issue `33bc825b`): the reverse-direction lint
+        // — declared `verdict.values` entries that no downstream cond
+        // references — runs in the same walk. Under
+        // `BlueprintMetadata.strict_verdict_handling = Some(true)` it
+        // rejects the compile; otherwise it only surfaces
+        // `tracing::warn!` so existing Blueprints that intentionally leave
+        // some verdict values as silent-pass informational tokens keep
+        // compiling unchanged.
+        let strict_verdict_handling = bp.metadata.strict_verdict_handling.unwrap_or(false);
+        verify_verdict_conds(&bp.flow, &verdict_contracts, strict_verdict_handling)?;
 
         if bp.strategy.strict_refs {
             verify_refs(&bp.flow, &routes, self.default_spawner.is_some())?;
@@ -593,12 +634,28 @@ fn static_step_meta_ref(value: &Value) -> Option<String> {
 fn verify_verdict_conds(
     flow: &FlowNode,
     verdict_contracts: &HashMap<String, VerdictContract>,
+    strict_verdict_handling: bool,
 ) -> Result<(), CompileError> {
     let mut step_outputs: HashMap<String, String> = HashMap::new();
-    collect_step_outputs(flow, &mut step_outputs);
+    let mut step_agents: HashMap<String, String> = HashMap::new();
+    collect_step_outputs_and_agents(flow, &mut step_outputs, &mut step_agents);
 
     let mut errors: Vec<CompileError> = Vec::new();
-    collect_verdict_conds(flow, &step_outputs, verdict_contracts, &mut errors);
+    let mut referenced_values: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    collect_verdict_conds(
+        flow,
+        &step_outputs,
+        verdict_contracts,
+        &mut referenced_values,
+        &mut errors,
+    );
+    check_unhandled_verdict_values(
+        verdict_contracts,
+        &referenced_values,
+        &step_agents,
+        strict_verdict_handling,
+        &mut errors,
+    );
     match errors.into_iter().next() {
         Some(e) => Err(e),
         None => Ok(()),
@@ -612,7 +669,18 @@ fn verify_verdict_conds(
 /// `verify_refs`). Only `Step` nodes produce agent output; `Fanout`'s
 /// joined-array `out` and `Assign`'s computed `at` are not attributed to
 /// any single agent and are not inserted here.
-fn collect_step_outputs(node: &FlowNode, out: &mut HashMap<String, String>) {
+///
+/// GH #50 follow-up (issue `33bc825b`): `step_agents` additionally maps
+/// each `Step.ref_` (= agent name) to the first-seen `Step.ref_` literal,
+/// so [`check_unhandled_verdict_values`] can attribute a diagnostic to a
+/// concrete step site. When the same agent is invoked at multiple sites,
+/// the first-encountered site is retained (best-effort — the diagnostic
+/// still identifies the offending agent uniquely).
+fn collect_step_outputs_and_agents(
+    node: &FlowNode,
+    out: &mut HashMap<String, String>,
+    step_agents: &mut HashMap<String, String>,
+) {
     match node {
         FlowNode::Step {
             ref_,
@@ -622,21 +690,24 @@ fn collect_step_outputs(node: &FlowNode, out: &mut HashMap<String, String>) {
             if let Expr::Path { at } = out_expr {
                 out.insert(at.to_string(), ref_.clone());
             }
+            step_agents
+                .entry(ref_.clone())
+                .or_insert_with(|| ref_.clone());
         }
         FlowNode::Seq { children } => {
             for c in children {
-                collect_step_outputs(c, out);
+                collect_step_outputs_and_agents(c, out, step_agents);
             }
         }
         FlowNode::Branch { then_, else_, .. } => {
-            collect_step_outputs(then_, out);
-            collect_step_outputs(else_, out);
+            collect_step_outputs_and_agents(then_, out, step_agents);
+            collect_step_outputs_and_agents(else_, out, step_agents);
         }
-        FlowNode::Fanout { body, .. } => collect_step_outputs(body, out),
-        FlowNode::Loop { body, .. } => collect_step_outputs(body, out),
+        FlowNode::Fanout { body, .. } => collect_step_outputs_and_agents(body, out, step_agents),
+        FlowNode::Loop { body, .. } => collect_step_outputs_and_agents(body, out, step_agents),
         FlowNode::Try { body, catch, .. } => {
-            collect_step_outputs(body, out);
-            collect_step_outputs(catch, out);
+            collect_step_outputs_and_agents(body, out, step_agents);
+            collect_step_outputs_and_agents(catch, out, step_agents);
         }
         FlowNode::Assign { .. } => {} // The Assign node produces no agent output.
     }
@@ -650,29 +721,84 @@ fn collect_verdict_conds(
     node: &FlowNode,
     step_outputs: &HashMap<String, String>,
     verdict_contracts: &HashMap<String, VerdictContract>,
+    referenced_values: &mut HashMap<String, std::collections::HashSet<String>>,
     errors: &mut Vec<CompileError>,
 ) {
     match node {
         FlowNode::Branch { cond, then_, else_ } => {
-            lint_cond_expr(cond, "Branch cond", step_outputs, verdict_contracts, errors);
-            collect_verdict_conds(then_, step_outputs, verdict_contracts, errors);
-            collect_verdict_conds(else_, step_outputs, verdict_contracts, errors);
+            lint_cond_expr(
+                cond,
+                "Branch cond",
+                step_outputs,
+                verdict_contracts,
+                referenced_values,
+                errors,
+            );
+            collect_verdict_conds(
+                then_,
+                step_outputs,
+                verdict_contracts,
+                referenced_values,
+                errors,
+            );
+            collect_verdict_conds(
+                else_,
+                step_outputs,
+                verdict_contracts,
+                referenced_values,
+                errors,
+            );
         }
         FlowNode::Loop { cond, body, .. } => {
-            lint_cond_expr(cond, "Loop cond", step_outputs, verdict_contracts, errors);
-            collect_verdict_conds(body, step_outputs, verdict_contracts, errors);
+            lint_cond_expr(
+                cond,
+                "Loop cond",
+                step_outputs,
+                verdict_contracts,
+                referenced_values,
+                errors,
+            );
+            collect_verdict_conds(
+                body,
+                step_outputs,
+                verdict_contracts,
+                referenced_values,
+                errors,
+            );
         }
         FlowNode::Seq { children } => {
             for c in children {
-                collect_verdict_conds(c, step_outputs, verdict_contracts, errors);
+                collect_verdict_conds(
+                    c,
+                    step_outputs,
+                    verdict_contracts,
+                    referenced_values,
+                    errors,
+                );
             }
         }
-        FlowNode::Fanout { body, .. } => {
-            collect_verdict_conds(body, step_outputs, verdict_contracts, errors)
-        }
+        FlowNode::Fanout { body, .. } => collect_verdict_conds(
+            body,
+            step_outputs,
+            verdict_contracts,
+            referenced_values,
+            errors,
+        ),
         FlowNode::Try { body, catch, .. } => {
-            collect_verdict_conds(body, step_outputs, verdict_contracts, errors);
-            collect_verdict_conds(catch, step_outputs, verdict_contracts, errors);
+            collect_verdict_conds(
+                body,
+                step_outputs,
+                verdict_contracts,
+                referenced_values,
+                errors,
+            );
+            collect_verdict_conds(
+                catch,
+                step_outputs,
+                verdict_contracts,
+                referenced_values,
+                errors,
+            );
         }
         FlowNode::Step { .. } | FlowNode::Assign { .. } => {}
     }
@@ -691,6 +817,7 @@ fn lint_cond_expr(
     where_: &str,
     step_outputs: &HashMap<String, String>,
     verdict_contracts: &HashMap<String, VerdictContract>,
+    referenced_values: &mut HashMap<String, std::collections::HashSet<String>>,
     errors: &mut Vec<CompileError>,
 ) {
     match expr {
@@ -702,6 +829,7 @@ fn lint_cond_expr(
                     where_,
                     step_outputs,
                     verdict_contracts,
+                    referenced_values,
                     errors,
                 );
             }
@@ -715,15 +843,37 @@ fn lint_cond_expr(
             ) = (needle.as_ref(), haystack.as_ref())
             {
                 let lits: Vec<&Value> = items.iter().collect();
-                resolve_and_check(at, &lits, where_, step_outputs, verdict_contracts, errors);
+                resolve_and_check(
+                    at,
+                    &lits,
+                    where_,
+                    step_outputs,
+                    verdict_contracts,
+                    referenced_values,
+                    errors,
+                );
             }
         }
         Expr::And { args } | Expr::Or { args } => {
             for a in args {
-                lint_cond_expr(a, where_, step_outputs, verdict_contracts, errors);
+                lint_cond_expr(
+                    a,
+                    where_,
+                    step_outputs,
+                    verdict_contracts,
+                    referenced_values,
+                    errors,
+                );
             }
         }
-        Expr::Not { arg } => lint_cond_expr(arg, where_, step_outputs, verdict_contracts, errors),
+        Expr::Not { arg } => lint_cond_expr(
+            arg,
+            where_,
+            step_outputs,
+            verdict_contracts,
+            referenced_values,
+            errors,
+        ),
         _ => {}
     }
 }
@@ -761,6 +911,7 @@ fn resolve_and_check(
     where_: &str,
     step_outputs: &HashMap<String, String>,
     verdict_contracts: &HashMap<String, VerdictContract>,
+    referenced_values: &mut HashMap<String, std::collections::HashSet<String>>,
     errors: &mut Vec<CompileError>,
 ) {
     let path_str = path.to_string();
@@ -807,9 +958,84 @@ fn resolve_and_check(
             errors.push(CompileError::VerdictValueNotInContract {
                 where_: where_.to_string(),
                 agent: agent.clone(),
-                value: value_str,
+                value: value_str.clone(),
                 values: contract.values.clone(),
             });
+        }
+        // GH #50 follow-up (issue `33bc825b`): record the referenced value
+        // regardless of contract membership. `VerdictValueNotInContract`
+        // already caught the out-of-set case above; recording here still
+        // helps future variants that widen the set later. The value string
+        // is normalized identically to the membership check for symmetric
+        // comparison in `check_unhandled_verdict_values`.
+        referenced_values
+            .entry(agent.clone())
+            .or_default()
+            .insert(value_str);
+    }
+}
+
+/// GH #50 follow-up (issue `33bc825b`): reverse-direction lint.
+///
+/// For every agent that declares a [`VerdictContract`], check that every
+/// entry of `contract.values` was referenced by at least one downstream
+/// `Branch`/`Loop` `cond` `Lit` (as collected into `referenced_values` by
+/// [`resolve_and_check`] during the forward pass). Any declared value
+/// that no cond references is a `verdict_value` the flow author declared
+/// but forgot to write a handler for.
+///
+/// When `strict_verdict_handling` is `true` (opt-in via
+/// [`BlueprintMetadata::strict_verdict_handling`]), every unhandled value
+/// pushes a [`CompileError::VerdictValueUnhandled`] onto `errors` and
+/// [`verify_verdict_conds`] surfaces the first one, rejecting the compile.
+/// Under the default (`false`), unhandled values only surface via
+/// `tracing::warn!` — existing Blueprints that intentionally leave some
+/// verdict values as silent-pass informational tokens keep compiling
+/// unchanged (back-compat with GH #50's opt-in posture).
+fn check_unhandled_verdict_values(
+    verdict_contracts: &HashMap<String, VerdictContract>,
+    referenced_values: &HashMap<String, std::collections::HashSet<String>>,
+    step_agents: &HashMap<String, String>,
+    strict_verdict_handling: bool,
+    errors: &mut Vec<CompileError>,
+) {
+    // Iterate in a stable order (BTreeMap-style sort by agent name, then
+    // by declared value) so the first `VerdictValueUnhandled` error
+    // surfaced under strict mode is deterministic across HashMap hash
+    // seeds. This mirrors GH #50's other lint diagnostics, which are
+    // stable because they walk the flow tree in source order.
+    let mut agents: Vec<&String> = verdict_contracts.keys().collect();
+    agents.sort();
+    for agent in agents {
+        let contract = &verdict_contracts[agent];
+        let referenced = referenced_values.get(agent);
+        let step_ref = step_agents
+            .get(agent)
+            .cloned()
+            .unwrap_or_else(|| agent.clone());
+        for value in &contract.values {
+            let handled = referenced
+                .map(|set| set.contains(value))
+                .unwrap_or(false);
+            if handled {
+                continue;
+            }
+            if strict_verdict_handling {
+                errors.push(CompileError::VerdictValueUnhandled {
+                    agent: agent.clone(),
+                    value: value.clone(),
+                    declared_values: contract.values.clone(),
+                    step_ref: step_ref.clone(),
+                });
+            } else {
+                tracing::warn!(
+                    agent = %agent,
+                    value = %value,
+                    step_ref = %step_ref,
+                    "declared verdict value has no downstream cond handler; \
+                     opt in to `metadata.strict_verdict_handling` to reject at compile"
+                );
+            }
         }
     }
 }
@@ -2482,6 +2708,156 @@ mod verdict_contract_lint_tests {
             Compiler::new(registry_with_echo()).compile(&bp).is_ok(),
             "an `In` haystack whose every Lit is a declared value must compile"
         );
+    }
+
+    /// GH #50 follow-up (issue `33bc825b`): opt-in strict mode rejects a
+    /// Blueprint whose declared `verdict.values` set includes at least one
+    /// entry that no downstream `Branch`/`Loop` `cond` references. The
+    /// contract declares `["PASS", "BLOCKED"]` but only "BLOCKED" is
+    /// referenced by the cond → "PASS" is unhandled → `CompileError::
+    /// VerdictValueUnhandled` under `strict_verdict_handling: Some(true)`.
+    #[test]
+    fn strict_mode_rejects_unhandled_declared_value() {
+        let agent = gate_agent(Some(body_contract(&["PASS", "BLOCKED"])));
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.verdict"),
+                branch(eq_cond("$.verdict", "BLOCKED"), noop(), noop()),
+            ],
+        };
+        let mut bp = minimal_bp(agent, flow);
+        bp.metadata.strict_verdict_handling = Some(true);
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::VerdictValueUnhandled {
+                agent,
+                value,
+                declared_values,
+                step_ref,
+            }) => {
+                assert_eq!(agent, "gate");
+                assert_eq!(value, "PASS");
+                assert_eq!(
+                    declared_values,
+                    vec!["PASS".to_string(), "BLOCKED".to_string()]
+                );
+                assert_eq!(step_ref, "gate");
+            }
+            Err(other) => {
+                panic!("expected VerdictValueUnhandled, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!(
+                "expected compile-time rejection for a declared verdict value with no \
+                 downstream handler under strict_verdict_handling=Some(true)"
+            ),
+        }
+    }
+
+    /// GH #50 follow-up (issue `33bc825b`): default mode (i.e.
+    /// `strict_verdict_handling` absent or `Some(false)`) surfaces
+    /// unhandled declared values via `tracing::warn!` only — the compile
+    /// still succeeds. This preserves back-compat with GH #50's original
+    /// test cases (many of which declare `values = ["PASS", "BLOCKED"]`
+    /// and cond-reference only one).
+    #[test]
+    fn default_mode_permits_unhandled_declared_value() {
+        let agent = gate_agent(Some(body_contract(&["PASS", "BLOCKED"])));
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.verdict"),
+                branch(eq_cond("$.verdict", "BLOCKED"), noop(), noop()),
+            ],
+        };
+        let bp = minimal_bp(agent, flow);
+        // `strict_verdict_handling` left as `None` (default)
+        assert!(
+            Compiler::new(registry_with_echo()).compile(&bp).is_ok(),
+            "default mode must never reject a Blueprint for unhandled declared values \
+             (opt-in, back-compat with GH #50)"
+        );
+    }
+
+    /// GH #50 follow-up (issue `33bc825b`): under strict mode, when every
+    /// declared value is referenced by at least one downstream cond, the
+    /// compile succeeds. This tests the positive path of the reverse-
+    /// direction lint.
+    #[test]
+    fn strict_mode_accepts_all_declared_values_handled() {
+        let agent = gate_agent(Some(body_contract(&["PASS", "BLOCKED"])));
+        // Two branches, each cond referencing one declared value —
+        // together they cover the full `values` set.
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.verdict"),
+                branch(eq_cond("$.verdict", "BLOCKED"), noop(), noop()),
+                branch(eq_cond("$.verdict", "PASS"), noop(), noop()),
+            ],
+        };
+        let mut bp = minimal_bp(agent, flow);
+        bp.metadata.strict_verdict_handling = Some(true);
+        assert!(
+            Compiler::new(registry_with_echo()).compile(&bp).is_ok(),
+            "strict mode must accept a Blueprint that handles every declared value"
+        );
+    }
+
+    /// GH #50 follow-up (issue `33bc825b`): under strict mode, an `In`
+    /// cond whose `Lit` haystack lists every declared value satisfies
+    /// the handler-coverage check in one go.
+    #[test]
+    fn strict_mode_accepts_declared_values_covered_by_in_expr() {
+        let agent = gate_agent(Some(body_contract(&["PASS", "BLOCKED"])));
+        let cond = Expr::In {
+            needle: Box::new(Expr::Path {
+                at: "$.verdict".parse().expect("literal test path"),
+            }),
+            haystack: Box::new(Expr::Lit {
+                value: serde_json::json!(["PASS", "BLOCKED"]),
+            }),
+        };
+        let flow = FlowNode::Seq {
+            children: vec![step("gate", "$.verdict"), branch(cond, noop(), noop())],
+        };
+        let mut bp = minimal_bp(agent, flow);
+        bp.metadata.strict_verdict_handling = Some(true);
+        assert!(
+            Compiler::new(registry_with_echo()).compile(&bp).is_ok(),
+            "strict mode must accept an `In` haystack that covers every declared value"
+        );
+    }
+
+    /// GH #50 follow-up (issue `33bc825b`): under strict mode, a `part`
+    /// channel contract with unhandled declared value is rejected the same
+    /// way as the `body` channel case. Confirms channel-agnostic coverage.
+    #[test]
+    fn strict_mode_rejects_unhandled_part_channel_value() {
+        let agent = gate_agent(Some(part_contract(&["PASS", "BLOCKED"])));
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.gate"),
+                branch(eq_cond("$.gate.parts.verdict", "BLOCKED"), noop(), noop()),
+            ],
+        };
+        let mut bp = minimal_bp(agent, flow);
+        bp.metadata.strict_verdict_handling = Some(true);
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::VerdictValueUnhandled {
+                agent,
+                value,
+                step_ref,
+                ..
+            }) => {
+                assert_eq!(agent, "gate");
+                assert_eq!(value, "PASS");
+                assert_eq!(step_ref, "gate");
+            }
+            Err(other) => {
+                panic!("expected VerdictValueUnhandled, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!(
+                "expected compile-time rejection for a declared verdict value with no \
+                 downstream handler (part channel) under strict_verdict_handling=Some(true)"
+            ),
+        }
     }
 
     /// Acceptance criterion #7 (5th case): a Blueprint shaped like the
