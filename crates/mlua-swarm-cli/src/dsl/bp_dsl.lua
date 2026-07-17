@@ -190,7 +190,14 @@ end
 --- unresolved reference is an `error()`.
 function M.pipeline(spec)
   local halt_on = spec.halt_on or {}
-  local halted_at = spec.halted_at
+  -- Default `halted_at` so a pipeline without an explicit halt-site knob
+  -- still compiles: the per-stage gate always emits
+  -- `assign{at=F.p(halted_at), value=lit(stage_id)}` on its `then` branch,
+  -- and a nil target passes through as an empty `path{}` node that fails
+  -- shape validation downstream. `"$.halted_at"` matches the bundled
+  -- sample's convention (see mse://blueprints/samples/07-dsl-pipeline);
+  -- authors who care can still override via `halted_at = "$.custom"`.
+  local halted_at = spec.halted_at or "$.halted_at"
   local done = spec.done
 
   local stages = {}

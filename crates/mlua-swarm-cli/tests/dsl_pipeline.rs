@@ -7,6 +7,8 @@
 //! (e) `B.from` resolution
 //! (f) `gate = false` opt-out
 //! (g) an undefined `B.from` reference raising `error()`
+//! (h) `halted_at` omitted → `B.pipeline` defaults it to `"$.halted_at"`
+//!     so the produced flow.ir Node still validates
 //! (+) an `eval` smoke test: a small flow_dsl-built flow (`assign` +
 //!     `branch`) run end-to-end through `mlua-flow-ir`'s Lua `flow.eval`,
 //!     no server involved.
@@ -285,6 +287,43 @@ fn f_obj_emits_an_empty_json_object() {
     let value = build_pipeline(r#"return { spec = F.obj() }"#);
     assert_eq!(value["spec"], serde_json::json!({}));
     assert!(value["spec"].is_object());
+}
+
+/// (h) `halted_at` omitted → `B.pipeline` defaults it to `"$.halted_at"`
+/// so the produced flow.ir Node still validates. Regression guard for the
+/// pre-fix crash where the per-stage gate emitted
+/// `assign{at=path{}, value=lit(stage_id)}` (empty `at`) whenever the
+/// caller omitted `halted_at`, tripping shape validation downstream. The
+/// canonical fix path (documented in mse://guides/dsl-authoring) is the
+/// DSL-side default; if this ever regresses to erroring, the fix belongs
+/// in `bp_dsl.M.pipeline`, not in the compiler.
+#[test]
+fn halted_at_defaults_when_unset() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "scout" { agent = "mock-scout" },
+          done = "$.done",
+          -- halted_at intentionally omitted
+        }
+        "#,
+    );
+
+    // Shape validation must pass — this is what failed before the fix.
+    serde_json::from_value::<mlua_flow_ir::Node>(value.clone())
+        .expect("must be a valid flow.ir Node even without an explicit halted_at");
+
+    let gate = &value["children"][1];
+    assert_eq!(gate["kind"], serde_json::json!("branch"));
+    assert_eq!(
+        gate["then"],
+        serde_json::json!({
+            "kind": "assign",
+            "at": {"op": "path", "at": "$.halted_at"},
+            "value": {"op": "lit", "value": "scout"},
+        }),
+        "default halted_at must be `$.halted_at` (matches the bundled sample convention)",
+    );
 }
 
 /// eval smoke: a small flow_dsl-built flow (`assign` +
