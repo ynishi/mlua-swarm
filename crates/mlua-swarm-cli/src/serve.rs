@@ -25,6 +25,7 @@ use mlua_swarm::store::enhance_setting::{
 };
 use mlua_swarm::store::issue::{InMemoryIssueStore, IssueStore, SqliteIssueStore};
 use mlua_swarm::store::output::{InMemoryOutputStore, OutputStore, SqliteOutputStore};
+use mlua_swarm::store::replay::{InMemoryReplayStore, ReplayStore, SqliteReplayStore};
 use mlua_swarm::store::run::{InMemoryRunStore, RunStore, SqliteRunStore};
 use mlua_swarm::store::task::{InMemoryTaskStore, SqliteTaskStore, TaskStore};
 use mlua_swarm::{
@@ -105,6 +106,14 @@ pub struct Args {
     /// `--ephemeral` / the persist-by-default when set.
     #[arg(long)]
     run_store_path: Option<std::path::PathBuf>,
+    /// Path to the SQLite database file backing the `ReplayStore` (per-run
+    /// Ctx-snapshot + step-output log). Persisted by default even when
+    /// omitted (sibling of `--run-store-path`): falls back to
+    /// `~/.mse/store/replay.sqlite` unless `--ephemeral` is set. Overrides
+    /// `replay_store_path` in the config file, and always wins over
+    /// `--ephemeral` / the persist-by-default when set.
+    #[arg(long)]
+    replay_store_path: Option<std::path::PathBuf>,
     /// Merges the 4 enhance-flow workers (patch-spawner / patch-applier /
     /// verifier-router / committer) + 3 host bridges into `default_registry`.
     /// Used when running the default enhance Blueprint through `/v1/tasks`. A pure
@@ -189,6 +198,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         output_store_path: args.output_store_path.clone(),
         task_store_path: args.task_store_path.clone(),
         run_store_path: args.run_store_path.clone(),
+        replay_store_path: args.replay_store_path.clone(),
         ephemeral: if args.ephemeral { Some(true) } else { None },
         seed_blueprint_id: args.seed_blueprint_id.clone(),
         default_agent_kind: args.default_agent_kind.clone(),
@@ -379,6 +389,17 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
         None => Arc::new(InMemoryRunStore::new()),
     };
+    let replay_store: Arc<dyn ReplayStore> = match &cfg.replay_store_path {
+        Some(path) => {
+            eprintln!("mse serve: SqliteReplayStore at {}", path.display());
+            let (s, driver) = SqliteReplayStore::open(path)
+                .await
+                .unwrap_or_else(|e| panic!("mse serve: SqliteReplayStore open failed: {e}"));
+            isle_drivers.push(driver);
+            Arc::new(s)
+        }
+        None => Arc::new(InMemoryReplayStore::new()),
+    };
 
     recover_interrupted_runs(&task_store, &run_store).await;
 
@@ -397,6 +418,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(base_url),
         Some(task_store),
         Some(run_store),
+        Some(replay_store),
         cfg.sync_timeout_secs,
     );
 
@@ -650,6 +672,7 @@ mod tests {
                 degradations: vec![],
                 operator_sid: None,
                 result_ref: None,
+                input_json: None,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -664,6 +687,7 @@ mod tests {
                 degradations: vec![],
                 operator_sid: None,
                 result_ref: None,
+                input_json: None,
                 created_at: 2,
                 updated_at: 2,
             })

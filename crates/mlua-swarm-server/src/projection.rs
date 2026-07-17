@@ -1247,6 +1247,7 @@ mod tests {
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
+            replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         }
@@ -1737,6 +1738,7 @@ mod tests {
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
+            replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         };
@@ -2373,6 +2375,7 @@ mod tests {
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
+            replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         };

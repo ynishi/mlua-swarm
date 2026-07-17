@@ -99,6 +99,27 @@ impl RunStore for InMemoryRunStore {
         Ok(())
     }
 
+    async fn try_transition(
+        &self,
+        id: &RunId,
+        from: RunStatus,
+        to: RunStatus,
+    ) -> Result<bool, RunStoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Held under the single `inner` mutex, so the read + compare + set
+        // is atomic against any other appender/transition. An absent row or
+        // a status mismatch both report `false` (the caller's race signal),
+        // not an error.
+        match inner.records.get_mut(id) {
+            Some(record) if record.status == from => {
+                record.status = to;
+                record.updated_at = crate::types::now_unix();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn set_result(
         &self,
         id: &RunId,
@@ -144,6 +165,7 @@ mod tests {
             degradations: vec![],
             operator_sid: None,
             result_ref: None,
+            input_json: None,
             created_at,
             updated_at: created_at,
         }
@@ -344,5 +366,68 @@ mod tests {
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].id, RunId::parse("R-2").unwrap());
         assert_eq!(running[0].status, RunStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn try_transition_flips_on_match_and_is_idempotent_under_race() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        s.update_status(&RunId::parse("R-1").unwrap(), RunStatus::Interrupted)
+            .await
+            .unwrap();
+
+        // First CAS matches `Interrupted` and flips to `Running`.
+        let first = s
+            .try_transition(
+                &RunId::parse("R-1").unwrap(),
+                RunStatus::Interrupted,
+                RunStatus::Running,
+            )
+            .await
+            .unwrap();
+        assert!(first, "first CAS must flip Interrupted -> Running");
+        assert_eq!(
+            s.get(&RunId::parse("R-1").unwrap()).await.unwrap().status,
+            RunStatus::Running
+        );
+
+        // Second CAS (a racing double-resume) no longer sees `Interrupted`
+        // and must report `false` without touching the row.
+        let second = s
+            .try_transition(
+                &RunId::parse("R-1").unwrap(),
+                RunStatus::Interrupted,
+                RunStatus::Running,
+            )
+            .await
+            .unwrap();
+        assert!(!second, "second CAS must not flip a now-Running row");
+    }
+
+    #[tokio::test]
+    async fn try_transition_absent_run_reports_false() {
+        let s = InMemoryRunStore::new();
+        let flipped = s
+            .try_transition(
+                &RunId::parse("R-nope").unwrap(),
+                RunStatus::Interrupted,
+                RunStatus::Running,
+            )
+            .await
+            .unwrap();
+        assert!(!flipped, "an absent Run must report false, not error");
+    }
+
+    #[tokio::test]
+    async fn input_json_roundtrips_through_create_get() {
+        let s = InMemoryRunStore::new();
+        let mut rec = mk("R-1", "T-1", 100);
+        rec.input_json = Some(r#"{"blueprint":"snapshot"}"#.to_string());
+        s.create(rec).await.unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
+        assert_eq!(
+            got.input_json.as_deref(),
+            Some(r#"{"blueprint":"snapshot"}"#)
+        );
     }
 }

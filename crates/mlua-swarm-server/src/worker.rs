@@ -110,7 +110,7 @@ pub async fn worker_prompt(
             .engine
             .task_id_from_handle(handle)
             .await
-            .map_err(|e| ApiError::engine(format!("task_id_from_handle: {e}")))?;
+            .map_err(map_handle_lookup_err)?;
         if resolved != task_id {
             return Err(ApiError::bad_request(format!(
                 "handle {handle} is bound to task {resolved}, not {task_id}"
@@ -599,7 +599,7 @@ pub async fn worker_submit(
             .engine
             .task_id_from_handle(handle)
             .await
-            .map_err(|e| ApiError::engine(format!("task_id_from_handle: {e}")))?
+            .map_err(map_handle_lookup_err)?
     } else {
         let token = CapToken::decode(bearer.trim())
             .map_err(|e| ApiError::bad_request(format!("invalid token: {e}")))?;
@@ -702,7 +702,7 @@ pub async fn worker_artifact(
             .engine
             .task_id_from_handle(handle)
             .await
-            .map_err(|e| ApiError::engine(format!("task_id_from_handle: {e}")))?
+            .map_err(map_handle_lookup_err)?
     } else {
         let token = CapToken::decode(bearer.trim())
             .map_err(|e| ApiError::bad_request(format!("invalid token: {e}")))?;
@@ -793,7 +793,7 @@ pub async fn worker_degradation(
             .engine
             .task_id_from_handle(handle)
             .await
-            .map_err(|e| ApiError::engine(format!("task_id_from_handle: {e}")))?
+            .map_err(map_handle_lookup_err)?
     } else {
         let token = CapToken::decode(bearer.trim())
             .map_err(|e| ApiError::bad_request(format!("invalid token: {e}")))?;
@@ -947,7 +947,7 @@ pub async fn worker_prompt_system(
             .engine
             .task_id_from_handle(handle)
             .await
-            .map_err(|e| ApiError::engine(format!("task_id_from_handle: {e}")))?;
+            .map_err(map_handle_lookup_err)?;
         if resolved != task_id {
             return Err(ApiError::bad_request(format!(
                 "handle {handle} is bound to task {resolved}, not {task_id}"
@@ -1028,6 +1028,30 @@ fn extract_bearer_raw(headers: &HeaderMap) -> Result<String, ApiError> {
     Ok(s.to_string())
 }
 
+/// Maps a `task_id_from_handle` failure on the short-handle Bearer path. A
+/// `wh-`-prefixed handle that parsed as well-formed (via
+/// [`parse_worker_handle`]) but is unknown to the engine
+/// (`EngineError::TokenNotFound`) is a handle that was minted before the
+/// engine's in-memory state was wiped — typically a server restart. "Once
+/// valid, now gone" is exactly `410 Gone`: the worker should re-kick its
+/// task and fetch a fresh handle rather than treat this as a server fault.
+/// Every other engine error stays a `500` (unchanged), same wrapping style
+/// as the pre-existing call sites.
+///
+/// Only reached on the handle path (`parse_worker_handle` returned `Some`),
+/// so it never re-labels a full-`CapToken` decode/verify failure.
+fn map_handle_lookup_err(e: EngineError) -> ApiError {
+    match e {
+        EngineError::TokenNotFound(_) => ApiError::gone(
+            "worker handle is no longer valid (the engine's in-flight state was reset, \
+             e.g. by a server restart): re-kick the task (POST /v1/tasks/:id/runs) and \
+             fetch a fresh prompt/handle"
+                .to_string(),
+        ),
+        other => ApiError::engine(format!("task_id_from_handle: {other}")),
+    }
+}
+
 /// Decides whether the Bearer is a short handle (`wh-XXXXXXXX`). Returns
 /// `Some(handle)` on a match, `None` otherwise (= caller proceeds to try decoding
 /// as full `CapToken` JSON).
@@ -1102,6 +1126,7 @@ mod tests {
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store,
+            replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         }
@@ -1146,6 +1171,7 @@ mod tests {
             degradations: Vec::new(),
             operator_sid: None,
             result_ref: None,
+            input_json: None,
             created_at: 0,
             updated_at: 0,
         }

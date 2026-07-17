@@ -30,14 +30,19 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use mlua_swarm::application::{TaskApplicationError, TaskApplicationInput, TaskApplicationOutput};
+use mlua_swarm::application::{
+    BlueprintRef, TaskApplicationError, TaskApplicationInput, TaskApplicationOutput,
+};
+use mlua_swarm::core::config::CheckPolicy;
 use mlua_swarm::service::merge_init_ctx_3layer;
+use mlua_swarm::store::replay::ReplayCursor;
 use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStoreError};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStoreError};
-use mlua_swarm::{Role, RunId, TaskId, TaskInputSpec};
+use mlua_swarm::{OperatorKind, Role, RunId, TaskId, TaskInputSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{ApiError, AppState};
@@ -50,6 +55,86 @@ pub(crate) fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Serializable mirror of [`TaskApplicationInput`] — the launch-input
+/// snapshot persisted into `RunRecord.input_json` at Run-creation time so a
+/// later `POST /v1/runs/:id/resume` can rebuild the exact input and re-run
+/// the flow under the SAME `run_id`.
+///
+/// [`TaskApplicationInput`] itself is deliberately not `Serialize`/
+/// `Deserialize` (its doc comment explains why — keeping the exhaustive
+/// `TaskApplicationInput { .. }` struct literal in the MCP adapter
+/// compiling), so this is a dedicated snapshot type with the exact same
+/// field set. Every field type already derives serde
+/// (`BlueprintRef` / `Role` / `Duration` / `OperatorKind` / `TaskInputSpec`
+/// / `CheckPolicy`), so the mirror is total — no field is dropped, and an
+/// operator-injected launch round-trips as faithfully as a plain one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RunLaunchSnapshot {
+    blueprint: BlueprintRef,
+    operator_id: String,
+    role: Role,
+    ttl: Duration,
+    init_ctx: Value,
+    operator_kind: Option<OperatorKind>,
+    bridge_id: Option<String>,
+    hook_id: Option<String>,
+    operator_backend_id: Option<String>,
+    #[serde(default)]
+    operator_kind_overrides: HashMap<String, OperatorKind>,
+    task_input: Option<TaskInputSpec>,
+    check_policy: Option<CheckPolicy>,
+}
+
+impl RunLaunchSnapshot {
+    /// Capture a launch input as a snapshot (clones each field — the
+    /// original is still dispatched).
+    fn from_input(input: &TaskApplicationInput) -> Self {
+        Self {
+            blueprint: input.blueprint.clone(),
+            operator_id: input.operator_id.clone(),
+            role: input.role,
+            ttl: input.ttl,
+            init_ctx: input.init_ctx.clone(),
+            operator_kind: input.operator_kind,
+            bridge_id: input.bridge_id.clone(),
+            hook_id: input.hook_id.clone(),
+            operator_backend_id: input.operator_backend_id.clone(),
+            operator_kind_overrides: input.operator_kind_overrides.clone(),
+            task_input: input.task_input.clone(),
+            check_policy: input.check_policy,
+        }
+    }
+
+    /// Rebuild the launch input from a snapshot for resume.
+    fn into_input(self) -> TaskApplicationInput {
+        TaskApplicationInput {
+            blueprint: self.blueprint,
+            operator_id: self.operator_id,
+            role: self.role,
+            ttl: self.ttl,
+            init_ctx: self.init_ctx,
+            operator_kind: self.operator_kind,
+            bridge_id: self.bridge_id,
+            hook_id: self.hook_id,
+            operator_backend_id: self.operator_backend_id,
+            operator_kind_overrides: self.operator_kind_overrides,
+            task_input: self.task_input,
+            check_policy: self.check_policy,
+        }
+    }
+}
+
+/// Serialize a launch input into the opaque `RunRecord.input_json` blob.
+/// Shared by both Run-creation sites (`run_flow_form` in `crate::lib` and
+/// [`task_rekick`]) so every persisted Run carries the snapshot resume
+/// needs. A serialization failure is a `400` — it means the caller handed
+/// in a value the snapshot cannot round-trip, which must surface before the
+/// Run is dispatched, not silently.
+pub(crate) fn snapshot_launch_input(input: &TaskApplicationInput) -> Result<String, ApiError> {
+    serde_json::to_string(&RunLaunchSnapshot::from_input(input))
+        .map_err(|e| ApiError::bad_request(format!("launch input snapshot: {e}")))
 }
 
 /// Shared finalize step for a dispatched kick: updates the Run's
@@ -358,26 +443,6 @@ pub async fn task_rekick(
 
     let run_id = RunId::new();
     let now = now_secs();
-    state
-        .task_store
-        .update_status(&task_id, TaskRecordStatus::Running)
-        .await
-        .map_err(ApiError::engine)?;
-    state
-        .run_store
-        .create(RunRecord {
-            id: run_id.clone(),
-            task_id: task_id.clone(),
-            status: RunStatus::Running,
-            step_entries: Vec::new(),
-            degradations: Vec::new(),
-            operator_sid: None,
-            result_ref: None,
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .map_err(ApiError::engine)?;
 
     let input = TaskApplicationInput {
         blueprint: blueprint_ref,
@@ -396,7 +461,36 @@ pub async fn task_rekick(
         // server-wide default (backward compat).
         check_policy: None,
     };
-    let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone());
+    // Persist a launch-input snapshot so this kick's Run can be resumed
+    // under the same run_id if it is later interrupted
+    // (`POST /v1/runs/:id/resume`). Built from `input` before it is moved
+    // into the dispatch below.
+    let input_json = Some(snapshot_launch_input(&input)?);
+
+    state
+        .task_store
+        .update_status(&task_id, TaskRecordStatus::Running)
+        .await
+        .map_err(ApiError::engine)?;
+    state
+        .run_store
+        .create(RunRecord {
+            id: run_id.clone(),
+            task_id: task_id.clone(),
+            status: RunStatus::Running,
+            step_entries: Vec::new(),
+            degradations: Vec::new(),
+            operator_sid: None,
+            result_ref: None,
+            input_json,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .map_err(ApiError::engine)?;
+
+    let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone())
+        .with_replay_store(state.replay_store.clone());
 
     // GH #37 detached rekick: same driver-detach semantics as
     // `run_flow_form` — the eval runs in its own spawned task bounded by
@@ -502,6 +596,184 @@ pub async fn task_rekick(
             task_id,
             run_id,
             status: RunStatus::Done,
+        }),
+    ))
+}
+
+/// Response body for `POST /v1/runs/:id/resume`.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct RunResumeResponse {
+    /// The resumed Run's id — echoes the path param. Resume never mints a
+    /// new `RunId`; the interrupted Run is re-run in place so its
+    /// replay-entry Ctx snapshots (which bake this id into
+    /// `meta.runtime[run_id]`) stay consistent.
+    #[schemars(with = "String")]
+    pub run_id: RunId,
+    /// The Task this Run belongs to.
+    #[schemars(with = "String")]
+    pub task_id: TaskId,
+    /// Count of already-completed steps handed to the replay cursor — the
+    /// engine returns each of these verbatim (no re-dispatch) before
+    /// resuming fresh work. `0` = the Run was interrupted before any step
+    /// completed, so it re-runs from scratch under the same `run_id`.
+    pub replayed_steps: usize,
+}
+
+/// `POST /v1/runs/:id/resume`. Resumes an `Interrupted` Run under the SAME
+/// `run_id` (no new `RunId` is minted): the stored launch-input snapshot
+/// (`RunRecord.input_json`) is rebuilt into a `TaskApplicationInput`, a
+/// `ReplayCursor` is built from the Run's logged step snapshots
+/// (`ReplayStore::list_by_run`), and the flow is re-dispatched with both
+/// wired into a fresh `RunContext`. On dispatch the engine's replay path
+/// returns each already-completed step's stored value verbatim (cursor hit,
+/// no Adapter spawn) and dispatches only the steps that never finished —
+/// reconstructing the same final Ctx a restart-free run would have reached.
+///
+/// Status codes:
+/// - `404` — no Run with this id.
+/// - `409` — the Run is not `Interrupted` (already `Running` / `Done` /
+///   `Failed` / `Pending`), OR a concurrent resume already won the
+///   `Interrupted -> Running` compare-and-set (double-resume guard).
+/// - `422` — the Run has no recorded launch-input snapshot, so it cannot be
+///   resumed (an older row predating resume support, or a path that does
+///   not persist one).
+/// - `202 Accepted` — resume accepted; the flow re-runs in a detached
+///   background task (same `tokio::spawn` + run-TTL ceiling shape as a
+///   detached rekick). Poll `GET /v1/runs/:id` for the terminal status.
+///
+/// The launch-input decode and the `422` check run BEFORE the
+/// compare-and-set so a non-resumable Run is never flipped to `Running`
+/// and stranded without a driver behind it.
+pub async fn run_resume(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<RunResumeResponse>), ApiError> {
+    let run_id =
+        RunId::parse(id).map_err(|e| ApiError::bad_request(format!("invalid run id: {e}")))?;
+
+    // 404 when the Run does not exist.
+    let run = state
+        .run_store
+        .get(&run_id)
+        .await
+        .map_err(map_run_store_err)?;
+
+    // Status gate: only an `Interrupted` Run can be resumed.
+    if run.status != RunStatus::Interrupted {
+        return Err(ApiError::conflict(format!(
+            "run {run_id} is {:?}, not Interrupted; only an interrupted run can be resumed",
+            run.status
+        )));
+    }
+
+    // Decode the launch-input snapshot BEFORE the compare-and-set: a Run
+    // with no recorded input can never be resumed, and returning `422`
+    // here — before flipping the status — avoids stranding it in `Running`
+    // with no driver behind it.
+    let Some(input_json) = run.input_json.clone() else {
+        return Err(ApiError::unprocessable(format!(
+            "run {run_id} cannot be resumed: no launch input was recorded for it (it \
+             predates resume support, or was created by a path that does not persist one)"
+        )));
+    };
+    let snapshot: RunLaunchSnapshot = serde_json::from_str(&input_json).map_err(|e| {
+        ApiError::bad_request(format!(
+            "run {run_id}: stored launch input failed to decode: {e}"
+        ))
+    })?;
+
+    // Atomically flip Interrupted -> Running. A racing double resume loses
+    // the compare-and-set and gets a `409` rather than dispatching a second
+    // driver over the same Run.
+    let won = state
+        .run_store
+        .try_transition(&run_id, RunStatus::Interrupted, RunStatus::Running)
+        .await
+        .map_err(ApiError::engine)?;
+    if !won {
+        return Err(ApiError::conflict(format!(
+            "run {run_id} was concurrently resumed (or left the Interrupted state); it is \
+             no longer resumable"
+        )));
+    }
+
+    // Build the replay cursor from the Run's logged step snapshots. An
+    // empty log is fine — the cursor has zero hits and every step is
+    // dispatched fresh (a from-scratch re-run under the same run_id).
+    let entries = state
+        .replay_store
+        .list_by_run(&run_id)
+        .await
+        .map_err(|e| ApiError::engine(format!("replay list_by_run: {e}")))?;
+    let replayed_steps = entries.len();
+    let cursor = ReplayCursor::from_entries(entries);
+
+    // RunContext for the SAME run_id — run_store + replay_store +
+    // replay_cursor all wired. No new RunRecord is minted.
+    let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone())
+        .with_replay_store(state.replay_store.clone())
+        .with_replay_cursor(Arc::new(Mutex::new(cursor)));
+
+    let input = snapshot.into_input();
+    let task_id = run.task_id.clone();
+
+    // A resumed Task is running again; finalize_run resets it to
+    // Done/Failed at the end, same as the rekick path.
+    state
+        .task_store
+        .update_status(&task_id, TaskRecordStatus::Running)
+        .await
+        .map_err(ApiError::engine)?;
+
+    // Detached dispatch — same `tokio::spawn` + run-TTL-ceiling shape as
+    // the detached rekick path; `finalize_run` (or the ttl-expiry `Failed`
+    // marking) owns the terminal persistence.
+    let ttl_secs = crate::default_run_ttl();
+    let bg_state = state.clone();
+    let bg_task_id = task_id.clone();
+    let bg_run_id = run_id.clone();
+    tokio::spawn(async move {
+        let outcome = match tokio::time::timeout(
+            Duration::from_secs(ttl_secs),
+            bg_state.task_app.handle_with_run(input, Some(run_ctx)),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => {
+                let reason = serde_json::json!({
+                    "error": format!("resumed run exceeded {ttl_secs}s ttl ceiling"),
+                });
+                if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
+                    tracing::warn!(%bg_run_id, error = %e, "run_resume: ttl set_result failed");
+                }
+                if let Err(e) = bg_state
+                    .run_store
+                    .update_status(&bg_run_id, RunStatus::Failed)
+                    .await
+                {
+                    tracing::warn!(%bg_run_id, error = %e, "run_resume: ttl run update_status failed");
+                }
+                if let Err(e) = bg_state
+                    .task_store
+                    .update_status(&bg_task_id, TaskRecordStatus::Failed)
+                    .await
+                {
+                    tracing::warn!(%bg_task_id, error = %e, "run_resume: ttl task update_status failed");
+                }
+                return;
+            }
+        };
+        // `finalize_run` persists both the Ok and Err outcomes itself.
+        let _ = finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RunResumeResponse {
+            run_id,
+            task_id,
+            replayed_steps,
         }),
     ))
 }
@@ -624,6 +896,7 @@ mod tests {
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
+            replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         }

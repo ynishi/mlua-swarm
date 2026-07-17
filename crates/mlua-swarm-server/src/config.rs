@@ -60,6 +60,19 @@ pub fn default_run_store_path() -> PathBuf {
     }
 }
 
+/// Default `ReplayStore` SQLite path, `~/.mse/store/replay.sqlite`. Sibling
+/// of [`default_run_store_path`] — persisted by default so a restart can
+/// consult the replay log (see `mlua_swarm::store::replay` module doc).
+pub fn default_replay_store_path() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home)
+            .join(".mse")
+            .join("store")
+            .join("replay.sqlite"),
+        Err(_) => PathBuf::from(".mse/store/replay.sqlite"),
+    }
+}
+
 /// TOML config schema. All fields are optional — a missing field falls back
 /// to the CLI-supplied value or the built-in default at [`resolve`] time.
 /// Unknown fields are a hard error (`deny_unknown_fields`; typo guard).
@@ -93,6 +106,12 @@ pub struct FileConfig {
     /// Path to the SQLite database file backing the `RunStore` (one kick of
     /// a Task). `None` = fall back to `InMemoryRunStore` (process-volatile).
     pub run_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `ReplayStore` (per-run
+    /// Ctx-snapshot + step-output log). Persisted by default even when
+    /// omitted (sibling of `run_store_path`): resolves to
+    /// `~/.mse/store/replay.sqlite` unless `ephemeral` is set. `None` = fall
+    /// back to `InMemoryReplayStore` (process-volatile).
+    pub replay_store_path: Option<PathBuf>,
     /// Opt-out flag: when `true`, restores the InMemory default for
     /// `task_store_path`/`run_store_path` even though the built-in default
     /// (issue #35 ST1) is now to persist. Has no effect when an explicit
@@ -152,6 +171,8 @@ pub struct CliOverrides {
     pub task_store_path: Option<PathBuf>,
     /// `--run-store-path` value (mirrors [`FileConfig::run_store_path`]).
     pub run_store_path: Option<PathBuf>,
+    /// `--replay-store-path` value (mirrors [`FileConfig::replay_store_path`]).
+    pub replay_store_path: Option<PathBuf>,
     /// `--ephemeral` flag (mirrors [`FileConfig::ephemeral`]).
     pub ephemeral: Option<bool>,
     /// `--seed-blueprint-id` value.
@@ -199,6 +220,9 @@ pub struct ResolvedConfig {
     /// Path to the SQLite database file backing the `RunStore`.
     /// `None` = `InMemoryRunStore`.
     pub run_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `ReplayStore`.
+    /// `None` = `InMemoryReplayStore`.
+    pub replay_store_path: Option<PathBuf>,
     /// Seed blueprint id used in combined-mode default routing.
     pub seed_blueprint_id: String,
     /// snake_case `AgentKind` literal, unvalidated. `None` = caller applies
@@ -234,6 +258,7 @@ impl Default for ResolvedConfig {
             output_store_path: None,
             task_store_path: None,
             run_store_path: None,
+            replay_store_path: None,
             seed_blueprint_id: "main".into(),
             default_agent_kind: None,
             token_secret: None,
@@ -319,6 +344,16 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
                 Some(default_run_store_path())
             }
         }),
+        replay_store_path: cli
+            .replay_store_path
+            .or(file.replay_store_path)
+            .or_else(|| {
+                if ephemeral {
+                    None
+                } else {
+                    Some(default_replay_store_path())
+                }
+            }),
         seed_blueprint_id: cli
             .seed_blueprint_id
             .or(file.seed_blueprint_id)
@@ -507,6 +542,78 @@ mod tests {
         let resolved = resolve(CliOverrides::default(), file).expect("resolve");
         assert_eq!(resolved.task_store_path, None);
         assert_eq!(resolved.run_store_path, None);
+        assert_eq!(resolved.replay_store_path, None);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // `replay_store_path` resolution cascade (sibling of run_store_path)
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_replay_store_path_cli_wins_over_file() {
+        let cli = CliOverrides {
+            replay_store_path: Some(PathBuf::from("/tmp/cli-replay.db")),
+            ..Default::default()
+        };
+        let file = FileConfig {
+            replay_store_path: Some(PathBuf::from("/tmp/file-replay.db")),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).expect("resolve");
+        assert_eq!(
+            resolved.replay_store_path,
+            Some(PathBuf::from("/tmp/cli-replay.db")),
+            "cli replay_store_path must win over file"
+        );
+    }
+
+    #[test]
+    fn resolve_replay_store_path_file_wins_over_default() {
+        let file = FileConfig {
+            replay_store_path: Some(PathBuf::from("/tmp/file-replay.db")),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file).expect("resolve");
+        assert_eq!(
+            resolved.replay_store_path,
+            Some(PathBuf::from("/tmp/file-replay.db")),
+            "file replay_store_path must win over built-in default"
+        );
+    }
+
+    #[test]
+    fn resolve_replay_store_path_default_persists() {
+        let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
+        assert_eq!(
+            resolved.replay_store_path,
+            Some(default_replay_store_path()),
+            "replay_store_path persists by default (sibling of run_store_path)"
+        );
+    }
+
+    #[test]
+    fn resolve_replay_store_path_ephemeral_restores_in_memory() {
+        let cli = CliOverrides {
+            ephemeral: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, FileConfig::default()).expect("resolve");
+        assert_eq!(resolved.replay_store_path, None);
+    }
+
+    #[test]
+    fn resolve_replay_store_path_explicit_wins_over_ephemeral() {
+        let cli = CliOverrides {
+            replay_store_path: Some(PathBuf::from("/tmp/explicit-replay.db")),
+            ephemeral: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, FileConfig::default()).expect("resolve");
+        assert_eq!(
+            resolved.replay_store_path,
+            Some(PathBuf::from("/tmp/explicit-replay.db")),
+            "explicit replay path must win over ephemeral"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────

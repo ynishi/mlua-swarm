@@ -20,17 +20,20 @@
 //!   degradations_json  TEXT NOT NULL DEFAULT '[]', -- JSON-encoded `Vec<DegradationEntry>` (GH #32)
 //!   operator_sid       TEXT,
 //!   result_ref_json    TEXT,               -- JSON-encoded `serde_json::Value`, NULL when unset
+//!   input_json         TEXT,               -- opaque launch-input snapshot for resume, NULL when unset
 //!   created_at         INTEGER NOT NULL,
 //!   updated_at         INTEGER NOT NULL
 //! );
 //! CREATE INDEX IF NOT EXISTS ix_runs_task_id ON runs(task_id, created_at);
 //! ```
 //!
-//! `degradations_json` was added after the initial release (GH #32); the
-//! migration is applied idempotently on open via a `PRAGMA table_info(runs)`
-//! existence check followed by `ALTER TABLE runs ADD COLUMN degradations_json
-//! TEXT NOT NULL DEFAULT '[]'` when missing, so pre-existing database files
-//! pick up the column without a manual migration step.
+//! `degradations_json` (GH #32) and `input_json` (the resume launch-input
+//! snapshot) were both added after the initial release; each migration is
+//! applied idempotently on open via a `PRAGMA table_info(runs)` existence
+//! check followed by the matching `ALTER TABLE runs ADD COLUMN …` when
+//! missing, so pre-existing database files pick up the columns without a
+//! manual migration step. `input_json` is a nullable `TEXT` (no default) —
+//! rows written before resume support simply read back `None`.
 
 use super::{
     DegradationEntry, RunId, RunRecord, RunStatus, RunStore, RunStoreError, StepEntry, TaskId,
@@ -49,27 +52,31 @@ CREATE TABLE IF NOT EXISTS runs (\
   degradations_json  TEXT NOT NULL DEFAULT '[]', \
   operator_sid       TEXT, \
   result_ref_json    TEXT, \
+  input_json         TEXT, \
   created_at         INTEGER NOT NULL, \
   updated_at         INTEGER NOT NULL\
 );\
 CREATE INDEX IF NOT EXISTS ix_runs_task_id ON runs(task_id, created_at);\
 ";
 
-/// Idempotently ensures `runs.degradations_json` exists — for database
-/// files created before GH #32 introduced the column. Fresh databases get
-/// the column from [`SCHEMA_SQL`] directly; this only fires the `ALTER
-/// TABLE` on pre-existing files where `runs` was created without it.
-fn migrate_degradations_column(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+/// Idempotently ensures a nullable column named `column` exists on `runs`,
+/// adding it via `ALTER TABLE … ADD COLUMN <column> <decl>` when a
+/// pre-existing database file was created before the column was introduced.
+/// Fresh databases get every column from [`SCHEMA_SQL`] directly; this only
+/// fires the `ALTER TABLE` on older files missing it.
+fn migrate_add_column_if_missing(
+    conn: &rusqlite::Connection,
+    column: &str,
+    decl: &str,
+) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(runs)")?;
     let has_column = stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<String>, _>>()?
         .iter()
-        .any(|name| name == "degradations_json");
+        .any(|name| name == column);
     if !has_column {
-        conn.execute_batch(
-            "ALTER TABLE runs ADD COLUMN degradations_json TEXT NOT NULL DEFAULT '[]';",
-        )?;
+        conn.execute_batch(&format!("ALTER TABLE runs ADD COLUMN {column} {decl};"))?;
     }
     Ok(())
 }
@@ -91,7 +98,8 @@ impl SqliteRunStore {
     pub async fn open(path: impl AsRef<Path>) -> Result<(Self, AsyncIsleDriver), RunStoreError> {
         let (isle, driver) = AsyncIsle::spawn(path.as_ref().to_path_buf(), |conn| {
             conn.execute_batch(SCHEMA_SQL)?;
-            migrate_degradations_column(conn)
+            migrate_add_column_if_missing(conn, "degradations_json", "TEXT NOT NULL DEFAULT '[]'")?;
+            migrate_add_column_if_missing(conn, "input_json", "TEXT")
         })
         .await
         .map_err(map_isle_err)?;
@@ -102,7 +110,8 @@ impl SqliteRunStore {
     pub async fn open_in_memory() -> Result<(Self, AsyncIsleDriver), RunStoreError> {
         let (isle, driver) = AsyncIsle::open_in_memory(|conn| {
             conn.execute_batch(SCHEMA_SQL)?;
-            migrate_degradations_column(conn)
+            migrate_add_column_if_missing(conn, "degradations_json", "TEXT NOT NULL DEFAULT '[]'")?;
+            migrate_add_column_if_missing(conn, "input_json", "TEXT")
         })
         .await
         .map_err(map_isle_err)?;
@@ -116,7 +125,7 @@ fn map_isle_err(e: IsleError) -> RunStoreError {
 
 /// One `runs` SELECT row in column order: id, task_id, status,
 /// step_entries_json, degradations_json, operator_sid, result_ref_json,
-/// created_at, updated_at.
+/// input_json, created_at, updated_at.
 type RunRow = (
     String,
     String,
@@ -125,12 +134,13 @@ type RunRow = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
     i64,
     i64,
 );
 
 const RUN_SELECT_COLUMNS: &str = "id, task_id, status, step_entries_json, degradations_json, \
-     operator_sid, result_ref_json, created_at, updated_at";
+     operator_sid, result_ref_json, input_json, created_at, updated_at";
 
 fn row_to_record(row: RunRow) -> Result<RunRecord, RunStoreError> {
     let (
@@ -141,6 +151,7 @@ fn row_to_record(row: RunRow) -> Result<RunRecord, RunStoreError> {
         degradations_json,
         operator_sid,
         result_ref_json,
+        input_json,
         created_at,
         updated_at,
     ) = row;
@@ -171,6 +182,7 @@ fn row_to_record(row: RunRow) -> Result<RunRecord, RunStoreError> {
         degradations,
         operator_sid,
         result_ref,
+        input_json,
         created_at: created_at as u64,
         updated_at: updated_at as u64,
     })
@@ -199,6 +211,7 @@ impl RunStore for SqliteRunStore {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| RunStoreError::Other(format!("encode result_ref: {e}")))?;
+        let input_json = record.input_json.clone();
         let created_at = record.created_at as i64;
         let updated_at = record.updated_at as i64;
 
@@ -218,8 +231,9 @@ impl RunStore for SqliteRunStore {
                 }
                 tx.execute(
                     "INSERT INTO runs (id, task_id, status, step_entries_json, \
-                     degradations_json, operator_sid, result_ref_json, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     degradations_json, operator_sid, result_ref_json, input_json, \
+                     created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         id,
                         task_id,
@@ -228,6 +242,7 @@ impl RunStore for SqliteRunStore {
                         degradations_json,
                         operator_sid,
                         result_ref_json,
+                        input_json,
                         created_at,
                         updated_at,
                     ],
@@ -264,8 +279,9 @@ impl RunStore for SqliteRunStore {
                             row.get::<_, String>(4)?,
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, Option<String>>(6)?,
-                            row.get::<_, i64>(7)?,
+                            row.get::<_, Option<String>>(7)?,
                             row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(9)?,
                         ))
                     },
                 )
@@ -297,8 +313,9 @@ impl RunStore for SqliteRunStore {
                         row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
-                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(7)?,
                         row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 })?;
                 let mut out = Vec::new();
@@ -421,6 +438,36 @@ impl RunStore for SqliteRunStore {
         }
     }
 
+    async fn try_transition(
+        &self,
+        id: &RunId,
+        from: RunStatus,
+        to: RunStatus,
+    ) -> Result<bool, RunStoreError> {
+        let id_str = id.to_string();
+        let from_json = serde_json::to_string(&from)
+            .map_err(|e| RunStoreError::Other(format!("encode from status: {e}")))?;
+        let to_json = serde_json::to_string(&to)
+            .map_err(|e| RunStoreError::Other(format!("encode to status: {e}")))?;
+        let updated_at = crate::types::now_unix() as i64;
+        // A single conditional UPDATE is the compare-and-set: the `AND
+        // status = ?from` predicate makes the read+set atomic at the SQLite
+        // level, so two concurrent resumes cannot both flip the same row.
+        // `rows_affected == 1` = we won the transition; `0` = the row was
+        // absent or no longer `from` (a racing transition already won).
+        let n = self
+            .isle
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE runs SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status = ?4",
+                    params![to_json, updated_at, id_str, from_json],
+                )
+            })
+            .await
+            .map_err(map_isle_err)?;
+        Ok(n == 1)
+    }
+
     async fn set_result(
         &self,
         id: &RunId,
@@ -466,8 +513,9 @@ impl RunStore for SqliteRunStore {
                         row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
-                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(7)?,
                         row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 })?;
                 let mut out = Vec::new();
@@ -500,6 +548,7 @@ mod tests {
             degradations: vec![],
             operator_sid: None,
             result_ref: None,
+            input_json: None,
             created_at,
             updated_at: created_at,
         }
@@ -748,6 +797,76 @@ mod tests {
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].id, RunId::parse("R-2").unwrap());
         assert_eq!(running[0].status, RunStatus::Running);
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn try_transition_is_atomic_compare_and_set() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        s.update_status(&RunId::parse("R-1").unwrap(), RunStatus::Interrupted)
+            .await
+            .unwrap();
+
+        let first = s
+            .try_transition(
+                &RunId::parse("R-1").unwrap(),
+                RunStatus::Interrupted,
+                RunStatus::Running,
+            )
+            .await
+            .unwrap();
+        assert!(first, "first CAS must flip Interrupted -> Running");
+        assert_eq!(
+            s.get(&RunId::parse("R-1").unwrap()).await.unwrap().status,
+            RunStatus::Running
+        );
+
+        let second = s
+            .try_transition(
+                &RunId::parse("R-1").unwrap(),
+                RunStatus::Interrupted,
+                RunStatus::Running,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !second,
+            "a racing second CAS must not flip a now-Running row"
+        );
+
+        let absent = s
+            .try_transition(
+                &RunId::parse("R-nope").unwrap(),
+                RunStatus::Interrupted,
+                RunStatus::Running,
+            )
+            .await
+            .unwrap();
+        assert!(!absent, "an absent Run must report false, not error");
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_json_roundtrips_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let snapshot = r#"{"blueprint":"snapshot","init_ctx":{}}"#;
+
+        {
+            let (s, driver) = SqliteRunStore::open(&path).await.unwrap();
+            let mut rec = mk("R-keep", "T-keep", 42);
+            rec.input_json = Some(snapshot.to_string());
+            s.create(rec).await.unwrap();
+            drop(s);
+            driver.shutdown().await.unwrap();
+        }
+
+        let (s, driver) = SqliteRunStore::open(&path).await.unwrap();
+        let got = s.get(&RunId::parse("R-keep").unwrap()).await.unwrap();
+        assert_eq!(got.input_json.as_deref(), Some(snapshot));
         drop(s);
         driver.shutdown().await.unwrap();
     }

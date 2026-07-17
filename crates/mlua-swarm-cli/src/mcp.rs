@@ -1408,6 +1408,7 @@ impl MseServer {
                 degradations: Vec::new(),
                 operator_sid: None,
                 result_ref: None,
+                input_json: None,
                 created_at: now,
                 updated_at: now,
             })

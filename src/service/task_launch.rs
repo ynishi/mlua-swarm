@@ -1629,6 +1629,7 @@ mod tests {
                 degradations: Vec::new(),
                 operator_sid: None,
                 result_ref: None,
+                input_json: None,
                 created_at: 0,
                 updated_at: 0,
             })

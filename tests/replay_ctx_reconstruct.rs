@@ -159,6 +159,7 @@ async fn seed_run(run_store: &Arc<dyn RunStore>, task_id: TaskId) -> RunId {
             degradations: Vec::new(),
             operator_sid: None,
             result_ref: None,
+            input_json: None,
             created_at: now,
             updated_at: now,
         })

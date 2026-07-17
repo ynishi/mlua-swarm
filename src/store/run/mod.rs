@@ -128,6 +128,18 @@ pub struct RunRecord {
     /// [`RunStore::set_result`]. `None` while the Run is in flight.
     #[schemars(with = "Option<serde_json::Value>")]
     pub result_ref: Option<serde_json::Value>,
+    /// Opaque JSON snapshot of the launch input this Run was kicked with
+    /// (blueprint / init_ctx / operator injection / ttl / …). The server
+    /// serializes its own launch-input struct into this string at Run
+    /// creation time so an `Interrupted` Run can be resumed under the SAME
+    /// `run_id` without re-deriving the input from a since-stale request
+    /// body. The store treats it as an opaque blob — the schema is owned by
+    /// the caller (the server crate). `None` = no snapshot recorded (older
+    /// rows predating resume support, or a caller that never opts in); such
+    /// a Run cannot be resumed. Additive with `#[serde(default)]` so
+    /// pre-existing serialized rows deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_json: Option<String>,
     /// Unix epoch seconds — creation time.
     pub created_at: u64,
     /// Unix epoch seconds — last update time.
@@ -270,6 +282,23 @@ pub trait RunStore: Send + Sync {
 
     /// Update a Run's status, bumping `updated_at` to now.
     async fn update_status(&self, id: &RunId, status: RunStatus) -> Result<(), RunStoreError>;
+
+    /// Atomically transition a Run's status from `from` to `to`, bumping
+    /// `updated_at` to now — the compare-and-set primitive the resume path
+    /// (`POST /v1/runs/:id/resume`) uses to guard against a double resume
+    /// racing the same `Interrupted` Run into `Running` twice.
+    ///
+    /// Returns `Ok(true)` when a row with this `id` AND current status
+    /// `from` was found and flipped to `to`; `Ok(false)` when the row's
+    /// current status was not `from` (a concurrent transition already won,
+    /// or the Run is absent). Never a hard error for the status-mismatch /
+    /// absent case — the boolean is the caller's race signal.
+    async fn try_transition(
+        &self,
+        id: &RunId,
+        from: RunStatus,
+        to: RunStatus,
+    ) -> Result<bool, RunStoreError>;
 
     /// Set a Run's terminal `result_ref`, bumping `updated_at` to now.
     async fn set_result(

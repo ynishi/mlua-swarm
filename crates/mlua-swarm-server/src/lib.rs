@@ -95,7 +95,7 @@ pub use operator_ws::{
     OperatorSessionEntry, ServerMsg, WSOperatorSession,
 };
 pub use projection::{McpQueryAdapter, ProjectionSource, StepList, StepPathQuery, StepSummary};
-pub use tasks::{RunKickRequest, RunKickResponse, TaskDetailResponse};
+pub use tasks::{RunKickRequest, RunKickResponse, RunResumeResponse, TaskDetailResponse};
 pub use worker::{
     worker_artifact, worker_prompt, worker_result, ArtifactQuery, PromptQuery, WorkerResultReq,
 };
@@ -111,6 +111,7 @@ use mlua_swarm::application::{BlueprintRef, TaskApplication};
 use mlua_swarm::blueprint::store::BlueprintStore;
 use mlua_swarm::core::config::CheckPolicy;
 use mlua_swarm::service::TaskLaunchService;
+use mlua_swarm::store::replay::{InMemoryReplayStore, ReplayStore};
 use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStore};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
 use mlua_swarm::{
@@ -181,6 +182,13 @@ pub struct AppState {
     /// `mlua_swarm::store::run` module doc). Default = `InMemoryRunStore`;
     /// callers can swap in a `SqliteRunStore` via the `run_store` argument.
     pub run_store: Arc<dyn RunStore>,
+    /// Per-run replay log — the Ctx-snapshot + step-output store the engine
+    /// appends to after every completed step (see `mlua_swarm::store::replay`
+    /// module doc). Threaded into `RunContext` at every dispatch site so a
+    /// later restart-equivalent recovery can reconstruct the run. Default =
+    /// `InMemoryReplayStore` (process-volatile); callers can swap in a
+    /// `SqliteReplayStore` via the `replay_store` argument.
+    pub replay_store: Arc<dyn ReplayStore>,
     /// Public HTTP base URL the server is reachable at (e.g.
     /// `"http://127.0.0.1:7777"`), sourced from the binary at boot time.
     /// When `Some`, `WSOperatorSession` renders it literally into the
@@ -271,6 +279,7 @@ pub fn build_router_with_ws_factory_and_output(
         None,
         None,
         None,
+        None,
         crate::config::default_sync_timeout_secs(),
     )
 }
@@ -303,6 +312,7 @@ pub fn build_router_full(
     base_url: Option<Arc<str>>,
     task_store: Option<Arc<dyn TaskStore>>,
     run_store: Option<Arc<dyn RunStore>>,
+    replay_store: Option<Arc<dyn ReplayStore>>,
     sync_timeout_secs: u64,
 ) -> Router {
     let compiler = Compiler::new(registry);
@@ -332,6 +342,10 @@ pub fn build_router_full(
         Some(s) => s,
         None => Arc::new(mlua_swarm::store::run::InMemoryRunStore::new()),
     };
+    let replay_store: Arc<dyn ReplayStore> = match replay_store {
+        Some(s) => s,
+        None => Arc::new(InMemoryReplayStore::new()),
+    };
     let state = AppState {
         engine,
         sessions: Arc::new(Mutex::new(SessionStore::default())),
@@ -342,6 +356,7 @@ pub fn build_router_full(
         roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
         task_store,
         run_store,
+        replay_store,
         base_url,
         sync_timeout_secs,
     };
@@ -367,6 +382,9 @@ pub fn build_router_full(
             get(projection::step_content),
         )
         .route("/v1/runs/:id", get(tasks::run_get))
+        // Resume an Interrupted Run under the SAME run_id (replay cursor +
+        // stored launch-input snapshot); see `tasks::run_resume`.
+        .route("/v1/runs/:id/resume", post(tasks::run_resume))
         // REST-like Operator login flow (Bearer-mandatory, roles exclusivity).
         // Sole WS Operator session route; see `operator_ws::login` module doc.
         .route("/v1/operators", post(operators_create))
@@ -1010,6 +1028,28 @@ async fn run_flow_form(
         }
     };
 
+    // Build the launch input up front so a snapshot of it can be persisted
+    // into the RunRecord below — an Interrupted Run is resumed from that
+    // snapshot (`POST /v1/runs/:id/resume`) under the same run_id.
+    let input = TaskApplicationInput {
+        blueprint,
+        operator_id: operator_id.clone(),
+        role: Role::Operator,
+        ttl: Duration::from_secs(ttl_secs),
+        init_ctx,
+        operator_kind,
+        bridge_id: op_req.senior_bridge_id,
+        hook_id: op_req.spawn_hook_id,
+        operator_backend_id: op_req.operator_backend_id,
+        operator_kind_overrides,
+        task_input: task_input_spec,
+        // The request-body top-level `check_policy` (tier 1)
+        // flows straight into the cascade resolved once in
+        // `TaskLaunchService::launch`.
+        check_policy: req.check_policy,
+    };
+    let input_json = Some(tasks::snapshot_launch_input(&input)?);
+
     // issue #13 ID-hierarchy persistence: mint the work-item identity (Task)
     // and this kick's identity (Run) *before* dispatching, so a Task/Run
     // pair always exists even if the flow itself fails mid-way (the
@@ -1041,30 +1081,15 @@ async fn run_flow_form(
             degradations: Vec::new(),
             operator_sid: req.operator_sid.clone(),
             result_ref: None,
+            input_json,
             created_at: now,
             updated_at: now,
         })
         .await
         .map_err(ApiError::engine)?;
 
-    let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone());
-    let input = TaskApplicationInput {
-        blueprint,
-        operator_id: operator_id.clone(),
-        role: Role::Operator,
-        ttl: Duration::from_secs(ttl_secs),
-        init_ctx,
-        operator_kind,
-        bridge_id: op_req.senior_bridge_id,
-        hook_id: op_req.spawn_hook_id,
-        operator_backend_id: op_req.operator_backend_id,
-        operator_kind_overrides,
-        task_input: task_input_spec,
-        // The request-body top-level `check_policy` (tier 1)
-        // flows straight into the cascade resolved once in
-        // `TaskLaunchService::launch`.
-        check_policy: req.check_policy,
-    };
+    let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone())
+        .with_replay_store(state.replay_store.clone());
 
     // GH #37 detached launch: the eval driver runs in its own spawned
     // task — its lifetime is bound to `ttl_secs`, not to this request's
@@ -1311,6 +1336,15 @@ impl ApiError {
     pub fn bad_request(m: String) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: m,
+        }
+    }
+    /// Builds a `409 Conflict` with the given message (`POST
+    /// /v1/runs/:id/resume` — the Run is not `Interrupted`, or a concurrent
+    /// resume already won the `Interrupted -> Running` compare-and-set).
+    pub fn conflict(m: String) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: m,
         }
     }
@@ -1604,6 +1638,7 @@ mod tests {
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
             task_store: Arc::new(mlua_swarm::store::task::InMemoryTaskStore::new()),
             run_store: Arc::new(mlua_swarm::store::run::InMemoryRunStore::new()),
+            replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         }
@@ -1632,6 +1667,7 @@ mod tests {
                 degradations: Vec::new(),
                 operator_sid: None,
                 result_ref: None,
+                input_json: None,
                 created_at: now,
                 updated_at: now,
             })
