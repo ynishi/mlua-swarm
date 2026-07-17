@@ -350,6 +350,14 @@ struct BpDoctorReq {
     /// bypass while the convention is still being rolled out.
     #[serde(default)]
     disable_output_contract_lint: Option<bool>,
+    /// GH #61 worker_binding_lint family (default enabled): when true,
+    /// skip checking each operator-kind agent for the compile-required
+    /// `profile.worker_binding`. Set true to bypass when auditing a
+    /// Blueprint whose operator backends genuinely do not need one (i.e.
+    /// direct-LLM operators; `mse serve`'s stock WS thin-path backend
+    /// requires it).
+    #[serde(default)]
+    disable_worker_binding_lint: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -570,6 +578,61 @@ fn classify_output_contract_lint(extras: &serde_json::Value) -> serde_json::Valu
             "present": true,
             "reason": format!("unknown expected_output.kind: {other}"),
         }),
+    }
+}
+
+/// GH #61: check whether an operator-backed agent declares the
+/// `profile.worker_binding` the WS thin-path operator (`mse serve`'s only
+/// production operator backend, `WSOperatorSession`) requires at
+/// dispatch. Front-loads the same fail-loud check `Compiler::compile`
+/// applies at dispatch (`src/blueprint/compiler.rs` —
+/// `profile.worker_binding is required`) into a lint the author sees
+/// before the undispatchable Blueprint is registered.
+///
+/// Severity `WARN` — matches the sibling `tool_lint` /
+/// `output_contract_lint` families' `bp_doctor` posture (report-only,
+/// never blocks). BLOCK-severity front-loading is `bp_build`'s job (the
+/// compile-lint stage there is fail-loud via `LintStubOperator`).
+///
+/// The `reason` field on WARN reuses the exact stderr message the
+/// Compiler emits — same fix hint on either path (JSON literal /
+/// `$agent_md` frontmatter), so an author who sees the lint here and an
+/// author who sees the dispatch-time error read the same guidance.
+///
+/// Non-operator kinds (RustFn / Lua / AgentBlock / Subprocess) return
+/// `OK` unconditionally — `worker_binding` is only meaningful for
+/// WS-thin-path operator backends. `AgentKind::Operator` is the only
+/// arm this lint fires on.
+fn classify_worker_binding_lint(
+    kind: &mlua_swarm::blueprint::AgentKind,
+    worker_binding: Option<&str>,
+) -> serde_json::Value {
+    if !matches!(kind, mlua_swarm::blueprint::AgentKind::Operator) {
+        return serde_json::json!({
+            "severity": "OK",
+            "kind_requires_binding": false,
+        });
+    }
+    let present = worker_binding.is_some_and(|s| !s.is_empty());
+    if present {
+        serde_json::json!({
+            "severity": "OK",
+            "kind_requires_binding": true,
+            "present": true,
+        })
+    } else {
+        serde_json::json!({
+            "severity": "WARN",
+            "kind_requires_binding": true,
+            "present": false,
+            "reason": "profile.worker_binding is required for this operator backend. \
+                       Fix by either: \
+                       (a) if authoring the Blueprint JSON directly, add \
+                       `agents[N].profile.worker_binding: \"<subagent-type>\"` \
+                       to the JSON literal; or \
+                       (b) if using an $agent_md file ref, add \
+                       `worker_binding: <subagent-type>` to the agent .md frontmatter.",
+        })
     }
 }
 
@@ -2106,7 +2169,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Per-Blueprint agent.md size check plus GH #45 contract lints. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline. GH #45: each agent entry also carries `tool_lint` (phantom MCP tool refs — profile.tools entries with the `mcp__mse__` prefix are compared against the live `mse://api/mcp-tools` registry; unknown names surface as WARN with the unknown tool list) and `output_contract_lint` (absent or malformed `profile.extras.expected_output` under the GH #44 convention surfaces as WARN with a specific reason). Either family can be disabled per call via `disable_tool_lint` / `disable_output_contract_lint`; the disabled family's field is omitted entirely from each entry (not `null`) so a caller cannot mistake a disabled family for a passed check. The aggregate verdict folds size + tool + contract severities via the same OK/WARN/BLOCK precedence."
+        description = "Per-Blueprint agent.md size check plus GH #45 contract lints and GH #61 worker_binding lint. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline. GH #45: each agent entry also carries `tool_lint` (phantom MCP tool refs — profile.tools entries with the `mcp__mse__` prefix are compared against the live `mse://api/mcp-tools` registry; unknown names surface as WARN with the unknown tool list) and `output_contract_lint` (absent or malformed `profile.extras.expected_output` under the GH #44 convention surfaces as WARN with a specific reason). GH #61: each operator-kind agent additionally carries `worker_binding_lint` (missing `profile.worker_binding` surfaces as WARN — same fail-loud condition `Compiler::compile` enforces at dispatch, retroactively surfaced on already-registered Blueprints); non-operator kinds are OK and carry `kind_requires_binding: false`. Any family can be disabled per call via `disable_tool_lint` / `disable_output_contract_lint` / `disable_worker_binding_lint`; the disabled family's field is omitted entirely from each entry (not `null`) so a caller cannot mistake a disabled family for a passed check. The aggregate verdict folds size + tool + contract + worker_binding severities via the same OK/WARN/BLOCK precedence."
     )]
     async fn bp_doctor(
         &self,
@@ -2160,15 +2223,17 @@ impl MseServer {
         let tool_registry = build_mcp_tool_registry();
         let disable_tool_lint = req.disable_tool_lint.unwrap_or(false);
         let disable_output_contract_lint = req.disable_output_contract_lint.unwrap_or(false);
+        let disable_worker_binding_lint = req.disable_worker_binding_lint.unwrap_or(false);
 
         let mut per_agent = Vec::with_capacity(bp.agents.len());
         let mut severities: Vec<&'static str> = Vec::with_capacity(bp.agents.len());
-        // GH #45: track lint-family severities separately so the
+        // GH #45 / #61: track lint-family severities separately so the
         // aggregate verdict can factor them in without disturbing the
         // size-check `severities` vec (which downstream callers already
         // consume verbatim).
         let mut tool_lint_severities: Vec<String> = Vec::new();
         let mut output_contract_lint_severities: Vec<String> = Vec::new();
+        let mut worker_binding_lint_severities: Vec<String> = Vec::new();
         for agent in &bp.agents {
             let (bytes, lines) = match &agent.profile {
                 Some(p) => (p.system_prompt.len(), p.system_prompt.lines().count()),
@@ -2252,21 +2317,38 @@ impl MseServer {
                     obj.insert("output_contract_lint".to_string(), contract_lint);
                 }
             }
+            if !disable_worker_binding_lint {
+                let wb: Option<&str> = agent
+                    .profile
+                    .as_ref()
+                    .and_then(|p| p.worker_binding.as_deref());
+                let wb_lint = classify_worker_binding_lint(&agent.kind, wb);
+                if let Some(sev) = wb_lint.get("severity").and_then(|v| v.as_str()) {
+                    worker_binding_lint_severities.push(sev.to_string());
+                }
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("worker_binding_lint".to_string(), wb_lint);
+                }
+            }
 
             per_agent.push(entry);
         }
-        // GH #45: fold the two lint families into the aggregate verdict.
-        // `aggregate_agent_md_verdict` already implements the
+        // GH #45 / #61: fold the three lint families into the aggregate
+        // verdict. `aggregate_agent_md_verdict` already implements the
         // BLOCK-dominates-WARN-dominates-OK precedence — reuse it by
         // pushing each family's severities into a single flattened
         // vector so an agent with a passing size-check and a
         // phantom-tool WARN still surfaces at the top-level verdict.
         let mut all_severities: Vec<&str> = Vec::with_capacity(
-            severities.len() + tool_lint_severities.len() + output_contract_lint_severities.len(),
+            severities.len()
+                + tool_lint_severities.len()
+                + output_contract_lint_severities.len()
+                + worker_binding_lint_severities.len(),
         );
         all_severities.extend(severities.iter().copied());
         all_severities.extend(tool_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(output_contract_lint_severities.iter().map(|s| s.as_str()));
+        all_severities.extend(worker_binding_lint_severities.iter().map(|s| s.as_str()));
         let verdict = aggregate_agent_md_verdict(&all_severities);
         let over_threshold_count = severities.iter().filter(|s| **s != "OK").count();
         let tool_lint_warn_count = tool_lint_severities
@@ -2274,6 +2356,10 @@ impl MseServer {
             .filter(|s| s.as_str() != "OK")
             .count();
         let output_contract_lint_warn_count = output_contract_lint_severities
+            .iter()
+            .filter(|s| s.as_str() != "OK")
+            .count();
+        let worker_binding_lint_warn_count = worker_binding_lint_severities
             .iter()
             .filter(|s| s.as_str() != "OK")
             .count();
@@ -2287,6 +2373,7 @@ impl MseServer {
             "over_threshold_count": over_threshold_count,
             "tool_lint_warn_count": tool_lint_warn_count,
             "output_contract_lint_warn_count": output_contract_lint_warn_count,
+            "worker_binding_lint_warn_count": worker_binding_lint_warn_count,
             "thresholds": {
                 "warn_bytes": thresholds.warn_bytes,
                 "warn_lines": thresholds.warn_lines,
@@ -2297,6 +2384,7 @@ impl MseServer {
             "lint_families": {
                 "tool_lint_enabled": !disable_tool_lint,
                 "output_contract_lint_enabled": !disable_output_contract_lint,
+                "worker_binding_lint_enabled": !disable_worker_binding_lint,
             },
             "agents": per_agent,
             "guide_ref": "mse://guides/agent-md-authoring",
@@ -4435,6 +4523,68 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("missing string field `kind`"));
+    }
+
+    // ─── GH #61: bp_doctor worker_binding_lint ────────────────────
+
+    #[test]
+    fn worker_binding_lint_returns_ok_when_operator_kind_has_worker_binding() {
+        let lint = classify_worker_binding_lint(
+            &mlua_swarm::blueprint::AgentKind::Operator,
+            Some("claude"),
+        );
+        assert_eq!(lint["severity"], "OK");
+        assert_eq!(lint["kind_requires_binding"], true);
+        assert_eq!(lint["present"], true);
+    }
+
+    #[test]
+    fn worker_binding_lint_flags_operator_kind_missing_worker_binding_as_warn() {
+        let lint =
+            classify_worker_binding_lint(&mlua_swarm::blueprint::AgentKind::Operator, None);
+        assert_eq!(lint["severity"], "WARN");
+        assert_eq!(lint["kind_requires_binding"], true);
+        assert_eq!(lint["present"], false);
+        // Reason reuses the Compiler's fail-loud message so both fix
+        // paths (JSON literal / $agent_md frontmatter) are named.
+        let reason = lint["reason"].as_str().expect("reason is a string");
+        assert!(reason.contains("profile.worker_binding is required"));
+        assert!(reason.contains("agents[N].profile.worker_binding"));
+        assert!(reason.contains("$agent_md file ref"));
+    }
+
+    #[test]
+    fn worker_binding_lint_flags_empty_string_worker_binding_as_warn() {
+        // Non-empty string is the contract — an empty literal is
+        // treated the same as absent (the Compiler would build a
+        // WorkerBinding with an empty variant, which the WS thin-path
+        // has no way to resolve).
+        let lint =
+            classify_worker_binding_lint(&mlua_swarm::blueprint::AgentKind::Operator, Some(""));
+        assert_eq!(lint["severity"], "WARN");
+        assert_eq!(lint["present"], false);
+    }
+
+    #[test]
+    fn worker_binding_lint_is_ok_for_non_operator_kinds_regardless_of_binding() {
+        // RustFn / Lua / Subprocess don't consume worker_binding — the
+        // lint is scoped to operator-tier backends only.
+        for kind in [
+            mlua_swarm::blueprint::AgentKind::RustFn,
+            mlua_swarm::blueprint::AgentKind::Lua,
+            mlua_swarm::blueprint::AgentKind::AgentBlock,
+            mlua_swarm::blueprint::AgentKind::Subprocess,
+        ] {
+            let lint_absent = classify_worker_binding_lint(&kind, None);
+            assert_eq!(lint_absent["severity"], "OK", "kind={kind:?}");
+            assert_eq!(lint_absent["kind_requires_binding"], false, "kind={kind:?}");
+            // Non-operator kinds don't grow a `present` field — the
+            // check simply doesn't apply.
+            assert!(
+                lint_absent.get("present").is_none(),
+                "kind={kind:?} unexpectedly carries `present`"
+            );
+        }
     }
 
     // ─── GH #34: mse_doctor audit_findings surfacing ───────────

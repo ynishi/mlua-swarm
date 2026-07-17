@@ -37,19 +37,19 @@ return {
       name = "mock-scout",
       kind = "operator",
       spec = { operator_ref = "main-ai" },
-      profile = { system_prompt = "Always reply `SCOUT_OK`", tools = {} },
+      profile = { system_prompt = "Always reply `SCOUT_OK`", tools = {}, worker_binding = "claude" },
     },
     {
       name = "mock-planner",
       kind = "operator",
       spec = { operator_ref = "main-ai" },
-      profile = { system_prompt = "Always reply `PLAN_OK`", tools = {} },
+      profile = { system_prompt = "Always reply `PLAN_OK`", tools = {}, worker_binding = "claude" },
     },
     {
       name = "mock-resolver",
       kind = "operator",
       spec = { operator_ref = "main-ai" },
-      profile = { system_prompt = "Always reply `FIX_OK`", tools = {} },
+      profile = { system_prompt = "Always reply `FIX_OK`", tools = {}, worker_binding = "claude" },
     },
     {
       name = "mock-gate",
@@ -58,19 +58,20 @@ return {
       profile = {
         system_prompt = "Always reply `PASS` (change to `BLOCKED` if you want to exercise the retry path)",
         tools = {},
+        worker_binding = "claude",
       },
     },
     {
       name = "mock-commit",
       kind = "operator",
       spec = { operator_ref = "main-ai" },
-      profile = { system_prompt = "Always reply `COMMITTED`", tools = {} },
+      profile = { system_prompt = "Always reply `COMMITTED`", tools = {}, worker_binding = "claude" },
     },
     {
       name = "mock-escalate",
       kind = "operator",
       spec = { operator_ref = "main-ai" },
-      profile = { system_prompt = "Always reply `ESCALATED`", tools = {} },
+      profile = { system_prompt = "Always reply `ESCALATED`", tools = {}, worker_binding = "claude" },
     },
   },
   operators = {

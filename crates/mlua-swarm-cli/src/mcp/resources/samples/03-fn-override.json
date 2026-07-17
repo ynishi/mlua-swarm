@@ -132,7 +132,8 @@
       },
       "profile": {
         "system_prompt": "Always reply `BLOCKED` (= FN signal)",
-        "tools": []
+        "tools": [],
+        "worker_binding": "claude"
       }
     },
     {
@@ -143,7 +144,8 @@
       },
       "profile": {
         "system_prompt": "Always reply `ALLOW` (= override)",
-        "tools": []
+        "tools": [],
+        "worker_binding": "claude"
       }
     },
     {
@@ -154,7 +156,8 @@
       },
       "profile": {
         "system_prompt": "Always reply `COMMITTED`",
-        "tools": []
+        "tools": [],
+        "worker_binding": "claude"
       }
     }
   ],

@@ -172,9 +172,14 @@ pub(crate) fn compile_lint(bp_value: &serde_json::Value, script_path: &Path) -> 
 /// A stub `Operator` backend used only so `kind = operator` agents (the
 /// `$agent_md` loader's default kind) resolve during lint — no live WS
 /// session exists at authoring time, so `execute` is never actually
-/// called. `requires_worker_binding() = false` keeps the lint focused on
-/// the GH #50 verdict-contract checks this command exists for, rather
-/// than also gating on `profile.worker_binding` presence.
+/// called. `requires_worker_binding() = true` mirrors the production
+/// `WSOperatorSession` (the only real operator backend `mse serve` ships)
+/// so the compile-lint fails loud at authoring time when
+/// `profile.worker_binding` is absent — the same fail-loud gate the
+/// Compiler applies at dispatch (`src/blueprint/compiler.rs` — the
+/// `profile.worker_binding is required` path), just front-loaded into
+/// `bp_build`'s lint stage so an author sees the failure before the
+/// undispatchable Blueprint is registered. GH #61.
 struct LintStubOperator;
 
 #[async_trait::async_trait]
@@ -193,7 +198,7 @@ impl mlua_swarm::Operator for LintStubOperator {
         })
     }
     fn requires_worker_binding(&self) -> bool {
-        false
+        true
     }
 }
 

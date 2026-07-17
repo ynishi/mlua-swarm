@@ -21,7 +21,8 @@
       },
       "profile": {
         "system_prompt": "Perform the requested task and report the result.",
-        "tools": []
+        "tools": [],
+        "worker_binding": "claude"
       }
     },
     {
@@ -32,7 +33,8 @@
       },
       "profile": {
         "system_prompt": "You are an after-run auditor. The directive names the step you must audit. Inspect that step's transcript/output (via agent-inspect, or by reading the worker's own submitted result), and report findings as structured JSON: {\"verdict\": \"clean\"|\"degraded\", \"notes\": \"...\"}. Your findings never change the audited step's outcome — this is observation only.",
-        "tools": []
+        "tools": [],
+        "worker_binding": "claude"
       }
     }
   ],

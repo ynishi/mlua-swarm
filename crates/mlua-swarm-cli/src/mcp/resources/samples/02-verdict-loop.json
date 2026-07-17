@@ -125,7 +125,8 @@
       },
       "profile": {
         "system_prompt": "Always reply `SCOUT_OK`",
-        "tools": []
+        "tools": [],
+        "worker_binding": "claude"
       }
     },
     {
@@ -136,7 +137,8 @@
       },
       "profile": {
         "system_prompt": "Always reply `PLAN_OK`",
-        "tools": []
+        "tools": [],
+        "worker_binding": "claude"
       }
     },
     {
@@ -147,7 +149,8 @@
       },
       "profile": {
         "system_prompt": "Always reply `FIX_OK`",
-        "tools": []
+        "tools": [],
+        "worker_binding": "claude"
       }
     },
     {
@@ -158,7 +161,8 @@
       },
       "profile": {
         "system_prompt": "Always reply `PASS` (change to `BLOCKED` if you want to exercise the retry path)",
-        "tools": []
+        "tools": [],
+        "worker_binding": "claude"
       }
     },
     {
@@ -169,7 +173,8 @@
       },
       "profile": {
         "system_prompt": "Always reply `COMMITTED`",
-        "tools": []
+        "tools": [],
+        "worker_binding": "claude"
       }
     },
     {
@@ -180,7 +185,8 @@
       },
       "profile": {
         "system_prompt": "Always reply `ESCALATED`",
-        "tools": []
+        "tools": [],
+        "worker_binding": "claude"
       }
     }
   ],
