@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(store)* add Ctx-snapshot replay Core primitive (`store::replay` module with `ReplayStore` trait, `InMemoryReplayStore`, `SqliteReplayStore`, and `ReplayCursor`) plus `Engine::dispatch_attempt_with_run_ctx` for deterministic step-level replay of a `Ctx` across a fresh engine
 - *(store)* extend `RunContext` with opt-in `replay_store` / `replay_cursor` fields
 
+### Changed
+
+- *(store)* `SqliteReplayStore::open` now auto-migrates the `replay_log` schema on open, tracked by `PRAGMA user_version`. Existing `~/.mse/store/replay.sqlite` files created by mse `< v0.11.0` have their legacy `replay_log` table dropped and recreated in the current shape (two-column split with `ctx_snapshot_json` + `step_output_json`). Legacy entries carry no Ctx snapshot and cannot be replayed against the current wire, so the loss is safe. Files written by a newer schema version are rejected instead of being silently mangled
+
 ## [0.11.0](https://github.com/ynishi/mlua-swarm/compare/v0.10.0...v0.11.0) - 2026-07-16
 
 ### Added
