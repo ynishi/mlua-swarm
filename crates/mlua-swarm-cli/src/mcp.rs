@@ -150,7 +150,7 @@ struct AuditFinding {
 /// body (`{task_id, run_id, steps: [{name, ...}, ...]}`), pick out every
 /// step whose `name` starts with `audit:` — the
 /// `AfterRunAuditMiddleware`/`OutputEvent::Artifact` naming convention
-/// (GH #34, ST1). A step whose name does not carry that prefix (the
+/// (GH #34). A step whose name does not carry that prefix (the
 /// audited step itself, or any other OUTPUT artifact) is not a finding.
 ///
 /// Kept a pure function (no I/O, no `self`) so it is testable without a
@@ -655,7 +655,7 @@ struct WorkerSubmitReq {
     /// completed via a later `ok=false`-capable submit, does).
     #[serde(default)]
     ok: Option<bool>,
-    /// GH #36 ST2: when given, this call **stages one named output part**
+    /// GH #36: when given, this call **stages one named output part**
     /// (`POST /v1/worker/artifact?name=<name>`) instead of completing the
     /// attempt (`POST /v1/worker/submit`) — the task stays open, and the
     /// worker may POST any number of additional named parts (same or
@@ -669,7 +669,7 @@ struct WorkerSubmitReq {
     /// the attempt).
     #[serde(default)]
     name: Option<String>,
-    /// GH #32 ST3: optional structured worker-degradation entries. When
+    /// GH #32: optional structured worker-degradation entries. When
     /// non-empty, each entry is POSTed to `/v1/worker/degradation` BEFORE
     /// this call's own submit/artifact POST (serial, in append order) —
     /// an independent channel from `body`/`name`, never folded into step
@@ -679,8 +679,8 @@ struct WorkerSubmitReq {
     degradations: Option<Vec<DegradationInput>>,
 }
 
-/// Client-facing shape for one worker-reported degradation entry (GH #32
-/// ST3) — mirrors the wire body `mlua-swarm-server`'s `POST
+/// Client-facing shape for one worker-reported degradation entry (GH #32) —
+/// mirrors the wire body `mlua-swarm-server`'s `POST
 /// /v1/worker/degradation` endpoint expects
 /// (`crates/mlua-swarm-server/src/worker.rs`'s `DegradationBody`). The
 /// server-injected metadata (`step_ref` / `attempt` / `at`) is deliberately
@@ -721,9 +721,10 @@ fn worker_submit_endpoint_url(base_url: &str, name: Option<&str>) -> Result<reqw
     Ok(url)
 }
 
+// convention-token-ok: mse_worker_submit is a mlua-swarm public MCP tool name.
 /// Builds the `/v1/worker/degradation` endpoint URL for
-/// [`MseServer::mse_worker_submit`]'s pre-submit degradation POSTs (GH #32
-/// ST3). `base_url`'s trailing slash (if any) is trimmed before joining;
+/// [`MseServer::mse_worker_submit`]'s pre-submit degradation POSTs (GH #32).
+/// `base_url`'s trailing slash (if any) is trimmed before joining;
 /// no query params — unlike [`worker_submit_endpoint_url`]'s `name` case,
 /// the degradation body carries its shape as a JSON payload, not a query
 /// key. Pure and side-effect-free, mirroring `worker_submit_endpoint_url`'s
@@ -1155,8 +1156,9 @@ impl MseServer {
         json_result(&out)
     }
 
+    // convention-token-ok: mse_pending_wait is a mlua-swarm public MCP tool name.
     #[tool(
-        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Normally `worker_handle` + `body` are the ONLY required params — base_url auto-resolves from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass it explicitly to override (or when the Bearer is a full capability_token). Optional ok=false marks the attempt failed (flow.ir Try catch path); mutually exclusive with `name`. Optional `name` (GH #36 ST2) stages ONE named output part instead of completing the attempt — POST /v1/worker/artifact?name=<name> — call again (same or different name) for more parts, then finish with a plain (no-name) call; the step's final output becomes {\"out\": <final submit body>, \"parts\": {<name>: <value>, ...}}, read downstream via bracket notation e.g. \"$.<step>.parts[\\\"plan.md\\\"]\". Optional `degradations` array (GH #32 ST3) — each entry POSTed to /v1/worker/degradation before the main submit, structured tool-failure trace persisted on the Run record. Backward compat: absent field = pre-#32 behavior. Expects HTTP 204 and returns {submitted: true} (name path) or {submitted: true} (plain path); any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
+        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Normally `worker_handle` + `body` are the ONLY required params — base_url auto-resolves from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass it explicitly to override (or when the Bearer is a full capability_token). Optional ok=false marks the attempt failed (flow.ir Try catch path); mutually exclusive with `name`. Optional `name` (GH #36) stages ONE named output part instead of completing the attempt — POST /v1/worker/artifact?name=<name> — call again (same or different name) for more parts, then finish with a plain (no-name) call; the step's final output becomes {\"out\": <final submit body>, \"parts\": {<name>: <value>, ...}}, read downstream via bracket notation e.g. \"$.<step>.parts[\\\"plan.md\\\"]\". Optional `degradations` array (GH #32) — each entry POSTed to /v1/worker/degradation before the main submit, structured tool-failure trace persisted on the Run record. Backward compat: absent field = pre-#32 behavior. Expects HTTP 204 and returns {submitted: true} (name path) or {submitted: true} (plain path); any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
     )]
     async fn mse_worker_submit(
         &self,
@@ -1194,7 +1196,7 @@ impl MseServer {
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
 
-        // GH #32 ST3: pre-submit degradation reporting. Each entry is
+        // GH #32: pre-submit degradation reporting. Each entry is
         // POSTed to `/v1/worker/degradation` BEFORE the submit/artifact
         // call below (serial, in append order — not parallelized, since
         // ordering matters for the append semantics and the POSTs are
@@ -1908,8 +1910,8 @@ impl MseServer {
             severities.push(severity);
 
             // GH #31: live post-render size lookup, reusing the same
-            // `bind`/`client` already constructed above (Subtask 2's new
-            // route). `last_rendered_bytes: null` is a normal response
+            // `bind`/`client` already constructed above.
+            // `last_rendered_bytes: null` is a normal response
             // (agent never dispatched) — always 200, never a 404.
             let render_size_url = format!("http://{bind}/v1/agents/{}/render-size", agent.name);
             let last_rendered_bytes: Option<usize> = match client.get(&render_size_url).send().await
@@ -2263,8 +2265,8 @@ impl MseServer {
         // `AfterRunAuditMiddleware` artifact naming convention). Runs with
         // no known task_id yet (an HTTP-proxied dispatch whose response is
         // still in flight) are silently skipped, not noted — that is not a
-        // fetch failure. Per Invariant #1 (subtask-2): this scan NEVER
-        // fails the doctor call — every error becomes a note.
+        // fetch failure. Invariant: this scan NEVER fails the doctor call —
+        // every error becomes a note.
         let mut audit_findings: Vec<AuditFinding> = Vec::new();
         let mut audit_fetch_notes: Vec<String> = Vec::new();
         if server_up {
@@ -2305,7 +2307,7 @@ impl MseServer {
             audit_fetch_notes.push("mse serve down; audit_findings scan skipped".to_string());
         }
 
-        // GH #32 ST3: degradations — for each tracked run whose task_id is
+        // GH #32: degradations — for each tracked run whose task_id is
         // known, fetch the plain `RunRecord` via `GET /v1/runs/:id` (not
         // the steps listing above — degradations never surface there,
         // per Crux invariant 2) and sum its `degradations` array length.
@@ -2450,9 +2452,10 @@ impl MseServer {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    // Occupancy unknown (network hiccup / pre-ST4 server
-                    // binary) — fail open, do not block a legitimate
-                    // shutdown/restart indefinitely. Log for visibility.
+                    // Occupancy unknown (network hiccup / older server binary
+                    // without the /v1/status occupancy fields) — fail open,
+                    // do not block a legitimate shutdown/restart indefinitely.
+                    // Log for visibility.
                     eprintln!("mse mcp: occupancy check failed, proceeding: {e}");
                 }
             }
@@ -2488,9 +2491,10 @@ impl MseServer {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    // Occupancy unknown (network hiccup / pre-ST4 server
-                    // binary) — fail open, do not block a legitimate
-                    // shutdown/restart indefinitely. Log for visibility.
+                    // Occupancy unknown (network hiccup / older server binary
+                    // without the /v1/status occupancy fields) — fail open,
+                    // do not block a legitimate shutdown/restart indefinitely.
+                    // Log for visibility.
                     eprintln!("mse mcp: occupancy check failed, proceeding: {e}");
                 }
             }
@@ -2588,7 +2592,7 @@ fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
 /// GH #31: fetches (`Http` mode) or reads (`File` mode) the content a
 /// `SystemRef` points to. `base` is the already-`trim_end_matches('/')`d
 /// server root (only consulted for `Http` mode when `system_ref.uri` is a
-/// bare path, per the shipped Subtask 1 contract — `Http`-mode `uri` is
+/// bare path, per the shipped `SystemRef` contract — `Http`-mode `uri` is
 /// never fully-qualified). Errors are returned as a display string, not a
 /// typed error — the caller wraps every failure into a value-level
 /// `{ok: false, stage: "download", ...}` JSON result, never an `McpError`.
@@ -3084,7 +3088,7 @@ mod tests {
         assert!(msg.contains("expected 204"), "err: {msg}");
     }
 
-    /// GH #36 ST2: `name` and `ok=false` are mutually exclusive — the
+    /// GH #36: `name` and `ok=false` are mutually exclusive — the
     /// mismatch must be rejected as an MCP `invalid_params` error *before*
     /// any HTTP I/O (base_url is a black-hole address on purpose, so a
     /// network attempt would hang/timeout instead of failing fast).
@@ -3106,7 +3110,7 @@ mod tests {
         assert!(msg.contains("mutually exclusive"), "err: {msg}");
     }
 
-    /// GH #36 ST2: a `name`-bearing submit call hits `POST
+    /// GH #36: a `name`-bearing submit call hits `POST
     /// /v1/worker/artifact?name=<name>` (not `/v1/worker/submit`) against a
     /// real in-process router — same "bogus handle surfaces the HTTP
     /// error" shape as the sibling submit test above, confirming the URL
@@ -3144,7 +3148,7 @@ mod tests {
         assert!(msg.contains("expected 204"), "err: {msg}");
     }
 
-    /// GH #32 ST3: a `degradations`-bearing submit call POSTs each entry to
+    /// GH #32: a `degradations`-bearing submit call POSTs each entry to
     /// `/v1/worker/degradation` BEFORE the plain submit — against a real
     /// in-process router, a bogus (never-minted) handle fails handle
     /// resolution inside `worker_degradation` itself (500, not 204), which
@@ -3192,7 +3196,7 @@ mod tests {
         );
     }
 
-    /// GH #32 ST3: without `degradations`, the request path is byte-for-byte
+    /// GH #32: without `degradations`, the request path is byte-for-byte
     /// the pre-#32 behavior — the error is the existing `worker submit:
     /// HTTP ...` message, proving the new field is truly opt-in.
     #[tokio::test]
@@ -3273,7 +3277,7 @@ mod tests {
         assert!(!err.is_empty());
     }
 
-    // --- worker_degradation_endpoint_url (GH #32 ST3, pure URL-building) ---
+    // --- worker_degradation_endpoint_url (GH #32, pure URL-building) ---
 
     #[test]
     fn worker_degradation_endpoint_url_shape() {
@@ -3355,7 +3359,7 @@ mod tests {
         handle
     }
 
-    /// GH #31 subtask-3 E2E: a real server, with `system_ref` config
+    /// GH #31 E2E: a real server, with `system_ref` config
     /// tuned to a tiny threshold so an intentionally-oversized
     /// `system_prompt` triggers `File`-mode by-reference delivery, then
     /// `mse_worker_fetch` resolves it — asserts `{ok: true, path, sha256,
@@ -3431,7 +3435,7 @@ mod tests {
         assert_eq!(written, rendered);
     }
 
-    /// GH #31 subtask-3 E2E, `hash_mismatch` path: a minimal fake HTTP
+    /// GH #31 E2E, `hash_mismatch` path: a minimal fake HTTP
     /// server (not the real `Engine`) serves a `WorkerPayload` whose
     /// `system_ref.sha256` deliberately does not match the bytes served at
     /// `system_ref.uri` (simulating server/client corruption or a stale
@@ -3505,8 +3509,8 @@ mod tests {
         );
     }
 
-    /// ST5 (`projection-adapter`) removal confirmation: `mse_ctx_get` no
-    /// longer exists as an MCP tool — the Worker axis now gets prior
+    /// `projection-adapter` removal confirmation: `mse_ctx_get` no longer
+    /// exists as an MCP tool — the Worker axis now gets prior
     /// steps' OUTPUT pointers automatically via `context.steps` on `GET
     /// /v1/worker/prompt` (see `mlua_swarm::core::agent_context`'s module
     /// doc), so the tool's existence reason (a manual pull wrapper over
@@ -3520,7 +3524,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(
             !names.contains(&"mse_ctx_get"),
-            "mse_ctx_get must be retired (ST5): {names:?}"
+            "mse_ctx_get must be retired: {names:?}"
         );
     }
 
@@ -3829,7 +3833,7 @@ mod tests {
         );
     }
 
-    // ─── explain-agent subtask-3: diff_tools drift classifier ──────────────
+    // ─── explain-agent: diff_tools drift classifier ──────────────
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -3950,7 +3954,7 @@ mod tests {
         assert_eq!(meaningful_out, strs(&["Read", "read"]));
     }
 
-    // ─── GH #34: mse_doctor audit_findings surfacing (subtask-2) ───────────
+    // ─── GH #34: mse_doctor audit_findings surfacing ───────────
 
     #[test]
     fn extract_audit_findings_returns_empty_for_no_steps() {
@@ -4013,8 +4017,8 @@ mod tests {
     }
 
     /// `mse serve` unreachable: the audit scan must degrade to an empty
-    /// section plus a note, never fail the doctor call (subtask-2
-    /// Invariant #1).
+    /// section plus a note, never fail the doctor call (audit-scan
+    /// Invariant #1: this scan NEVER fails the doctor call).
     #[tokio::test]
     async fn mse_doctor_server_down_notes_the_audit_scan_skip() {
         let server = MseServer::new();
@@ -4058,21 +4062,20 @@ mod tests {
         );
     }
 
-    /// GH #34 subtask-3 gap fix: dispatches a real Blueprint with `audits`
-    /// declared through a real in-process `mse serve` router (same setup
-    /// pattern as `mse_worker_fetch_and_submit_hit_the_http_endpoints`)
+    /// GH #34: end-to-end coverage that dispatches a real Blueprint with
+    /// `audits` declared through a real in-process `mse serve` router
+    /// (same setup pattern as `mse_worker_fetch_and_submit_hit_the_http_endpoints`)
     /// and inspects the real `GET /v1/tasks/:id/runs/:run/steps` response.
     ///
-    /// **Formerly** (subtask-2's `..._but_not_yet_the_audit_artifact`
-    /// name): `Engine::submit_output` (`src/core/engine.rs`) only
-    /// dual-wrote to the Data-plane `OutputStore` the HTTP steps API reads
-    /// from for `OutputEvent::Final` events. `AfterRunAuditMiddleware`
-    /// submits `OutputEvent::Artifact` — a different variant — so the
-    /// audit finding never reached the Data-plane store and never
-    /// appeared in the steps listing, even though it WAS recorded in the
-    /// domain-plane (`Engine::output_tail`).
+    /// **Historical gap**: `Engine::submit_output` (`src/core/engine.rs`)
+    /// only dual-wrote to the Data-plane `OutputStore` the HTTP steps API
+    /// reads from for `OutputEvent::Final` events.
+    /// `AfterRunAuditMiddleware` submits `OutputEvent::Artifact` — a
+    /// different variant — so the audit finding never reached the
+    /// Data-plane store and never appeared in the steps listing, even
+    /// though it WAS recorded in the domain-plane (`Engine::output_tail`).
     ///
-    /// **Now**: two changes were needed, not one.
+    /// **Current shape**: two changes were needed, not one.
     ///
     /// 1. `Engine::submit_output` (`src/core/engine.rs`) dual-writes
     ///    `Artifact` events too (general form — every `Artifact`, no
@@ -4094,10 +4097,6 @@ mod tests {
     ///    `OutputEvent::Artifact` under a row's `StepId`
     ///    (`OutputStore::list_for_attempt`) and surfaces each under its
     ///    own name — additive, never overrides the canonical-name lookup.
-    ///    This is a deviation from subtask-3.md's literal "Do NOT touch
-    ///    ... server routes" scope note, made because the flipped
-    ///    assertion below could not otherwise pass; see the impl-lead
-    ///    report for this task for the full rationale.
     #[tokio::test]
     async fn steps_api_exposes_both_the_audited_steps_own_output_and_the_audit_artifact() {
         use mlua_swarm::{RustFnInProcessSpawnerFactory, SpawnerRegistry, WorkerResult};
@@ -4239,15 +4238,14 @@ mod tests {
     }
 
     /// `mse_doctor`'s own HTTP-calling + extraction logic, isolated from the
-    /// core-crate gap documented on
-    /// `steps_api_exposes_the_audited_steps_own_output_but_not_yet_the_audit_artifact`
-    /// above: a stub router serving the real `GET
-    /// /v1/tasks/:id/runs/:run/steps` response *shape* (not a real
-    /// dispatch) proves the doctor tool round-trips correctly once the
-    /// steps API genuinely returns an `audit:`-prefixed entry — i.e. this
-    /// is subtask-2's own code working correctly against the documented
-    /// contract, decoupled from whether core currently honors that
-    /// contract for `OutputEvent::Artifact`.
+    /// historical core-crate gap where `OutputEvent::Artifact` did not
+    /// dual-write to the Data-plane `OutputStore`: a stub router serving
+    /// the real `GET /v1/tasks/:id/runs/:run/steps` response *shape* (not
+    /// a real dispatch) proves the doctor tool round-trips correctly once
+    /// the steps API genuinely returns an `audit:`-prefixed entry — i.e.
+    /// the doctor code works correctly against the documented contract,
+    /// decoupled from whether core currently honors that contract for
+    /// `OutputEvent::Artifact`.
     #[tokio::test]
     async fn mse_doctor_surfaces_audit_findings_via_stub_steps_api() {
         use axum::extract::Path as AxumPath;
@@ -4311,7 +4309,7 @@ mod tests {
         assert_eq!(findings[0]["artifact_name"], "audit:worker");
     }
 
-    /// GH #32 ST3: `mse_doctor`'s own HTTP-calling + extraction logic for
+    /// GH #32: `mse_doctor`'s own HTTP-calling + extraction logic for
     /// the `degradations` section, isolated the same way
     /// `mse_doctor_surfaces_audit_findings_via_stub_steps_api` isolates the
     /// `audit_findings` one — a stub router serving the real `GET

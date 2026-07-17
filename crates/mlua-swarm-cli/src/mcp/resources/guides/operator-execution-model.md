@@ -384,9 +384,10 @@ relay the header lines it just read.
 
 The minimum contract the SubAgent's fetch depends on is a four-line body
 consisting of `agent_id`, `worker_handle`, `base_url`, and `task_id` (in
-that literal shape). This is documented in the orch driver guides
-(`sets/coding/skills/orch-mse/SKILL.md`, sec. Step 4) and in the
-`mse-worker` agent definition.
+that literal shape). Orch drivers that ship as separate distributions
+document this in their own Step 4 guide; the `mse-worker` agent
+<!-- convention-token-ok: mse-worker is a mlua-swarm public agent kind. -->
+definition also carries it verbatim.
 
 Beyond that four-line minimum, the MainAI is expected to forward whatever
 header lines the SubAgent needs to do its work end-to-end. That is a

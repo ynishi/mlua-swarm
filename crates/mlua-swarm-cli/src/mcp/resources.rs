@@ -49,7 +49,7 @@
 //! | `mse://blueprints/samples/06-dsl-verdict-loop` | Sample `.bp.lua` — flow_dsl verdict-loop reproduction. |
 //! | `mse://blueprints/samples/07-dsl-pipeline`   | Sample `.bp.lua` — bp_dsl verdict-gated pipeline.   |
 //! | `mse://api/blueprint-schema`                 | Live Blueprint JSON Schema (generated per read).    |
-//! | `mse://api/http-endpoints`                   | Live HTTP wire-body JSON Schemas, keyed by endpoint (issue #19 ST5). |
+//! | `mse://api/http-endpoints`                   | Live HTTP wire-body JSON Schemas, keyed by endpoint (issue #19). |
 //! | `mse://api/mcp-tools`                        | Live schemars-generated MCP tool inputSchemas keyed by tool name (GH #24 sibling). |
 //!
 //! `mse://api/http-endpoints` is deliberately a separate resource from
@@ -237,7 +237,7 @@ pub const RESOURCES: &[ResourceEntry] = &[
     ResourceEntry {
         uri: "mse://api/http-endpoints",
         title: "HTTP endpoint wire-body JSON Schemas",
-        description: "Live schemars-generated request/response JSON Schemas for /v1/blueprints, /v1/tasks, and /v1/tasks/:id/runs, keyed by endpoint. A separate resource from mse://api/blueprint-schema (issue #19 ST5).",
+        description: "Live schemars-generated request/response JSON Schemas for /v1/blueprints, /v1/tasks, and /v1/tasks/:id/runs, keyed by endpoint. A separate resource from mse://api/blueprint-schema (issue #19).",
         mime_type: "application/json",
         body: ResourceBody::HttpEndpoints,
     },
@@ -264,7 +264,7 @@ pub fn blueprint_schema_value() -> Result<serde_json::Value, serde_json::Error> 
     serde_json::to_value(&schema)
 }
 
-/// Generate the HTTP endpoint wire-body JSON Schemas (issue #19 ST5) as a
+/// Generate the HTTP endpoint wire-body JSON Schemas (issue #19) as a
 /// `serde_json::Value`, keyed by endpoint. Shared by the
 /// `mse://api/http-endpoints` dynamic resource; regenerated on every call
 /// so it never drifts from the wire structs' current shape.
