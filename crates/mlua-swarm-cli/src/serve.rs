@@ -401,7 +401,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         None => Arc::new(InMemoryReplayStore::new()),
     };
 
-    recover_interrupted_runs(&task_store, &run_store).await;
+    recover_interrupted_runs(&task_store, &run_store, &replay_store).await;
 
     // Issue #8: source the public base URL from the same bind the
     // listener will use, so `WSOperatorSession` can render it into
@@ -492,16 +492,32 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Boot-time recovery sweep (issue #35 ST2): any Run left `Running` from
-/// a previous process (crash / supervisor restart) is marked
-/// `Interrupted` with a structured reason; the owning Task is marked
-/// `Interrupted` likewise. Terminal-only — never touches `EngineState`,
-/// never re-dispatches. Only meaningful when the store is persistent
-/// (issue #35 ST1); on a fresh `InMemoryRunStore` this is always a no-op
-/// (nothing survives to sweep).
+/// Boot-time recovery sweep (issue #35): any Run left `Running` from a
+/// previous process (crash / supervisor restart) is marked `Interrupted`
+/// with a structured reason; the owning Task is marked `Interrupted`
+/// likewise. Terminal-only — never touches `EngineState`, never
+/// re-dispatches. Only meaningful when the store is persistent; on a
+/// fresh `InMemoryRunStore` this is always a no-op (nothing survives to
+/// sweep).
+///
+/// After each Interrupted mark the replay log for the run is consulted
+/// via `ReplayStore::list_by_run`. When at least one entry exists, the
+/// run is emitted at `tracing::info!` level as a **resumable candidate**
+/// — the attached operator can then kick `POST /v1/runs/<id>/resume`
+/// under the same `run_id` (state-driven resume endpoint). Runs with no
+/// replay entries are logged at `debug!` level (not resumable — nothing
+/// to replay against). This function itself never auto-respawns: an
+/// operator that has not attached would burn its TTL for nothing, so the
+/// actual resume kick is left to the operator (per User direction —
+/// boot-time auto-respawn is deferred to a separate issue).
+///
+/// Replay-store failures follow the same best-effort discipline as the
+/// per-run store updates above: a warning is emitted and the sweep
+/// continues; a single `list_by_run` error must not stall the boot path.
 async fn recover_interrupted_runs(
     task_store: &std::sync::Arc<dyn mlua_swarm::store::task::TaskStore>,
     run_store: &std::sync::Arc<dyn mlua_swarm::store::run::RunStore>,
+    replay_store: &std::sync::Arc<dyn mlua_swarm::store::replay::ReplayStore>,
 ) {
     let running = match run_store.list_running().await {
         Ok(v) => v,
@@ -538,6 +554,41 @@ async fn recover_interrupted_runs(
                 "mse serve: boot sweep: task {} update_status failed: {e}",
                 run.task_id
             );
+        }
+
+        // Classify each Interrupted run as resumable / non-resumable by
+        // consulting the replay log entry count. Emit at info! when
+        // resumable (operator can kick `POST /v1/runs/<id>/resume`) and
+        // debug! when not (nothing to replay against). Failures are
+        // logged as warn! and skipped so a single lookup error cannot
+        // stall the whole sweep.
+        match replay_store.list_by_run(&run.id).await {
+            Ok(entries) => {
+                let replayed_steps = entries.len();
+                if replayed_steps > 0 {
+                    tracing::info!(
+                        run_id = %run.id,
+                        task_id = %run.task_id,
+                        replayed_steps,
+                        resume_url = %format!("POST /v1/runs/{}/resume", run.id),
+                        "boot sweep: resumable Interrupted run"
+                    );
+                } else {
+                    tracing::debug!(
+                        run_id = %run.id,
+                        task_id = %run.task_id,
+                        "boot sweep: not resumable, no replay entries"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %run.id,
+                    task_id = %run.task_id,
+                    error = %e,
+                    "boot sweep: replay_store list_by_run failed; skipping resumable classification"
+                );
+            }
         }
     }
 }
@@ -622,6 +673,7 @@ fn seed_blueprint(id: &str) -> Blueprint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlua_swarm::store::replay::ReplayEntry;
     use mlua_swarm::store::run::{RunRecord, RunStatus};
     use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus};
     use mlua_swarm::types::{RunId, TaskId};
@@ -630,6 +682,7 @@ mod tests {
     async fn recover_interrupted_runs_marks_running_as_interrupted() {
         let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
         let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let replay_store: Arc<dyn ReplayStore> = Arc::new(InMemoryReplayStore::new());
 
         let running_task_id = TaskId::parse("T-running").unwrap();
         let done_task_id = TaskId::parse("T-done").unwrap();
@@ -694,7 +747,7 @@ mod tests {
             .await
             .unwrap();
 
-        recover_interrupted_runs(&task_store, &run_store).await;
+        recover_interrupted_runs(&task_store, &run_store, &replay_store).await;
 
         let running_run = run_store.get(&running_run_id).await.unwrap();
         assert_eq!(running_run.status, RunStatus::Interrupted);
@@ -711,5 +764,89 @@ mod tests {
         assert_eq!(done_run.result_ref, None);
         let done_task = task_store.get(&done_task_id).await.unwrap();
         assert_eq!(done_task.status, TaskRecordStatus::Done);
+    }
+
+    /// The sweep classifies each Interrupted run as resumable /
+    /// non-resumable based on the replay-log entry count. This test
+    /// covers the pure sweep semantics (both runs get marked
+    /// Interrupted, one has replay entries, one does not); the actual
+    /// `tracing` field emission is exercised by the integration test in
+    /// `mlua-swarm-server/tests/replay_e2e.rs` (which drives a real
+    /// two-server-process partial-then-resume flow).
+    #[tokio::test]
+    async fn recover_interrupted_runs_classifies_by_replay_entries() {
+        let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let replay_store: Arc<dyn ReplayStore> = Arc::new(InMemoryReplayStore::new());
+
+        let task_with_replay = TaskId::parse("T-resumable").unwrap();
+        let task_without_replay = TaskId::parse("T-not-resumable").unwrap();
+        let run_with_replay = RunId::parse("R-resumable").unwrap();
+        let run_without_replay = RunId::parse("R-not-resumable").unwrap();
+
+        for (tid, rid) in [
+            (&task_with_replay, &run_with_replay),
+            (&task_without_replay, &run_without_replay),
+        ] {
+            task_store
+                .create(TaskRecord {
+                    id: tid.clone(),
+                    goal: "resume classification fixture".into(),
+                    blueprint_ref: json!({}),
+                    input_ctx: json!({}),
+                    task_input_spec: None,
+                    status: TaskRecordStatus::Running,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .await
+                .unwrap();
+            run_store
+                .create(RunRecord {
+                    id: rid.clone(),
+                    task_id: tid.clone(),
+                    status: RunStatus::Running,
+                    step_entries: vec![],
+                    degradations: vec![],
+                    operator_sid: None,
+                    result_ref: None,
+                    input_json: Some("{}".to_string()),
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Seed exactly one replay entry for the resumable run.
+        replay_store
+            .append(ReplayEntry {
+                run_id: run_with_replay.clone(),
+                step_ref: "step-a".into(),
+                input_hash: "hash-a".into(),
+                occurrence: 0,
+                ctx_snapshot_json: "{}".into(),
+                step_output_json: "{}".into(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+
+        recover_interrupted_runs(&task_store, &run_store, &replay_store).await;
+
+        // Both runs are marked Interrupted regardless of replay-log
+        // membership — the classification is orthogonal to the mark.
+        let with_replay = run_store.get(&run_with_replay).await.unwrap();
+        assert_eq!(with_replay.status, RunStatus::Interrupted);
+        let without_replay = run_store.get(&run_without_replay).await.unwrap();
+        assert_eq!(without_replay.status, RunStatus::Interrupted);
+
+        // Sanity: the replay log for the resumable run does carry
+        // exactly one entry, matching what the sweep's `info!` branch
+        // observed.
+        let entries = replay_store.list_by_run(&run_with_replay).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        let empty = replay_store.list_by_run(&run_without_replay).await.unwrap();
+        assert!(empty.is_empty());
     }
 }

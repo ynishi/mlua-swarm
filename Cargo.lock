@@ -1780,6 +1780,7 @@ dependencies = [
  "mlua-swarm",
  "mlua-swarm-schema",
  "reqwest 0.12.28",
+ "rusqlite-isle",
  "schemars",
  "serde",
  "serde_json",
