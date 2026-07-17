@@ -337,6 +337,19 @@ struct BpDoctorReq {
     /// band when running against a strict 200 K-window model.
     #[serde(default)]
     disable_block: Option<bool>,
+    /// GH #45 tool_lint family (default enabled): when true, skip
+    /// checking each agent profile's `tools` list against the live
+    /// `mse://api/mcp-tools` registry. Set true to bypass the family
+    /// when running against a Blueprint that intentionally references
+    /// tool names not surfaced by the local `mse` build.
+    #[serde(default)]
+    disable_tool_lint: Option<bool>,
+    /// GH #45 output_contract_lint family (default enabled): when true,
+    /// skip checking each agent profile's `extras.expected_output`
+    /// declaration (see GH #44 for the field convention). Set true to
+    /// bypass while the convention is still being rolled out.
+    #[serde(default)]
+    disable_output_contract_lint: Option<bool>,
 }
 
 /// Default directory holding worker wrapper `.md` files, relative to the
@@ -416,6 +429,126 @@ fn diff_tools(declared: &[String], wrapper: &[String]) -> ToolDrift {
             .difference(&declared_set)
             .map(|s| (*s).clone())
             .collect(),
+    }
+}
+
+/// GH #45: builds the MCP tool-name registry that bp_doctor's
+/// `tool_lint` family compares agent-profile tool declarations against.
+/// Pulls the set of tool names from the live `mse://api/mcp-tools`
+/// resource (same source of truth every other schema resource uses), so
+/// a phantom tool reference in an agent profile is a WARN even when the
+/// server binary and the agent profile were authored against different
+/// tool surfaces.
+///
+/// The registry is a `BTreeSet<String>` of *bare* MCP tool names (no
+/// `mcp__mse__` prefix — that prefix is a Claude Code frontmatter
+/// convention that lives on the profile side and is stripped when the
+/// lint compares).
+fn build_mcp_tool_registry() -> std::collections::BTreeSet<String> {
+    use std::collections::BTreeSet;
+    let value = match resources::mcp_tools_schema_value() {
+        Ok(v) => v,
+        Err(_) => return BTreeSet::new(),
+    };
+    value
+        .get("tools")
+        .and_then(|t| t.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// GH #45 Lint 1: extract MCP tool references from an agent profile's
+/// `tools` list and check each against the live registry. Pure,
+/// unit-testable — the actual registry is built once per `bp_doctor`
+/// invocation and threaded in by reference.
+///
+/// The heuristic for what counts as "an MCP tool reference" is
+/// deliberately conservative:
+///
+/// - Entries with the `mcp__mse__` prefix are treated as MCP references;
+///   the prefix is stripped and the tail must appear in the registry.
+/// - Everything else (Claude Code built-ins such as `Read` / `Edit` /
+///   `Grep` / `Bash` / `WebFetch` / `WebSearch`) is skipped — those are
+///   not in the MCP registry by design, and false-positive averse is
+///   this lint's stated posture (v1: `WARN` only, no BLOCK, per GH #45).
+///
+/// A profile with no `tools` entries returns severity `OK` and an empty
+/// `unknown_tools` list.
+fn classify_tool_lint(
+    profile_tools: &[String],
+    registry: &std::collections::BTreeSet<String>,
+) -> serde_json::Value {
+    let mcp_prefix = "mcp__mse__";
+    let unknown: Vec<String> = profile_tools
+        .iter()
+        .filter_map(|t| {
+            t.strip_prefix(mcp_prefix)
+                .filter(|bare| !registry.contains(*bare))
+                .map(|_| t.clone())
+        })
+        .collect();
+    let severity = if unknown.is_empty() { "OK" } else { "WARN" };
+    serde_json::json!({
+        "severity": severity,
+        "unknown_tools": unknown,
+    })
+}
+
+/// GH #45 Lint 2: check whether an agent profile declares a
+/// machine-readable output contract in the documented `extras`
+/// convention. Sibling issue GH #44 defines the field:
+///
+/// ```json
+/// {"expected_output": {"kind": "literal_enum" | "inline_markdown" | "file_sentinel",
+///                       "pattern": <optional enum values or regex>}}
+/// ```
+///
+/// The lint is intentionally permissive at v1 — the `pattern` field is
+/// not validated, only `kind`. A missing `expected_output` is `WARN`
+/// with a documented reason; a present-but-malformed one is `WARN` with
+/// the specific defect named. A well-formed one is `OK`.
+fn classify_output_contract_lint(extras: &serde_json::Value) -> serde_json::Value {
+    let expected = match extras.get("expected_output") {
+        Some(v) => v,
+        None => {
+            return serde_json::json!({
+                "severity": "WARN",
+                "present": false,
+                "reason": "no expected_output declared in profile.extras",
+            });
+        }
+    };
+    let obj = match expected.as_object() {
+        Some(o) => o,
+        None => {
+            return serde_json::json!({
+                "severity": "WARN",
+                "present": true,
+                "reason": "expected_output is not a JSON object",
+            });
+        }
+    };
+    let kind = match obj.get("kind").and_then(|v| v.as_str()) {
+        Some(k) => k,
+        None => {
+            return serde_json::json!({
+                "severity": "WARN",
+                "present": true,
+                "reason": "expected_output missing string field `kind`",
+            });
+        }
+    };
+    match kind {
+        "literal_enum" | "inline_markdown" | "file_sentinel" => serde_json::json!({
+            "severity": "OK",
+            "present": true,
+            "kind": kind,
+        }),
+        other => serde_json::json!({
+            "severity": "WARN",
+            "present": true,
+            "reason": format!("unknown expected_output.kind: {other}"),
+        }),
     }
 }
 
@@ -1852,7 +1985,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Per-Blueprint agent.md size check. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline."
+        description = "Per-Blueprint agent.md size check plus GH #45 contract lints. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline. GH #45: each agent entry also carries `tool_lint` (phantom MCP tool refs — profile.tools entries with the `mcp__mse__` prefix are compared against the live `mse://api/mcp-tools` registry; unknown names surface as WARN with the unknown tool list) and `output_contract_lint` (absent or malformed `profile.extras.expected_output` under the GH #44 convention surfaces as WARN with a specific reason). Either family can be disabled per call via `disable_tool_lint` / `disable_output_contract_lint`; the disabled family's field is omitted entirely from each entry (not `null`) so a caller cannot mistake a disabled family for a passed check. The aggregate verdict folds size + tool + contract severities via the same OK/WARN/BLOCK precedence."
     )]
     async fn bp_doctor(
         &self,
@@ -1899,8 +2032,22 @@ impl MseServer {
         let bp: Blueprint = serde_json::from_value(bp_value)
             .map_err(|e| McpError::internal_error(format!("bp_doctor bp parse: {e}"), None))?;
 
+        // GH #45: build the MCP tool-name registry once per invocation
+        // so `classify_tool_lint` is a pure function (registry threaded
+        // in by reference), and cache the per-family disable flags so
+        // the flag lookup is out of the per-agent loop.
+        let tool_registry = build_mcp_tool_registry();
+        let disable_tool_lint = req.disable_tool_lint.unwrap_or(false);
+        let disable_output_contract_lint = req.disable_output_contract_lint.unwrap_or(false);
+
         let mut per_agent = Vec::with_capacity(bp.agents.len());
         let mut severities: Vec<&'static str> = Vec::with_capacity(bp.agents.len());
+        // GH #45: track lint-family severities separately so the
+        // aggregate verdict can factor them in without disturbing the
+        // size-check `severities` vec (which downstream callers already
+        // consume verbatim).
+        let mut tool_lint_severities: Vec<String> = Vec::new();
+        let mut output_contract_lint_severities: Vec<String> = Vec::new();
         for agent in &bp.agents {
             let (bytes, lines) = match &agent.profile {
                 Some(p) => (p.system_prompt.len(), p.system_prompt.lines().count()),
@@ -1948,10 +2095,67 @@ impl MseServer {
                     }
                 }
             }
+
+            // GH #45: attach the two lint-family sections. When a
+            // family is disabled at the call site, the field is
+            // omitted entirely (not `null`) — matching the `delivery`
+            // field's conditional-presence convention above so a
+            // caller inspecting the response cannot mistake a
+            // disabled family for a passed check.
+            if !disable_tool_lint {
+                let tools_ref: &[String] = agent
+                    .profile
+                    .as_ref()
+                    .map(|p| p.tools.as_slice())
+                    .unwrap_or(&[]);
+                let tool_lint = classify_tool_lint(tools_ref, &tool_registry);
+                if let Some(sev) = tool_lint.get("severity").and_then(|v| v.as_str()) {
+                    tool_lint_severities.push(sev.to_string());
+                }
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("tool_lint".to_string(), tool_lint);
+                }
+            }
+            if !disable_output_contract_lint {
+                let extras = agent
+                    .profile
+                    .as_ref()
+                    .map(|p| &p.extras)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let contract_lint = classify_output_contract_lint(&extras);
+                if let Some(sev) = contract_lint.get("severity").and_then(|v| v.as_str()) {
+                    output_contract_lint_severities.push(sev.to_string());
+                }
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("output_contract_lint".to_string(), contract_lint);
+                }
+            }
+
             per_agent.push(entry);
         }
-        let verdict = aggregate_agent_md_verdict(&severities);
+        // GH #45: fold the two lint families into the aggregate verdict.
+        // `aggregate_agent_md_verdict` already implements the
+        // BLOCK-dominates-WARN-dominates-OK precedence — reuse it by
+        // pushing each family's severities into a single flattened
+        // vector so an agent with a passing size-check and a
+        // phantom-tool WARN still surfaces at the top-level verdict.
+        let mut all_severities: Vec<&str> = Vec::with_capacity(
+            severities.len() + tool_lint_severities.len() + output_contract_lint_severities.len(),
+        );
+        all_severities.extend(severities.iter().copied());
+        all_severities.extend(tool_lint_severities.iter().map(|s| s.as_str()));
+        all_severities.extend(output_contract_lint_severities.iter().map(|s| s.as_str()));
+        let verdict = aggregate_agent_md_verdict(&all_severities);
         let over_threshold_count = severities.iter().filter(|s| **s != "OK").count();
+        let tool_lint_warn_count = tool_lint_severities
+            .iter()
+            .filter(|s| s.as_str() != "OK")
+            .count();
+        let output_contract_lint_warn_count = output_contract_lint_severities
+            .iter()
+            .filter(|s| s.as_str() != "OK")
+            .count();
 
         let body = serde_json::json!({
             "bp_id": req.id,
@@ -1960,12 +2164,18 @@ impl MseServer {
             "verdict": verdict,
             "agent_count": bp.agents.len(),
             "over_threshold_count": over_threshold_count,
+            "tool_lint_warn_count": tool_lint_warn_count,
+            "output_contract_lint_warn_count": output_contract_lint_warn_count,
             "thresholds": {
                 "warn_bytes": thresholds.warn_bytes,
                 "warn_lines": thresholds.warn_lines,
                 "block_bytes": thresholds.block_bytes,
                 "block_lines": thresholds.block_lines,
                 "disable_block": thresholds.disable_block,
+            },
+            "lint_families": {
+                "tool_lint_enabled": !disable_tool_lint,
+                "output_contract_lint_enabled": !disable_output_contract_lint,
             },
             "agents": per_agent,
             "guide_ref": "mse://guides/agent-md-authoring",
@@ -3952,6 +4162,158 @@ mod tests {
         let (contract_out, meaningful_out) = classify_wrapper_only(&wrapper_only, &contract);
         assert!(contract_out.is_empty());
         assert_eq!(meaningful_out, strs(&["Read", "read"]));
+    }
+
+    // ─── GH #45: bp_doctor tool_lint / output_contract_lint ───────────
+
+    #[test]
+    fn build_mcp_tool_registry_contains_the_actual_mcp_tools() {
+        // The registry is the ground truth for `classify_tool_lint`;
+        // asserting non-emptiness and a couple of load-bearing tool
+        // names here catches a schema-generation regression that would
+        // otherwise silently flag every real tool call as unknown.
+        let reg = build_mcp_tool_registry();
+        assert!(
+            !reg.is_empty(),
+            "registry must be populated from the tool router"
+        );
+        for name in ["mse_worker_fetch", "mse_worker_submit", "bp_doctor"] {
+            assert!(
+                reg.contains(name),
+                "registry must include {name} (all: {reg:?})"
+            );
+        }
+    }
+
+    fn tool_registry_fixture() -> std::collections::BTreeSet<String> {
+        // A hand-rolled subset of the real registry — keeps the pure
+        // helper tests independent of the tool router's live output so
+        // adding / renaming a tool does not force this file to move.
+        ["mse_worker_fetch", "mse_worker_submit", "bp_doctor"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn tool_lint_returns_ok_when_every_mcp_ref_is_in_the_registry() {
+        let tools = strs(&[
+            "Read",
+            "Edit",
+            "mcp__mse__mse_worker_fetch",
+            "mcp__mse__mse_worker_submit",
+        ]);
+        let lint = classify_tool_lint(&tools, &tool_registry_fixture());
+        assert_eq!(lint["severity"], "OK");
+        assert_eq!(lint["unknown_tools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn tool_lint_flags_a_phantom_mcp_tool_reference_as_warn() {
+        let tools = strs(&[
+            "Read",
+            "mcp__mse__mse_worker_fetch",
+            "mcp__mse__mse_ghost_tool",
+        ]);
+        let lint = classify_tool_lint(&tools, &tool_registry_fixture());
+        assert_eq!(lint["severity"], "WARN");
+        assert_eq!(
+            lint["unknown_tools"],
+            serde_json::json!(["mcp__mse__mse_ghost_tool"])
+        );
+    }
+
+    #[test]
+    fn tool_lint_skips_claude_builtins_that_are_not_in_the_registry() {
+        // Read / Edit / Grep / Bash never appear in an MCP registry;
+        // they must not surface as phantom references. This asserts
+        // the heuristic's stated `mcp__mse__`-prefix scope.
+        let tools = strs(&["Read", "Edit", "Grep", "Bash", "WebFetch"]);
+        let lint = classify_tool_lint(&tools, &tool_registry_fixture());
+        assert_eq!(lint["severity"], "OK");
+        assert_eq!(lint["unknown_tools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn tool_lint_empty_profile_tools_is_ok() {
+        let lint = classify_tool_lint(&[], &tool_registry_fixture());
+        assert_eq!(lint["severity"], "OK");
+        assert_eq!(lint["unknown_tools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn output_contract_lint_returns_warn_when_extras_has_no_expected_output() {
+        let extras = serde_json::json!({ "other_key": 1 });
+        let lint = classify_output_contract_lint(&extras);
+        assert_eq!(lint["severity"], "WARN");
+        assert_eq!(lint["present"], false);
+        assert!(lint["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no expected_output"));
+    }
+
+    #[test]
+    fn output_contract_lint_returns_warn_when_extras_is_null() {
+        // profile-less agents surface as `Value::Null` extras — this
+        // asserts the helper handles that path without panicking or
+        // treating null as "present".
+        let lint = classify_output_contract_lint(&serde_json::Value::Null);
+        assert_eq!(lint["severity"], "WARN");
+        assert_eq!(lint["present"], false);
+    }
+
+    #[test]
+    fn output_contract_lint_accepts_every_documented_kind() {
+        for kind in ["literal_enum", "inline_markdown", "file_sentinel"] {
+            let extras = serde_json::json!({
+                "expected_output": {"kind": kind, "pattern": "any"}
+            });
+            let lint = classify_output_contract_lint(&extras);
+            assert_eq!(lint["severity"], "OK", "kind={kind}");
+            assert_eq!(lint["present"], true);
+            assert_eq!(lint["kind"], kind);
+        }
+    }
+
+    #[test]
+    fn output_contract_lint_flags_unknown_kind_as_warn() {
+        let extras = serde_json::json!({
+            "expected_output": {"kind": "something_else"}
+        });
+        let lint = classify_output_contract_lint(&extras);
+        assert_eq!(lint["severity"], "WARN");
+        assert_eq!(lint["present"], true);
+        assert!(lint["reason"]
+            .as_str()
+            .unwrap()
+            .contains("unknown expected_output.kind: something_else"));
+    }
+
+    #[test]
+    fn output_contract_lint_flags_expected_output_that_is_not_an_object() {
+        let extras = serde_json::json!({ "expected_output": "literal_enum" });
+        let lint = classify_output_contract_lint(&extras);
+        assert_eq!(lint["severity"], "WARN");
+        assert_eq!(lint["present"], true);
+        assert!(lint["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not a JSON object"));
+    }
+
+    #[test]
+    fn output_contract_lint_flags_object_missing_kind_as_warn() {
+        let extras = serde_json::json!({
+            "expected_output": {"pattern": "foo|bar"}
+        });
+        let lint = classify_output_contract_lint(&extras);
+        assert_eq!(lint["severity"], "WARN");
+        assert_eq!(lint["present"], true);
+        assert!(lint["reason"]
+            .as_str()
+            .unwrap()
+            .contains("missing string field `kind`"));
     }
 
     // ─── GH #34: mse_doctor audit_findings surfacing ───────────
