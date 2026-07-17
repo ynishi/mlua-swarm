@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1](https://github.com/ynishi/mlua-swarm/compare/v0.12.0...v0.12.1) - 2026-07-17
+
+### Added
+
+- *(bp_doctor)* add tool_lint + output_contract_lint families (GH #45)
+
+### Other
+
+- *(serve)* lock in operator-session non-persistence across restart
+- strip internal subtask/ST narrative from public code doc
+- *(mcp-resources)* surface GET /v1/worker/prompt schema (WorkerPayload)
+
 ## [0.12.0](https://github.com/ynishi/mlua-swarm/compare/v0.11.0...v0.12.0) - 2026-07-17
 
 ### Added
