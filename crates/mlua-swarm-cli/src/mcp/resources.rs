@@ -288,6 +288,8 @@ pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Er
     let run_kick_request = serde_json::to_value(&run_kick_request_schema)?;
     let run_kick_response_schema = schemars::schema_for!(mlua_swarm_server::RunKickResponse);
     let run_kick_response = serde_json::to_value(&run_kick_response_schema)?;
+    let worker_payload_schema = schemars::schema_for!(mlua_swarm::WorkerPayload);
+    let worker_payload = serde_json::to_value(&worker_payload_schema)?;
 
     Ok(serde_json::json!({
         "endpoints": {
@@ -310,6 +312,10 @@ pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Er
             "POST /v1/tasks/:id/runs": {
                 "request": run_kick_request,
                 "response": run_kick_response,
+            },
+            "GET /v1/worker/prompt": {
+                "$comment": "Worker self-fetch. Query: `task_id=<StepId>`. Auth: `Authorization: Bearer <worker_handle>` (short handle from the Spawn frame, or full capability_token). Response body = WorkerPayload; `context` carries the AgentContextView (GH #20 Contract C) when AgentContextMiddleware was layered; exactly one of `system` / `system_ref` is populated when a system_prompt was baked (GH #31).",
+                "response": worker_payload,
             },
         },
     }))
@@ -420,11 +426,26 @@ mod tests {
             "POST /v1/tasks",
             "GET /v1/tasks/:id",
             "POST /v1/tasks/:id/runs",
+            "GET /v1/worker/prompt",
         ] {
             assert!(
                 endpoints.contains_key(key),
                 "endpoints map must include {key}, got keys: {:?}",
                 endpoints.keys().collect::<Vec<_>>()
+            );
+        }
+        // GET /v1/worker/prompt response is the WorkerPayload schema —
+        // GH #20 Contract C means the `context` field (AgentContextView)
+        // must surface here so authoring readers can discover it without
+        // reading the wire struct source directly.
+        let worker_prompt_response = &endpoints["GET /v1/worker/prompt"]["response"];
+        let worker_props = worker_prompt_response
+            .get("properties")
+            .expect("GET /v1/worker/prompt response must expose properties");
+        for field in ["task_id", "attempt", "agent", "prompt", "context"] {
+            assert!(
+                worker_props.get(field).is_some(),
+                "WorkerPayload schema must expose {field}: {worker_prompt_response}"
             );
         }
         // POST /v1/tasks request schema must expose the TaskLaunchRequest
