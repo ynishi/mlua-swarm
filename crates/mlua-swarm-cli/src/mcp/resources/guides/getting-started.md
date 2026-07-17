@@ -69,14 +69,20 @@ Notable flags (see `mse serve --help` for the full set):
   `$agent_md` refs in seeded Blueprint bodies.
 
 On boot, `mse serve` sweeps any `Run`/`Task` left `Running` from a prior
-process into a terminal `Interrupted` status (reason `"server restart"`) —
-persisted state never resumes an in-flight run, it is only marked so
-`GET /v1/runs/:id` reports the truth after a crash or restart.
+process into an `Interrupted` status (reason `"server restart"`). Runs
+that recorded at least one Ctx-snapshot replay entry before the crash
+are logged as **resumable candidates** at `tracing::info!` level; the
+attached operator can then bring them back to `Done` by kicking
+`POST /v1/runs/:id/resume` (state-driven, same `run_id`). Runs with
+no replay entries are logged at `debug!` level — they can only be
+rekicked, not resumed. Full replay wire narrative:
+`mse://guides/replay-and-resume`.
 
-Routes served: `/v1/tasks`, `/v1/tasks/:id/runs` (re-kick), `/v1/status`
-(occupancy: `{running_runs, attached_operators}`, used by the
-`mlua_swarm_server_restart`/`_shutdown` MCP tools' busy-refusal guard),
-`/v1/operators` (WS login flow), `/v1/blueprints`, `/v1/issues`,
+Routes served: `/v1/tasks`, `/v1/tasks/:id/runs` (re-kick — fresh
+`RunId`), `/v1/runs/:id/resume` (state-driven resume — same `RunId`),
+`/v1/status` (occupancy: `{running_runs, attached_operators}`, used by
+the `mlua_swarm_server_restart`/`_shutdown` MCP tools' busy-refusal
+guard), `/v1/operators` (WS login flow), `/v1/blueprints`, `/v1/issues`,
 `/v1/enhance-settings`, `/v1/worker/*`.
 
 ### `mse mcp`

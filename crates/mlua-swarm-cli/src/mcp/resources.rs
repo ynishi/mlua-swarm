@@ -98,6 +98,7 @@ const OPERATOR_EXECUTION_MODEL_BODY: &str =
 const AGENT_MD_AUTHORING_BODY: &str = include_str!("./resources/guides/agent-md-authoring.md");
 const DSL_AUTHORING_GUIDE_BODY: &str = include_str!("./resources/guides/dsl-authoring.md");
 const WORKER_IO_CONTRACT_BODY: &str = include_str!("./resources/guides/worker-io-contract.md");
+const REPLAY_AND_RESUME_BODY: &str = include_str!("./resources/guides/replay-and-resume.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -169,6 +170,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "Why worker IN is one authenticated prompt fetch and OUT is path-free tool calls (submit / artifact?name=), with the server-side projection sink materializing the next step's IN files. Design rationale + authoring checklist.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(WORKER_IO_CONTRACT_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/replay-and-resume",
+        title: "mse — Replay & Resume",
+        description: "Ctx-snapshot replay log, SqliteReplayStore config + schema versioning (PRAGMA user_version state machine), POST /v1/runs/:id/resume state-driven endpoint (404/409/422/202), boot recovery sweep + resumable-log hint, and deferred pieces (boot auto-respawn / subprocess-mode E2E).",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(REPLAY_AND_RESUME_BODY),
     },
     ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",
