@@ -16,17 +16,13 @@
 //!    `Done`, then forces the `RunRecord` back to `Interrupted` via
 //!    the store handle (the cleanest way to stage a mid-flight restart
 //!    without hooking dispatch cancellation).
-//! 2. **Test-side replay seed** — one `ReplayEntry` for the run is
-//!    appended directly through the shared `SqliteReplayStore` handle,
-//!    simulating a partial-mid-run replay row that would have been
-//!    written by `Engine::dispatch_attempt_with_run_ctx`. See
-//!    `EngineDispatcher::dispatch` in `src/blueprint.rs` — it still
-//!    routes through the legacy `dispatch_attempt_with` and therefore
-//!    does not yet append replay rows; that wiring is a separate
-//!    subtask (out of this test's file scope — the `Core / engine
-//!    unchanged` constraint holds here) that this test treats as a hard
-//!    boundary via the seed. Once the dispatcher migration lands the
-//!    seed drops.
+//! 2. **Real replay append** — `EngineDispatcher::dispatch`
+//!    (`src/blueprint.rs`) routes through
+//!    `Engine::dispatch_attempt_with_run_ctx`, so Server A's successful
+//!    dispatch persists one `ReplayEntry` per step through the shared
+//!    `SqliteReplayStore` handle. The test asserts the row appears in
+//!    the store before forcing `Interrupted`, so Server B has real
+//!    replay content to resume against (no test-side seeding).
 //! 3. **Server A shutdown** — the `axum::serve` join handle is aborted
 //!    and every `AsyncIsleDriver` is `.shutdown().await`ed so the
 //!    SQLite writer threads flush cleanly (dropping without shutdown
@@ -39,10 +35,10 @@
 //!    directly on Server B's fresh store handle plus over HTTP via
 //!    `GET /v1/runs/:id`.
 //! 5. `POST /v1/runs/:id/resume` returns `202` with `replayed_steps: 1`
-//!    (the seeded row). Polling `GET /v1/runs/:id` settles on `Done`,
-//!    and the resumed run persists a `result_ref` — the persisted
-//!    launch-input snapshot + replay cursor are what let Server B
-//!    complete the same `run_id`.
+//!    (the row Server A appended). Polling `GET /v1/runs/:id` settles
+//!    on `Done`, and the resumed run persists a `result_ref` — the
+//!    persisted launch-input snapshot + replay cursor are what let
+//!    Server B complete the same `run_id`.
 //!
 //! The Core "identical final Ctx across a restart" invariant already
 //! has a byte-exact assertion at the in-process layer
@@ -61,7 +57,7 @@ use mlua_swarm::blueprint::{
 };
 use mlua_swarm::core::config::EngineCfg;
 use mlua_swarm::core::engine::Engine;
-use mlua_swarm::store::replay::{ReplayEntry, ReplayStore, SqliteReplayStore};
+use mlua_swarm::store::replay::{ReplayStore, SqliteReplayStore};
 use mlua_swarm::store::run::{RunStatus, RunStore, SqliteRunStore};
 use mlua_swarm::store::task::{SqliteTaskStore, TaskStore};
 use mlua_swarm::RunId;
@@ -274,34 +270,12 @@ async fn restart_across_server_processes_resumes_interrupted_run_under_same_id()
          Interrupted (launch_body={launch_body}, terminal_a={terminal_a:?})"
     );
 
-    // Test-side replay seed — one row for the identity step, as if
-    // `Engine::dispatch_attempt_with_run_ctx` had written it during
-    // dispatch. `EngineDispatcher::dispatch` (`src/blueprint.rs`) still
-    // routes through the legacy `dispatch_attempt_with` and does not
-    // append replay rows yet; the `Core / engine unchanged` constraint
-    // for this test scope means that wiring lands in a follow-up
-    // subtask. Until then this seed models the row that would have been
-    // persisted by the fully-wired dispatcher, so the SQLite roundtrip
-    // + resume-endpoint assertions below still exercise the code path
-    // this test cares about.
-    bundle_a
-        .replay_store
-        .append(ReplayEntry {
-            run_id: run_id.clone(),
-            step_ref: mlua_swarm::worker::baseline::AG_IDENTITY.to_string(),
-            input_hash: "e2e-seed-input-hash".to_string(),
-            occurrence: 0,
-            ctx_snapshot_json: "{}".to_string(),
-            step_output_json: serde_json::json!({
-                "by": "baseline-identity",
-                "agent": mlua_swarm::worker::baseline::AG_IDENTITY,
-                "echoed": "hello",
-            })
-            .to_string(),
-            created_at: 0,
-        })
-        .await
-        .expect("seed replay entry on server A");
+    // Server A's dispatch is expected to have appended one Ctx-snapshot
+    // row to the replay log via `EngineDispatcher::dispatch` →
+    // `Engine::dispatch_attempt_with_run_ctx`. No test-side seeding —
+    // we assert the row appears on the shared SQLite handle so that
+    // Server B (fresh process, same file) has real replay content to
+    // resume against.
     let logged_a = bundle_a
         .replay_store
         .list_by_run(&run_id)
@@ -310,7 +284,8 @@ async fn restart_across_server_processes_resumes_interrupted_run_under_same_id()
     assert_eq!(
         logged_a.len(),
         1,
-        "seeded replay entry must land in the SQLite store (got {:?})",
+        "dispatch on server A must append exactly one ReplayEntry \
+         for the identity step (got {:?})",
         logged_a
     );
 

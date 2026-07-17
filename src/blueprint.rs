@@ -1,7 +1,7 @@
 //! Blueprint runner — glue that executes a flow.ir AST
 //! (`mlua_flow_ir::Node`) through the engine. Each `Step.ref` is run as a
-//! single task via `start_task` + `dispatch_attempt_with`, and the
-//! resulting `Pass` `Value` is written back to `Step.out`.
+//! single task via `start_task` + `dispatch_attempt_with_run_ctx`, and
+//! the resulting `Pass` `Value` is written back to `Step.out`.
 //!
 //! **Fully-async chain.** Uses `mlua_flow_ir::eval_async` and
 //! `AsyncDispatcher`; `block_on` and `spawn_blocking` are never mixed in,
@@ -57,13 +57,15 @@ pub use mlua_swarm_schema::{
 };
 
 /// Bridges `mlua_flow_ir::AsyncDispatcher` to the engine's
-/// `start_task` + `dispatch_attempt_with` pair. Holds one Operator session
-/// token and one `spawner`, and spins up a fresh task per `Step.ref`, using
-/// it as the agent name.
+/// `start_task` + `dispatch_attempt_with_run_ctx` pair. Holds one
+/// Operator session token and one `spawner`, and spins up a fresh task
+/// per `Step.ref`, using it as the agent name.
 ///
 /// Constructed via `with_spawner`; each dispatch goes through
-/// `engine.dispatch_attempt_with(token, tid, spawner, run_id)`, carrying the
-/// spawner per request. Nothing is stashed on engine-global state, so
+/// `engine.dispatch_attempt_with_run_ctx(token, tid, spawner, run_ctx)`
+/// so that when the enclosing `RunContext` carries a `replay_store` /
+/// `replay_cursor`, replay-hit skip and Ctx-snapshot append happen
+/// transparently. Nothing is stashed on engine-global state, so
 /// multiple dispatchers can drive different Blueprints against the same
 /// `Engine` in parallel without racing.
 ///
@@ -334,7 +336,7 @@ impl AsyncDispatcher for EngineDispatcher {
         // as `TaskSpec.initial_directive` — no premature `Value → String`
         // coercion here. Consumers that need a rendered `String` do so at
         // their own late boundary: `Engine::start_task` /
-        // `Engine::dispatch_attempt_with` render it into the
+        // `Engine::dispatch_attempt_with_run_ctx` render it into the
         // `EngineState.prompts` table for the Worker HTTP path
         // (`/v1/worker/prompt`), and
         // `operator_ws::session::default_spawn_directive_with_task_directive`
@@ -418,10 +420,22 @@ impl AsyncDispatcher for EngineDispatcher {
             }
         }
 
-        let run_id_for_ctx = self.run_ctx.as_ref().map(|rc| rc.run_id.clone());
+        // Route dispatch through the replay-aware sibling. When
+        // `run_ctx` carries a `replay_cursor` populated by the caller
+        // (`POST /v1/runs/:id/resume`), a matching row short-circuits
+        // to `DispatchOutcome::Pass` without touching the spawner; when
+        // `run_ctx.replay_store` is `Some`, every fresh Pass appends
+        // one Ctx-snapshot row so a later resume can replay it. With
+        // `run_ctx = None` this collapses to the same behavior as the
+        // legacy `dispatch_attempt_with(..., None)` call.
         let outcome = self
             .engine
-            .dispatch_attempt_with(&self.op_token, &tid, &self.spawner, run_id_for_ctx.as_ref())
+            .dispatch_attempt_with_run_ctx(
+                &self.op_token,
+                &tid,
+                &self.spawner,
+                self.run_ctx.as_ref(),
+            )
             .await;
 
         // issue #13 run_id propagation: append one step_entry per dispatched
