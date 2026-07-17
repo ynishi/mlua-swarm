@@ -352,6 +352,27 @@ struct BpDoctorReq {
     disable_output_contract_lint: Option<bool>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct BpBuildReq {
+    /// Path to the `.bp.lua` DSL script (absolute, or relative to the
+    /// mse-mcp process CWD).
+    script_path: String,
+    /// POST the built JSON to the running `mse serve`
+    /// (`/v1/blueprints/:id`). Default true — this tool exists so a
+    /// `.bp.lua` script can be registered without shelling out to
+    /// `mse bp build --register`. Pass false for a build+lint-only dry
+    /// run (the built JSON is then included in the response).
+    #[serde(default = "default_true_bool")]
+    register: bool,
+    /// mse serve bind address (default 127.0.0.1:7777).
+    #[serde(default)]
+    bind: Option<String>,
+    /// Also write the built (pre-expansion) Blueprint JSON to this path,
+    /// pretty-printed — same as the CLI's `-o`.
+    #[serde(default)]
+    out: Option<String>,
+}
+
 /// Default directory holding worker wrapper `.md` files, relative to the
 /// mse-mcp process CWD — matches the Claude Code convention
 /// (`.claude/agents/<variant>.md`).
@@ -1951,6 +1972,106 @@ impl MseServer {
         let body = resources::blueprint_schema_value()
             .map_err(|e| McpError::internal_error(format!("schema serialize: {e}"), None))?;
         json_result(&body)
+    }
+
+    #[tool(
+        description = "Build a `.bp.lua` authoring-DSL script into canonical Blueprint JSON and (by default) register it with the running `mse serve` — the MCP twin of the `mse bp build --register` CLI, so a Blueprint can go from Lua script to registered without shelling out. Pipeline: run the script in an embedded Lua VM (`require(\"flow_dsl\")` / `require(\"bp_dsl\")`), best-effort compile-lint the result through the real Compiler (includes the GH #50 verdict-contract lints; reported as `lint: \"skipped: ...\"` — never silently — when `$file`/`$agent_md` refs cannot be resolved relative to the script's own directory, since the server resolves those itself against its `--blueprint-ref-base` at register time), then POST the built JSON to `/v1/blueprints/:id`. The server never runs Lua — JSON stays the canonical wire format; the DSL is an authoring frontend (GH #52). Failures return `status: \"error\"` with a `stage` field (read | build | lint | write_out | register) so an authoring loop can fix the script and re-call. Pass `register=false` for a build+lint-only dry run; the dry run (and any lint error) includes the built JSON as `blueprint` for inspection, while a successful register returns `json_bytes` instead (read it back via bp-family read tools or the emitted `out` file)."
+    )]
+    async fn bp_build(
+        &self,
+        Parameters(req): Parameters<BpBuildReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let script_path = std::path::PathBuf::from(&req.script_path);
+        let script = match std::fs::read_to_string(&script_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return json_result(&serde_json::json!({
+                    "status": "error",
+                    "stage": "read",
+                    "script_path": req.script_path,
+                    "error": e.to_string(),
+                }))
+            }
+        };
+        let bp_value = match mlua_swarm_cli::dsl::build_bp_from_script(&script) {
+            Ok(v) => v,
+            Err(e) => {
+                return json_result(&serde_json::json!({
+                    "status": "error",
+                    "stage": "build",
+                    "script_path": req.script_path,
+                    "error": format!("{e:#}"),
+                }))
+            }
+        };
+        let lint = match crate::bp::compile_lint(&bp_value, &script_path) {
+            Ok(crate::bp::LintReport::Ok { agents, operators }) => {
+                format!("ok ({agents} agent(s), {operators} operator(s) checked)")
+            }
+            Ok(crate::bp::LintReport::Skipped { reason }) => format!("skipped: {reason}"),
+            Err(e) => {
+                return json_result(&serde_json::json!({
+                    "status": "error",
+                    "stage": "lint",
+                    "script_path": req.script_path,
+                    "error": format!("{e:#}"),
+                    "blueprint": bp_value,
+                }))
+            }
+        };
+        let bp_id = bp_value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if let Some(out) = &req.out {
+            let pretty = serde_json::to_string_pretty(&bp_value)
+                .map_err(|e| McpError::internal_error(format!("bp_build stringify: {e}"), None))?;
+            if let Err(e) = std::fs::write(out, &pretty) {
+                return json_result(&serde_json::json!({
+                    "status": "error",
+                    "stage": "write_out",
+                    "bp_id": bp_id,
+                    "lint": lint,
+                    "out": out,
+                    "error": e.to_string(),
+                }));
+            }
+        }
+        if !req.register {
+            return json_result(&serde_json::json!({
+                "status": "built",
+                "bp_id": bp_id,
+                "lint": lint,
+                "out": req.out,
+                "blueprint": bp_value,
+            }));
+        }
+        let bind = req
+            .bind
+            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+        match crate::bp::register(&bp_value, Some(&bind)).await {
+            Ok(outcome) => {
+                let json_bytes = serde_json::to_vec(&bp_value).map(|v| v.len()).unwrap_or(0);
+                json_result(&serde_json::json!({
+                    "status": "registered",
+                    "bp_id": bp_id,
+                    "lint": lint,
+                    "out": req.out,
+                    "url": outcome.url,
+                    "http_status": outcome.http_status,
+                    "body": outcome.body,
+                    "json_bytes": json_bytes,
+                }))
+            }
+            Err(e) => json_result(&serde_json::json!({
+                "status": "error",
+                "stage": "register",
+                "bp_id": bp_id,
+                "lint": lint,
+                "bind": bind,
+                "error": format!("{e:#}"),
+            })),
+        }
     }
 
     #[tool(

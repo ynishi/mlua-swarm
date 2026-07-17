@@ -28,6 +28,11 @@
 //!    `http://<server>/v1/blueprints/<id>` (the server resolves
 //!    `$agent_md` itself). Failure exits non-zero with a message; no
 //!    retry.
+//!
+//! The same pipeline is exposed as the `bp_build` MCP tool (`mse mcp`,
+//! see `crate::mcp`) so MCP clients can register a `.bp.lua` without
+//! shelling out — [`compile_lint`] / [`register`] are `pub(crate)` for
+//! that caller.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -89,7 +94,14 @@ async fn run_build(args: BuildArgs) -> Result<()> {
     let bp_value = dsl::build_bp_from_script(&script)
         .with_context(|| format!("building Blueprint from {}", args.script.display()))?;
 
-    compile_lint(&bp_value, &args.script)?;
+    match compile_lint(&bp_value, &args.script)? {
+        LintReport::Ok { agents, operators } => {
+            eprintln!("compile lint: OK ({agents} agent(s), {operators} operator(s) checked)");
+        }
+        LintReport::Skipped { reason } => {
+            eprintln!("compile lint: skipped — {reason}");
+        }
+    }
 
     let out_str = serde_json::to_string_pretty(&bp_value)?;
     match &args.out {
@@ -101,29 +113,46 @@ async fn run_build(args: BuildArgs) -> Result<()> {
     }
 
     if args.register {
-        register(&bp_value, args.server.as_deref()).await?;
+        let outcome = register(&bp_value, args.server.as_deref()).await?;
+        eprintln!(
+            "register: {} -> HTTP {}: {}",
+            outcome.url, outcome.http_status, outcome.body
+        );
     }
 
     Ok(())
+}
+
+/// How a [`compile_lint`] invocation concluded (a lint *failure* is the
+/// `Err` arm of the `Result`, not a variant here). Shared with the
+/// `bp_build` MCP tool (`crate::mcp`), which reports it as a response
+/// field instead of printing to stderr.
+pub(crate) enum LintReport {
+    /// The full compile lint ran against the resolved Blueprint.
+    Ok { agents: usize, operators: usize },
+    /// `$file`/`$agent_md` refs could not be resolved locally, so only the
+    /// static DSL shape was validated (never a silent skip).
+    Skipped { reason: String },
 }
 
 /// Step 2 of the module doc's pipeline: best-effort compile lint. Never
 /// hard-fails on an unresolved `$agent_md`/`$file` ref — that's the
 /// server's job at register time via its own `--blueprint-ref-base` —
 /// but always reports explicitly when it had to skip (no silent skip).
-fn compile_lint(bp_value: &serde_json::Value, script_path: &Path) -> Result<()> {
+pub(crate) fn compile_lint(bp_value: &serde_json::Value, script_path: &Path) -> Result<LintReport> {
     let base = script_path.parent().unwrap_or_else(|| Path::new("."));
     let default_kind = mlua_swarm::blueprint::loader::pre_read_default_agent_kind(bp_value);
     let expanded = match mlua_swarm::expand_file_refs(bp_value.clone(), base, default_kind) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "compile lint: skipped — could not resolve $file/$agent_md refs relative to \
-                 {} ({e}). Only the static DSL shape was validated; the server resolves these \
-                 refs against its own --blueprint-ref-base at register time.",
-                base.display()
-            );
-            return Ok(());
+            return Ok(LintReport::Skipped {
+                reason: format!(
+                    "could not resolve $file/$agent_md refs relative to {} ({e}). Only the \
+                     static DSL shape was validated; the server resolves these refs against \
+                     its own --blueprint-ref-base at register time.",
+                    base.display()
+                ),
+            });
         }
     };
     let bp: mlua_swarm::Blueprint = serde_json::from_value(expanded).map_err(|e| {
@@ -134,12 +163,10 @@ fn compile_lint(bp_value: &serde_json::Value, script_path: &Path) -> Result<()> 
     Compiler::new(registry)
         .compile(&bp)
         .map_err(|e| anyhow!("compile lint FAILED: {e}"))?;
-    eprintln!(
-        "compile lint: OK ({} agent(s), {} operator(s) checked)",
-        bp.agents.len(),
-        bp.operators.len()
-    );
-    Ok(())
+    Ok(LintReport::Ok {
+        agents: bp.agents.len(),
+        operators: bp.operators.len(),
+    })
 }
 
 /// A stub `Operator` backend used only so `kind = operator` agents (the
@@ -188,8 +215,20 @@ fn lint_registry(bp: &mlua_swarm::Blueprint) -> SpawnerRegistry {
     reg
 }
 
+/// A successful `--register` POST, for the caller to report (the CLI
+/// prints it to stderr; the `bp_build` MCP tool returns it as response
+/// fields).
+pub(crate) struct RegisterOutcome {
+    pub url: String,
+    pub http_status: u16,
+    pub body: String,
+}
+
 /// Step 4: `--register`. Failure exits non-zero with a message; no retry.
-async fn register(bp_value: &serde_json::Value, server: Option<&str>) -> Result<()> {
+pub(crate) async fn register(
+    bp_value: &serde_json::Value,
+    server: Option<&str>,
+) -> Result<RegisterOutcome> {
     let server = server.unwrap_or(DEFAULT_SERVER);
     let id = bp_value
         .get("id")
@@ -208,6 +247,9 @@ async fn register(bp_value: &serde_json::Value, server: Option<&str>) -> Result<
     if !status.is_success() {
         return Err(anyhow!("register: {url} returned HTTP {status}: {body}"));
     }
-    eprintln!("register: {url} -> HTTP {status}: {body}");
-    Ok(())
+    Ok(RegisterOutcome {
+        url,
+        http_status: status.as_u16(),
+        body,
+    })
 }
