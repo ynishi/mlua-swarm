@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/ynishi/mlua-swarm/compare/v0.11.0...v0.12.0) - 2026-07-17
+
+### Added
+
+- *(serve,tests)* boot resumable-log classification + in-process E2E for restart-crossing resume
+- *(replay)* wire server / CLI / resume endpoint over Ctx-snapshot replay Core
+- *(store)* add Ctx-snapshot replay Core primitive
+
+### Fixed
+
+- *(store)* auto-migrate legacy SqliteReplayStore schema on open
+
+### Other
+
+- *(dispatch)* route EngineDispatcher through replay-aware dispatch_attempt_with_run_ctx
+- *(mcp-resources)* bundle the replay & resume wire narrative
+
 ### Added
 
 - *(store)* add Ctx-snapshot replay Core primitive (`store::replay` module with `ReplayStore` trait, `InMemoryReplayStore`, `SqliteReplayStore`, and `ReplayCursor`) plus `Engine::dispatch_attempt_with_run_ctx` for deterministic step-level replay of a `Ctx` across a fresh engine
