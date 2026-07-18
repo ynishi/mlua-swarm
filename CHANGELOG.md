@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.3](https://github.com/ynishi/mlua-swarm/compare/v0.12.2...v0.12.3) - 2026-07-18
+
+### Added
+
+- *(dsl)* add opt-in `chain = true` to B.pipeline sugar (GH #65)
+
+### Fixed
+
+- *(cli)* restore #[test] on pipeline_template_documents_init_ctx_seeding
+
+### Other
+
+- Merge branch 'fix/gh-67-swarm-status-stale'
+- Merge branch 'fix/gh-66-scaffold-operator-kind'
+- Merge branch 'fix/gh-65-pipeline-chain-option'
+
 ## [0.12.2](https://github.com/ynishi/mlua-swarm/compare/v0.12.1...v0.12.2) - 2026-07-18
 
 ### Added
