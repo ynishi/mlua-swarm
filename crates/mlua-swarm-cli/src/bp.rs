@@ -201,8 +201,7 @@ fn run_new(args: NewArgs) -> Result<()> {
     let out = render_template(&args)?;
     match &args.out {
         Some(path) => {
-            std::fs::write(path, &out)
-                .with_context(|| format!("writing {}", path.display()))?;
+            std::fs::write(path, &out).with_context(|| format!("writing {}", path.display()))?;
             eprintln!("mse bp new: wrote {} ({} bytes)", path.display(), out.len());
         }
         None => print!("{out}"),
@@ -314,7 +313,11 @@ fn render_pipeline_template(
     out.push_str("-- Scaffolded by `mse bp new pipeline` (GH #62 Axis A).\n");
     out.push_str("-- Every mandatory field is pre-filled: `halted_at` (compile-lint\n");
     out.push_str("-- default), each operator agent's `profile.worker_binding` (WS\n");
-    out.push_str("-- thin-path requirement, GH #61), `strict_refs` + `strict_kind`.\n\n");
+    out.push_str("-- thin-path requirement, GH #61), the operator's `kind` (main_ai,\n");
+    out.push_str("-- so a caller can omit `operator_kind` at swarm_run time and the\n");
+    out.push_str("-- BP Agent-level tier of the OperatorKind cascade routes spawns to\n");
+    out.push_str("-- a joined main-ai session instead of silently falling through to\n");
+    out.push_str("-- the Automate backend, GH #66), `strict_refs` + `strict_kind`.\n\n");
     out.push_str("local B = require(\"bp_dsl\")\n\n");
     out.push_str("local flow = B.pipeline({\n");
     for stage in stages {
@@ -337,7 +340,7 @@ fn render_pipeline_template(
     }
     out.push_str("  },\n");
     out.push_str(&format!(
-        "  operators = {{ {{ name = \"{operator}\" }} }},\n"
+        "  operators = {{ {{ name = \"{operator}\", kind = \"main_ai\" }} }},\n"
     ));
     out.push_str("  strategy = { strict_refs = true, strict_kind = true },\n");
     out.push_str(&format!(
@@ -352,7 +355,10 @@ fn render_single_template(name: &str, agent: &str, operator: &str, binding: &str
     out.push_str("-- Scaffolded by `mse bp new single` (GH #62 Axis A).\n");
     out.push_str("-- Minimal 1-step 1-agent shape — `flow_dsl` directly, no pipeline\n");
     out.push_str("-- sugar. All mandatory fields (`worker_binding`, `strict_refs`,\n");
-    out.push_str("-- `strict_kind`) are pre-filled.\n\n");
+    out.push_str("-- `strict_kind`) are pre-filled. The operator's `kind` is also\n");
+    out.push_str("-- pre-filled as `main_ai` (GH #66) so `swarm_run` can omit\n");
+    out.push_str("-- `operator_kind` at launch and spawns route to a joined\n");
+    out.push_str("-- main-ai session.\n\n");
     out.push_str("local F = require(\"flow_dsl\")\n\n");
     out.push_str(&format!(
         "local flow = F.step({{ id = \"{agent}\", agent = \"{agent}\", \
@@ -368,7 +374,7 @@ fn render_single_template(name: &str, agent: &str, operator: &str, binding: &str
     ));
     out.push_str("  },\n");
     out.push_str(&format!(
-        "  operators = {{ {{ name = \"{operator}\" }} }},\n"
+        "  operators = {{ {{ name = \"{operator}\", kind = \"main_ai\" }} }},\n"
     ));
     out.push_str("  strategy = { strict_refs = true, strict_kind = true },\n");
     out.push_str(&format!(
@@ -390,8 +396,11 @@ fn render_verdict_template(
     out.push_str(&format!(
         "-- Mirrors `mse://blueprints/samples/07-dsl-pipeline`: {analyze} -> \
          {review} (verdict-gated, bounded retry through fixer on BLOCKED) -> \
-         {publish}. All mandatory fields pre-filled.\n\n"
+         {publish}. All mandatory fields pre-filled.\n"
     ));
+    out.push_str("-- The operator's `kind` is also pre-filled as `main_ai` (GH #66)\n");
+    out.push_str("-- so `swarm_run` can omit `operator_kind` at launch and spawns\n");
+    out.push_str("-- route to a joined main-ai session.\n\n");
     out.push_str("local B = require(\"bp_dsl\")\n\n");
     out.push_str("local flow = B.pipeline({\n");
     out.push_str(&format!(
@@ -442,7 +451,7 @@ fn render_verdict_template(
     ));
     out.push_str("  },\n");
     out.push_str(&format!(
-        "  operators = {{ {{ name = \"{operator}\" }} }},\n"
+        "  operators = {{ {{ name = \"{operator}\", kind = \"main_ai\" }} }},\n"
     ));
     out.push_str("  strategy = { strict_refs = true, strict_kind = true },\n");
     out.push_str(&format!(
@@ -710,6 +719,10 @@ mod tests {
         // both appear in the rendered text.
         assert!(rendered.contains("worker_binding = \"claude\""));
         assert!(rendered.contains("halted_at = \"$.halted_at\""));
+        // GH #66: operator entry must pre-declare `kind = "main_ai"` so the
+        // BP Agent-level tier of the OperatorKind cascade resolves without
+        // requiring a `swarm_run(operator_kind = ...)` override.
+        assert!(rendered.contains("kind = \"main_ai\""));
         // Round-trip through the real Compiler — this is the AC.
         let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
         match report {
@@ -718,6 +731,30 @@ mod tests {
                 assert_eq!(operators, 1);
             }
             LintReport::Skipped { reason } => panic!("expected Ok, got Skipped: {reason}"),
+        }
+    }
+
+    #[test]
+    fn all_templates_pre_declare_operator_kind_main_ai() {
+        // GH #66: silent-fall-through fix. Every emitted template must
+        // include `kind = "main_ai"` inside its `operators = { ... }`
+        // block so a `swarm_run` invocation without an explicit
+        // `operator_kind` resolves through the BP Agent-level tier to
+        // `MainAi` instead of dropping to the default `Automate` — the
+        // silent fall-through the issue documents. Assert exactly the
+        // literal shape (`name = "..."` followed by `kind = "main_ai"`
+        // in the same operator entry) so a future refactor that splits
+        // the entry across lines still passes iff both fields land on
+        // the same entry.
+        for template in ["pipeline", "single", "verdict"] {
+            let rendered =
+                render_template_by_kind(template, "op-kind-check", None, None, None, None)
+                    .expect("render must succeed with defaults");
+            assert!(
+                rendered
+                    .contains("operators = { { name = \"main-ai\", kind = \"main_ai\" } }"),
+                "{template} template must emit an operator entry with `kind = \"main_ai\"` pre-declared, got: {rendered}"
+            );
         }
     }
 
@@ -790,24 +827,12 @@ mod tests {
                 .expect("render must succeed with partial stages");
         assert!(rendered.contains("B.stage \"scan\""));
         // Slot 2 / 3 fall back to defaults.
-        assert!(rendered.contains(&format!(
-            "B.stage \"{}\"",
-            DEFAULT_VERDICT_STAGES[1]
-        )));
-        assert!(rendered.contains(&format!(
-            "B.stage \"{}\"",
-            DEFAULT_VERDICT_STAGES[2]
-        )));
+        assert!(rendered.contains(&format!("B.stage \"{}\"", DEFAULT_VERDICT_STAGES[1])));
+        assert!(rendered.contains(&format!("B.stage \"{}\"", DEFAULT_VERDICT_STAGES[2])));
         // Extra names are truncated (>3 supplied → tail dropped).
-        let over = render_template_by_kind(
-            "verdict",
-            "rv-over",
-            Some("a,b,c,d,e"),
-            None,
-            None,
-            None,
-        )
-        .expect("render must succeed with over-supplied stages");
+        let over =
+            render_template_by_kind("verdict", "rv-over", Some("a,b,c,d,e"), None, None, None)
+                .expect("render must succeed with over-supplied stages");
         assert!(!over.contains("B.stage \"d\""));
         assert!(!over.contains("B.stage \"e\""));
     }
@@ -835,7 +860,9 @@ mod tests {
         let hint = fix_hint_from_compile_error(msg).expect("worker_binding hint must fire");
         assert_eq!(hint.kind, "worker-binding-missing");
         assert!(hint.reason.contains("greeter"));
-        assert!(hint.patch_suggestion.contains("worker_binding = \"claude\""));
+        assert!(hint
+            .patch_suggestion
+            .contains("worker_binding = \"claude\""));
         assert_eq!(
             hint.docs_ref.as_deref(),
             Some("mse://guides/bp-dsl-templates")
@@ -844,7 +871,8 @@ mod tests {
 
     #[test]
     fn fix_hint_worker_binding_reason_falls_back_when_no_agent_quoted() {
-        let msg = "compile lint FAILED: profile.worker_binding is required for this operator backend.";
+        let msg =
+            "compile lint FAILED: profile.worker_binding is required for this operator backend.";
         let hint = fix_hint_from_compile_error(msg).expect("worker_binding hint must fire");
         // Fallback reason (no agent name parsed) still names the kind
         // and remedy.
@@ -857,27 +885,28 @@ mod tests {
         let msg = "compile lint FAILED: value 'NOT_DECLARED' is not a member of the declared values [\"PASS\", \"BLOCKED\"]";
         let hint = fix_hint_from_compile_error(msg).expect("verdict hint must fire");
         assert_eq!(hint.kind, "verdict-value-not-in-contract");
-        assert!(hint
-            .reason
-            .contains("`agents[N].verdict.values`"));
-        assert!(hint
-            .patch_suggestion
-            .contains("add the cond's literal"));
+        assert!(hint.reason.contains("`agents[N].verdict.values`"));
+        assert!(hint.patch_suggestion.contains("add the cond's literal"));
     }
 
     #[test]
     fn fix_hint_halted_at_fires_on_missing_field_at() {
-        let msg = "compile lint FAILED: missing field `at` (hint: fetch the Blueprint JSON Schema...)";
+        let msg =
+            "compile lint FAILED: missing field `at` (hint: fetch the Blueprint JSON Schema...)";
         let hint = fix_hint_from_compile_error(msg).expect("halted_at hint must fire");
         assert_eq!(hint.kind, "halted-at-missing");
-        assert!(hint.patch_suggestion.contains("halted_at = \"$.halted_at\""));
+        assert!(hint
+            .patch_suggestion
+            .contains("halted_at = \"$.halted_at\""));
     }
 
     #[test]
     fn fix_hint_returns_none_for_unknown_lint_shape() {
         // A lint kind without a canonical fix recipe returns None so
         // the caller never renders a wrong-but-confident hint.
-        assert!(fix_hint_from_compile_error("some new lint the mapping doesn't know about").is_none());
+        assert!(
+            fix_hint_from_compile_error("some new lint the mapping doesn't know about").is_none()
+        );
         assert!(fix_hint_from_compile_error("").is_none());
     }
 
@@ -894,9 +923,8 @@ mod tests {
         // an empty Vec; the render fn falls back to the default set
         // rather than emitting a stage-less pipeline (which would be
         // rejected at compile-lint anyway).
-        let rendered =
-            render_template_by_kind("pipeline", "rp-empty", Some(""), None, None, None)
-                .expect("render must succeed and fall back");
+        let rendered = render_template_by_kind("pipeline", "rp-empty", Some(""), None, None, None)
+            .expect("render must succeed and fall back");
         let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
         assert!(matches!(
             report,
