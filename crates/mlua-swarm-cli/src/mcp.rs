@@ -2129,7 +2129,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Build a `.bp.lua` authoring-DSL script into canonical Blueprint JSON and (by default) register it with the running `mse serve` — the MCP twin of the `mse bp build --register` CLI, so a Blueprint can go from Lua script to registered without shelling out. Pipeline: run the script in an embedded Lua VM (`require(\"flow_dsl\")` / `require(\"bp_dsl\")`), best-effort compile-lint the result through the real Compiler (includes the GH #50 verdict-contract lints; reported as `lint: \"skipped: ...\"` — never silently — when `$file`/`$agent_md` refs cannot be resolved relative to the script's own directory, since the server resolves those itself against its `--blueprint-ref-base` at register time), then POST the built JSON to `/v1/blueprints/:id`. The server never runs Lua — JSON stays the canonical wire format; the DSL is an authoring frontend (GH #52). Failures return `status: \"error\"` with a `stage` field (read | build | lint | write_out | register) so an authoring loop can fix the script and re-call. Pass `register=false` for a build+lint-only dry run; the dry run (and any lint error) includes the built JSON as `blueprint` for inspection, while a successful register returns `json_bytes` instead (read it back via bp-family read tools or the emitted `out` file)."
+        description = "Build a `.bp.lua` authoring-DSL script into canonical Blueprint JSON and (by default) register it with the running `mse serve` — the MCP twin of the `mse bp build --register` CLI, so a Blueprint can go from Lua script to registered without shelling out. Pipeline: run the script in an embedded Lua VM (`require(\"flow_dsl\")` / `require(\"bp_dsl\")`), best-effort compile-lint the result through the real Compiler (includes the GH #50 verdict-contract lints; reported as `lint: \"skipped: ...\"` — never silently — when `$file`/`$agent_md` refs cannot be resolved relative to the script's own directory, since the server resolves those itself against its `--blueprint-ref-base` at register time), then POST the built JSON to `/v1/blueprints/:id`. The server never runs Lua — JSON stays the canonical wire format; the DSL is an authoring frontend (GH #52). Failures return `status: \"error\"` with a `stage` field (read | build | lint | write_out | register) so an authoring loop can fix the script and re-call. GH #62 Axis B.1: on `stage: \"lint\"` failures whose Compiler message matches a known lint kind (worker-binding-missing / verdict-value-not-in-contract / halted-at-missing), the response also carries `fix_hint: {kind, reason, patch_suggestion, docs_ref}` — a Clippy-style structured recovery hint the caller can render. `fix_hint` is `null` on lint failures without a canonical fix recipe (never a wrong-but-confident hint). Pass `register=false` for a build+lint-only dry run; the dry run (and any lint error) includes the built JSON as `blueprint` for inspection, while a successful register returns `json_bytes` instead (read it back via bp-family read tools or the emitted `out` file)."
     )]
     async fn bp_build(
         &self,
@@ -2164,13 +2164,26 @@ impl MseServer {
             }
             Ok(crate::bp::LintReport::Skipped { reason }) => format!("skipped: {reason}"),
             Err(e) => {
+                // GH #62 Axis B.1: attach a structured `fix_hint` when
+                // the Compiler error matches a known lint kind. `null`
+                // otherwise — never a wrong-but-confident hint.
+                let msg = format!("{e:#}");
+                let fix_hint = crate::bp::fix_hint_from_compile_error(&msg).map(|h| {
+                    serde_json::json!({
+                        "kind": h.kind,
+                        "reason": h.reason,
+                        "patch_suggestion": h.patch_suggestion,
+                        "docs_ref": h.docs_ref,
+                    })
+                });
                 return json_result(&serde_json::json!({
                     "status": "error",
                     "stage": "lint",
                     "script_path": req.script_path,
-                    "error": format!("{e:#}"),
+                    "error": msg,
+                    "fix_hint": fix_hint,
                     "blueprint": bp_value,
-                }))
+                }));
             }
         };
         let bp_id = bp_value

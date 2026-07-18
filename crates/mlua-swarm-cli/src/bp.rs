@@ -128,12 +128,35 @@ async fn run_build(args: BuildArgs) -> Result<()> {
     let bp_value = dsl::build_bp_from_script(&script)
         .with_context(|| format!("building Blueprint from {}", args.script.display()))?;
 
-    match compile_lint(&bp_value, &args.script)? {
-        LintReport::Ok { agents, operators } => {
+    match compile_lint(&bp_value, &args.script) {
+        Ok(LintReport::Ok { agents, operators }) => {
             eprintln!("compile lint: OK ({agents} agent(s), {operators} operator(s) checked)");
         }
-        LintReport::Skipped { reason } => {
+        Ok(LintReport::Skipped { reason }) => {
             eprintln!("compile lint: skipped — {reason}");
+        }
+        Err(e) => {
+            // GH #62 Axis B.1: on a lint failure, render a structured
+            // fix hint after the raw Compiler error when the message
+            // matches a known lint kind — Clippy-style diagnostic
+            // affordance without changing what stderr's exit code
+            // signals (still non-zero via the `?` on this arm below).
+            let msg = format!("{e:#}");
+            if let Some(hint) = fix_hint_from_compile_error(&msg) {
+                eprintln!();
+                eprintln!("fix hint ({}):", hint.kind);
+                eprintln!("  {}", hint.reason);
+                eprintln!();
+                eprintln!("  suggested patch:");
+                for line in hint.patch_suggestion.lines() {
+                    eprintln!("    {line}");
+                }
+                if let Some(docs) = &hint.docs_ref {
+                    eprintln!();
+                    eprintln!("  see: {docs}");
+                }
+            }
+            return Err(e);
         }
     }
 
@@ -429,6 +452,104 @@ fn render_verdict_template(
     out
 }
 
+/// GH #62 Axis B.1: structured hint attached to a compile-lint failure
+/// so authors see a concrete "add this line, here" instead of only the
+/// Compiler's symptom text (e.g. `missing field 'at'` naming a JSON
+/// shape violation without naming which DSL knob to add). The sibling
+/// `mse bp fix` auto-apply command (Axis B.2) is deliberately out of
+/// scope — the hint is prose the author applies by hand, not a
+/// machine-applied patch. Text-substring matching against the raw
+/// Compiler error is intentional: the underlying messages are stable
+/// literals in the `mlua-swarm` crate (see `src/blueprint/compiler.rs`)
+/// and coupling via typed error variants would require re-exporting
+/// the full `CompileError` shape through the crate boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FixHint {
+    /// Machine-readable lint kind key, stable across the hint content.
+    /// Downstream tooling (a future `mse bp fix`, a Clippy-style
+    /// diagnostic renderer, etc.) can match on this rather than on the
+    /// human-facing `reason` text.
+    pub kind: &'static str,
+    /// One-line human-readable statement of what the author must add
+    /// or change. Written in the imperative ("add … / change …").
+    pub reason: String,
+    /// The patch text the author would paste in place. Format-agnostic —
+    /// may be a single-line snippet or a multi-line block; renderers
+    /// indent it as a code block.
+    pub patch_suggestion: String,
+    /// Optional pointer to a bundled MCP resource or docs section that
+    /// explains the underlying contract. `None` when no single guide
+    /// covers the lint kind.
+    pub docs_ref: Option<String>,
+}
+
+/// GH #62 Axis B.1: pattern-match on a compile-lint failure message
+/// and return a canonical [`FixHint`] for known lint kinds. Returns
+/// `None` for lint failures without a canonical fix recipe — the
+/// author sees the raw Compiler message and no synthesized hint,
+/// avoiding a wrong-but-confident "fix" for cases requiring
+/// surrounding-context judgment (per GH #62 Axis B "never a wrong
+/// `mse bp fix` command").
+pub(crate) fn fix_hint_from_compile_error(err_msg: &str) -> Option<FixHint> {
+    // GH #61 — profile.worker_binding required for the WS thin-path
+    // backend. The Compiler emits the agent name in single quotes:
+    //   "agent 'greeter' spec invalid: profile.worker_binding is required..."
+    if err_msg.contains("profile.worker_binding is required") {
+        let agent = extract_between(err_msg, "agent '", "'");
+        let reason = match agent {
+            Some(name) => format!(
+                "operator agent '{name}' has no `profile.worker_binding` — required for the WS thin-path backend (GH #61)"
+            ),
+            None => "an operator agent has no `profile.worker_binding` — required for the WS thin-path backend (GH #61)"
+                .into(),
+        };
+        return Some(FixHint {
+            kind: "worker-binding-missing",
+            reason,
+            patch_suggestion:
+                "profile = { system_prompt = \"...\", tools = {}, worker_binding = \"claude\" }"
+                    .into(),
+            docs_ref: Some("mse://guides/bp-dsl-templates".into()),
+        });
+    }
+    // GH #50 — verdict contract mismatch. Compiler wording:
+    //   "value 'X' is not a member of the declared values [...]"
+    if err_msg.contains("is not a member of the declared values") {
+        return Some(FixHint {
+            kind: "verdict-value-not-in-contract",
+            reason: "a Branch / Loop cond literal is outside its agent's declared verdict contract (`agents[N].verdict.values`)".into(),
+            patch_suggestion: "either add the cond's literal to `agents[N].verdict.values`, or change the cond to a value that is already declared".into(),
+            docs_ref: Some("mse://guides/blueprint-authoring".into()),
+        });
+    }
+    // GH #60 — B.pipeline default landed in commit 31d9c8e so most
+    // `bp_dsl` authors no longer hit this, but JSON-direct Blueprints
+    // and hand-rolled `flow_dsl` shapes with a halt-on rule still can.
+    if err_msg.contains("missing field `at`") || err_msg.contains("halted_at") {
+        return Some(FixHint {
+            kind: "halted-at-missing",
+            reason: "the flow declares a halt-on rule but has no `halted_at` sink — where should the halted-stage id land in ctx?".into(),
+            patch_suggestion:
+                "halted_at = \"$.halted_at\",  -- add inside the B.pipeline { ... } block, before `done = ...`"
+                    .into(),
+            docs_ref: Some("mse://guides/bp-dsl-templates".into()),
+        });
+    }
+    None
+}
+
+/// Substring helper for [`fix_hint_from_compile_error`]. Returns the slice
+/// between the first occurrence of `prefix` and the next occurrence of
+/// `suffix` after it, or `None` if either isn't found. Non-greedy —
+/// stops at the first `suffix` match, so `agent 'foo' ...` extracts
+/// `foo`.
+fn extract_between<'a>(s: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    let start = s.find(prefix)? + prefix.len();
+    let rest = s.get(start..)?;
+    let end = rest.find(suffix)?;
+    Some(&rest[..end])
+}
+
 /// How a [`compile_lint`] invocation concluded (a lint *failure* is the
 /// `Err` arm of the `Result`, not a variant here). Shared with the
 /// `bp_build` MCP tool (`crate::mcp`), which reports it as a response
@@ -702,6 +823,69 @@ mod tests {
         assert!(msg.contains("pipeline"));
         assert!(msg.contains("single"));
         assert!(msg.contains("verdict"));
+    }
+
+    // ─── GH #62 Axis B.1: fix_hint pattern matching ─────────────────
+
+    #[test]
+    fn fix_hint_worker_binding_extracts_agent_name_and_names_kind() {
+        let msg = "compile lint FAILED: agent 'greeter' spec invalid: \
+                   profile.worker_binding is required for this operator backend. Fix by either: \
+                   (a) if authoring the Blueprint JSON directly, ...";
+        let hint = fix_hint_from_compile_error(msg).expect("worker_binding hint must fire");
+        assert_eq!(hint.kind, "worker-binding-missing");
+        assert!(hint.reason.contains("greeter"));
+        assert!(hint.patch_suggestion.contains("worker_binding = \"claude\""));
+        assert_eq!(
+            hint.docs_ref.as_deref(),
+            Some("mse://guides/bp-dsl-templates")
+        );
+    }
+
+    #[test]
+    fn fix_hint_worker_binding_reason_falls_back_when_no_agent_quoted() {
+        let msg = "compile lint FAILED: profile.worker_binding is required for this operator backend.";
+        let hint = fix_hint_from_compile_error(msg).expect("worker_binding hint must fire");
+        // Fallback reason (no agent name parsed) still names the kind
+        // and remedy.
+        assert!(hint.reason.contains("operator agent"));
+        assert!(hint.reason.contains("`profile.worker_binding`"));
+    }
+
+    #[test]
+    fn fix_hint_verdict_contract_mismatch_names_the_contract_field() {
+        let msg = "compile lint FAILED: value 'NOT_DECLARED' is not a member of the declared values [\"PASS\", \"BLOCKED\"]";
+        let hint = fix_hint_from_compile_error(msg).expect("verdict hint must fire");
+        assert_eq!(hint.kind, "verdict-value-not-in-contract");
+        assert!(hint
+            .reason
+            .contains("`agents[N].verdict.values`"));
+        assert!(hint
+            .patch_suggestion
+            .contains("add the cond's literal"));
+    }
+
+    #[test]
+    fn fix_hint_halted_at_fires_on_missing_field_at() {
+        let msg = "compile lint FAILED: missing field `at` (hint: fetch the Blueprint JSON Schema...)";
+        let hint = fix_hint_from_compile_error(msg).expect("halted_at hint must fire");
+        assert_eq!(hint.kind, "halted-at-missing");
+        assert!(hint.patch_suggestion.contains("halted_at = \"$.halted_at\""));
+    }
+
+    #[test]
+    fn fix_hint_returns_none_for_unknown_lint_shape() {
+        // A lint kind without a canonical fix recipe returns None so
+        // the caller never renders a wrong-but-confident hint.
+        assert!(fix_hint_from_compile_error("some new lint the mapping doesn't know about").is_none());
+        assert!(fix_hint_from_compile_error("").is_none());
+    }
+
+    #[test]
+    fn extract_between_returns_first_match_only() {
+        assert_eq!(extract_between("agent 'a' 'b'", "agent '", "'"), Some("a"));
+        assert_eq!(extract_between("no prefix here", "agent '", "'"), None);
+        assert_eq!(extract_between("agent 'unclosed", "agent '", "'"), None);
     }
 
     #[test]

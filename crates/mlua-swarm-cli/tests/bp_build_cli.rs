@@ -69,7 +69,13 @@ return {
         .assert()
         .failure()
         .stderr(contains("compile lint FAILED"))
-        .stderr(contains("is not a member of the declared values"));
+        .stderr(contains("is not a member of the declared values"))
+        // GH #62 Axis B.1: the verdict-contract lint gets a canonical
+        // fix hint block; assert on the kind key + the actionable text
+        // so a regression in `fix_hint_from_compile_error`'s mapping
+        // for this lint kind fails here.
+        .stderr(contains("fix hint (verdict-value-not-in-contract)"))
+        .stderr(contains("`agents[N].verdict.values`"));
 }
 
 /// GH #61: `bp_build` compile-lint must fail loud when an operator-kind
@@ -118,7 +124,13 @@ return {
         .stderr(contains("profile.worker_binding is required"))
         // Both fix paths named in the Compiler message.
         .stderr(contains("agents[N].profile.worker_binding"))
-        .stderr(contains("$agent_md file ref"));
+        .stderr(contains("$agent_md file ref"))
+        // GH #62 Axis B.1: the worker_binding lint gets a canonical
+        // fix hint block naming the offending agent and the concrete
+        // patch line.
+        .stderr(contains("fix hint (worker-binding-missing)"))
+        .stderr(contains("operator agent 'greeter'"))
+        .stderr(contains("worker_binding = \"claude\""));
 }
 
 /// GH #61 regression guard: the bundled `07-dsl-pipeline.bp.lua` sample
