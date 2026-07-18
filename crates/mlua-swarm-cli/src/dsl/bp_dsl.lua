@@ -108,11 +108,12 @@ end
 -- Resolve a stage's `input` field to a path string: `B.from "x"`
 -- placeholders resolve against `outs` (populated for every stage, and
 -- every retry `fix` stage, before any Node is built — so both forward and
--- backward references work); `nil` falls back to the R1 default; any
--- other value is assumed to already be a path string.
-local function resolve_input_path(input, stage_id, outs)
+-- backward references work); `nil` falls back to `chain_default` when the
+-- caller supplies one (see `B.pipeline`'s `chain` option), otherwise to
+-- the R1 default; any other value is assumed to already be a path string.
+local function resolve_input_path(input, stage_id, outs, chain_default)
   if input == nil then
-    return default_input_path(stage_id)
+    return chain_default or default_input_path(stage_id)
   end
   if is_placeholder(input) then
     local target = outs[input.stage_id]
@@ -130,9 +131,11 @@ end
 -- Build the `step` Node for one stage record. `outs` must already carry
 -- this stage's own resolved `out` path (`rec._out`, set by the
 -- register-outs pass below) so R6 `B.from` references to THIS stage
--- resolve correctly even from earlier stages in the list.
-local function build_step(rec, outs)
-  local input_path = resolve_input_path(rec.input, rec.id, outs)
+-- resolve correctly even from earlier stages in the list. `chain_default`
+-- (nilable) is the `input` fallback for a stage whose `input` is `nil` —
+-- see `B.pipeline`'s `chain` option.
+local function build_step(rec, outs, chain_default)
+  local input_path = resolve_input_path(rec.input, rec.id, outs, chain_default)
   return F.step({
     id = rec.id,
     agent = rec.agent,
@@ -153,6 +156,19 @@ end
 --- `$.{stage_id}`. An explicit `input` / `out` on the stage record
 --- overrides the default (per-stage `input` may also be a `B.from`
 --- placeholder — see R6 below).
+---
+--- ## Chained pipelines
+---
+--- `chain = true` at the top level of the pipeline spec changes the
+--- `input` fallback for stage N (N ≥ 2) from `$.d.{stage_id}` to
+--- `$.{stage[N-1]_id}` — i.e. each stage reads the previous stage's own
+--- `out` path. Stage 1's default is unchanged (still `$.d.{stage_1_id}`).
+--- An explicit `input` on a stage record (whether a path string or a
+--- `B.from` placeholder) still overrides the chained default. Retry
+--- `fix` stages are not chained: they retain the R1 default so the
+--- fixer's own input can be seeded independently of the review stage's
+--- output. Omitting `chain` (or setting it `false`) preserves the R1
+--- default in every position.
 ---
 --- ## Automatic verdict gate
 ---
@@ -199,6 +215,7 @@ function M.pipeline(spec)
   -- authors who care can still override via `halted_at = "$.custom"`.
   local halted_at = spec.halted_at or "$.halted_at"
   local done = spec.done
+  local chain = spec.chain == true
 
   local stages = {}
   for i, rec in ipairs(spec) do
@@ -229,7 +246,11 @@ function M.pipeline(spec)
     end
     local rec = stages[idx]
     local this_halt_on = rec.halt_on or halt_on
-    local step_node = build_step(rec, outs)
+    local chain_default
+    if chain and idx >= 2 then
+      chain_default = stages[idx - 1]._out
+    end
+    local step_node = build_step(rec, outs, chain_default)
     local rest = build_from(idx + 1, rest_else)
 
     local children = { step_node }

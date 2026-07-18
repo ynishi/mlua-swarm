@@ -185,6 +185,116 @@ fn from_undefined_stage_errors() {
     );
 }
 
+/// GH #65: `chain = true` opts the pipeline into stage-to-stage
+/// chaining — stage N (N ≥ 2) whose `input` is nil defaults to
+/// `$.{stage[N-1]_id}` (the previous stage's own `out`) instead of the
+/// `$.d.{stage_id}` R1 default. Stage 1 is unchanged.
+#[test]
+fn chain_true_wires_stage_n_input_to_previous_out() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "ingest"    { agent = "mock-ingest" },
+          B.stage "transform" { agent = "mock-transform" },
+          B.stage "emit"      { agent = "mock-emit" },
+          chain = true,
+          halt_on = { "BLOCKED" },
+          halted_at = "$.halted_at",
+        }
+        "#,
+    );
+
+    // The pipeline is `seq{step_1, gate_1(else = seq{step_2, gate_2(else =
+    // seq{step_3, gate_3(...)})})}`. Walk the tree picking each step off
+    // its `in` path.
+    let step_1 = &value["children"][0];
+    assert_eq!(step_1["ref"], serde_json::json!("mock-ingest"));
+    assert_eq!(
+        step_1["in"],
+        serde_json::json!({"op": "path", "at": "$.d.ingest"}),
+        "stage 1 default stays $.d.<id> — no earlier stage to chain from"
+    );
+
+    let step_2 = &value["children"][1]["else"]["children"][0];
+    assert_eq!(step_2["ref"], serde_json::json!("mock-transform"));
+    assert_eq!(
+        step_2["in"],
+        serde_json::json!({"op": "path", "at": "$.ingest"}),
+        "chain=true rewires stage 2 default to $.<stage_1_id> (previous stage's out)"
+    );
+
+    let step_3 = &value["children"][1]["else"]["children"][1]["else"]["children"][0];
+    assert_eq!(step_3["ref"], serde_json::json!("mock-emit"));
+    assert_eq!(
+        step_3["in"],
+        serde_json::json!({"op": "path", "at": "$.transform"}),
+        "chain=true rewires stage 3 default to $.<stage_2_id>"
+    );
+}
+
+/// GH #65: an explicit per-stage `input` (path string or `B.from`
+/// placeholder) still overrides the chained default. Combined check so
+/// the two override paths are asserted against the same emitted flow.
+#[test]
+fn chain_true_respects_explicit_input_and_b_from_overrides() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "ingest"    { agent = "mock-ingest" },
+          B.stage "transform" { agent = "mock-transform", input = "$.d.custom" },
+          B.stage "emit"      { agent = "mock-emit",      input = B.from "ingest" },
+          chain = true,
+          halt_on = { "BLOCKED" },
+          halted_at = "$.halted_at",
+        }
+        "#,
+    );
+
+    let step_2 = &value["children"][1]["else"]["children"][0];
+    assert_eq!(
+        step_2["in"],
+        serde_json::json!({"op": "path", "at": "$.d.custom"}),
+        "explicit input= path string overrides the chained default"
+    );
+
+    let step_3 = &value["children"][1]["else"]["children"][1]["else"]["children"][0];
+    assert_eq!(
+        step_3["in"],
+        serde_json::json!({"op": "path", "at": "$.ingest"}),
+        "B.from placeholder overrides the chained default and points at the referenced stage's out"
+    );
+}
+
+/// GH #65: omitting `chain` (the pre-existing behavior) leaves every
+/// stage's default at `$.d.{stage_id}`, including stage 2+. Regression
+/// guard.
+#[test]
+fn chain_omitted_keeps_dot_d_default_on_every_stage() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "ingest"    { agent = "mock-ingest" },
+          B.stage "transform" { agent = "mock-transform" },
+          halt_on = { "BLOCKED" },
+          halted_at = "$.halted_at",
+        }
+        "#,
+    );
+
+    let step_1 = &value["children"][0];
+    assert_eq!(
+        step_1["in"],
+        serde_json::json!({"op": "path", "at": "$.d.ingest"})
+    );
+
+    let step_2 = &value["children"][1]["else"]["children"][0];
+    assert_eq!(
+        step_2["in"],
+        serde_json::json!({"op": "path", "at": "$.d.transform"}),
+        "chain omitted -> stage 2 keeps $.d.<own_id> default"
+    );
+}
+
 /// (d) `retry = { max = N, fix = <stage record> }` expands to the
 /// documented 3 parts, in order: step, loop, gate.
 #[test]
