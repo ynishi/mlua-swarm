@@ -41,6 +41,7 @@
 //! | `mse://guides/agent-md-authoring`            | SubAgent (agent.md) canonical shape, size targets, fetch-vs-embed policy. |
 //! | `mse://guides/dsl-authoring`                 | flow_dsl/bp_dsl authoring DSL: Expr/Node builders, pipeline conventions, JSON→DSL migration SOP. |
 //! | `mse://guides/worker-io-contract`            | Worker I/O contract: fetch-based IN, path-free tool-call OUT, server-side file materialization. |
+//! | `mse://guides/bp-dsl-templates`              | `mse bp new` / `bp_new` template inventory + flag surface (GH #62 Axis A). |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
@@ -99,6 +100,7 @@ const AGENT_MD_AUTHORING_BODY: &str = include_str!("./resources/guides/agent-md-
 const DSL_AUTHORING_GUIDE_BODY: &str = include_str!("./resources/guides/dsl-authoring.md");
 const WORKER_IO_CONTRACT_BODY: &str = include_str!("./resources/guides/worker-io-contract.md");
 const REPLAY_AND_RESUME_BODY: &str = include_str!("./resources/guides/replay-and-resume.md");
+const BP_DSL_TEMPLATES_BODY: &str = include_str!("./resources/guides/bp-dsl-templates.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -177,6 +179,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "Ctx-snapshot replay log, SqliteReplayStore config + schema versioning (PRAGMA user_version state machine), POST /v1/runs/:id/resume state-driven endpoint (404/409/422/202), boot recovery sweep + resumable-log hint, and deferred pieces (boot auto-respawn / subprocess-mode E2E).",
         mime_type: "text/markdown",
         body: ResourceBody::Static(REPLAY_AND_RESUME_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/bp-dsl-templates",
+        title: "mse — bp_dsl authoring templates (mse bp new)",
+        description: "GH #62 Axis A: `mse bp new` / `bp_new` MCP scaffolding — three templates (pipeline / single / verdict) that emit a compile-lint-legal `.bp.lua` with every currently-mandatory field pre-filled (halted_at, worker_binding, strict_refs/strict_kind). Prevention layer for the trap surface that GH #60 / GH #61 sibling fixes tightened.",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(BP_DSL_TEMPLATES_BODY),
     },
     ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",

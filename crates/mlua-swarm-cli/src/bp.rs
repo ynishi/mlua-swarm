@@ -57,6 +57,11 @@ enum BpCmd {
     /// Build a `.bp.lua` DSL script into Blueprint JSON (compile-lint +
     /// emit, optionally register with a running `mse serve`).
     Build(BuildArgs),
+    /// Scaffold a minimal `.bp.lua` from a bundled template with all
+    /// currently-mandatory fields pre-filled (`halted_at`, `worker_binding`,
+    /// `strict_refs`/`strict_kind`). GH #62 Axis A. See
+    /// `mse://guides/bp-dsl-templates` for template inventory.
+    New(NewArgs),
 }
 
 #[derive(Debug, Args)]
@@ -75,6 +80,34 @@ struct BuildArgs {
     server: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct NewArgs {
+    /// Template kind: `pipeline` (N-stage main-ai) / `single`
+    /// (one-agent one-step) / `verdict` (3-stage verdict-gated with
+    /// retry-through-fixer).
+    template: String,
+    /// Blueprint id, also the emitted `id` field.
+    name: String,
+    /// Stage names, comma-separated (`pipeline` / `verdict` templates only).
+    /// `pipeline`: defaults to `stage1,stage2`. `verdict`: defaults to
+    /// `analyze,review,publish` — fixed 3-stage shape, extra values ignored.
+    #[arg(long)]
+    stages: Option<String>,
+    /// Agent name (`single` template only). Defaults to `solo`.
+    #[arg(long)]
+    agent: Option<String>,
+    /// Operator role name every agent points at. Defaults to `main-ai`.
+    #[arg(long)]
+    operator: Option<String>,
+    /// `profile.worker_binding` value for every emitted operator agent.
+    /// Defaults to `claude` (the Claude Code catch-all SubAgent variant).
+    #[arg(long)]
+    binding: Option<String>,
+    /// Write the rendered `.bp.lua` here instead of stdout.
+    #[arg(short = 'o', long = "out")]
+    out: Option<PathBuf>,
+}
+
 /// Default `mse serve` bind address. Kept as a local literal (matching
 /// `mcp::server_control::DEFAULT_BIND`'s value) rather than reaching
 /// into that bin-private module — see `server_control.rs` for the
@@ -85,6 +118,7 @@ const DEFAULT_SERVER: &str = "127.0.0.1:7777";
 pub async fn run(args: BpArgs) -> Result<()> {
     match args.cmd {
         BpCmd::Build(build_args) => run_build(build_args).await,
+        BpCmd::New(new_args) => run_new(new_args),
     }
 }
 
@@ -121,6 +155,278 @@ async fn run_build(args: BuildArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// GH #62 Axis A default `worker_binding` — the Claude Code catch-all
+/// SubAgent variant. Overridable per invocation via `--binding`.
+const DEFAULT_BINDING: &str = "claude";
+/// GH #62 Axis A default operator role name — the same `main-ai`
+/// convention every bundled sample points at. Overridable via `--operator`.
+const DEFAULT_OPERATOR: &str = "main-ai";
+/// GH #62 Axis A `pipeline` template default stage list when `--stages`
+/// is not supplied.
+const DEFAULT_PIPELINE_STAGES: &[&str] = &["stage1", "stage2"];
+/// GH #62 Axis A `verdict` template canonical 3-stage names. The verdict
+/// template's shape is fixed at 3 (analyze / review / publish) mirroring
+/// `mse://blueprints/samples/07-dsl-pipeline`; extra `--stages` values are
+/// ignored, fewer than 3 fall back to these defaults per position.
+const DEFAULT_VERDICT_STAGES: [&str; 3] = ["analyze", "review", "publish"];
+/// GH #62 Axis A `single` template default sole-agent name.
+const DEFAULT_SINGLE_AGENT: &str = "solo";
+
+fn run_new(args: NewArgs) -> Result<()> {
+    let out = render_template(&args)?;
+    match &args.out {
+        Some(path) => {
+            std::fs::write(path, &out)
+                .with_context(|| format!("writing {}", path.display()))?;
+            eprintln!("mse bp new: wrote {} ({} bytes)", path.display(), out.len());
+        }
+        None => print!("{out}"),
+    }
+    Ok(())
+}
+
+fn render_template(args: &NewArgs) -> Result<String> {
+    render_template_by_kind(
+        &args.template,
+        &args.name,
+        args.stages.as_deref(),
+        args.agent.as_deref(),
+        args.operator.as_deref(),
+        args.binding.as_deref(),
+    )
+}
+
+/// GH #62 Axis A: dispatch on template name. Pure — no I/O. Shared with the
+/// `bp_new` MCP tool (`crate::mcp`), which returns the rendered `.bp.lua`
+/// as a response field. Errors on unknown template (with the accepted list)
+/// so an author who typos `template` sees the closed set. Primitive-typed
+/// signature so the MCP request struct (which doesn't own a `NewArgs`) can
+/// call it directly.
+pub(crate) fn render_template_by_kind(
+    template: &str,
+    name: &str,
+    stages: Option<&str>,
+    agent: Option<&str>,
+    operator: Option<&str>,
+    binding: Option<&str>,
+) -> Result<String> {
+    let operator = operator.unwrap_or(DEFAULT_OPERATOR);
+    let binding = binding.unwrap_or(DEFAULT_BINDING);
+    match template {
+        "pipeline" => Ok(render_pipeline_template(
+            name,
+            &parse_stages(stages, DEFAULT_PIPELINE_STAGES),
+            operator,
+            binding,
+        )),
+        "single" => Ok(render_single_template(
+            name,
+            agent.unwrap_or(DEFAULT_SINGLE_AGENT),
+            operator,
+            binding,
+        )),
+        "verdict" => Ok(render_verdict_template(
+            name,
+            &parse_verdict_stages(stages),
+            operator,
+            binding,
+        )),
+        other => Err(anyhow!(
+            "unknown template '{other}': accepted = pipeline / single / verdict"
+        )),
+    }
+}
+
+fn parse_stages(raw: Option<&str>, default: &[&str]) -> Vec<String> {
+    match raw {
+        Some(s) => s
+            .split(',')
+            .map(|part| part.trim())
+            .filter(|part| !part.is_empty())
+            .map(String::from)
+            .collect(),
+        None => default.iter().map(|s| (*s).to_string()).collect(),
+    }
+}
+
+/// `verdict` template stage names — 3 fixed positional slots. Fewer than 3
+/// supplied → remaining fall back to `DEFAULT_VERDICT_STAGES[i]`; more than
+/// 3 → tail truncated. This is deliberate: `verdict`'s shape ties stage
+/// identity to role (analyze produces the input, review issues the
+/// verdict, publish consumes on PASS) — variable stage counts would
+/// change the flow shape, not just names.
+fn parse_verdict_stages(raw: Option<&str>) -> [String; 3] {
+    let supplied = parse_stages(raw, &[]);
+    let mut out = DEFAULT_VERDICT_STAGES.map(String::from);
+    for (slot, val) in out.iter_mut().zip(supplied) {
+        *slot = val;
+    }
+    out
+}
+
+fn render_pipeline_template(
+    name: &str,
+    stages: &[String],
+    operator: &str,
+    binding: &str,
+) -> String {
+    let stages: &[String] = if stages.is_empty() {
+        // parse_stages returns empty only when `--stages ""` is passed
+        // literally; fall back to the same default the None arm uses.
+        return render_pipeline_template(
+            name,
+            &DEFAULT_PIPELINE_STAGES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+            operator,
+            binding,
+        );
+    } else {
+        stages
+    };
+    let mut out = String::new();
+    out.push_str("-- Scaffolded by `mse bp new pipeline` (GH #62 Axis A).\n");
+    out.push_str("-- Every mandatory field is pre-filled: `halted_at` (compile-lint\n");
+    out.push_str("-- default), each operator agent's `profile.worker_binding` (WS\n");
+    out.push_str("-- thin-path requirement, GH #61), `strict_refs` + `strict_kind`.\n\n");
+    out.push_str("local B = require(\"bp_dsl\")\n\n");
+    out.push_str("local flow = B.pipeline({\n");
+    for stage in stages {
+        out.push_str(&format!(
+            "  B.stage \"{stage}\" {{ agent = \"{stage}\" }},\n"
+        ));
+    }
+    out.push_str("  halted_at = \"$.halted_at\",\n");
+    out.push_str("  done      = \"$.pipeline_complete\",\n");
+    out.push_str("})\n\n");
+    out.push_str(&format!("return {{\n  id = \"{name}\",\n  flow = flow,\n"));
+    out.push_str("  agents = {\n");
+    for stage in stages {
+        out.push_str(&format!(
+            "    {{ name = \"{stage}\", kind = \"operator\",\n      \
+             spec = {{ operator_ref = \"{operator}\" }},\n      \
+             profile = {{ system_prompt = \"TODO: describe {stage}\", \
+             tools = {{}}, worker_binding = \"{binding}\" }} }},\n"
+        ));
+    }
+    out.push_str("  },\n");
+    out.push_str(&format!(
+        "  operators = {{ {{ name = \"{operator}\" }} }},\n"
+    ));
+    out.push_str("  strategy = { strict_refs = true, strict_kind = true },\n");
+    out.push_str(&format!(
+        "  metadata = {{ description = \"TODO: describe {name}\" }},\n"
+    ));
+    out.push_str("}\n");
+    out
+}
+
+fn render_single_template(name: &str, agent: &str, operator: &str, binding: &str) -> String {
+    let mut out = String::new();
+    out.push_str("-- Scaffolded by `mse bp new single` (GH #62 Axis A).\n");
+    out.push_str("-- Minimal 1-step 1-agent shape — `flow_dsl` directly, no pipeline\n");
+    out.push_str("-- sugar. All mandatory fields (`worker_binding`, `strict_refs`,\n");
+    out.push_str("-- `strict_kind`) are pre-filled.\n\n");
+    out.push_str("local F = require(\"flow_dsl\")\n\n");
+    out.push_str(&format!(
+        "local flow = F.step({{ id = \"{agent}\", agent = \"{agent}\", \
+         input = F.lit(\"\"), out = F.p(\"$.{agent}\") }})\n\n"
+    ));
+    out.push_str(&format!("return {{\n  id = \"{name}\",\n  flow = flow,\n"));
+    out.push_str("  agents = {\n");
+    out.push_str(&format!(
+        "    {{ name = \"{agent}\", kind = \"operator\",\n      \
+         spec = {{ operator_ref = \"{operator}\" }},\n      \
+         profile = {{ system_prompt = \"TODO: describe {agent}\", \
+         tools = {{}}, worker_binding = \"{binding}\" }} }},\n"
+    ));
+    out.push_str("  },\n");
+    out.push_str(&format!(
+        "  operators = {{ {{ name = \"{operator}\" }} }},\n"
+    ));
+    out.push_str("  strategy = { strict_refs = true, strict_kind = true },\n");
+    out.push_str(&format!(
+        "  metadata = {{ description = \"TODO: describe {name}\" }},\n"
+    ));
+    out.push_str("}\n");
+    out
+}
+
+fn render_verdict_template(
+    name: &str,
+    stages: &[String; 3],
+    operator: &str,
+    binding: &str,
+) -> String {
+    let [analyze, review, publish] = stages;
+    let mut out = String::new();
+    out.push_str("-- Scaffolded by `mse bp new verdict` (GH #62 Axis A).\n");
+    out.push_str(&format!(
+        "-- Mirrors `mse://blueprints/samples/07-dsl-pipeline`: {analyze} -> \
+         {review} (verdict-gated, bounded retry through fixer on BLOCKED) -> \
+         {publish}. All mandatory fields pre-filled.\n\n"
+    ));
+    out.push_str("local B = require(\"bp_dsl\")\n\n");
+    out.push_str("local flow = B.pipeline({\n");
+    out.push_str(&format!(
+        "  B.stage \"{analyze}\" {{ agent = \"{analyze}\" }},\n"
+    ));
+    out.push_str(&format!(
+        "  B.stage \"{review}\" {{\n    \
+         agent = \"{review}\",\n    \
+         retry = {{\n      \
+         max = 2,\n      \
+         fix = B.stage \"fix\" {{ agent = \"fixer\", input = B.from \"{review}\" }},\n    \
+         }},\n  }},\n"
+    ));
+    out.push_str(&format!(
+        "  B.stage \"{publish}\" {{ agent = \"{publish}\" }},\n"
+    ));
+    out.push_str("  halt_on   = { \"BLOCKED\" },\n");
+    out.push_str("  halted_at = \"$.halted_at\",\n");
+    out.push_str("  done      = \"$.pipeline_complete\",\n");
+    out.push_str("})\n\n");
+    out.push_str(&format!("return {{\n  id = \"{name}\",\n  flow = flow,\n"));
+    out.push_str("  agents = {\n");
+    // analyze / publish: plain operator, no verdict contract.
+    for stage in [analyze.as_str(), publish.as_str()] {
+        out.push_str(&format!(
+            "    {{ name = \"{stage}\", kind = \"operator\",\n      \
+             spec = {{ operator_ref = \"{operator}\" }},\n      \
+             profile = {{ system_prompt = \"TODO: describe {stage}\", \
+             tools = {{}}, worker_binding = \"{binding}\" }} }},\n"
+        ));
+    }
+    // review: verdict-gated (PASS / BLOCKED).
+    out.push_str(&format!(
+        "    {{ name = \"{review}\", kind = \"operator\",\n      \
+         spec = {{ operator_ref = \"{operator}\" }},\n      \
+         profile = {{ system_prompt = \"TODO: stage a `verdict` part = \
+         `PASS` or `BLOCKED`, then finish with report body\", \
+         tools = {{}}, worker_binding = \"{binding}\" }},\n      \
+         verdict = {{ channel = \"part\", values = {{ \"PASS\", \"BLOCKED\" }} }} }},\n"
+    ));
+    // fixer: plain operator, referenced by retry.fix.
+    out.push_str(&format!(
+        "    {{ name = \"fixer\", kind = \"operator\",\n      \
+         spec = {{ operator_ref = \"{operator}\" }},\n      \
+         profile = {{ system_prompt = \"TODO: given the reviewer's report, \
+         emit a fix and reply so the review can retry\", \
+         tools = {{}}, worker_binding = \"{binding}\" }} }},\n"
+    ));
+    out.push_str("  },\n");
+    out.push_str(&format!(
+        "  operators = {{ {{ name = \"{operator}\" }} }},\n"
+    ));
+    out.push_str("  strategy = { strict_refs = true, strict_kind = true },\n");
+    out.push_str(&format!(
+        "  metadata = {{ description = \"TODO: describe {name}\" }},\n"
+    ));
+    out.push_str("}\n");
+    out
 }
 
 /// How a [`compile_lint`] invocation concluded (a lint *failure* is the
@@ -257,4 +563,163 @@ pub(crate) async fn register(
         http_status: status.as_u16(),
         body,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── GH #62 Axis A: template rendering + round-trip through Compiler ───
+
+    fn build_and_compile_lint(rendered: &str) -> Result<LintReport> {
+        let bp_value = dsl::build_bp_from_script(rendered)?;
+        // No `$file` / `$agent_md` refs in rendered templates → the
+        // `script_path` arg is only used as the parent for ref
+        // resolution, so any path resolves (the loader never touches disk
+        // when the Blueprint carries no refs).
+        compile_lint(&bp_value, Path::new("/tmp/nonexistent.bp.lua"))
+    }
+
+    #[test]
+    fn pipeline_template_round_trips_with_defaults() {
+        let rendered =
+            render_template_by_kind("pipeline", "roundtrip-pipe", None, None, None, None)
+                .expect("render must succeed with defaults");
+        // Sanity: the two mandatory fields GH #61 / GH #60 tightened must
+        // both appear in the rendered text.
+        assert!(rendered.contains("worker_binding = \"claude\""));
+        assert!(rendered.contains("halted_at = \"$.halted_at\""));
+        // Round-trip through the real Compiler — this is the AC.
+        let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
+        match report {
+            LintReport::Ok { agents, operators } => {
+                assert_eq!(agents, DEFAULT_PIPELINE_STAGES.len());
+                assert_eq!(operators, 1);
+            }
+            LintReport::Skipped { reason } => panic!("expected Ok, got Skipped: {reason}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_template_honours_stages_operator_binding_flags() {
+        let rendered = render_template_by_kind(
+            "pipeline",
+            "roundtrip-pipe-3",
+            Some("greet,echo,farewell"),
+            None,
+            Some("primary"),
+            Some("claude-lite"),
+        )
+        .expect("render must succeed with custom flags");
+        assert!(rendered.contains("worker_binding = \"claude-lite\""));
+        assert!(rendered.contains("operator_ref = \"primary\""));
+        // 3 stages requested → 3 agents rendered.
+        assert_eq!(rendered.matches("kind = \"operator\"").count(), 3);
+        let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
+        assert!(matches!(
+            report,
+            LintReport::Ok {
+                agents: 3,
+                operators: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn single_template_round_trips_with_defaults() {
+        let rendered =
+            render_template_by_kind("single", "roundtrip-single", None, None, None, None)
+                .expect("render must succeed with defaults");
+        assert!(rendered.contains(&format!("worker_binding = \"{DEFAULT_BINDING}\"")));
+        assert!(rendered.contains(&format!("operator_ref = \"{DEFAULT_OPERATOR}\"")));
+        assert!(rendered.contains(&format!("agent = \"{DEFAULT_SINGLE_AGENT}\"")));
+        let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
+        assert!(matches!(
+            report,
+            LintReport::Ok {
+                agents: 1,
+                operators: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn verdict_template_round_trips_with_defaults() {
+        let rendered =
+            render_template_by_kind("verdict", "roundtrip-verdict", None, None, None, None)
+                .expect("render must succeed with defaults");
+        // Verdict template ships 3 stage agents + 1 fixer agent.
+        assert_eq!(rendered.matches("kind = \"operator\"").count(), 4);
+        assert!(rendered.contains("verdict = { channel = \"part\""));
+        let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
+        assert!(matches!(
+            report,
+            LintReport::Ok {
+                agents: 4,
+                operators: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn verdict_template_stage_override_stays_3_slot() {
+        // Fewer than 3 → remaining slots use defaults.
+        let rendered =
+            render_template_by_kind("verdict", "rv-partial", Some("scan"), None, None, None)
+                .expect("render must succeed with partial stages");
+        assert!(rendered.contains("B.stage \"scan\""));
+        // Slot 2 / 3 fall back to defaults.
+        assert!(rendered.contains(&format!(
+            "B.stage \"{}\"",
+            DEFAULT_VERDICT_STAGES[1]
+        )));
+        assert!(rendered.contains(&format!(
+            "B.stage \"{}\"",
+            DEFAULT_VERDICT_STAGES[2]
+        )));
+        // Extra names are truncated (>3 supplied → tail dropped).
+        let over = render_template_by_kind(
+            "verdict",
+            "rv-over",
+            Some("a,b,c,d,e"),
+            None,
+            None,
+            None,
+        )
+        .expect("render must succeed with over-supplied stages");
+        assert!(!over.contains("B.stage \"d\""));
+        assert!(!over.contains("B.stage \"e\""));
+    }
+
+    #[test]
+    fn unknown_template_returns_error_naming_accepted_list() {
+        let err = render_template_by_kind("bogus", "x", None, None, None, None)
+            .expect_err("unknown template must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown template 'bogus'"));
+        // Accepted list appears in the error so an author who typos sees
+        // the closed set.
+        assert!(msg.contains("pipeline"));
+        assert!(msg.contains("single"));
+        assert!(msg.contains("verdict"));
+    }
+
+    #[test]
+    fn pipeline_template_with_empty_stages_flag_falls_back_to_defaults() {
+        // `--stages ""` at the CLI parses to `Some("")` which becomes
+        // an empty Vec; the render fn falls back to the default set
+        // rather than emitting a stage-less pipeline (which would be
+        // rejected at compile-lint anyway).
+        let rendered =
+            render_template_by_kind("pipeline", "rp-empty", Some(""), None, None, None)
+                .expect("render must succeed and fall back");
+        let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
+        assert!(matches!(
+            report,
+            LintReport::Ok {
+                agents: n,
+                operators: 1
+            } if n == DEFAULT_PIPELINE_STAGES.len()
+        ));
+    }
 }

@@ -361,6 +361,40 @@ struct BpDoctorReq {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct BpNewReq {
+    /// Template kind: `pipeline` (N-stage main-ai) / `single` (one-agent
+    /// one-step) / `verdict` (3-stage verdict-gated with retry-through-fixer).
+    /// Any other value returns `status: "error"`, `stage: "render"` with the
+    /// accepted list — the DSL parser stays strict; the "fuzzy" scope
+    /// (`GH #62 Axis B`) is separate.
+    template: String,
+    /// Blueprint id (also the emitted `id` field in the rendered script).
+    name: String,
+    /// Stage names, comma-separated. `pipeline` / `verdict` only.
+    /// `pipeline` default: `stage1,stage2`. `verdict` default:
+    /// `analyze,review,publish` (fixed 3-stage — extras ignored, missing
+    /// slots fall back to defaults per position).
+    #[serde(default)]
+    stages: Option<String>,
+    /// Agent name for the `single` template. Default `solo`.
+    #[serde(default)]
+    agent: Option<String>,
+    /// Operator role name every emitted agent points at. Default `main-ai`
+    /// (the same convention every bundled sample uses).
+    #[serde(default)]
+    operator: Option<String>,
+    /// `profile.worker_binding` value for every emitted operator agent.
+    /// Default `claude` (the Claude Code catch-all SubAgent variant).
+    #[serde(default)]
+    binding: Option<String>,
+    /// Write the rendered `.bp.lua` here (absolute, or relative to the
+    /// mse-mcp process CWD). When omitted, the rendered text is included
+    /// in the response as `script`.
+    #[serde(default)]
+    out: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct BpBuildReq {
     /// Path to the `.bp.lua` DSL script (absolute, or relative to the
     /// mse-mcp process CWD).
@@ -2035,6 +2069,63 @@ impl MseServer {
         let body = resources::blueprint_schema_value()
             .map_err(|e| McpError::internal_error(format!("schema serialize: {e}"), None))?;
         json_result(&body)
+    }
+
+    #[tool(
+        description = "Scaffold a minimal `.bp.lua` from a bundled template with every currently-mandatory field pre-filled (`halted_at` compile-lint default, each operator agent's `profile.worker_binding`, `strict_refs`/`strict_kind`) — the MCP twin of the `mse bp new` CLI (GH #62 Axis A). Templates: `pipeline` (N-stage main-ai with `--stages`), `single` (one-agent one-step), `verdict` (3-stage verdict-gated with retry-through-fixer, fixed shape mirroring `mse://blueprints/samples/07-dsl-pipeline`). When `out` is set, writes the rendered text to that path (relative resolves against the mse-mcp process CWD) and reports the byte count; when omitted, includes the rendered `.bp.lua` inline as `script`. Failures return `status: \"error\"` with `stage` (`render` for unknown template / rendering, `write_out` for I/O). Guide: `mse://guides/bp-dsl-templates` lists every template + flag surface. Non-goal: fuzzy parsing — the DSL parser stays strict; the fuzzy scope (GH #62 Axis B, lint→patch mapping) is a separate follow-up."
+    )]
+    async fn bp_new(
+        &self,
+        Parameters(req): Parameters<BpNewReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let rendered = match crate::bp::render_template_by_kind(
+            &req.template,
+            &req.name,
+            req.stages.as_deref(),
+            req.agent.as_deref(),
+            req.operator.as_deref(),
+            req.binding.as_deref(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return json_result(&serde_json::json!({
+                    "status": "error",
+                    "stage": "render",
+                    "template": req.template,
+                    "name": req.name,
+                    "error": format!("{e:#}"),
+                }))
+            }
+        };
+        let bytes = rendered.len();
+        if let Some(out) = &req.out {
+            if let Err(e) = std::fs::write(out, &rendered) {
+                return json_result(&serde_json::json!({
+                    "status": "error",
+                    "stage": "write_out",
+                    "template": req.template,
+                    "name": req.name,
+                    "out": out,
+                    "error": e.to_string(),
+                }));
+            }
+            return json_result(&serde_json::json!({
+                "status": "scaffolded",
+                "template": req.template,
+                "name": req.name,
+                "out": out,
+                "bytes": bytes,
+                "guide_ref": "mse://guides/bp-dsl-templates",
+            }));
+        }
+        json_result(&serde_json::json!({
+            "status": "scaffolded",
+            "template": req.template,
+            "name": req.name,
+            "bytes": bytes,
+            "script": rendered,
+            "guide_ref": "mse://guides/bp-dsl-templates",
+        }))
     }
 
     #[tool(

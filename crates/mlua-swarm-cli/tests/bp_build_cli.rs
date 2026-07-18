@@ -147,3 +147,102 @@ fn bp_build_dsl_pipeline_sample_still_lints_ok_after_worker_binding_tightening()
         // to shape-only) also surfaces here.
         .stderr(contains("compile lint: OK"));
 }
+
+/// GH #62 Axis A CLI round-trip: `mse bp new pipeline` output must
+/// round-trip through `mse bp build` with `compile lint: OK`. Covers the
+/// AC on the CLI-invoke path (unit tests already cover the pure render
+/// function).
+#[test]
+fn bp_new_pipeline_scaffold_round_trips_through_bp_build() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let scaffold_path = tmp.path().join("hello.bp.lua");
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .args([
+            "bp",
+            "new",
+            "pipeline",
+            "hello",
+            "--stages",
+            "greet,echo",
+            "-o",
+        ])
+        .arg(&scaffold_path)
+        .assert()
+        .success()
+        .stderr(contains("mse bp new: wrote"));
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .args(["bp", "build"])
+        .arg(&scaffold_path)
+        .assert()
+        .success()
+        .stderr(contains("compile lint: OK"));
+}
+
+/// GH #62 Axis A CLI round-trip: `mse bp new single` — the minimal
+/// `flow_dsl`-only shape. Separate test so a regression in either
+/// template's DSL surface stays specific.
+#[test]
+fn bp_new_single_scaffold_round_trips_through_bp_build() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let scaffold_path = tmp.path().join("solo.bp.lua");
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .args(["bp", "new", "single", "solo-run", "--agent", "solo", "-o"])
+        .arg(&scaffold_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .args(["bp", "build"])
+        .arg(&scaffold_path)
+        .assert()
+        .success()
+        .stderr(contains("compile lint: OK"));
+}
+
+/// GH #62 Axis A CLI round-trip: `mse bp new verdict` — 3-stage
+/// verdict-gated shape. This is the most complex template; if it lints
+/// OK from the CLI, the two simpler ones do too, but each has its own
+/// test to keep failure attribution specific.
+#[test]
+fn bp_new_verdict_scaffold_round_trips_through_bp_build() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let scaffold_path = tmp.path().join("review-loop.bp.lua");
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .args(["bp", "new", "verdict", "review-loop", "-o"])
+        .arg(&scaffold_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .args(["bp", "build"])
+        .arg(&scaffold_path)
+        .assert()
+        .success()
+        .stderr(contains("compile lint: OK"));
+}
+
+/// GH #62 Axis A CLI error path: an unknown template must exit non-zero
+/// with the accepted list named — closed set discoverable from the
+/// error rather than requiring the author to open the guide.
+#[test]
+fn bp_new_unknown_template_exits_error_with_accepted_list() {
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .args(["bp", "new", "bogus", "foo"])
+        .assert()
+        .failure()
+        .stderr(contains("unknown template 'bogus'"))
+        .stderr(contains("pipeline"))
+        .stderr(contains("single"))
+        .stderr(contains("verdict"));
+}
