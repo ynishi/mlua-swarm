@@ -53,6 +53,13 @@ struct RunHandle {
     /// start (issue GH #34 — `mse_doctor`'s `audit_findings` scan needs
     /// `task_id` to address `GET /v1/tasks/:id/runs/:run/steps`).
     task_id: Option<String>,
+    /// Local cancel-request mark, flipped by `swarm_cancel`. Independent
+    /// from `status` because `swarm_status`'s HTTP enrichment overwrites
+    /// `status` with the server's authoritative view — which currently
+    /// does not yet know about the cancel (in-flight handle abort is v3
+    /// carry). Callers who need to know "was cancel requested locally?"
+    /// read this flag instead of relying on `status` staying `Cancelled`.
+    cancel_requested: bool,
 }
 
 #[allow(dead_code)]
@@ -1605,6 +1612,7 @@ impl MseServer {
                     run_id: run_id.clone(),
                     status: RunStatus::Running,
                     task_id: Some(task_id_typed.to_string()),
+                    cancel_requested: false,
                 },
             );
             (inner.task_app.clone(), inner.run_store.clone())
@@ -1860,6 +1868,7 @@ impl MseServer {
                     // Not known yet — the server mints/reports it in the
                     // POST /v1/tasks response body, parsed below.
                     task_id: None,
+                    cancel_requested: false,
                 },
             );
         }
@@ -2008,6 +2017,7 @@ impl MseServer {
                         run_id: effective_run_id.clone(),
                         status: final_status,
                         task_id: effective_task_id,
+                        cancel_requested: false,
                     },
                 );
             } else if let Some(h) = inner.runs.get_mut(&run_id) {
@@ -2021,7 +2031,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Peek at a known run by run_id. Returns a status snapshot enriched, best-effort, from three sources in this order: (1) the local `RunHandle` (in-process detach runs update this handle when they finish); (2) `GET /v1/runs/:id` on the server bind (GH #67 — folds `status` / `step_entries` / `result_ref` for `detach: true` runs whose completion the local handle never observed, and the tool updates the local handle to match); (3) the local run store's `RunRecord` (fallback for in-process trace when the server is unreachable). The HTTP lookup uses a short timeout and its failure is silent."
+        description = "Peek at a known run by run_id. Returns a status snapshot enriched, best-effort, from three sources in this order: (1) the local `RunHandle` (in-process detach runs update this handle when they finish); (2) `GET /v1/runs/:id` on the server bind (GH #67 — folds `status` / `step_entries` / `result_ref` for `detach: true` runs whose completion the local handle never observed, and the tool updates the local handle to match); (3) the local run store's `RunRecord` (fallback for in-process trace when the server is unreachable). The HTTP lookup uses a short timeout and its failure is silent. Always includes `cancel_requested: bool` from the local handle — flipped by `swarm_cancel` and preserved through the HTTP enrichment even when the server still reports `status: \"running\"` (in-flight abort is v3 carry)."
     )]
     async fn swarm_status(
         &self,
@@ -2043,6 +2053,11 @@ impl MseServer {
         let mut body = serde_json::json!({
             "run_id": h.run_id,
             "status": h.status,
+            // Local cancel-request mark (issue 9b3f225b): flipped by
+            // `swarm_cancel`, independent from `status` so the HTTP
+            // enrichment below cannot overwrite it. In-flight handle
+            // abort remains v3 carry.
+            "cancel_requested": h.cancel_requested,
         });
         if let Some(task_id) = &h.task_id {
             body["task_id"] = serde_json::json!(task_id);
@@ -3099,7 +3114,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Mark a run as cancelled in the local registry. Note: in-flight handle abort is v3 carry."
+        description = "Mark a run as cancelled in the local registry. Sets a `cancel_requested` mark on the local `RunHandle` — `swarm_status` surfaces it as `cancel_requested: true` alongside whatever `status` the server reports (the mark is preserved even when the server's HTTP enrichment overwrites `status` back to `running` / `done`). Note: in-flight handle abort is v3 carry; only the local mark flips today. Consumers watching for `swarm_status` to report `status: \"cancelled\"` should watch `cancel_requested` instead for immediate feedback."
     )]
     async fn swarm_cancel(
         &self,
@@ -3109,7 +3124,10 @@ impl MseServer {
         match inner.runs.get_mut(&req.run_id) {
             Some(h) => {
                 h.status = RunStatus::Cancelled;
-                json_result(&serde_json::json!({ "ok": true, "run_id": req.run_id }))
+                h.cancel_requested = true;
+                json_result(
+                    &serde_json::json!({ "ok": true, "run_id": req.run_id, "cancel_requested": true }),
+                )
             }
             None => Err(McpError::invalid_params(
                 format!("run_id not found: {}", req.run_id),
@@ -4301,10 +4319,53 @@ mod tests {
             .await
             .unwrap();
         let inner = server.state.read().await;
-        assert!(matches!(
-            inner.runs.get(&run_id).unwrap().status,
-            RunStatus::Cancelled
-        ));
+        let h = inner.runs.get(&run_id).unwrap();
+        assert!(matches!(h.status, RunStatus::Cancelled));
+        assert!(h.cancel_requested);
+    }
+
+    /// Issue 9b3f225b: after `swarm_cancel`, `swarm_status` must surface
+    /// the local `cancel_requested` mark even if the HTTP enrichment
+    /// (unreachable server here — port 1) can't reach the server. The
+    /// mark is independent from `status`, so it survives regardless of
+    /// what the server would have reported.
+    #[tokio::test]
+    async fn swarm_status_surfaces_cancel_requested_after_cancel() {
+        let server = MseServer::new();
+        let _ = server
+            .swarm_run(Parameters(SwarmRunReq {
+                blueprint: BlueprintInput::BareInline(serde_json::json!({})),
+                init_ctx: None,
+                timeout_secs: Some(5),
+                operator_id: None,
+                operator_kind: None,
+                operator_kind_overrides: None,
+                detach: None,
+            }))
+            .await
+            .unwrap();
+        let run_id = {
+            let inner = server.state.read().await;
+            inner.runs.keys().next().cloned().unwrap()
+        };
+        let _ = server
+            .swarm_cancel(Parameters(SwarmCancelReq {
+                run_id: run_id.clone(),
+            }))
+            .await
+            .unwrap();
+        let result = server
+            .swarm_status(Parameters(SwarmStatusReq {
+                run_id: run_id.clone(),
+                // Port 1 is RFC 6335 reserved — connect always refuses,
+                // so the HTTP enrichment falls back to the local view.
+                bind: Some("127.0.0.1:1".into()),
+            }))
+            .await
+            .unwrap();
+        let text = extract_text_payload(&result);
+        let body: serde_json::Value = serde_json::from_str(&text).expect("json body");
+        assert_eq!(body["cancel_requested"], serde_json::json!(true));
     }
 
     // --- agent.md size classifier tests (bp_doctor pure logic) ---
@@ -4867,6 +4928,7 @@ mod tests {
                     run_id: "R-unknown".into(),
                     status: RunStatus::Running,
                     task_id: Some("T-unknown".into()),
+                    cancel_requested: false,
                 },
             );
         }
@@ -5126,6 +5188,7 @@ mod tests {
                     run_id: "R-stub".into(),
                     status: RunStatus::Done,
                     task_id: Some("T-stub".into()),
+                    cancel_requested: false,
                 },
             );
         }
@@ -5205,6 +5268,7 @@ mod tests {
                     run_id: "R-stub".into(),
                     status: RunStatus::Running,
                     task_id: Some("T-stub".into()),
+                    cancel_requested: false,
                 },
             );
         }
