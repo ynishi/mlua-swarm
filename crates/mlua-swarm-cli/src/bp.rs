@@ -318,7 +318,11 @@ fn render_pipeline_template(
     out.push_str("-- Scaffolded by `mse bp new pipeline` (GH #62 Axis A).\n");
     out.push_str("-- Every mandatory field is pre-filled: `halted_at` (compile-lint\n");
     out.push_str("-- default), each operator agent's `profile.worker_binding` (WS\n");
-    out.push_str("-- thin-path requirement, GH #61), `strict_refs` + `strict_kind`.\n");
+    out.push_str("-- thin-path requirement, GH #61), the operator's `kind` (main_ai,\n");
+    out.push_str("-- so a caller can omit `operator_kind` at swarm_run time and the\n");
+    out.push_str("-- BP Agent-level tier of the OperatorKind cascade routes spawns to\n");
+    out.push_str("-- a joined main-ai session instead of silently falling through to\n");
+    out.push_str("-- the Automate backend, GH #66), `strict_refs` + `strict_kind`.\n");
     out.push_str("--\n");
     out.push_str("-- Launch prerequisite (GH #64): the pipeline sugar reads each stage's\n");
     out.push_str("-- input from `$.d.<stage_name>` and does NOT auto-chain outputs into\n");
@@ -352,7 +356,7 @@ fn render_pipeline_template(
     }
     out.push_str("  },\n");
     out.push_str(&format!(
-        "  operators = {{ {{ name = \"{operator}\" }} }},\n"
+        "  operators = {{ {{ name = \"{operator}\", kind = \"main_ai\" }} }},\n"
     ));
     out.push_str("  strategy = { strict_refs = true, strict_kind = true },\n");
     out.push_str(&format!(
@@ -367,7 +371,10 @@ fn render_single_template(name: &str, agent: &str, operator: &str, binding: &str
     out.push_str("-- Scaffolded by `mse bp new single` (GH #62 Axis A).\n");
     out.push_str("-- Minimal 1-step 1-agent shape — `flow_dsl` directly, no pipeline\n");
     out.push_str("-- sugar. All mandatory fields (`worker_binding`, `strict_refs`,\n");
-    out.push_str("-- `strict_kind`) are pre-filled.\n\n");
+    out.push_str("-- `strict_kind`) are pre-filled. The operator's `kind` is also\n");
+    out.push_str("-- pre-filled as `main_ai` (GH #66) so `swarm_run` can omit\n");
+    out.push_str("-- `operator_kind` at launch and spawns route to a joined\n");
+    out.push_str("-- main-ai session.\n\n");
     out.push_str("local F = require(\"flow_dsl\")\n\n");
     out.push_str(&format!(
         "local flow = F.step({{ id = \"{agent}\", agent = \"{agent}\", \
@@ -383,7 +390,7 @@ fn render_single_template(name: &str, agent: &str, operator: &str, binding: &str
     ));
     out.push_str("  },\n");
     out.push_str(&format!(
-        "  operators = {{ {{ name = \"{operator}\" }} }},\n"
+        "  operators = {{ {{ name = \"{operator}\", kind = \"main_ai\" }} }},\n"
     ));
     out.push_str("  strategy = { strict_refs = true, strict_kind = true },\n");
     out.push_str(&format!(
@@ -407,6 +414,9 @@ fn render_verdict_template(
          {review} (verdict-gated, bounded retry through fixer on BLOCKED) -> \
          {publish}. All mandatory fields pre-filled.\n"
     ));
+    out.push_str("-- The operator's `kind` is also pre-filled as `main_ai` (GH #66)\n");
+    out.push_str("-- so `swarm_run` can omit `operator_kind` at launch and spawns\n");
+    out.push_str("-- route to a joined main-ai session.\n");
     out.push_str("--\n");
     out.push_str("-- Launch prerequisite (GH #64): the pipeline sugar reads each stage's\n");
     out.push_str("-- input from `$.d.<stage_name>` and does NOT auto-chain outputs into\n");
@@ -468,7 +478,7 @@ fn render_verdict_template(
     ));
     out.push_str("  },\n");
     out.push_str(&format!(
-        "  operators = {{ {{ name = \"{operator}\" }} }},\n"
+        "  operators = {{ {{ name = \"{operator}\", kind = \"main_ai\" }} }},\n"
     ));
     out.push_str("  strategy = { strict_refs = true, strict_kind = true },\n");
     out.push_str(&format!(
@@ -736,6 +746,10 @@ mod tests {
         // both appear in the rendered text.
         assert!(rendered.contains("worker_binding = \"claude\""));
         assert!(rendered.contains("halted_at = \"$.halted_at\""));
+        // GH #66: operator entry must pre-declare `kind = "main_ai"` so the
+        // BP Agent-level tier of the OperatorKind cascade resolves without
+        // requiring a `swarm_run(operator_kind = ...)` override.
+        assert!(rendered.contains("kind = \"main_ai\""));
         // Round-trip through the real Compiler — this is the AC.
         let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
         match report {
@@ -747,7 +761,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn pipeline_template_documents_init_ctx_seeding() {
         // GH #64: the header must tell the author that each stage reads
         // from `$.d.<stage>` and needs an init_ctx seed at launch —
@@ -776,6 +789,29 @@ mod tests {
             rendered.contains("mse://guides/bp-dsl-templates"),
             "header must link to the guide covering the convention"
         );
+    }
+
+    #[test]
+    fn all_templates_pre_declare_operator_kind_main_ai() {
+        // GH #66: silent-fall-through fix. Every emitted template must
+        // include `kind = "main_ai"` inside its `operators = { ... }`
+        // block so a `swarm_run` invocation without an explicit
+        // `operator_kind` resolves through the BP Agent-level tier to
+        // `MainAi` instead of dropping to the default `Automate` — the
+        // silent fall-through the issue documents. Assert exactly the
+        // literal shape (`name = "..."` followed by `kind = "main_ai"`
+        // in the same operator entry) so a future refactor that splits
+        // the entry across lines still passes iff both fields land on
+        // the same entry.
+        for template in ["pipeline", "single", "verdict"] {
+            let rendered =
+                render_template_by_kind(template, "op-kind-check", None, None, None, None)
+                    .expect("render must succeed with defaults");
+            assert!(
+                rendered.contains("operators = { { name = \"main-ai\", kind = \"main_ai\" } }"),
+                "{template} template must emit an operator entry with `kind = \"main_ai\"` pre-declared, got: {rendered}"
+            );
+        }
     }
 
     #[test]
