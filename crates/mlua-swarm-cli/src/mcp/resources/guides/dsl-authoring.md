@@ -115,6 +115,37 @@ A stage's `input` defaults to `$.d.{stage_id}`; its `out` defaults to
 default (per-stage `input` may also be a `B.from` placeholder — see
 § `B.from` below).
 
+### Chained pipelines
+
+`chain = true` at the top level of the `B.pipeline{}` spec opts the pipeline
+into stage-to-stage chaining: stage N (N ≥ 2) whose `input` is nil defaults
+to `$.{stage[N-1]_id}` — the previous stage's own `out` — instead of the
+`$.d.{stage_id}` default. Stage 1's default is unchanged (still
+`$.d.{stage_1_id}`), because there is no earlier stage to chain from; seed it
+via the launcher's `init_ctx` as usual (`init_ctx = { d = { {stage_1_id} =
+... } }`).
+
+```lua
+local flow = B.pipeline({
+  B.stage "ingest"    { agent = "ingest" },
+  B.stage "transform" { agent = "transform" },
+  B.stage "emit"      { agent = "emit" },
+  chain = true,
+  halted_at = "$.halted_at",
+  done      = "$.pipeline_complete",
+})
+-- ingest:    in = $.d.ingest, out = $.ingest        (stage 1 unchanged)
+-- transform: in = $.ingest,   out = $.transform     (chained from ingest)
+-- emit:      in = $.transform, out = $.emit         (chained from transform)
+```
+
+An explicit per-stage `input` (either a path string or a `B.from`
+placeholder) still overrides the chained default. Retry `fix` stages are not
+chained: they keep the R1 default so the fixer's input can be seeded
+independently of the review stage's output. Omitting `chain` (or setting it
+to `false`) preserves the R1 default (`$.d.{stage_id}`) in every position —
+the pre-existing behavior.
+
 ### Automatic verdict gate
 
 Immediately after each stage's `step` Node, a `branch` Node is inserted
