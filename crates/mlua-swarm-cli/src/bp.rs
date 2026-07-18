@@ -761,6 +761,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn pipeline_template_documents_init_ctx_seeding() {
         // GH #64: the header must tell the author that each stage reads
         // from `$.d.<stage>` and needs an init_ctx seed at launch —
