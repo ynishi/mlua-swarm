@@ -4644,8 +4644,7 @@ mod tests {
 
     #[test]
     fn worker_binding_lint_flags_operator_kind_missing_worker_binding_as_warn() {
-        let lint =
-            classify_worker_binding_lint(&mlua_swarm::blueprint::AgentKind::Operator, None);
+        let lint = classify_worker_binding_lint(&mlua_swarm::blueprint::AgentKind::Operator, None);
         assert_eq!(lint["severity"], "WARN");
         assert_eq!(lint["kind_requires_binding"], true);
         assert_eq!(lint["present"], false);
