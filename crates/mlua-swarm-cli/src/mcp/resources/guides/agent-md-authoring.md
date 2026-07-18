@@ -41,6 +41,67 @@ The Anthropic official examples (`code-reviewer`, `debugger`, `data-scientist`,
 input. Do not enumerate example inputs in the durable prompt — that content is
 per-invocation and belongs in the caller's `Task` dispatch, not in agent.md.
 
+## Frontmatter shape (how mse's `$agent_md` loader parses this file)
+
+The Blueprint `$agent_md` ref (`{"$agent_md": "path/to/agent.md"}`) resolves the
+file through mse's `agent_md_loader`. The loader is a thin adaptor around the
+same Claude Code SubAgent shape — YAML frontmatter between `---` fences, then a
+Markdown body — so the on-disk shape you already use with Claude Code is what
+mse consumes. There's no separate mse-specific frontmatter dialect.
+
+- **Frontmatter is required.** The file must start with `---\n`, contain YAML
+  key/value pairs, and close with a `---\n` line. Files with no frontmatter are
+  **silently skipped** in a directory scan (they're treated as explanatory
+  docs, not agents), and rejected outright when loaded by explicit path with a
+  `NoFrontmatter` error. A leading blank line before the opening `---` breaks
+  detection — start the file with `---` on line 1.
+
+- **`name:` is the only required field.** Missing `name` fails with
+  `MissingName`. Every other key is optional; missing keys default to nothing
+  and are not reported as errors.
+
+- **First-class fields.** These six keys are extracted into typed
+  `AgentProfile` slots. The names and semantics are Claude Code's:
+
+  | key              | shape                              | slot                          |
+  |------------------|------------------------------------|-------------------------------|
+  | `name`           | string (required)                  | `AgentDef.name`               |
+  | `description`    | string                             | `profile.description` (trimmed) |
+  | `model`          | string (`sonnet` / `haiku` / …)    | `profile.model`               |
+  | `effort`         | string (`low` / `medium` / `high` / …) | `profile.effort`          |
+  | `tools`          | CSV string **or** YAML array       | `profile.tools` (normalized `Vec<String>`) |
+  | `worker_binding` | string (SubAgent variant name)     | `profile.worker_binding`      |
+
+  `tools` accepts either form — `tools: "Read, Edit, Grep"` and
+  `tools: [Read, Edit, Grep]` produce the same `Vec<String>`. Whitespace and
+  empty entries are trimmed.
+
+- **Everything else is dumped into `extras`.** Any key outside the first-class
+  set (`permissionMode`, `memory`, `abtest`, arbitrary custom keys, …) is
+  preserved verbatim as JSON under `profile.extras`. This is a future-proof
+  carry — Claude Code frontmatter keys mse doesn't know about yet still round-
+  trip through the loader unchanged. They're **not** injected into the SubAgent
+  system prompt on the mse side; if a key like `permissionMode` needs to affect
+  the actual SubAgent grant, that's the wrapper file's job (mse's binding
+  target), not the loader's.
+
+- **Body is verbatim.** Everything after the closing `---\n` becomes
+  `profile.system_prompt` as-is — no heading normalization, no truncation, no
+  hidden preface. The body is what the SubAgent sees; the frontmatter never
+  bleeds into the prompt.
+
+- **Content hash.** `profile.version_hash` is `blake3(body)` (hex-encoded), so
+  frontmatter edits don't invalidate the hash — only body changes do. This
+  matches how the compiler's post-hook recomputes the hash for
+  `/agents/N/profile/system_prompt` replacements.
+
+**Practical implication for authoring.** You can write agent.md files in the
+same shape you already use with Claude Code and drop them straight into a
+mse Blueprint with `$agent_md`. mse-only fields (`worker_binding`) go in the
+same frontmatter block; Claude Code-only fields (`permissionMode`, `memory`,
+…) survive round-trip but don't affect mse's dispatch — they belong to the
+wrapper's grant, not to this durable prompt.
+
 ## Output contract: inline body vs `@file:` sentinel
 
 `POST /v1/worker/submit` accepts two body forms. Declare **exactly one** in
