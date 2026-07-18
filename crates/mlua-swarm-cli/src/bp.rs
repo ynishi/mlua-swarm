@@ -201,8 +201,7 @@ fn run_new(args: NewArgs) -> Result<()> {
     let out = render_template(&args)?;
     match &args.out {
         Some(path) => {
-            std::fs::write(path, &out)
-                .with_context(|| format!("writing {}", path.display()))?;
+            std::fs::write(path, &out).with_context(|| format!("writing {}", path.display()))?;
             eprintln!("mse bp new: wrote {} ({} bytes)", path.display(), out.len());
         }
         None => print!("{out}"),
@@ -790,24 +789,12 @@ mod tests {
                 .expect("render must succeed with partial stages");
         assert!(rendered.contains("B.stage \"scan\""));
         // Slot 2 / 3 fall back to defaults.
-        assert!(rendered.contains(&format!(
-            "B.stage \"{}\"",
-            DEFAULT_VERDICT_STAGES[1]
-        )));
-        assert!(rendered.contains(&format!(
-            "B.stage \"{}\"",
-            DEFAULT_VERDICT_STAGES[2]
-        )));
+        assert!(rendered.contains(&format!("B.stage \"{}\"", DEFAULT_VERDICT_STAGES[1])));
+        assert!(rendered.contains(&format!("B.stage \"{}\"", DEFAULT_VERDICT_STAGES[2])));
         // Extra names are truncated (>3 supplied → tail dropped).
-        let over = render_template_by_kind(
-            "verdict",
-            "rv-over",
-            Some("a,b,c,d,e"),
-            None,
-            None,
-            None,
-        )
-        .expect("render must succeed with over-supplied stages");
+        let over =
+            render_template_by_kind("verdict", "rv-over", Some("a,b,c,d,e"), None, None, None)
+                .expect("render must succeed with over-supplied stages");
         assert!(!over.contains("B.stage \"d\""));
         assert!(!over.contains("B.stage \"e\""));
     }
@@ -835,7 +822,9 @@ mod tests {
         let hint = fix_hint_from_compile_error(msg).expect("worker_binding hint must fire");
         assert_eq!(hint.kind, "worker-binding-missing");
         assert!(hint.reason.contains("greeter"));
-        assert!(hint.patch_suggestion.contains("worker_binding = \"claude\""));
+        assert!(hint
+            .patch_suggestion
+            .contains("worker_binding = \"claude\""));
         assert_eq!(
             hint.docs_ref.as_deref(),
             Some("mse://guides/bp-dsl-templates")
@@ -844,7 +833,8 @@ mod tests {
 
     #[test]
     fn fix_hint_worker_binding_reason_falls_back_when_no_agent_quoted() {
-        let msg = "compile lint FAILED: profile.worker_binding is required for this operator backend.";
+        let msg =
+            "compile lint FAILED: profile.worker_binding is required for this operator backend.";
         let hint = fix_hint_from_compile_error(msg).expect("worker_binding hint must fire");
         // Fallback reason (no agent name parsed) still names the kind
         // and remedy.
@@ -857,27 +847,28 @@ mod tests {
         let msg = "compile lint FAILED: value 'NOT_DECLARED' is not a member of the declared values [\"PASS\", \"BLOCKED\"]";
         let hint = fix_hint_from_compile_error(msg).expect("verdict hint must fire");
         assert_eq!(hint.kind, "verdict-value-not-in-contract");
-        assert!(hint
-            .reason
-            .contains("`agents[N].verdict.values`"));
-        assert!(hint
-            .patch_suggestion
-            .contains("add the cond's literal"));
+        assert!(hint.reason.contains("`agents[N].verdict.values`"));
+        assert!(hint.patch_suggestion.contains("add the cond's literal"));
     }
 
     #[test]
     fn fix_hint_halted_at_fires_on_missing_field_at() {
-        let msg = "compile lint FAILED: missing field `at` (hint: fetch the Blueprint JSON Schema...)";
+        let msg =
+            "compile lint FAILED: missing field `at` (hint: fetch the Blueprint JSON Schema...)";
         let hint = fix_hint_from_compile_error(msg).expect("halted_at hint must fire");
         assert_eq!(hint.kind, "halted-at-missing");
-        assert!(hint.patch_suggestion.contains("halted_at = \"$.halted_at\""));
+        assert!(hint
+            .patch_suggestion
+            .contains("halted_at = \"$.halted_at\""));
     }
 
     #[test]
     fn fix_hint_returns_none_for_unknown_lint_shape() {
         // A lint kind without a canonical fix recipe returns None so
         // the caller never renders a wrong-but-confident hint.
-        assert!(fix_hint_from_compile_error("some new lint the mapping doesn't know about").is_none());
+        assert!(
+            fix_hint_from_compile_error("some new lint the mapping doesn't know about").is_none()
+        );
         assert!(fix_hint_from_compile_error("").is_none());
     }
 
@@ -894,9 +885,8 @@ mod tests {
         // an empty Vec; the render fn falls back to the default set
         // rather than emitting a stage-less pipeline (which would be
         // rejected at compile-lint anyway).
-        let rendered =
-            render_template_by_kind("pipeline", "rp-empty", Some(""), None, None, None)
-                .expect("render must succeed and fall back");
+        let rendered = render_template_by_kind("pipeline", "rp-empty", Some(""), None, None, None)
+            .expect("render must succeed and fall back");
         let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
         assert!(matches!(
             report,

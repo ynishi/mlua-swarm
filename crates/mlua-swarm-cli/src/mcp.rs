@@ -110,6 +110,36 @@ impl MseServer {
 }
 
 /// Unix epoch seconds (same convention as the store records' timestamps).
+/// GH #67: best-effort `GET /v1/runs/:id` used by `swarm_status` to reach
+/// past the local `RunHandle` and pick up the server-side
+/// `SqliteRunStore`'s authoritative view of a detached run. `None` on any
+/// error (HTTP client build / send / non-2xx / non-JSON body / timeout) —
+/// callers fall back to the local run store trace.
+async fn fetch_run_via_http(bind: &str, run_id: &str) -> Option<JsonValue> {
+    let url = format!("http://{bind}/v1/runs/{run_id}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<JsonValue>().await.ok()
+}
+
+/// GH #67: reflect a server-reported run status string back into the local
+/// `RunHandle`'s `RunStatus`. Returns `None` for unrecognized strings
+/// (leaves the handle untouched) or when the server's status is still
+/// `Running` (no change needed).
+fn parse_run_status(s: &str) -> Option<RunStatus> {
+    match s {
+        "done" => Some(RunStatus::Done),
+        "failed" => Some(RunStatus::Failed),
+        _ => None,
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1151,6 +1181,16 @@ fn read_blueprint_from_file(path: &str) -> Result<JsonValue, String> {
 #[derive(Deserialize, JsonSchema)]
 struct SwarmStatusReq {
     run_id: String,
+    /// GH #67: `mse serve` bind address the run was launched against.
+    /// When present (or defaulted via `server_control::DEFAULT_BIND`), the
+    /// tool issues a best-effort `GET /v1/runs/:id` to fold the server's
+    /// authoritative `RunRecord` (`status` / `step_entries` / `result_ref`)
+    /// into the response — so a `detach: true` run whose completion the
+    /// local `RunHandle` never observed is no longer reported as stale
+    /// `running`. The HTTP fetch is guarded by a short timeout and its
+    /// failure is silent: the tool falls back to the local run store.
+    #[serde(default)]
+    bind: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1981,7 +2021,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Peek at a known run by run_id. Returns status snapshot; for in-process runs the per-step trace (step_entries) is included."
+        description = "Peek at a known run by run_id. Returns a status snapshot enriched, best-effort, from three sources in this order: (1) the local `RunHandle` (in-process detach runs update this handle when they finish); (2) `GET /v1/runs/:id` on the server bind (GH #67 — folds `status` / `step_entries` / `result_ref` for `detach: true` runs whose completion the local handle never observed, and the tool updates the local handle to match); (3) the local run store's `RunRecord` (fallback for in-process trace when the server is unreachable). The HTTP lookup uses a short timeout and its failure is silent."
     )]
     async fn swarm_status(
         &self,
@@ -1994,30 +2034,60 @@ impl MseServer {
                 inner.run_store.clone(),
             )
         };
-        match handle {
-            Some(h) => {
-                let mut body = serde_json::json!({
-                    "run_id": h.run_id,
-                    "status": h.status,
-                });
-                // In-process runs carry a local step trace (issue #13);
-                // HTTP-proxied runs live on the server — drill down there
-                // via GET /v1/runs/:id instead. Both lookups are best-effort
-                // enrichment, so a non-`R-` run_id simply skips the trace.
-                if let Ok(rid) = RunId::parse(req.run_id.clone()) {
-                    if let Ok(rec) = run_store.get(&rid).await {
-                        body["task_id"] = serde_json::json!(rec.task_id);
-                        body["step_entries"] =
-                            serde_json::to_value(&rec.step_entries).unwrap_or(JsonValue::Null);
-                    }
-                }
-                json_result(&body)
-            }
-            None => Err(McpError::invalid_params(
+        let Some(h) = handle else {
+            return Err(McpError::invalid_params(
                 format!("run_id not found: {}", req.run_id),
                 None,
-            )),
+            ));
+        };
+        let mut body = serde_json::json!({
+            "run_id": h.run_id,
+            "status": h.status,
+        });
+        if let Some(task_id) = &h.task_id {
+            body["task_id"] = serde_json::json!(task_id);
         }
+
+        // GH #67: HTTP-proxied `detach: true` runs never update the local
+        // handle after the initial 202 (the tool does not spawn a polling
+        // task), so the local `h.status` sits at `Running` forever. Poll
+        // the server's `GET /v1/runs/:id`, which reads the same
+        // `SqliteRunStore` the run's finalizer wrote its terminal state to,
+        // and fold the authoritative view over the local snapshot. In-process
+        // detach runs also gain the enrichment (their handle transitions to
+        // Done on its own, so the poll is redundant but harmless).
+        let bind = req
+            .bind
+            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+        let http_body: Option<JsonValue> = fetch_run_via_http(&bind, &req.run_id).await;
+        if let Some(server_body) = http_body {
+            // Server is the id authority; overwrite the fields it knows.
+            if let Some(status) = server_body.get("status").cloned() {
+                body["status"] = status.clone();
+                if let Some(new_status) = status.as_str().and_then(parse_run_status) {
+                    let mut inner = self.state.write().await;
+                    if let Some(handle) = inner.runs.get_mut(&req.run_id) {
+                        handle.status = new_status;
+                    }
+                }
+            }
+            for field in ["task_id", "step_entries", "result_ref"] {
+                if let Some(v) = server_body.get(field).cloned() {
+                    body[field] = v;
+                }
+            }
+        } else {
+            // Fallback: enrich from the local run store trace (in-process
+            // runs — issue #13). Same best-effort behavior as before GH #67.
+            if let Ok(rid) = RunId::parse(req.run_id.clone()) {
+                if let Ok(rec) = run_store.get(&rid).await {
+                    body["task_id"] = serde_json::json!(rec.task_id);
+                    body["step_entries"] =
+                        serde_json::to_value(&rec.step_entries).unwrap_or(JsonValue::Null);
+                }
+            }
+        }
+        json_result(&body)
     }
 
     #[tool(
@@ -3258,10 +3328,39 @@ mod tests {
         let err = server
             .swarm_status(Parameters(SwarmStatusReq {
                 run_id: "nope".into(),
+                bind: None,
             }))
             .await
             .unwrap_err();
         let _ = format!("{:?}", err);
+    }
+
+    /// GH #67: helper that maps a server-reported status string back to
+    /// the local `RunStatus` — `done` / `failed` are terminal, everything
+    /// else (including `running`) leaves the handle untouched.
+    #[test]
+    fn parse_run_status_maps_terminal_states_only() {
+        assert!(matches!(parse_run_status("done"), Some(RunStatus::Done)));
+        assert!(matches!(
+            parse_run_status("failed"),
+            Some(RunStatus::Failed)
+        ));
+        assert!(parse_run_status("running").is_none());
+        assert!(parse_run_status("").is_none());
+        assert!(parse_run_status("something-else").is_none());
+    }
+
+    /// GH #67: the HTTP enrichment is best-effort — an unreachable server
+    /// bind must return `None` (so `swarm_status` silently falls back to
+    /// the local run store trace) rather than propagating a client error.
+    /// Uses port 1 (RFC 6335 reserved, connect always refuses) as an
+    /// unreachable bind.
+    #[tokio::test]
+    async fn fetch_run_via_http_returns_none_when_server_unreachable() {
+        // A short client timeout keeps the test snappy even if a
+        // reactor happens to accept the connection.
+        let result = fetch_run_via_http("127.0.0.1:1", "R-does-not-matter").await;
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -3323,6 +3422,7 @@ mod tests {
             let status_res = server
                 .swarm_status(Parameters(SwarmStatusReq {
                     run_id: run_id.clone(),
+                    bind: None,
                 }))
                 .await
                 .expect("swarm_status");
@@ -3363,6 +3463,7 @@ mod tests {
         let status = server
             .swarm_status(Parameters(SwarmStatusReq {
                 run_id: run_id.to_string(),
+                bind: None,
             }))
             .await
             .expect("swarm_status");
@@ -4644,8 +4745,7 @@ mod tests {
 
     #[test]
     fn worker_binding_lint_flags_operator_kind_missing_worker_binding_as_warn() {
-        let lint =
-            classify_worker_binding_lint(&mlua_swarm::blueprint::AgentKind::Operator, None);
+        let lint = classify_worker_binding_lint(&mlua_swarm::blueprint::AgentKind::Operator, None);
         assert_eq!(lint["severity"], "WARN");
         assert_eq!(lint["kind_requires_binding"], true);
         assert_eq!(lint["present"], false);
