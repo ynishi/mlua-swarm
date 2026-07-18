@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2](https://github.com/ynishi/mlua-swarm/compare/v0.12.1...v0.12.2) - 2026-07-18
+
+### Added
+
+- *(cli)* add fix_hint payload to compile-lint failures (GH #62 Axis B.1)
+- *(cli)* add mse bp new scaffolding CLI + bp_new MCP tool (GH #62 Axis A)
+- *(cli)* front-load worker_binding into bp_build compile-lint + bp_doctor family (GH #61)
+- *(cli)* add bp_build MCP tool for direct .bp.lua registration
+
+### Fixed
+
+- *(dsl)* default `halted_at` in B.pipeline so verdict-less pipelines compile
+
 ## [0.12.1](https://github.com/ynishi/mlua-swarm/compare/v0.12.0...v0.12.1) - 2026-07-17
 
 ### Added
