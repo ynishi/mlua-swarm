@@ -70,8 +70,8 @@ pub async fn healthz_ok(bind: &str) -> bool {
     }
 }
 
-/// `GET /v1/status` on the running `mse serve` process (issue #35 ST4
-/// — lifecycle occupancy guard). `Err` covers both network failure and
+/// `GET /v1/status` on the running `mse serve` process — the lifecycle
+/// occupancy guard. `Err` covers both network failure and
 /// an older server binary predating this route (404) — callers should
 /// treat `Err` as "occupancy unknown", not "occupancy = busy" (see the
 /// MCP tool handlers' fail-open-on-Err policy).
@@ -586,7 +586,7 @@ pub async fn uninstall() -> Result<UninstallOutcome, ServerError> {
 /// (`/tmp/mse-server.stdout` / `/tmp/mse-server.stderr`). Missing files
 /// surface as empty `stdout_tail` / `stderr_tail`, not an `Err` — the
 /// user just hasn't started the server yet. `tail` defaults to 20 lines;
-/// `--follow` is not implemented (deferred to a future subtask).
+/// `--follow` is not implemented (may arrive in a follow-up).
 pub async fn logs(tail: Option<usize>) -> Result<LogsOutcome, ServerError> {
     let stdout_path = PathBuf::from("/tmp/mse-server.stdout");
     let stderr_path = PathBuf::from("/tmp/mse-server.stderr");
@@ -840,7 +840,7 @@ com.mse.server = {
         assert_eq!(occ.attached_operators, 0);
     }
 
-    // ---- Subtask 1b additions --------------------------------------------
+    // ---- Lifecycle-family test additions ---------------------------------
 
     #[test]
     fn render_substitutes_placeholders() {

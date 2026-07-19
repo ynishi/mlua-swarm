@@ -312,8 +312,8 @@ pub fn blueprint_schema_value() -> Result<serde_json::Value, serde_json::Error> 
 /// /v1/blueprints/:id`) point at `mse://api/blueprint-schema` by URI
 /// instead of duplicating that schema here — the two resources stay
 /// separate documents (see the module doc / `must_not_simplify #1` /
-/// `#6`). Thin endpoints (`doctor` / `healthz`) are out of this
-/// subtask's scope; adding one later is one more map entry.
+/// `#6`). Thin endpoints (`doctor` / `healthz`) are out of scope here;
+/// adding one later is one more map entry.
 pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Error> {
     let task_launch_request_schema = schemars::schema_for!(mlua_swarm_server::TaskLaunchRequest);
     let task_launch_request = serde_json::to_value(&task_launch_request_schema)?;
