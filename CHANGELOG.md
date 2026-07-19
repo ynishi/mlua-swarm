@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/ynishi/mlua-swarm/compare/v0.13.0...v0.14.0) - 2026-07-19
+
+### Added
+
+- *(server)* add POST /v1/runs/:id/rerun-from — GH #71 Layer A
+
+### Other
+
+- *(cli)* explain Operator naming glue in guide + all bp scaffolds
+
 ## [0.13.0](https://github.com/ynishi/mlua-swarm/compare/v0.12.3...v0.13.0) - 2026-07-19
 
 ### Added
