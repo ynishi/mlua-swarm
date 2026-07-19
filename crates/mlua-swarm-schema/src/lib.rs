@@ -73,6 +73,7 @@
 //!     runners: vec![],
 //!     default_runner: None,
 //!     check_policy: None,
+//!     blueprint_ref_includes: vec![],
 //! };
 //!
 //! assert_eq!(bp.id.as_str(), "hello");
@@ -114,6 +115,7 @@
 //!     runners: vec![],
 //!     default_runner: None,
 //!     check_policy: None,
+//!     blueprint_ref_includes: vec![],
 //! };
 //!
 //! let json = serde_json::to_string(&bp).unwrap();
