@@ -278,6 +278,53 @@ impl ReplayStore for SqliteReplayStore {
             )
             .collect())
     }
+
+    async fn delete_from(
+        &self,
+        run_id: &RunId,
+        from_index: usize,
+    ) -> Result<usize, ReplayStoreError> {
+        let run_id_str = run_id.to_string();
+        let deleted: usize = self
+            .isle
+            .call(move |conn| {
+                // Collect the seq values in the same order list_by_run uses
+                // (`ORDER BY seq ASC`), skip the first `from_index` rows,
+                // and delete the rest in a single statement. `LIMIT -1
+                // OFFSET n` in SQLite returns "all rows after skipping n"
+                // — this is the shape we want.
+                let mut stmt = conn.prepare(
+                    "SELECT seq FROM replay_log WHERE run_id = ?1 \
+                     ORDER BY seq ASC LIMIT -1 OFFSET ?2",
+                )?;
+                let seqs: Vec<i64> = stmt
+                    .query_map(params![run_id_str, from_index as i64], |row| {
+                        row.get::<_, i64>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(stmt);
+
+                if seqs.is_empty() {
+                    return Ok(0usize);
+                }
+
+                // Build a parameterized IN (...) clause. All seqs came from
+                // the same replay_log table so the row count IS the deleted
+                // row count; no need to consult the driver's changes counter.
+                let placeholders = std::iter::repeat("?")
+                    .take(seqs.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!("DELETE FROM replay_log WHERE seq IN ({placeholders})");
+                let params_dyn: Vec<&dyn rusqlite::ToSql> =
+                    seqs.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                conn.execute(&sql, params_dyn.as_slice())?;
+                Ok(seqs.len())
+            })
+            .await
+            .map_err(map_isle_err)?;
+        Ok(deleted)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -588,6 +635,140 @@ mod tests {
 
         // Still at the current schema version.
         assert_eq!(read_user_version(&path), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn sqlite_delete_from_truncates_and_returns_count() {
+        let (store, driver) = SqliteReplayStore::open_in_memory().await.unwrap();
+        let run_id = RunId::new();
+        let ctx = mk_ctx();
+        for (step, occ) in [("a", 0), ("b", 0), ("c", 0), ("d", 0)] {
+            store
+                .append(
+                    ReplayEntry::from_completion(
+                        run_id.clone(),
+                        step,
+                        "h",
+                        occ,
+                        &ctx,
+                        &json!({ "s": step }),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let dropped = store.delete_from(&run_id, 2).await.unwrap();
+        assert_eq!(dropped, 2);
+
+        let listed = store.list_by_run(&run_id).await.unwrap();
+        let refs: Vec<String> = listed.iter().map(|e| e.step_ref.clone()).collect();
+        assert_eq!(refs, vec!["a", "b"]);
+
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_delete_from_past_length_is_noop() {
+        let (store, driver) = SqliteReplayStore::open_in_memory().await.unwrap();
+        let run_id = RunId::new();
+        let ctx = mk_ctx();
+        store
+            .append(
+                ReplayEntry::from_completion(run_id.clone(), "a", "h", 0, &ctx, &json!(1)).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.delete_from(&run_id, 1).await.unwrap(), 0);
+        assert_eq!(store.delete_from(&run_id, 99).await.unwrap(), 0);
+        assert_eq!(store.list_by_run(&run_id).await.unwrap().len(), 1);
+
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_delete_from_missing_run_is_noop() {
+        let (store, driver) = SqliteReplayStore::open_in_memory().await.unwrap();
+        let run_id = RunId::new();
+        assert_eq!(store.delete_from(&run_id, 0).await.unwrap(), 0);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_delete_from_isolates_runs() {
+        let (store, driver) = SqliteReplayStore::open_in_memory().await.unwrap();
+        let r1 = RunId::new();
+        let r2 = RunId::new();
+        let ctx = mk_ctx();
+        for step in ["a", "b"] {
+            store
+                .append(
+                    ReplayEntry::from_completion(r1.clone(), step, "h", 0, &ctx, &json!(step))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            store
+                .append(
+                    ReplayEntry::from_completion(r2.clone(), step, "h", 0, &ctx, &json!(step))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.delete_from(&r1, 0).await.unwrap(), 2);
+        assert!(store.list_by_run(&r1).await.unwrap().is_empty());
+        assert_eq!(store.list_by_run(&r2).await.unwrap().len(), 2);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_delete_from_frees_slots_for_reappend() {
+        let (store, driver) = SqliteReplayStore::open_in_memory().await.unwrap();
+        let run_id = RunId::new();
+        let ctx = mk_ctx();
+        for step in ["a", "b"] {
+            store
+                .append(
+                    ReplayEntry::from_completion(
+                        run_id.clone(),
+                        step,
+                        "hash",
+                        0,
+                        &ctx,
+                        &json!({ "v": step }),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.delete_from(&run_id, 1).await.unwrap(), 1);
+        store
+            .append(
+                ReplayEntry::from_completion(
+                    run_id.clone(),
+                    "b",
+                    "hash",
+                    0,
+                    &ctx,
+                    &json!({ "v": "b-fresh" }),
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("re-append after delete_from must not collide with UNIQUE");
+        let listed = store.list_by_run(&run_id).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].step_ref, "a");
+        assert_eq!(listed[1].step_ref, "b");
+        assert_eq!(
+            listed[1].decode_step_output().unwrap(),
+            json!({ "v": "b-fresh" })
+        );
+        driver.shutdown().await.unwrap();
     }
 
     #[tokio::test]

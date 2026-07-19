@@ -12,6 +12,13 @@
 //!   pair. A body-less request (or one that omits both fields) preserves the
 //!   pre-#19 rekick behavior byte-for-byte.
 //! - `GET  /v1/runs/:id`       — a single `RunRecord` (`step_entries` trace included).
+//! - `POST /v1/runs/:id/resume` — resume an `Interrupted` Run under the SAME
+//!   `run_id` (replay cursor + stored launch-input snapshot).
+//! - `POST /v1/runs/:id/rerun-from` — GH #71 Layer A. Rerun a terminal Run
+//!   (`Done` / `Failed` / `Interrupted`) from a caller-specified step under
+//!   the SAME `run_id`; physically truncates the replay log at the cut
+//!   point so re-dispatch does not collide with the pre-rerun rows. See
+//!   [`run_rerun_from`] for the full contract + Known Limitations.
 //!
 //! `POST /v1/tasks` itself (the flow-eval entry point, `tasks_start` /
 //! `run_flow_form`) stays in `crate::lib` — it is the pre-existing
@@ -774,6 +781,265 @@ pub async fn run_resume(
             run_id,
             task_id,
             replayed_steps,
+        }),
+    ))
+}
+
+/// Request body for `POST /v1/runs/:id/rerun-from` (GH #71 Layer A).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RunRerunFromRequest {
+    /// The step to re-execute. This is a raw `step_ref` (the agent name the
+    /// dispatcher recorded as `ReplayEntry.step_ref`), NOT a projection
+    /// canonical name. See [`run_rerun_from`] doc for the Known Limitations
+    /// this carries (loop bodies match the first occurrence,
+    /// `AgentMeta.projection_name` is not resolved, `BlueprintRef::Inline`
+    /// re-decodes the frozen inline BP).
+    pub from_step: String,
+}
+
+/// Response body for `POST /v1/runs/:id/rerun-from` (GH #71 Layer A).
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct RunRerunFromResponse {
+    /// The rerun's Run id — echoes the path param. Rerun-from-step never
+    /// mints a new `RunId`; it re-runs in place so the replay-entry Ctx
+    /// snapshots (which bake this id into `meta.runtime[run_id]`) stay
+    /// consistent.
+    #[schemars(with = "String")]
+    pub run_id: RunId,
+    /// The Task this Run belongs to.
+    #[schemars(with = "String")]
+    pub task_id: TaskId,
+    /// Count of pre-cut entries handed to the replay cursor — each is
+    /// returned verbatim by the engine before fresh dispatch resumes at
+    /// the cut point.
+    pub replayed_steps: usize,
+    /// Count of entries physically dropped from the replay store — the
+    /// target step's row plus every downstream row.
+    pub dropped_steps: usize,
+}
+
+/// `POST /v1/runs/:id/rerun-from` — GH #71 Layer A. Re-executes a specific
+/// step (and every downstream step) of a terminal Run under the SAME
+/// `run_id`. Mirrors [`run_resume`], with two deltas: it accepts any
+/// terminal status (`Done` / `Failed` / `Interrupted`) rather than only
+/// `Interrupted`, and it physically truncates the replay log at the cut
+/// point (via [`crate::AppState::replay_store`]'s `delete_from`) so that
+/// re-dispatch's `append` does not collide with the pre-rerun row and so
+/// `list_by_run` reflects the rerun's real history rather than the
+/// pre-rerun ghost.
+///
+/// # Status codes
+///
+/// - `400` — invalid `run_id`, malformed body, or launch-snapshot decode failure.
+/// - `404` — no Run with this id.
+/// - `409` — the Run is `Running` / `Pending` (would race the in-flight
+///   driver), OR a concurrent transition won the compare-and-set.
+/// - `422` — the Run has no recorded launch-input snapshot, OR `from_step`
+///   is not present in this Run's replay log.
+/// - `202 Accepted` — accepted; the flow re-runs in a detached background
+///   task (same `tokio::spawn` + run-TTL ceiling shape as [`run_resume`]).
+///   Poll `GET /v1/runs/:id` for the terminal status.
+///
+/// # Order of operations
+///
+/// The compare-and-set runs BEFORE the `delete_from` on purpose: a losing
+/// cas returns `409` without ever touching the store, so a lost race can
+/// never leave the store truncated while the status stayed at its old
+/// terminal value.
+///
+/// 1. 404 check.
+/// 2. Status gate (fast 409 for `Running` / `Pending`).
+/// 3. Decode launch snapshot (fast 400 / 422).
+/// 4. Compute cut index via `list_by_run` + `.position(step_ref == from_step)`
+///    (fast 422 when the step is not present).
+/// 5. Atomic transition `<current terminal> -> Running` (409 on loss).
+/// 6. Physical `delete_from(cut)` on the replay store — safe now because we
+///    won the cas and own the Run.
+/// 7. Build `ReplayCursor` from the truncated entries.
+/// 8. Detached dispatch, same `tokio::spawn` + `default_run_ttl` shape as
+///    [`run_resume`].
+///
+/// # Known limitations (Layer A)
+///
+/// 1. **`from_step` is a raw `step_ref` (agent name)** — projection alias
+///    resolution via `StepNaming` is Layer B territory. For undeclared
+///    steps `step_ref == canonical` so this is only visible when
+///    `AgentMeta.projection_name` is in use.
+/// 2. **`BlueprintRef::Inline` freezes the BP in the launch snapshot** —
+///    the rerun re-decodes the same inline BP, so agent-definition edits
+///    landed on disk between the original dispatch and the rerun are NOT
+///    honored for inline runs. Use `BlueprintRef::Id` for the
+///    iterate-and-rerun workflow.
+/// 3. **Loop bodies match the first occurrence** — `step_ref` is the agent
+///    name, so `.position(|e| e.step_ref == from_step)` finds the FIRST
+///    occurrence and truncates from there. Rerunning a specific loop
+///    iteration needs Layer B semantics.
+/// 4. **Structural BP change is out of scope** — if steps were added /
+///    removed / reordered between the original dispatch and the rerun,
+///    the flow-ir re-eval will naturally miss the step or dispatch a
+///    different downstream. Start a fresh run in that case.
+pub async fn run_rerun_from(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RunRerunFromRequest>,
+) -> Result<(StatusCode, Json<RunRerunFromResponse>), ApiError> {
+    let run_id =
+        RunId::parse(id).map_err(|e| ApiError::bad_request(format!("invalid run id: {e}")))?;
+
+    if req.from_step.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "from_step must be a non-empty step ref".to_string(),
+        ));
+    }
+
+    // 404 when the Run does not exist.
+    let run = state
+        .run_store
+        .get(&run_id)
+        .await
+        .map_err(map_run_store_err)?;
+
+    // Status gate — reject in-flight statuses that would race the driver
+    // already dispatching against this run_id.
+    let current = run.status;
+    match current {
+        RunStatus::Done | RunStatus::Failed | RunStatus::Interrupted => { /* ok */ }
+        RunStatus::Running | RunStatus::Pending => {
+            return Err(ApiError::conflict(format!(
+                "run {run_id} is {current:?}; rerun-from requires a terminal run \
+                 (Done / Failed / Interrupted)"
+            )));
+        }
+    }
+
+    // Decode the launch-input snapshot BEFORE the compare-and-set: a Run
+    // with no recorded input can never be rerun-from, and returning `422`
+    // here — before flipping the status — avoids stranding it in `Running`
+    // with no driver behind it.
+    let Some(input_json) = run.input_json.clone() else {
+        return Err(ApiError::unprocessable(format!(
+            "run {run_id} cannot be rerun: no launch input was recorded for it (it \
+             predates resume/rerun support, or was created by a path that does not \
+             persist one)"
+        )));
+    };
+    let snapshot: RunLaunchSnapshot = serde_json::from_str(&input_json).map_err(|e| {
+        ApiError::bad_request(format!(
+            "run {run_id}: stored launch input failed to decode: {e}"
+        ))
+    })?;
+
+    // Load the replay log and locate the cut point via first-match on
+    // `step_ref`. See §Known limitations #3 (loop bodies).
+    let entries = state
+        .replay_store
+        .list_by_run(&run_id)
+        .await
+        .map_err(|e| ApiError::engine(format!("replay list_by_run: {e}")))?;
+    let cut = entries
+        .iter()
+        .position(|e| e.step_ref == req.from_step)
+        .ok_or_else(|| {
+            ApiError::unprocessable(format!(
+                "run {run_id}: from_step {:?} not present in this run's replay log \
+                 (nothing to rerun-from)",
+                req.from_step
+            ))
+        })?;
+
+    // Atomically flip the current terminal status -> Running. A racing
+    // rerun (or a boot-time recovery sweep, or a concurrent resume) loses
+    // the compare-and-set and gets `409` rather than dispatching a second
+    // driver over the same Run.
+    let won = state
+        .run_store
+        .try_transition(&run_id, current, RunStatus::Running)
+        .await
+        .map_err(ApiError::engine)?;
+    if !won {
+        return Err(ApiError::conflict(format!(
+            "run {run_id} was concurrently transitioned (or left the {current:?} state); \
+             it is no longer rerunnable"
+        )));
+    }
+
+    // We own the run now — physically truncate the replay log at the cut
+    // so the rerun dispatch's `append` cannot collide with the pre-rerun
+    // row and `list_by_run` reflects the rerun's real history rather than
+    // the pre-rerun ghost.
+    let dropped_steps = state
+        .replay_store
+        .delete_from(&run_id, cut)
+        .await
+        .map_err(|e| ApiError::engine(format!("replay delete_from: {e}")))?;
+
+    // Cursor is built from the pre-cut prefix; every retained entry hits
+    // verbatim in the engine's replay path.
+    let kept = entries.into_iter().take(cut).collect::<Vec<_>>();
+    let replayed_steps = kept.len();
+    let cursor = ReplayCursor::from_entries(kept);
+
+    let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone())
+        .with_replay_store(state.replay_store.clone())
+        .with_replay_cursor(Arc::new(Mutex::new(cursor)));
+
+    let input = snapshot.into_input();
+    let task_id = run.task_id.clone();
+
+    // A rerun-from is a running Run again; finalize_run resets it to
+    // Done/Failed at the end, same as the rekick / resume paths.
+    state
+        .task_store
+        .update_status(&task_id, TaskRecordStatus::Running)
+        .await
+        .map_err(ApiError::engine)?;
+
+    let ttl_secs = crate::default_run_ttl();
+    let bg_state = state.clone();
+    let bg_task_id = task_id.clone();
+    let bg_run_id = run_id.clone();
+    tokio::spawn(async move {
+        let outcome = match tokio::time::timeout(
+            Duration::from_secs(ttl_secs),
+            bg_state.task_app.handle_with_run(input, Some(run_ctx)),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => {
+                let reason = serde_json::json!({
+                    "error": format!("rerun-from run exceeded {ttl_secs}s ttl ceiling"),
+                });
+                if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
+                    tracing::warn!(%bg_run_id, error = %e, "run_rerun_from: ttl set_result failed");
+                }
+                if let Err(e) = bg_state
+                    .run_store
+                    .update_status(&bg_run_id, RunStatus::Failed)
+                    .await
+                {
+                    tracing::warn!(%bg_run_id, error = %e, "run_rerun_from: ttl run update_status failed");
+                }
+                if let Err(e) = bg_state
+                    .task_store
+                    .update_status(&bg_task_id, TaskRecordStatus::Failed)
+                    .await
+                {
+                    tracing::warn!(%bg_task_id, error = %e, "run_rerun_from: ttl task update_status failed");
+                }
+                return;
+            }
+        };
+        let _ = finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RunRerunFromResponse {
+            run_id,
+            task_id,
+            replayed_steps,
+            dropped_steps,
         }),
     ))
 }

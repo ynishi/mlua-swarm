@@ -26,6 +26,10 @@
 //!   (`projection-adapter` ST5 — replaces the ST2/ST4 single-value `GET
 //!   /v1/tasks/:id/ctx`).
 //! - `GET /v1/runs/:id` — a single `RunRecord` (its `step_entries` trace included).
+//! - `POST /v1/runs/:id/resume` — resume an `Interrupted` Run under the same `run_id`.
+//! - `POST /v1/runs/:id/rerun-from` — GH #71 Layer A. Rerun a terminal Run from
+//!   a caller-specified step under the same `run_id` (physically truncates the
+//!   replay log at the cut point). See `tasks::run_rerun_from`.
 //! - `POST /v1/operators` / `GET /v1/operators/:sid` / `DELETE /v1/operators/:sid` /
 //!   `GET /v1/operators/:sid/ws` (WS upgrade) — REST-like Operator login flow,
 //!   Bearer-mandatory; the sole WS Operator session route. See `operator_ws::login`
@@ -385,6 +389,10 @@ pub fn build_router_full(
         // Resume an Interrupted Run under the SAME run_id (replay cursor +
         // stored launch-input snapshot); see `tasks::run_resume`.
         .route("/v1/runs/:id/resume", post(tasks::run_resume))
+        // Rerun-from-step on a terminal Run under the SAME run_id (physically
+        // truncates the replay log at the cut point); see
+        // `tasks::run_rerun_from` for the full contract (GH #71 Layer A).
+        .route("/v1/runs/:id/rerun-from", post(tasks::run_rerun_from))
         // REST-like Operator login flow (Bearer-mandatory, roles exclusivity).
         // Sole WS Operator session route; see `operator_ws::login` module doc.
         .route("/v1/operators", post(operators_create))

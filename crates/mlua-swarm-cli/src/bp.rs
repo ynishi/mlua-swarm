@@ -459,11 +459,19 @@ fn render_pipeline_template(
     ));
     out.push_str("--\n");
     out.push_str("-- See `mse://guides/bp-dsl-templates` for the `$.d.<stage>` convention\n");
-    out.push_str("-- and recipes for hand-chaining outputs (e.g. `F.step { input = F.p \"$.<prev>\" }`).\n");
+    out.push_str(
+        "-- and recipes for hand-chaining outputs (e.g. `F.step { input = F.p \"$.<prev>\" }`).\n",
+    );
     out.push_str("--\n");
-    out.push_str("-- Naming glue (see `mse://guides/operator-execution-model` §Operator naming):\n");
-    out.push_str("--   `operators[].name` == mint-time `roles[]` alias == every agent's `operator_ref`.\n");
-    out.push_str("--   The literal is arbitrary (`main-ai` is a convention, not a system name); to run\n");
+    out.push_str(
+        "-- Naming glue (see `mse://guides/operator-execution-model` §Operator naming):\n",
+    );
+    out.push_str(
+        "--   `operators[].name` == mint-time `roles[]` alias == every agent's `operator_ref`.\n",
+    );
+    out.push_str(
+        "--   The literal is arbitrary (`main-ai` is a convention, not a system name); to run\n",
+    );
     out.push_str("--   two MainAIs in parallel, split into per-lane aliases (e.g. `phase_a_op`\n");
     out.push_str("--   / `phase_b_op`) and rebind the agents' `operator_ref` accordingly.\n\n");
     out.push_str("local B = require(\"bp_dsl\")\n\n");
@@ -508,8 +516,12 @@ fn render_single_template(name: &str, agent: &str, operator: &str, binding: &str
     out.push_str("-- `operator_kind` at launch and spawns route to a joined\n");
     out.push_str("-- main-ai session.\n");
     out.push_str("--\n");
-    out.push_str("-- Naming glue (see `mse://guides/operator-execution-model` §Operator naming):\n");
-    out.push_str("--   `operators[].name` == mint-time `roles[]` alias == agent's `operator_ref`.\n");
+    out.push_str(
+        "-- Naming glue (see `mse://guides/operator-execution-model` §Operator naming):\n",
+    );
+    out.push_str(
+        "--   `operators[].name` == mint-time `roles[]` alias == agent's `operator_ref`.\n",
+    );
     out.push_str("--   The literal is arbitrary (`main-ai` is a convention, not a system name);\n");
     out.push_str("--   rename it (e.g. `phase_a_op`) and update `operator_ref` in lockstep to\n");
     out.push_str("--   run this BP on a dedicated MainAI alongside other BPs.\n\n");
@@ -565,11 +577,19 @@ fn render_verdict_template(
     ));
     out.push_str("--\n");
     out.push_str("-- See `mse://guides/bp-dsl-templates` for the `$.d.<stage>` convention\n");
-    out.push_str("-- and recipes for hand-chaining outputs (e.g. `F.step { input = F.p \"$.<prev>\" }`).\n");
+    out.push_str(
+        "-- and recipes for hand-chaining outputs (e.g. `F.step { input = F.p \"$.<prev>\" }`).\n",
+    );
     out.push_str("--\n");
-    out.push_str("-- Naming glue (see `mse://guides/operator-execution-model` §Operator naming):\n");
-    out.push_str("--   `operators[].name` == mint-time `roles[]` alias == every agent's `operator_ref`.\n");
-    out.push_str("--   The literal is arbitrary (`main-ai` is a convention, not a system name); to run\n");
+    out.push_str(
+        "-- Naming glue (see `mse://guides/operator-execution-model` §Operator naming):\n",
+    );
+    out.push_str(
+        "--   `operators[].name` == mint-time `roles[]` alias == every agent's `operator_ref`.\n",
+    );
+    out.push_str(
+        "--   The literal is arbitrary (`main-ai` is a convention, not a system name); to run\n",
+    );
     out.push_str("--   two MainAIs in parallel, split into per-lane aliases (e.g. `phase_a_op`\n");
     out.push_str("--   / `phase_b_op`) and rebind the agents' `operator_ref` accordingly.\n\n");
     out.push_str("local B = require(\"bp_dsl\")\n\n");

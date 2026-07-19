@@ -194,6 +194,33 @@ pub trait ReplayStore: Send + Sync {
     /// Return every entry for `run_id`, in insertion order (the order the
     /// dispatcher wrote them).
     async fn list_by_run(&self, run_id: &RunId) -> Result<Vec<ReplayEntry>, ReplayStoreError>;
+
+    /// Delete every entry for `run_id` whose position in insertion order is
+    /// `>= from_index` — i.e. keep the first `from_index` entries and drop
+    /// the rest. Returns the number of rows deleted.
+    ///
+    /// Used by the rerun-from-step path
+    /// (`POST /v1/runs/:id/rerun-from`, [`crate::store::run::RunStatus`]):
+    /// the caller has already located the cut point via [`Self::list_by_run`]
+    /// and now needs the store to physically remove the target step's row
+    /// plus every downstream row so that the rerun dispatch's
+    /// [`Self::append`] does not collide with the old
+    /// `(step_ref, input_hash, occurrence)` row, and so subsequent
+    /// [`Self::list_by_run`] introspection reflects the rerun's real
+    /// history rather than the pre-rerun ghost.
+    ///
+    /// `from_index >= list_by_run(...).len()` is a no-op returning `0`
+    /// (not an error) — the caller is not expected to re-check the length.
+    ///
+    /// Index-based rather than `created_at`-based: `created_at` is Unix
+    /// seconds and two entries appended within the same second are
+    /// indistinguishable, so a timestamp cut would be ambiguous. The
+    /// insertion-order index the handler already computes is unambiguous.
+    async fn delete_from(
+        &self,
+        run_id: &RunId,
+        from_index: usize,
+    ) -> Result<usize, ReplayStoreError>;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -249,6 +276,23 @@ impl ReplayStore for InMemoryReplayStore {
     async fn list_by_run(&self, run_id: &RunId) -> Result<Vec<ReplayEntry>, ReplayStoreError> {
         let inner = self.inner.lock().expect("replay store mutex poisoned");
         Ok(inner.by_run.get(run_id).cloned().unwrap_or_default())
+    }
+
+    async fn delete_from(
+        &self,
+        run_id: &RunId,
+        from_index: usize,
+    ) -> Result<usize, ReplayStoreError> {
+        let mut inner = self.inner.lock().expect("replay store mutex poisoned");
+        let Some(rows) = inner.by_run.get_mut(run_id) else {
+            return Ok(0);
+        };
+        if from_index >= rows.len() {
+            return Ok(0);
+        }
+        let dropped = rows.len() - from_index;
+        rows.truncate(from_index);
+        Ok(dropped)
     }
 }
 
@@ -607,5 +651,153 @@ mod tests {
         assert!(pass_value(&DispatchOutcome::Blocked(json!("no"))).is_none());
         assert!(pass_value(&DispatchOutcome::Cancelled).is_none());
         assert!(pass_value(&DispatchOutcome::Timeout).is_none());
+    }
+
+    #[tokio::test]
+    async fn inmemory_delete_from_truncates_and_returns_count() {
+        let store = InMemoryReplayStore::new();
+        let run_id = RunId::new();
+        let ctx = mk_ctx();
+        for (step, occ) in [("a", 0), ("b", 0), ("c", 0), ("d", 0)] {
+            store
+                .append(
+                    ReplayEntry::from_completion(
+                        run_id.clone(),
+                        step,
+                        "h",
+                        occ,
+                        &ctx,
+                        &json!({ "s": step }),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Cut at index 2: keep a, b; drop c, d.
+        let dropped = store.delete_from(&run_id, 2).await.unwrap();
+        assert_eq!(dropped, 2);
+
+        let remaining = store.list_by_run(&run_id).await.unwrap();
+        let refs: Vec<String> = remaining.iter().map(|e| e.step_ref.clone()).collect();
+        assert_eq!(refs, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn inmemory_delete_from_past_length_is_noop() {
+        let store = InMemoryReplayStore::new();
+        let run_id = RunId::new();
+        let ctx = mk_ctx();
+        store
+            .append(
+                ReplayEntry::from_completion(run_id.clone(), "a", "h", 0, &ctx, &json!(1)).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.delete_from(&run_id, 1).await.unwrap(), 0);
+        assert_eq!(store.delete_from(&run_id, 99).await.unwrap(), 0);
+        assert_eq!(store.list_by_run(&run_id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn inmemory_delete_from_missing_run_is_noop() {
+        let store = InMemoryReplayStore::new();
+        let run_id = RunId::new();
+        assert_eq!(store.delete_from(&run_id, 0).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn inmemory_delete_from_zero_wipes_run() {
+        let store = InMemoryReplayStore::new();
+        let run_id = RunId::new();
+        let ctx = mk_ctx();
+        for step in ["a", "b", "c"] {
+            store
+                .append(
+                    ReplayEntry::from_completion(run_id.clone(), step, "h", 0, &ctx, &json!(step))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.delete_from(&run_id, 0).await.unwrap(), 3);
+        assert!(store.list_by_run(&run_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inmemory_delete_from_isolates_runs() {
+        let store = InMemoryReplayStore::new();
+        let r1 = RunId::new();
+        let r2 = RunId::new();
+        let ctx = mk_ctx();
+        for step in ["a", "b"] {
+            store
+                .append(
+                    ReplayEntry::from_completion(r1.clone(), step, "h", 0, &ctx, &json!(step))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            store
+                .append(
+                    ReplayEntry::from_completion(r2.clone(), step, "h", 0, &ctx, &json!(step))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.delete_from(&r1, 0).await.unwrap(), 2);
+        assert!(store.list_by_run(&r1).await.unwrap().is_empty());
+        assert_eq!(store.list_by_run(&r2).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn inmemory_delete_from_frees_slots_for_reappend() {
+        // After delete_from cuts the target row, the caller (rerun dispatch)
+        // must be able to re-append the same (step_ref, input_hash, occurrence)
+        // triple without hitting the Duplicate guard.
+        let store = InMemoryReplayStore::new();
+        let run_id = RunId::new();
+        let ctx = mk_ctx();
+        for step in ["a", "b"] {
+            store
+                .append(
+                    ReplayEntry::from_completion(
+                        run_id.clone(),
+                        step,
+                        "hash",
+                        0,
+                        &ctx,
+                        &json!({ "v": step }),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.delete_from(&run_id, 1).await.unwrap(), 1);
+        // Re-append `b` with a fresh output — must succeed.
+        store
+            .append(
+                ReplayEntry::from_completion(
+                    run_id.clone(),
+                    "b",
+                    "hash",
+                    0,
+                    &ctx,
+                    &json!({ "v": "b-fresh" }),
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("re-append after delete_from must not collide");
+        let listed = store.list_by_run(&run_id).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed[1].decode_step_output().unwrap(),
+            json!({ "v": "b-fresh" })
+        );
     }
 }
