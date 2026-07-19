@@ -10,7 +10,11 @@
 
 mod operator_client;
 mod resources;
-mod server_control;
+// launchd knowledge lives in `crate::server::launchd` (relocated from
+// `mcp/server_control.rs`). Alias keeps every `server_control::*`
+// reference in this file unchanged; a follow-up switches the tool bodies
+// over to a direct `use crate::server::launchd;` path.
+use crate::server::launchd as server_control;
 
 use std::collections::HashMap;
 use std::sync::Arc;
