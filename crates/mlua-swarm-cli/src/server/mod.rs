@@ -111,7 +111,9 @@ pub async fn run(args: Args) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 async fn run_macos(args: Args) -> Result<()> {
-    let bind = args.bind.unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+    let bind = args
+        .bind
+        .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
     match args.sub {
         ServerSub::Install {
             cargo_bin,
@@ -139,7 +141,9 @@ async fn run_macos(args: Args) -> Result<()> {
             emit(&outcome, args.json, human_start(&outcome))
         }
         ServerSub::Stop => {
-            let outcome = launchd::shutdown(&bind).await.map_err(anyhow::Error::from)?;
+            let outcome = launchd::shutdown(&bind)
+                .await
+                .map_err(anyhow::Error::from)?;
             emit(&outcome, args.json, human_stop(&outcome))
         }
         ServerSub::Restart => {

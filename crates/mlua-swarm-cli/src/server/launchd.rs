@@ -139,14 +139,12 @@ pub fn install_hint() -> String {
 }
 
 fn home_path() -> Result<PathBuf, ServerError> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            ServerError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "HOME env not set",
-            ))
-        })
+    std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME env not set",
+        ))
+    })
 }
 
 /// Absolute path of the installed LaunchAgent plist — `$HOME/Library/
@@ -226,11 +224,7 @@ async fn poll_healthz_until_up(bind: &str, total: Duration, step: Duration) -> b
 /// `ServerError::Render`; also rejects any surviving `{{...}}` placeholder
 /// as a defense against future template extensions silently leaking
 /// through.
-pub fn render(
-    home: &Path,
-    cargo_bin: &Path,
-    project_root: &Path,
-) -> Result<String, ServerError> {
+pub fn render(home: &Path, cargo_bin: &Path, project_root: &Path) -> Result<String, ServerError> {
     render_impl(TEMPLATE, home, cargo_bin, project_root)
 }
 
@@ -463,13 +457,11 @@ pub async fn install(
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".cargo/bin"))
     });
-    let project_root_pb = project_root
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| {
-            std::env::var_os("PWD")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-        });
+    let project_root_pb = project_root.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+        std::env::var_os("PWD")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    });
     let rendered = render(&home, &cargo_bin_pb, &project_root_pb)?;
     let plist_path = installed_plist_path()?;
     let launch_agents_dir = plist_path.parent().ok_or_else(|| {
@@ -814,13 +806,8 @@ com.mse.server = {
         // `ServerError::Render` rather than silently emitting the leaky
         // string.
         let extended = format!("{TEMPLATE}\n<key>Future</key><string>{{{{FUTURE}}}}</string>");
-        let err = render_impl(
-            &extended,
-            Path::new("/H"),
-            Path::new("/C"),
-            Path::new("/P"),
-        )
-        .expect_err("unresolved placeholder must be rejected");
+        let err = render_impl(&extended, Path::new("/H"), Path::new("/C"), Path::new("/P"))
+            .expect_err("unresolved placeholder must be rejected");
         match err {
             ServerError::Render(msg) => {
                 assert!(
@@ -843,9 +830,7 @@ com.mse.server = {
         assert!(looks_like_already_loaded(
             "Bootstrap failed: Service is already loaded"
         ));
-        assert!(looks_like_already_loaded(
-            "SERVICE ALREADY LOADED"
-        ));
+        assert!(looks_like_already_loaded("SERVICE ALREADY LOADED"));
         assert!(looks_like_already_loaded(
             "com.mse.server: already bootstrapped"
         ));

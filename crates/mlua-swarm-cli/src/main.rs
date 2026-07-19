@@ -24,7 +24,11 @@ mod server;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "mse", about = "mlua-swarm CLI (serve / mcp / bp / server).", version)]
+#[command(
+    name = "mse",
+    about = "mlua-swarm CLI (serve / mcp / bp / server).",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
