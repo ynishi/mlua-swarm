@@ -11,10 +11,10 @@
 mod operator_client;
 mod resources;
 // launchd knowledge lives in `crate::server::launchd` (relocated from
-// `mcp/server_control.rs`). Alias keeps every `server_control::*`
-// reference in this file unchanged; a follow-up switches the tool bodies
-// over to a direct `use crate::server::launchd;` path.
-use crate::server::launchd as server_control;
+// `mcp/server_control.rs`). Every lifecycle MCP tool body forwards to
+// `launchd::*` — the tool bodies themselves stay free of `launchctl` /
+// plist path / launchd state-parsing literals (Crux #1).
+use crate::server::launchd;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -843,6 +843,45 @@ struct ServerRestartReq {
     force: Option<bool>,
 }
 
+/// Input for `mlua_swarm_server_bootstrap` — load the LaunchAgent so
+/// launchd owns the mse-serve job. Idempotent on repeat.
+#[derive(Deserialize, JsonSchema, Default)]
+struct ServerBootstrapReq {
+    /// Reserved for a future signature widening of the underlying
+    /// bootstrap primitive; currently ignored — the handler always uses
+    /// the default healthz bind (`127.0.0.1:7777`).
+    #[serde(default)]
+    bind: Option<String>,
+    /// Reserved for a future signature widening of the underlying
+    /// bootstrap primitive; currently ignored — the handler always uses
+    /// the canonical installed LaunchAgent plist path. Declared as
+    /// `String` (not `PathBuf`) so the JSON Schema stays a concrete
+    /// `{"type":"string"}` when the field is re-wired — see GH #24
+    /// (schemars any-schema drop).
+    #[serde(default)]
+    plist_path: Option<String>,
+}
+
+/// Input for `mlua_swarm_server_install` — render the LaunchAgent plist
+/// and load it. Idempotent on repeat (a re-install with the same params
+/// produces a byte-identical plist and re-bootstraps).
+#[derive(Deserialize, JsonSchema)]
+struct ServerInstallReq {
+    /// Override cargo bin dir (default `$HOME/.cargo/bin`). Declared as
+    /// `String` for schema stability (see `ServerBootstrapReq::plist_path`).
+    #[serde(default)]
+    cargo_bin: Option<String>,
+    /// Override project root (default current working directory).
+    /// Declared as `String` for schema stability.
+    #[serde(default)]
+    project_root: Option<String>,
+}
+
+/// Input for `mlua_swarm_server_uninstall` — remove the LaunchAgent and
+/// its plist. Idempotent on repeat.
+#[derive(Deserialize, JsonSchema, Default)]
+struct ServerUninstallReq {}
+
 // ---- S3 operator client tool param schemas ----
 // (see the WS multi-session design for the MCP tool set).
 
@@ -1201,7 +1240,7 @@ fn read_blueprint_from_file(path: &str) -> Result<JsonValue, String> {
 struct SwarmStatusReq {
     run_id: String,
     /// GH #67: `mse serve` bind address the run was launched against.
-    /// When present (or defaulted via `server_control::DEFAULT_BIND`), the
+    /// When present (or defaulted via `launchd::DEFAULT_BIND`), the
     /// tool issues a best-effort `GET /v1/runs/:id` to fold the server's
     /// authoritative `RunRecord` (`status` / `step_entries` / `result_ref`)
     /// into the response — so a `detach: true` run whose completion the
@@ -1885,7 +1924,7 @@ impl MseServer {
             );
         }
 
-        let bind = bind.unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+        let bind = bind.unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         let url = format!("http://{bind}/v1/tasks");
 
         let mut operator_obj = serde_json::Map::new();
@@ -2085,7 +2124,7 @@ impl MseServer {
         // Done on its own, so the poll is redundant but harmless).
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         let http_body: Option<JsonValue> = fetch_run_via_http(&bind, &req.run_id).await;
         if let Some(server_body) = http_body {
             // Server is the id authority; overwrite the fields it knows.
@@ -2126,7 +2165,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         if !req.confirm {
             return json_result(&serde_json::json!({
                 "status": "dry_run",
@@ -2344,7 +2383,7 @@ impl MseServer {
         }
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         match crate::bp::register(&bp_value, Some(&bind)).await {
             Ok(outcome) => {
                 let json_bytes = serde_json::to_vec(&bp_value).map(|v| v.len()).unwrap_or(0);
@@ -2379,7 +2418,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         let url = format!("http://{bind}/v1/blueprints/{}/unarchive", req.id);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -2410,7 +2449,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         let thresholds = AgentMdThresholds::from_req(
             req.warn_bytes,
             req.warn_lines,
@@ -2634,7 +2673,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         let url = format!(
             "http://{bind}/v1/blueprints/{}/agents/{}/explain",
             req.bp_id, req.agent
@@ -2730,7 +2769,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -2874,8 +2913,8 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
-        let server_status = server_control::status(&bind).await;
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+        let server_status = launchd::status(&bind).await;
         let server_up = server_status.up;
 
         let server_info: JsonValue = if server_up {
@@ -3050,7 +3089,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Start mse serve via `launchctl kickstart gui/<uid>/com.mse.server`, then healthz-polls up to 30s. No-op if healthz is already up. Server settings come from ~/.mse/config.toml, not this call. Returns {status: already_running|started, bind}. Errors with install instructions if the launchd job is not bootstrapped yet."
+        description = "Start mse serve via `launchctl kickstart gui/<uid>/com.mse.server`, then healthz-polls up to 30s. No-op if healthz is already up. Server settings come from ~/.mse/config.toml, not this call. Returns {status: already_running|started, bind}. Errors with install instructions if the launchd job is not bootstrapped yet. Auto-bootstraps on missing-job (calls `mlua_swarm_server_bootstrap` transparently and retries kickstart). See `mse://guides/server-management` for recovery SOP."
     )]
     async fn mlua_swarm_server_start(
         &self,
@@ -3058,15 +3097,15 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
-        match server_control::start(&bind).await {
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+        match launchd::start(&bind).await {
             Ok(outcome) => json_result(&outcome),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
     #[tool(
-        description = "Report mse serve state: healthz + a `launchctl print gui/<uid>/com.mse.server` summary (state / pid / last exit code). Returns {bind, up, launchd_state, launchd_pid, launchd_last_exit_code}."
+        description = "Report mse serve state: healthz + a `launchctl print gui/<uid>/com.mse.server` summary (state / pid / last exit code). Returns {bind, up, launchd_state, launchd_pid, launchd_last_exit_code}. See `mse://guides/server-management` for recovery flow."
     )]
     async fn mlua_swarm_server_status(
         &self,
@@ -3074,13 +3113,13 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
-        let out = server_control::status(&bind).await;
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+        let out = launchd::status(&bind).await;
         json_result(&out)
     }
 
     #[tool(
-        description = "Fully stop mse serve via `launchctl bootout gui/<uid>/com.mse.server` (unloads the job; KeepAlive will not restart it until the next `mlua_swarm_server_start` / `mlua_swarm_server_restart`). Refuses (structured error) if the server reports in-flight runs or attached operators via GET /v1/status; pass force=true to skip the check and kill unconditionally. Returns {bind, stopped}."
+        description = "Fully stop mse serve via `launchctl bootout gui/<uid>/com.mse.server` (unloads the job; KeepAlive will not restart it until the next `mlua_swarm_server_start` / `mlua_swarm_server_restart`). Refuses (structured error) if the server reports in-flight runs or attached operators via GET /v1/status; pass force=true to skip the check and kill unconditionally. Returns {bind, stopped}. See `mse://guides/server-management` for occupancy-gate behavior."
     )]
     async fn mlua_swarm_server_shutdown(
         &self,
@@ -3088,10 +3127,10 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         let force = req.force.unwrap_or(false);
-        if !force && server_control::healthz_ok(&bind).await {
-            match server_control::occupancy(&bind).await {
+        if !force && launchd::healthz_ok(&bind).await {
+            match launchd::occupancy(&bind).await {
                 Ok(occ) if occ.running_runs > 0 || occ.attached_operators > 0 => {
                     return Err(McpError::invalid_params(
                         format!(
@@ -3112,14 +3151,14 @@ impl MseServer {
                 }
             }
         }
-        match server_control::shutdown(&bind).await {
+        match launchd::shutdown(&bind).await {
             Ok(out) => json_result(&out),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
     #[tool(
-        description = "Kill + restart mse serve via `launchctl kickstart -k gui/<uid>/com.mse.server`, then healthz-polls up to 30s. Use after editing ~/.mse/config.toml to pick up the new settings. Refuses (structured error) if the server reports in-flight runs or attached operators via GET /v1/status; pass force=true to skip the check and kill unconditionally. Returns {status: started, bind}."
+        description = "Kill + restart mse serve via `launchctl kickstart -k gui/<uid>/com.mse.server`, then healthz-polls up to 30s. Use after editing ~/.mse/config.toml to pick up the new settings. Refuses (structured error) if the server reports in-flight runs or attached operators via GET /v1/status; pass force=true to skip the check and kill unconditionally. Returns {status: started, bind}. Auto-bootstraps on missing-job (calls `mlua_swarm_server_bootstrap` transparently and retries kickstart). See `mse://guides/server-management` for recovery SOP."
     )]
     async fn mlua_swarm_server_restart(
         &self,
@@ -3127,10 +3166,10 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         let force = req.force.unwrap_or(false);
-        if !force && server_control::healthz_ok(&bind).await {
-            match server_control::occupancy(&bind).await {
+        if !force && launchd::healthz_ok(&bind).await {
+            match launchd::occupancy(&bind).await {
                 Ok(occ) if occ.running_runs > 0 || occ.attached_operators > 0 => {
                     return Err(McpError::invalid_params(
                         format!(
@@ -3151,7 +3190,81 @@ impl MseServer {
                 }
             }
         }
-        match server_control::restart(&bind).await {
+        match launchd::restart(&bind).await {
+            Ok(outcome) => json_result(&outcome),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Load the mse-serve LaunchAgent into launchd. Thin forwarder to
+    /// `crate::server::launchd::bootstrap()` — the tool description
+    /// spells out the exact launchctl invocation for MCP callers.
+    /// Idempotent on repeat: an already-loaded job returns
+    /// `{status: "already_loaded", plist_path}` instead of failing. Does
+    /// not stop or start the server; use `mlua_swarm_server_start` after
+    /// bootstrap to bring healthz up. See
+    /// `mse://guides/server-management` for recovery SOP.
+    #[tool(
+        annotations(read_only_hint = false, idempotent_hint = true),
+        description = "Load the LaunchAgent (com.mse.server) via `launchctl bootstrap gui/<uid> ~/Library/LaunchAgents/com.mse.server.plist`. Idempotent on repeat: an already-loaded job returns `{status: \"already_loaded\", plist_path}` instead of failing; a fresh bootstrap returns `{status: \"bootstrapped\", plist_path}`. Missing plist is surfaced as a hard error pointing at `mlua_swarm_server_install`. Does not touch running processes — call `mlua_swarm_server_start` next to bring healthz up. See `mse://guides/server-management` for recovery SOP."
+    )]
+    async fn mlua_swarm_server_bootstrap(
+        &self,
+        Parameters(req): Parameters<ServerBootstrapReq>,
+    ) -> Result<CallToolResult, McpError> {
+        // `bind` / `plist_path` are accepted for schema forward-compat
+        // and per-caller override intent, but the current
+        // `launchd::bootstrap()` signature is bind-agnostic and uses the
+        // canonical `installed_plist_path()`. Ack the fields (silence
+        // dead-code warnings) so the JSON Schema stays stable across
+        // future signature widening.
+        let _ = req.bind;
+        let _ = req.plist_path;
+        match launchd::bootstrap().await {
+            Ok(outcome) => json_result(&outcome),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Render the compile-time-baked LaunchAgent plist template, write
+    /// it to the canonical installed location, and load it. Thin
+    /// forwarder to `crate::server::launchd::install()` — the tool
+    /// description spells out the exact filesystem and launchctl
+    /// operations for MCP callers. Idempotent on repeat: re-running with
+    /// the same params produces a byte-identical plist (existing job is
+    /// unloaded first so the new plist body takes effect). See
+    /// `mse://guides/server-management` for recovery SOP.
+    #[tool(
+        annotations(read_only_hint = false, idempotent_hint = true),
+        description = "Render the embedded launchd plist template with `{{HOME}}` / `{{CARGO_BIN}}` / `{{PROJECT_ROOT}}` substitution and write it to `~/Library/LaunchAgents/com.mse.server.plist`, then run `launchctl bootstrap gui/<uid> <plist>` to load the job. Idempotent on repeat: an already-loaded job is bootout'd first so the new plist body takes effect. Returns `{plist_path, bootstrap: {status, plist_path}}`. See `mse://guides/server-management` for recovery SOP."
+    )]
+    async fn mlua_swarm_server_install(
+        &self,
+        Parameters(req): Parameters<ServerInstallReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let cargo_bin_pb = req.cargo_bin.as_deref().map(std::path::PathBuf::from);
+        let project_root_pb = req.project_root.as_deref().map(std::path::PathBuf::from);
+        match launchd::install(cargo_bin_pb.as_deref(), project_root_pb.as_deref()).await {
+            Ok(outcome) => json_result(&outcome),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Unload the mse-serve LaunchAgent and remove its plist. Thin
+    /// forwarder to `crate::server::launchd::uninstall()` — the tool
+    /// description spells out the exact launchctl and filesystem
+    /// operations for MCP callers. Idempotent on repeat: a missing job
+    /// / missing plist are both treated as success. See
+    /// `mse://guides/server-management` for recovery SOP.
+    #[tool(
+        annotations(read_only_hint = false, idempotent_hint = true),
+        description = "Run `launchctl bootout gui/<uid>/com.mse.server` and remove `~/Library/LaunchAgents/com.mse.server.plist`. Idempotent on repeat: a missing job / missing plist are both treated as success. Returns `{plist_path}` (the path that was, or would have been, removed). See `mse://guides/server-management` for recovery SOP."
+    )]
+    async fn mlua_swarm_server_uninstall(
+        &self,
+        Parameters(_req): Parameters<ServerUninstallReq>,
+    ) -> Result<CallToolResult, McpError> {
+        match launchd::uninstall().await {
             Ok(outcome) => json_result(&outcome),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
@@ -4213,6 +4326,116 @@ mod tests {
             !names.contains(&"mse_ctx_get"),
             "mse_ctx_get must be retired: {names:?}"
         );
+    }
+
+    // ─── GH #69 launchd lifecycle tool registration ────────
+
+    /// Registration smoke test — confirms the new `bootstrap` tool
+    /// appears in `MseServer::tool_router().list_all()` (the same source
+    /// of truth `tools/list` JSON-RPC returns). Guards against silent
+    /// dispatch loss if a future refactor drops the `#[tool]` attribute.
+    #[test]
+    fn mlua_swarm_server_bootstrap_registered() {
+        let tools = MseServer::tool_router().list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            names.contains(&"mlua_swarm_server_bootstrap"),
+            "mlua_swarm_server_bootstrap must be registered: {names:?}"
+        );
+    }
+
+    /// Registration smoke test — confirms the new `install` tool appears
+    /// in `MseServer::tool_router().list_all()`.
+    #[test]
+    fn mlua_swarm_server_install_registered() {
+        let tools = MseServer::tool_router().list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            names.contains(&"mlua_swarm_server_install"),
+            "mlua_swarm_server_install must be registered: {names:?}"
+        );
+    }
+
+    /// Registration smoke test — confirms the new `uninstall` tool
+    /// appears in `MseServer::tool_router().list_all()`.
+    #[test]
+    fn mlua_swarm_server_uninstall_registered() {
+        let tools = MseServer::tool_router().list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            names.contains(&"mlua_swarm_server_uninstall"),
+            "mlua_swarm_server_uninstall must be registered: {names:?}"
+        );
+    }
+
+    /// The 4 pre-existing lifecycle tools must remain registered
+    /// alongside the 3 new ones — the launchd-forwarder refactor (GH #69) changed only the
+    /// bodies (thin forwarders) and the `#[tool(description = ...)]`
+    /// literals, never the tool names / signatures. Guards against a
+    /// rename drift that would break every existing MCP caller.
+    #[test]
+    fn existing_launchd_lifecycle_tools_stay_registered() {
+        let tools = MseServer::tool_router().list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        for expected in [
+            "mlua_swarm_server_start",
+            "mlua_swarm_server_status",
+            "mlua_swarm_server_shutdown",
+            "mlua_swarm_server_restart",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} must remain registered after the launchd-forwarder rewire: {names:?}"
+            );
+        }
+    }
+
+    /// Schema stability guard — `plist_path` / `cargo_bin` /
+    /// `project_root` are declared as `Option<String>` (not
+    /// `Option<PathBuf>`) so schemars emits a concrete `type: "string"`
+    /// in the tool inputSchema (see GH #24 any-schema drop). A future
+    /// hand that flips the field type to `PathBuf` would silently drop
+    /// the field on the MCP wire; this asserts the concrete type
+    /// literal stays put.
+    #[test]
+    fn new_lifecycle_tool_paths_resolve_to_string_type_in_schema() {
+        let tools = MseServer::tool_router().list_all();
+        let by_name = |n: &str| {
+            tools
+                .iter()
+                .find(|t| t.name.as_ref() == n)
+                .unwrap_or_else(|| panic!("tool {n} not registered"))
+        };
+        for (tool_name, field) in [
+            ("mlua_swarm_server_bootstrap", "plist_path"),
+            ("mlua_swarm_server_install", "cargo_bin"),
+            ("mlua_swarm_server_install", "project_root"),
+        ] {
+            let schema = &by_name(tool_name).input_schema;
+            let prop = schema
+                .get("properties")
+                .and_then(|p| p.get(field))
+                .unwrap_or_else(|| panic!("{tool_name}.properties.{field} present"));
+            // Option<String> renders as either `{"type": "string"}` or
+            // `{"type": ["string", "null"]}` depending on schemars
+            // version; both are concrete-type resolutions (not any-
+            // schema drop = `{}`). Accept either shape.
+            let ty = prop.get("type").unwrap_or_else(|| {
+                panic!(
+                    "{tool_name}.{field} missing `type` — schemars any-schema regression \
+                     (GH #24): {prop:?}"
+                )
+            });
+            let matches_string = ty == &JsonValue::String("string".into())
+                || ty
+                    .as_array()
+                    .map(|arr| arr.iter().any(|v| v == &JsonValue::String("string".into())))
+                    .unwrap_or(false);
+            assert!(
+                matches_string,
+                "{tool_name}.{field}.type must include \"string\": {ty:?}"
+            );
+        }
     }
 
     /// GH #24 regression: `Option<JsonValue>` fields on the tool surface
