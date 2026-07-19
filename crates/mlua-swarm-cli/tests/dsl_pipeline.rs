@@ -223,7 +223,10 @@ fn default_no_stage_opt_in_emits_no_gate() {
     assert_eq!(children[0]["kind"], serde_json::json!("step"));
     // No branch anywhere along the chain — final_else is the `done` assign.
     assert_eq!(children[1]["kind"], serde_json::json!("assign"));
-    assert_eq!(children[1]["at"], serde_json::json!({"op": "path", "at": "$.done"}));
+    assert_eq!(
+        children[1]["at"],
+        serde_json::json!({"op": "path", "at": "$.done"})
+    );
 }
 
 /// Explicit `gate = true` on a stage opts it in even when the pipeline
@@ -404,8 +407,7 @@ fn gate_default_unknown_value_errors() {
           gate_default = "sometimes",
         }
     "#;
-    let err =
-        dsl::build_bp_from_script(source).expect_err("unknown gate_default must error");
+    let err = dsl::build_bp_from_script(source).expect_err("unknown gate_default must error");
     let message = err.to_string();
     assert!(
         message.contains("gate_default"),

@@ -103,8 +103,7 @@ const DSL_AUTHORING_GUIDE_BODY: &str = include_str!("./resources/guides/dsl-auth
 const WORKER_IO_CONTRACT_BODY: &str = include_str!("./resources/guides/worker-io-contract.md");
 const REPLAY_AND_RESUME_BODY: &str = include_str!("./resources/guides/replay-and-resume.md");
 const BP_DSL_TEMPLATES_BODY: &str = include_str!("./resources/guides/bp-dsl-templates.md");
-const BLUEPRINT_REF_PATHS_BODY: &str =
-    include_str!("./resources/guides/blueprint-ref-paths.md");
+const BLUEPRINT_REF_PATHS_BODY: &str = include_str!("./resources/guides/blueprint-ref-paths.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -601,10 +600,9 @@ mod tests {
                 "{}: parsed AgentDef must carry a name",
                 path.display()
             );
-            let profile = def
-                .profile
-                .as_ref()
-                .unwrap_or_else(|| panic!("{}: parsed AgentDef must carry a profile", path.display()));
+            let profile = def.profile.as_ref().unwrap_or_else(|| {
+                panic!("{}: parsed AgentDef must carry a profile", path.display())
+            });
             assert!(
                 !profile.system_prompt.is_empty(),
                 "{}: profile.system_prompt must be non-empty",
