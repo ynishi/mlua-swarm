@@ -205,6 +205,61 @@ fn looks_like_missing_plist(text: &str) -> bool {
         || lower.contains("could not find specified service")
 }
 
+/// Heuristically detects the macOS 15 (Sequoia) EIO signature launchctl
+/// returns for a double-`bootstrap` against an already-loaded job:
+///
+/// ```text
+/// Bootstrap failed: 5: Input/output error
+/// ```
+///
+/// Unlike [`looks_like_already_loaded`], this pattern is intentionally
+/// **ambiguous** — a genuine EIO (disk / IPC failure) prints the same
+/// text — so callers must pair the match with a `launchctl print`
+/// probe (see [`probe_already_loaded_via_print`]) before folding the
+/// failure into `BootstrapOutcome::AlreadyLoaded`. This is why the
+/// signature is not merged into `looks_like_already_loaded`: doing so
+/// would silently swallow real EIO conditions.
+fn looks_like_bootstrap_eio(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("bootstrap failed: 5") || lower.contains("input/output error")
+}
+
+/// Pure parser for [`probe_already_loaded_via_print`] — returns `true`
+/// iff `text` (leading whitespace trimmed) starts with the literal
+/// `<target> = {`, which is the shape `launchctl print <target>` emits
+/// when the job is loaded (top-level entry opening brace). A body of
+/// `Bad request.` / `Could not find service ...` — what launchctl
+/// prints when the target is unknown — falls through to `false`.
+fn launchctl_print_body_indicates_loaded(text: &str, target: &str) -> bool {
+    let prefix = format!("{target} = {{");
+    text.trim_start().starts_with(&prefix)
+}
+
+/// Consult `launchctl print <target>` and return `true` iff the process
+/// exits successfully AND its stdout matches
+/// [`launchctl_print_body_indicates_loaded`]. Used exclusively to
+/// disambiguate the macOS 15 EIO signature (see
+/// [`looks_like_bootstrap_eio`]): if `bootstrap` failed with the
+/// ambiguous EIO text and `print` confirms the job is loaded, the
+/// double-bootstrap is idempotent success; otherwise the original
+/// `LaunchctlFailed` propagates.
+///
+/// launchctl exec failure / non-zero exit / unrecognised body all fold
+/// to `false` (probe unsuccessful) — the caller then propagates the
+/// original failure rather than silently converting an unknown state to
+/// `AlreadyLoaded`.
+async fn probe_already_loaded_via_print(target: &str) -> bool {
+    let out = match run_launchctl(&["print", target]).await {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    launchctl_print_body_indicates_loaded(&stdout, target)
+}
+
 async fn poll_healthz_until_up(bind: &str, total: Duration, step: Duration) -> bool {
     let deadline = Instant::now() + total;
     while Instant::now() < deadline {
@@ -424,6 +479,19 @@ pub async fn bootstrap() -> Result<BootstrapOutcome, ServerError> {
     let text = combined_output_text(&out.stdout, &out.stderr);
     if looks_like_already_loaded(&text) {
         return Ok(BootstrapOutcome::AlreadyLoaded { plist_path });
+    }
+    // macOS 15 (Sequoia) collapses the classical "already loaded" phrasing
+    // into a bare `Bootstrap failed: 5: Input/output error`, which is
+    // ambiguous vs a genuine EIO. Post-check with `launchctl print` on
+    // the job target: if the job is present, treat the double-bootstrap
+    // as idempotent success; otherwise fall through and propagate the
+    // original `LaunchctlFailed`. Older macOS versions still hit the
+    // classical `looks_like_already_loaded` branch above.
+    if looks_like_bootstrap_eio(&text) {
+        let target = domain_target();
+        if probe_already_loaded_via_print(&target).await {
+            return Ok(BootstrapOutcome::AlreadyLoaded { plist_path });
+        }
     }
     if looks_like_missing_plist(&text) {
         return Err(ServerError::MissingJob {
@@ -844,6 +912,85 @@ com.mse.server = {
         assert!(!looks_like_already_loaded(
             "Could not find service in domain"
         ));
+    }
+
+    // ---- macOS 15 Sequoia EIO post-check ---------------------------------
+
+    #[test]
+    fn probe_already_loaded_recognises_running_body() {
+        // Real-shape `launchctl print gui/<uid>/<label>` output for a
+        // loaded job — top-level entry opens with the target followed
+        // by ` = {`.
+        // The path / state / pid lines below the header are decorative —
+        // the parser only inspects the header prefix — but the shape mirrors
+        // real `launchctl print` output so the fixture reads faithfully.
+        let body = "gui/501/com.mse.server = {\n\
+                    \tactive count = 1\n\
+                    \tstate = running\n\
+                    \tpid = 12345\n\
+                    }";
+        assert!(launchctl_print_body_indicates_loaded(
+            body,
+            "gui/501/com.mse.server"
+        ));
+    }
+
+    #[test]
+    fn probe_already_loaded_rejects_missing_body() {
+        // `launchctl print <unknown-target>` on macOS emits either
+        // `Bad request.` (older) or `Could not find service ...`
+        // (newer). Neither must be treated as loaded.
+        let bad_request = "Bad request.\n";
+        assert!(!launchctl_print_body_indicates_loaded(
+            bad_request,
+            "gui/501/com.mse.server"
+        ));
+        let not_found = "Could not find service \"com.mse.server\" in domain for port\n";
+        assert!(!launchctl_print_body_indicates_loaded(
+            not_found,
+            "gui/501/com.mse.server"
+        ));
+        // Empty stdout (probe exec succeeded but produced nothing) must
+        // also fall through.
+        assert!(!launchctl_print_body_indicates_loaded(
+            "",
+            "gui/501/com.mse.server"
+        ));
+    }
+
+    #[test]
+    fn looks_like_bootstrap_eio_matches_sequoia_signature() {
+        // Literal stderr observed on macOS 15.7.3 (kernel 24.6.0) when
+        // running `launchctl bootstrap gui/<uid> <plist>` against an
+        // already-loaded LaunchAgent.
+        let sequoia = "Bootstrap failed: 5: Input/output error\n\
+                       Try re-running the command as root for richer errors.";
+        assert!(looks_like_bootstrap_eio(sequoia));
+        // Case-insensitive on both signature substrings.
+        assert!(looks_like_bootstrap_eio("bootstrap failed: 5"));
+        assert!(looks_like_bootstrap_eio("INPUT/OUTPUT ERROR"));
+        // Unrelated launchctl chatter must not match.
+        assert!(!looks_like_bootstrap_eio(
+            "Bootstrap failed: 37: Service is already loaded"
+        ));
+        assert!(!looks_like_bootstrap_eio("Operation now in progress"));
+    }
+
+    #[test]
+    fn classical_heuristic_does_not_cover_sequoia_signature() {
+        // Design intent: the Sequoia EIO signature is intentionally NOT
+        // matched by `looks_like_already_loaded` — that branch is kept
+        // narrow (classical phrasings only) so a genuine EIO on older
+        // macOS is not silently folded into `AlreadyLoaded`. The
+        // Sequoia path is handled by the EIO-post-check branch in
+        // `bootstrap()`, which pairs `looks_like_bootstrap_eio` with a
+        // `launchctl print` probe to disambiguate.
+        let sequoia = "Bootstrap failed: 5: Input/output error";
+        assert!(
+            !looks_like_already_loaded(sequoia),
+            "classical heuristic must stay narrow; Sequoia goes through \
+             the EIO-post-check branch, not this one"
+        );
     }
 
     #[test]
