@@ -1,0 +1,25 @@
+[package]
+name = "mlua-swarm-compile"
+version = "0.12.3"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+description = "Compile pipeline for mlua-swarm Blueprints: linker (agent.md ref expansion via include cascade) + agent.md frontmatter parser + shape lint. Callable from CLI (mse bp lint / mse bp build) and server register path, so a Blueprint reaches BPReady state through the same code at either layer."
+keywords = ["swarm", "blueprint", "compile", "linker"]
+categories = ["development-tools"]
+
+[dependencies]
+mlua-swarm-schema.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

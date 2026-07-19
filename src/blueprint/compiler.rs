@@ -2096,6 +2096,7 @@ mod meta_ref_validation_tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         }
     }
 
@@ -2273,6 +2274,7 @@ mod audit_agent_validation_tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         }
     }
 
@@ -2378,6 +2380,7 @@ mod projection_placement_compile_tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         }
     }
 
@@ -2499,6 +2502,7 @@ mod verdict_contract_lint_tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         }
     }
 

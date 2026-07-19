@@ -1,0 +1,18 @@
+[package]
+name = "mlua-swarm-dsl"
+version = "0.12.3"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+description = "Lua authoring DSL (flow_dsl + bp_dsl) for mlua-swarm Blueprint / flow.ir JSON. Embeds the Lua source and executes .bp.lua scripts in a fresh mlua VM, returning serde_json::Value ready to feed into mlua-swarm-compile."
+keywords = ["swarm", "lua", "dsl", "blueprint"]
+categories = ["development-tools"]
+
+[dependencies]
+mlua.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

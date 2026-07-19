@@ -2243,7 +2243,7 @@ impl MseServer {
                 }))
             }
         };
-        let lint = match crate::bp::compile_lint(&bp_value, &script_path) {
+        let lint = match crate::bp::compile_lint(&bp_value, &script_path, &[]) {
             Ok(crate::bp::LintReport::Ok { agents, operators }) => {
                 format!("ok ({agents} agent(s), {operators} operator(s) checked)")
             }
@@ -3310,6 +3310,7 @@ mod tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         }
     }
 
@@ -5083,6 +5084,7 @@ mod tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         };
 
         let client = reqwest::Client::new();

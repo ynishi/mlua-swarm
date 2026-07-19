@@ -424,6 +424,17 @@ pub struct Blueprint {
     /// three fail-open reaction modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_policy: Option<CheckPolicy>,
+    /// Authoring-time include list consumed by the compile-side linker
+    /// (tier 2 of the include cascade — see `mlua-swarm-compile`'s
+    /// `ResolveConfig`). Each entry is a directory path resolved
+    /// relative to the bp.lua parent that `$agent_md` / `$file` refs
+    /// will search after the parent dir itself. Bare list; the schema
+    /// carries the field only so `deny_unknown_fields` won't reject a
+    /// bp.lua that declares it. `[]` (the default) — no in-bp includes;
+    /// every pre-cascade Blueprint is unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<String>")]
+    pub blueprint_ref_includes: Vec<std::path::PathBuf>,
 }
 
 /// How a submit-time projection sink reacts when a fail-open condition
@@ -1409,6 +1420,7 @@ mod tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         }
     }
 

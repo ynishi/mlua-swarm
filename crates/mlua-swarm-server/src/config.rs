@@ -85,6 +85,11 @@ pub struct FileConfig {
     pub enable_enhance_flow: Option<bool>,
     /// Base dir for `$file` / `$agent_md` ref expansion in seeded Blueprints.
     pub blueprint_ref_base: Option<PathBuf>,
+    /// Additional dirs (tier 5 of the include cascade — see
+    /// `mlua-swarm-compile::ResolveConfig`) searched after the CLI
+    /// `--include` list and before the bundled default. `None` = no
+    /// server-config includes.
+    pub blueprint_ref_includes: Option<Vec<PathBuf>>,
     /// Root path for the git-backed `BlueprintStore` (when using the git2 backend).
     pub git_store_path: Option<PathBuf>,
     /// Path to the SQLite database file backing the `IssueStore`. `None` = fall
@@ -157,6 +162,9 @@ pub struct CliOverrides {
     pub enable_enhance_flow: Option<bool>,
     /// `--blueprint-ref-base` value.
     pub blueprint_ref_base: Option<PathBuf>,
+    /// `--include` values (repeatable). Merged with the file config's
+    /// `blueprint_ref_includes` (CLI wins on conflict — see [`resolve`]).
+    pub blueprint_ref_includes: Vec<PathBuf>,
     /// `--git-store-path` value.
     pub git_store_path: Option<PathBuf>,
     /// `--issue-store-path` value (mirrors [`FileConfig::issue_store_path`]).
@@ -198,6 +206,10 @@ pub struct ResolvedConfig {
     pub enable_enhance_flow: bool,
     /// Base dir for `$file` / `$agent_md` ref expansion in seeded Blueprints.
     pub blueprint_ref_base: Option<PathBuf>,
+    /// Merged include list (CLI `--include` first, then file
+    /// `blueprint_ref_includes`) — tier 4+5 of the include cascade.
+    /// Always set (may be empty).
+    pub blueprint_ref_includes: Vec<PathBuf>,
     /// Root path for the git-backed `BlueprintStore`. Always set — defaults
     /// to [`default_store_path`] (`~/.mse/store`) when neither CLI nor config
     /// file provides one.
@@ -251,6 +263,7 @@ impl Default for ResolvedConfig {
             bind: default_bind(),
             enable_enhance_flow: false,
             blueprint_ref_base: None,
+            blueprint_ref_includes: Vec::new(),
             git_store_path: default_store_path(),
             issue_store_path: None,
             enhance_setting_store_path: None,
@@ -320,6 +333,11 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .or(file.enable_enhance_flow)
             .unwrap_or(default.enable_enhance_flow),
         blueprint_ref_base: cli.blueprint_ref_base.or(file.blueprint_ref_base),
+        blueprint_ref_includes: {
+            let mut merged = cli.blueprint_ref_includes;
+            merged.extend(file.blueprint_ref_includes.unwrap_or_default());
+            merged
+        },
         git_store_path: cli
             .git_store_path
             .or(file.git_store_path)

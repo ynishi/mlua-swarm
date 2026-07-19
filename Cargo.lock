@@ -1705,6 +1705,7 @@ dependencies = [
  "mlua",
  "mlua-flow-ir",
  "mlua-isle 0.5.0",
+ "mlua-swarm-compile",
  "mlua-swarm-schema",
  "rusqlite",
  "rusqlite-isle",
@@ -1735,6 +1736,8 @@ dependencies = [
  "mlua",
  "mlua-flow-ir",
  "mlua-swarm",
+ "mlua-swarm-compile",
+ "mlua-swarm-dsl",
  "mlua-swarm-schema",
  "mlua-swarm-server",
  "nix 0.29.0",
@@ -1752,6 +1755,28 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "mlua-swarm-compile"
+version = "0.12.3"
+dependencies = [
+ "blake3",
+ "mlua-swarm-schema",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "mlua-swarm-dsl"
+version = "0.12.3"
+dependencies = [
+ "anyhow",
+ "mlua",
+ "serde_json",
 ]
 
 [[package]]
@@ -1778,6 +1803,7 @@ dependencies = [
  "hex",
  "mlua-flow-ir",
  "mlua-swarm",
+ "mlua-swarm-compile",
  "mlua-swarm-schema",
  "reqwest 0.12.28",
  "rusqlite-isle",

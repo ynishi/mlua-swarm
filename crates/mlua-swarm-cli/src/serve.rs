@@ -128,6 +128,13 @@ pub struct Args {
     /// Overrides the config file's `blueprint_ref_base`.
     #[arg(long)]
     blueprint_ref_base: Option<std::path::PathBuf>,
+    /// Additional directory searched when resolving `$agent_md` /
+    /// `$file` refs at server register time. Repeatable (tier 4 of the
+    /// include cascade — see `mlua-swarm-compile::ResolveConfig`).
+    /// Appended after CLI `--blueprint-ref-base` (legacy single dir)
+    /// and before the config file's `blueprint_ref_includes` list.
+    #[arg(long = "include", action = clap::ArgAction::Append, value_name = "DIR")]
+    blueprint_ref_includes: Vec<std::path::PathBuf>,
     /// The (2) CLI override layer of the 4-tier cascade. Falls back when the BP
     /// top-level `default_agent_kind` JSON literal is absent; if that is also
     /// absent, the Schema-impl `Default` = `Operator` is used. The value is the
@@ -191,6 +198,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             None
         },
         blueprint_ref_base: args.blueprint_ref_base.clone(),
+        blueprint_ref_includes: args.blueprint_ref_includes.clone(),
         git_store_path: args.git_store_path.clone(),
         issue_store_path: args.issue_store_path.clone(),
         enhance_setting_store_path: args.enhance_setting_store_path.clone(),
@@ -459,6 +467,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .merge(build_blueprints_router_with_refs(
             store.clone(),
             cfg.blueprint_ref_base.clone(),
+            cfg.blueprint_ref_includes.clone(),
             default_agent_kind,
         ))
         .merge(build_enhance_log_router(log_store.clone()))
@@ -667,6 +676,7 @@ fn seed_blueprint(id: &str) -> Blueprint {
         runners: vec![],
         default_runner: None,
         check_policy: None,
+        blueprint_ref_includes: Vec::new(),
     }
 }
 

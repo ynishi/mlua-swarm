@@ -9,7 +9,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mlua_swarm::blueprint::loader::{expand_file_refs, pre_read_default_agent_kind};
+use mlua_swarm::blueprint::loader::pre_read_default_agent_kind;
+use mlua_swarm_compile::{
+    env_blueprint_includes, expand_file_refs_with_config, pre_read_in_bp_includes, ResolveConfig,
+};
 use mlua_swarm::blueprint::store::{
     blueprint_version, BlueprintId, BlueprintStore, CommitMetadata,
 };
@@ -34,13 +37,18 @@ pub struct BlueprintsState {
     pub store: Arc<dyn BlueprintStore>,
     /// Base dir for `$file` / `$agent_md` ref expansion; `None` skips expansion.
     pub ref_base: Option<PathBuf>,
+    /// Additional directories (tier 5 of the include cascade — see
+    /// `mlua-swarm-compile::ResolveConfig`) searched after `ref_base`
+    /// (tier 1). Empty vec = no server-config includes; the register
+    /// path still walks the in-bp and env tiers.
+    pub ref_includes: Vec<PathBuf>,
     /// CLI-level `default_agent_kind` override (layer (2) of the 4-tier cascade).
     pub cli_default_agent_kind: Option<AgentKind>,
 }
 
 /// Minimal entry: no `ref_base` (ref expansion skipped) and no CLI default kind override.
 pub fn build_blueprints_router(store: Arc<dyn BlueprintStore>) -> Router {
-    build_blueprints_router_with_refs(store, None, None)
+    build_blueprints_router_with_refs(store, None, Vec::new(), None)
 }
 
 /// When `ref_base` is set, `seed_blueprint` resolves `{"$file": ...}` /
@@ -55,11 +63,13 @@ pub fn build_blueprints_router(store: Arc<dyn BlueprintStore>) -> Router {
 pub fn build_blueprints_router_with_refs(
     store: Arc<dyn BlueprintStore>,
     ref_base: Option<PathBuf>,
+    ref_includes: Vec<PathBuf>,
     cli_default_agent_kind: Option<AgentKind>,
 ) -> Router {
     let state = BlueprintsState {
         store,
         ref_base,
+        ref_includes,
         cli_default_agent_kind,
     };
     Router::new()
@@ -186,7 +196,17 @@ async fn seed_blueprint(
                 .clone()
                 .unwrap_or_else(default_global_agent_kind),
         };
-        let expanded = expand_file_refs(raw_body, base, default_kind)
+        // Six-tier include cascade: (1) ref_base = bp.lua parent, (2)
+        // in-bp `blueprint_ref_includes`, (3) env
+        // `MSE_BLUEPRINT_INCLUDES`, (5) server config
+        // `blueprint_ref_includes`. Tiers 4 (CLI `--include` on the
+        // client) and 6 (bundled default) are client-side only —
+        // server-side never sees them.
+        let cfg = ResolveConfig::new(base.clone())
+            .with_in_bp_includes(pre_read_in_bp_includes(&raw_body))
+            .with_env_includes(env_blueprint_includes())
+            .with_config_includes(state.ref_includes.clone());
+        let expanded = expand_file_refs_with_config(raw_body, &cfg, default_kind)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("ref expand: {e}")))?;
         serde_json::from_value(expanded)
             .map_err(|e| (StatusCode::BAD_REQUEST, parse_error_with_schema_hint(&e)))?
@@ -888,6 +908,7 @@ mod explain_agent_tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         }
     }
 
@@ -904,6 +925,7 @@ mod explain_agent_tests {
         BlueprintsState {
             store: Arc::new(store),
             ref_base: None,
+            ref_includes: Vec::new(),
             cli_default_agent_kind: None,
         }
     }
@@ -1213,6 +1235,7 @@ mod explain_agent_tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         }
     }
 
@@ -1303,6 +1326,7 @@ mod explain_agent_tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         };
         let store = InMemoryBlueprintStore::new();
         seed(&store, &bp).await;

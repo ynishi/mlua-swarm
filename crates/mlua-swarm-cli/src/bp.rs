@@ -78,6 +78,14 @@ struct BuildArgs {
     /// Defaults to `mse serve`'s own default bind.
     #[arg(long)]
     server: Option<String>,
+    /// Additional directory to search when resolving `$agent_md` /
+    /// `$file` refs. Repeatable (tier 4 of the include cascade — see
+    /// `mlua-swarm-compile::ResolveConfig`). Search order:
+    /// bp.lua parent → in-bp `blueprint_ref_includes` → env
+    /// `MSE_BLUEPRINT_INCLUDES` → `--include` (this flag) →
+    /// bundled default samples dir.
+    #[arg(long = "include", action = clap::ArgAction::Append, value_name = "DIR")]
+    include: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -128,7 +136,7 @@ async fn run_build(args: BuildArgs) -> Result<()> {
     let bp_value = dsl::build_bp_from_script(&script)
         .with_context(|| format!("building Blueprint from {}", args.script.display()))?;
 
-    match compile_lint(&bp_value, &args.script) {
+    match compile_lint(&bp_value, &args.script, &args.include) {
         Ok(LintReport::Ok { agents, operators }) => {
             eprintln!("compile lint: OK ({agents} agent(s), {operators} operator(s) checked)");
         }
@@ -602,10 +610,27 @@ pub(crate) enum LintReport {
 /// hard-fails on an unresolved `$agent_md`/`$file` ref — that's the
 /// server's job at register time via its own `--blueprint-ref-base` —
 /// but always reports explicitly when it had to skip (no silent skip).
-pub(crate) fn compile_lint(bp_value: &serde_json::Value, script_path: &Path) -> Result<LintReport> {
+///
+/// `cli_includes` are the `--include <DIR>` flag values from the outer
+/// `mse bp build` command (tier 4 of the include cascade). The lint
+/// itself also picks up in-bp `blueprint_ref_includes` (tier 2) and
+/// `MSE_BLUEPRINT_INCLUDES` (tier 3).
+pub(crate) fn compile_lint(
+    bp_value: &serde_json::Value,
+    script_path: &Path,
+    cli_includes: &[PathBuf],
+) -> Result<LintReport> {
+    use mlua_swarm_compile::{
+        env_blueprint_includes, expand_file_refs_with_config, pre_read_in_bp_includes,
+        ResolveConfig,
+    };
     let base = script_path.parent().unwrap_or_else(|| Path::new("."));
     let default_kind = mlua_swarm::blueprint::loader::pre_read_default_agent_kind(bp_value);
-    let expanded = match mlua_swarm::expand_file_refs(bp_value.clone(), base, default_kind) {
+    let cfg = ResolveConfig::new(base.to_path_buf())
+        .with_in_bp_includes(pre_read_in_bp_includes(bp_value))
+        .with_env_includes(env_blueprint_includes())
+        .with_cli_includes(cli_includes.to_vec());
+    let expanded = match expand_file_refs_with_config(bp_value.clone(), &cfg, default_kind) {
         Ok(v) => v,
         Err(e) => {
             return Ok(LintReport::Skipped {
@@ -734,7 +759,7 @@ mod tests {
         // `script_path` arg is only used as the parent for ref
         // resolution, so any path resolves (the loader never touches disk
         // when the Blueprint carries no refs).
-        compile_lint(&bp_value, Path::new("/tmp/nonexistent.bp.lua"))
+        compile_lint(&bp_value, Path::new("/tmp/nonexistent.bp.lua"), &[])
     }
 
     #[test]

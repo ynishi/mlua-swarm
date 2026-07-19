@@ -1222,6 +1222,7 @@ mod tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         }
     }
 
@@ -1318,6 +1319,7 @@ mod tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         }
     }
 
@@ -1813,6 +1815,7 @@ mod tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         };
 
         let req = TaskLaunchRequest {
@@ -2445,6 +2448,7 @@ mod tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         };
 
         let req = TaskLaunchRequest {

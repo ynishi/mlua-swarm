@@ -1262,6 +1262,7 @@ mod after_run_audit_tests {
             runners: vec![],
             default_runner: None,
             check_policy: None,
+            blueprint_ref_includes: Vec::new(),
         }
     }
 

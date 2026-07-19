@@ -9,6 +9,15 @@
 //! the filesystem. The `flow-ir` / `mlua-swarm-schema` crates are not
 //! touched by this module — canonical JSON stays the wire format; the DSL
 //! is purely an authoring-time convenience that emits it.
+//!
+//! # Crate positioning
+//!
+//! This crate is the DSL frontend only (`.bp.lua` → `serde_json::Value`).
+//! The compile pipeline (linker → shape lint → BPReady) lives in the
+//! sibling `mlua-swarm-compile` crate, which consumes the JSON this crate
+//! produces. `mlua-swarm-schema` (types) stays free of the `mlua` runtime
+//! dep so that consumers who only need type surfaces (e.g. the server's
+//! wire codec) do not transitively pull the Lua interpreter.
 
 const FLOW_DSL_SRC: &str = include_str!("flow_dsl.lua");
 const BP_DSL_SRC: &str = include_str!("bp_dsl.lua");
