@@ -1,9 +1,19 @@
--- Sample: a bp_dsl `B.pipeline{}` Blueprint. Three verdict-gated stages run
--- in sequence: analyze -> review -> publish. Stage ids double as the wiring
--- defaults (input `$.d.{stage_id}`, output `$.{stage_id}`). The `review`
--- stage declares a verdict contract and retries through a `fix` stage while
--- it keeps returning BLOCKED (bounded); a stage that stays BLOCKED halts the
+-- Sample: a bp_dsl `B.pipeline{}` Blueprint. Three sequential stages —
+-- analyze -> review -> publish. Stage ids double as the wiring defaults
+-- (input `$.d.{stage_id}`, output `$.{stage_id}`). The `review` stage
+-- declares a verdict contract and retries through a `fix` stage while it
+-- keeps returning BLOCKED (bounded); a stage that stays BLOCKED halts the
 -- pipeline and records where it stopped in `$.halted_at`.
+--
+-- Post-bafe47d4 gate semantics: only `review` emits a verdict gate here,
+-- because it is the stage that actually emits verdict — `retry = {...}`
+-- opts it in implicitly (a retry loop reads verdict, so the post-retry
+-- gate makes sense). `analyze` and `publish` produce no verdict and get
+-- no gate. Pipeline-level `halt_on = { "BLOCKED" }` becomes the shared
+-- default value used by the opted-in stage rather than a cascade that
+-- forces every stage to gate. Add `gate = true` (or `halt_on = {...}`)
+-- on a stage record to opt in explicitly; set `gate_default = "auto"`
+-- at the pipeline level for the pre-fix cascade shape.
 --
 -- Agents are declared inline (no `$agent_md` refs). For a sample that pulls
 -- agents from `.md` files via the Blueprint include cascade — bp.lua parent

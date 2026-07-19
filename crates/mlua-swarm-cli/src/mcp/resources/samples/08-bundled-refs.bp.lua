@@ -22,10 +22,19 @@
 local F = require("flow_dsl")
 local B = require("bp_dsl")
 
+-- Post-bafe47d4 gate semantics: `review` opts into the verdict gate via
+-- stage-level `halt_on = { "BLOCKED" }` (mirrors the verdict declaration
+-- on `reviewer.md`). `research` produces no verdict and gets no gate;
+-- pipeline-level `halt_on` used to force one via the pre-fix cascade
+-- (dead branch on `research`). See `mse://guides/blueprint-ref-paths`
+-- for the full opt-in matrix and the `gate_default = "auto"` escape
+-- hatch for pre-fix scripts.
 local flow = B.pipeline({
   B.stage "research" { agent = "researcher" },
-  B.stage "review" { agent = "reviewer" },
-  halt_on = { "BLOCKED" },
+  B.stage "review" {
+    agent = "reviewer",
+    halt_on = { "BLOCKED" },
+  },
   halted_at = "$.halted_at",
   done = "$.pipeline_complete",
 })

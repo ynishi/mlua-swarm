@@ -39,6 +39,7 @@ fn single_stage_default_wiring_and_gate_shape() {
           halt_on = { "BLOCKED" },
           halted_at = "$.halted_at",
           done = "$.done",
+          gate_default = "auto",  -- bafe47d4: legacy cascade shape asserted below
         }
         "#,
     );
@@ -102,6 +103,7 @@ fn multiple_halt_on_values_combine_with_or() {
           B.stage "gate" { agent = "mock-gate" },
           halt_on = { "BLOCKED", "ESCALATE" },
           halted_at = "$.halted_at",
+          gate_default = "auto",  -- bafe47d4: legacy cascade shape asserted below
         }
         "#,
     );
@@ -125,6 +127,7 @@ fn gate_false_opts_out_of_branch_insertion() {
           B.stage "b" { agent = "agent-b" },
           halt_on = { "BLOCKED" },
           halted_at = "$.halted_at",
+          gate_default = "auto",  -- bafe47d4: b inherits the cascade, so we can assert its gate shape
         }
         "#,
     );
@@ -152,6 +155,7 @@ fn from_resolves_to_referenced_stage_out() {
           B.stage "planner" { agent = "mock-planner", input = B.from "scout" },
           halt_on = { "BLOCKED" },
           halted_at = "$.halted_at",
+          gate_default = "auto",  -- bafe47d4: legacy cascade shape asserted below (scout gate wraps planner)
         }
         "#,
     );
@@ -185,6 +189,234 @@ fn from_undefined_stage_errors() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// bafe47d4: opt-in verdict gate default + `gate_default = "auto"`
+// escape hatch. Pre-fix, pipeline-level `halt_on` cascaded to every
+// stage regardless of whether the stage emitted a verdict, producing
+// dead branches. The fix inverts the default (no gate unless the stage
+// opts in) and keeps the legacy shape reachable via
+// `gate_default = "auto"` for callers that need the old form.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Default (post-bafe47d4): a stage with no `gate` / `halt_on` / `retry`
+/// declaration emits NO verdict gate. Pipeline-level `halt_on` no longer
+/// forces a cascade; it stays as a shared default value for stages that
+/// do opt in.
+#[test]
+fn default_no_stage_opt_in_emits_no_gate() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "scout" { agent = "mock-scout" },
+          halt_on = { "BLOCKED" },  -- present but no longer cascades
+          halted_at = "$.halted_at",
+          done = "$.done",
+        }
+        "#,
+    );
+    let children = value["children"].as_array().expect("seq children");
+    assert_eq!(
+        children.len(),
+        2,
+        "single stage without opt-in -> [step, final_else]"
+    );
+    assert_eq!(children[0]["kind"], serde_json::json!("step"));
+    // No branch anywhere along the chain — final_else is the `done` assign.
+    assert_eq!(children[1]["kind"], serde_json::json!("assign"));
+    assert_eq!(children[1]["at"], serde_json::json!({"op": "path", "at": "$.done"}));
+}
+
+/// Explicit `gate = true` on a stage opts it in even when the pipeline
+/// has no `halt_on`. Pipeline-level `halt_on` still supplies the value
+/// list once a stage opts in.
+#[test]
+fn stage_gate_true_opts_in_without_pipeline_cascade() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "scout" { agent = "mock-scout", gate = true },
+          B.stage "follow" { agent = "mock-follow" },
+          halt_on = { "BLOCKED" },
+          halted_at = "$.halted_at",
+        }
+        "#,
+    );
+    // scout gates (opted in), follow does not (no opt-in). Shape:
+    //   seq{scout_step, branch{ cond=verdict==BLOCKED, then=halt, else=seq{follow_step, final_else} }}
+    let gate = &value["children"][1];
+    assert_eq!(gate["kind"], serde_json::json!("branch"));
+    assert_eq!(gate["cond"]["rhs"]["value"], serde_json::json!("BLOCKED"));
+    let follow_seq = &gate["else"];
+    let follow_children = follow_seq["children"].as_array().expect("follow children");
+    assert_eq!(
+        follow_children.len(),
+        2,
+        "follow (no opt-in) -> [step, final_else], no gate"
+    );
+    assert_eq!(follow_children[0]["ref"], serde_json::json!("mock-follow"));
+}
+
+/// Stage-level `halt_on = {...}` implies opt-in and shadows pipeline-level
+/// `halt_on` for the cond value list.
+#[test]
+fn stage_halt_on_implies_gate_and_shadows_pipeline_default() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "checker" { agent = "mock-checker", halt_on = { "ESCALATE" } },
+          halt_on = { "BLOCKED" },  -- shared default, but checker names its own
+          halted_at = "$.halted_at",
+        }
+        "#,
+    );
+    let gate = &value["children"][1];
+    assert_eq!(gate["kind"], serde_json::json!("branch"));
+    assert_eq!(
+        gate["cond"]["rhs"]["value"],
+        serde_json::json!("ESCALATE"),
+        "stage-level halt_on wins for the cond value list"
+    );
+}
+
+/// `retry = {...}` implies opt-in — the retry loop already reads verdict,
+/// so a post-retry gate makes sense. (Also verified indirectly by
+/// `retry_expands_to_step_loop_gate` which asserts on children.len() == 3
+/// even without a `gate = true`.)
+#[test]
+fn retry_implies_gate_without_explicit_opt_in() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "checker" {
+            agent = "mock-checker",
+            retry = {
+              max = 2,
+              fix = B.stage "checker_fix" { agent = "mock-fix" },
+            },
+          },
+          halt_on = { "BLOCKED" },
+          halted_at = "$.halted_at",
+        }
+        "#,
+    );
+    let children = value["children"].as_array().expect("seq children");
+    assert_eq!(
+        children.len(),
+        3,
+        "retry implies gate -> [step, loop, branch]"
+    );
+    assert_eq!(children[2]["kind"], serde_json::json!("branch"));
+}
+
+/// `gate = false` beats every opt-in signal (retry included) — an author
+/// can carry a verdict-emitting stage that intentionally doesn't halt the
+/// pipeline on BLOCKED.
+#[test]
+fn explicit_gate_false_overrides_retry_opt_in() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "checker" {
+            agent = "mock-checker",
+            gate = false,
+            retry = {
+              max = 2,
+              fix = B.stage "checker_fix" { agent = "mock-fix" },
+            },
+          },
+          B.stage "follow" { agent = "mock-follow" },
+          halt_on = { "BLOCKED" },
+          halted_at = "$.halted_at",
+        }
+        "#,
+    );
+    let children = value["children"].as_array().expect("seq children");
+    assert_eq!(
+        children.len(),
+        3,
+        "gate=false: [step, loop, rest] — no branch, `follow` splices in"
+    );
+    assert_eq!(children[0]["kind"], serde_json::json!("step"));
+    assert_eq!(children[1]["kind"], serde_json::json!("loop"));
+    // The rest is a seq wrapping follow's step + final_else — no branch.
+    let rest = &children[2];
+    assert_eq!(rest["kind"], serde_json::json!("seq"));
+    let rest_children = rest["children"].as_array().expect("rest children");
+    assert_eq!(rest_children[0]["ref"], serde_json::json!("mock-follow"));
+}
+
+/// `gate_default = "auto"` restores the pre-fix cascade — pipeline-level
+/// `halt_on` triggers a gate on every stage whose own `gate` / `halt_on` /
+/// `retry` are all unset. Escape hatch for pre-bafe47d4 bp.lua sources.
+#[test]
+fn gate_default_auto_restores_pipeline_cascade() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "a" { agent = "mock-a" },
+          B.stage "b" { agent = "mock-b" },
+          halt_on = { "BLOCKED" },
+          halted_at = "$.halted_at",
+          gate_default = "auto",
+        }
+        "#,
+    );
+    // Cascade shape: seq{a_step, branch{ cond=..., then=halt, else=seq{b_step, branch{...}} }}
+    let a_gate = &value["children"][1];
+    assert_eq!(a_gate["kind"], serde_json::json!("branch"));
+    let b_seq = &a_gate["else"];
+    let b_gate = &b_seq["children"][1];
+    assert_eq!(b_gate["kind"], serde_json::json!("branch"));
+}
+
+/// `gate_default = "auto"` with an empty pipeline `halt_on` still emits
+/// no cascade — the cascade only kicks in when there IS a pipeline-level
+/// halt-value list to inherit. Regression guard against a naive `auto`
+/// implementation that would emit a gate with an empty cond value list.
+#[test]
+fn gate_default_auto_with_empty_halt_on_still_emits_no_gate() {
+    let value = build_pipeline(
+        r#"
+        return B.pipeline{
+          B.stage "scout" { agent = "mock-scout" },
+          halted_at = "$.halted_at",
+          gate_default = "auto",
+          -- halt_on intentionally unset
+        }
+        "#,
+    );
+    let children = value["children"].as_array().expect("seq children");
+    assert_eq!(children.len(), 2, "no halt_on -> no gate even under auto");
+    assert_eq!(children[0]["kind"], serde_json::json!("step"));
+    assert_ne!(children[1]["kind"], serde_json::json!("branch"));
+}
+
+/// Unknown `gate_default` values must fail loud — typo protection.
+#[test]
+fn gate_default_unknown_value_errors() {
+    let source = r#"
+        local F = require("flow_dsl")
+        local B = require("bp_dsl")
+        return B.pipeline{
+          B.stage "scout" { agent = "mock-scout" },
+          halt_on = { "BLOCKED" },
+          halted_at = "$.halted_at",
+          gate_default = "sometimes",
+        }
+    "#;
+    let err =
+        dsl::build_bp_from_script(source).expect_err("unknown gate_default must error");
+    let message = err.to_string();
+    assert!(
+        message.contains("gate_default"),
+        "error must name the offending option, got: {message}"
+    );
+    assert!(
+        message.contains("sometimes"),
+        "error must echo the bad value, got: {message}"
+    );
+}
+
 /// GH #65: `chain = true` opts the pipeline into stage-to-stage
 /// chaining — stage N (N ≥ 2) whose `input` is nil defaults to
 /// `$.{stage[N-1]_id}` (the previous stage's own `out`) instead of the
@@ -200,6 +432,7 @@ fn chain_true_wires_stage_n_input_to_previous_out() {
           chain = true,
           halt_on = { "BLOCKED" },
           halted_at = "$.halted_at",
+          gate_default = "auto",  -- bafe47d4: legacy cascade shape asserted below (walks gate.else chain)
         }
         "#,
     );
@@ -246,6 +479,7 @@ fn chain_true_respects_explicit_input_and_b_from_overrides() {
           chain = true,
           halt_on = { "BLOCKED" },
           halted_at = "$.halted_at",
+          gate_default = "auto",  -- bafe47d4: legacy cascade shape asserted below
         }
         "#,
     );
@@ -277,6 +511,7 @@ fn chain_omitted_keeps_dot_d_default_on_every_stage() {
           B.stage "transform" { agent = "mock-transform" },
           halt_on = { "BLOCKED" },
           halted_at = "$.halted_at",
+          gate_default = "auto",  -- bafe47d4: legacy cascade shape asserted below (walks stage 1 gate.else)
         }
         "#,
     );
@@ -412,9 +647,11 @@ fn halted_at_defaults_when_unset() {
     let value = build_pipeline(
         r#"
         return B.pipeline{
-          B.stage "scout" { agent = "mock-scout" },
+          B.stage "scout" { agent = "mock-scout", gate = true },
           done = "$.done",
-          -- halted_at intentionally omitted
+          -- halted_at intentionally omitted; `gate = true` (bafe47d4) opts
+          -- the single stage into gate emission so the halted_at default
+          -- assertion still has a `branch` node to inspect.
         }
         "#,
     );

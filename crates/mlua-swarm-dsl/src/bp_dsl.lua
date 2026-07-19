@@ -170,22 +170,44 @@ end
 --- output. Omitting `chain` (or setting it `false`) preserves the R1
 --- default in every position.
 ---
---- ## Automatic verdict gate
+--- ## Opt-in verdict gate (bafe47d4)
 ---
---- Immediately after each stage's `step` Node, a `branch` Node is
---- inserted whose `cond` is `eq(path(<out>.parts["verdict"]),
---- lit(halt_on_value))` (`or`-combined across every `halt_on` value when
---- there's more than one; a stage's own `halt_on` field overrides the
---- pipeline-wide default). The gate's `then` (halt) branch is
---- `assign{at=halted_at, value=lit(stage_id)}` only — every remaining
---- stage is skipped. The gate's `else` branch nests the rest of the
---- pipeline (the following stage's step + its own gate, and so on); the
---- innermost `else` (after the LAST stage's gate) is
---- `assign{at=done, value=lit(true)}` when `done` was given, or an empty
---- `seq{}` otherwise. `gate = false` on a stage record opts that one
---- stage out of gate insertion entirely — its step Node is spliced
---- directly into the enclosing `seq`, and the rest of the pipeline
---- continues unconditionally (NOT nested under an `else`).
+--- A stage emits a verdict gate iff it opts in explicitly. The default
+--- is NO gate (fix for the pre-bafe47d4 dead-branch pattern where every
+--- stage in a pipeline with pipeline-level `halt_on` got a gate whose
+--- `cond` compared against a verdict the stage never emitted).
+---
+--- Opt-in rules (any one triggers gate emission):
+---   - `gate = true` explicit on the stage record.
+---   - `halt_on = {...}` set on the stage record (declares halt values,
+---     implies the stage means to gate).
+---   - `retry = {...}` set on the stage record (the retry loop reads
+---     verdict; the post-retry gate makes sense).
+---   - `gate_default = "auto"` at the pipeline level restores the old
+---     cascade — pipeline-level `halt_on` is inherited by every stage
+---     whose own `gate` / `halt_on` / `retry` are all unset, and they
+---     emit a gate. This is an escape hatch for pre-fix bp.lua sources
+---     that want their existing shape preserved; new code should not
+---     use it. Default is `gate_default = "explicit"` (the new,
+---     bug-fixed behavior).
+---
+--- `gate = false` overrides all four (opts out even with retry / stage
+--- halt_on / auto cascade). When set the stage's step spliced directly
+--- into the enclosing `seq` with no `branch`, and the rest of the
+--- pipeline continues unconditionally (NOT nested under an `else`).
+---
+--- When a gate emits, its shape:
+---   - `cond`: `eq(path(<out>.parts["verdict"]), lit(halt_on_value))`
+---     — `or`-combined across every value when there is more than one.
+---     Stage-level `halt_on` supersedes pipeline-level for the cond
+---     value list; the pipeline-level list stays a shared default for
+---     opted-in stages that do not name their own values.
+---   - `then` (halt): `assign{at=halted_at, value=lit(stage_id)}`.
+---     Every remaining stage is skipped.
+---   - `else`: the rest of the pipeline (next stage's step + its own
+---     gate if any). The innermost `else` (after the last stage) is
+---     `assign{at=done, value=lit(true)}` when `done` was given, or an
+---     empty `seq{}` otherwise.
 ---
 --- ## Retry
 ---
@@ -216,6 +238,18 @@ function M.pipeline(spec)
   local halted_at = spec.halted_at or "$.halted_at"
   local done = spec.done
   local chain = spec.chain == true
+  -- bafe47d4: gate emission is opt-in by default (`"explicit"`). The
+  -- old cascade behavior — pipeline-level `halt_on` triggers a gate
+  -- on every stage — is available via `gate_default = "auto"` for
+  -- pre-fix bp.lua sources that want their existing shape preserved.
+  local gate_default = spec.gate_default or "explicit"
+  if gate_default ~= "explicit" and gate_default ~= "auto" then
+    error(
+      'bp_dsl: gate_default must be "explicit" (default) or "auto", got '
+        .. tostring(gate_default),
+      0
+    )
+  end
 
   local stages = {}
   for i, rec in ipairs(spec) do
@@ -268,7 +302,27 @@ function M.pipeline(spec)
       })
     end
 
+    -- bafe47d4: opt-in gate decision. Order matters — `gate = false`
+    -- must win against every other opt-in signal (retry / stage
+    -- halt_on / auto cascade), and `gate = true` must beat the
+    -- default-off / auto-cascade split so an author can force a gate
+    -- in a pipeline that otherwise wouldn't emit one.
+    local wants_gate
     if rec.gate == false then
+      wants_gate = false
+    elseif rec.gate == true then
+      wants_gate = true
+    elseif rec.retry ~= nil then
+      wants_gate = true
+    elseif rec.halt_on ~= nil then
+      wants_gate = true
+    elseif gate_default == "auto" and #halt_on > 0 then
+      wants_gate = true
+    else
+      wants_gate = false
+    end
+
+    if not wants_gate then
       children[#children + 1] = rest
       return F.seq(children)
     end

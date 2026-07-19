@@ -146,21 +146,43 @@ independently of the review stage's output. Omitting `chain` (or setting it
 to `false`) preserves the R1 default (`$.d.{stage_id}`) in every position —
 the pre-existing behavior.
 
-### Automatic verdict gate
+### Opt-in verdict gate
 
-Immediately after each stage's `step` Node, a `branch` Node is inserted
-whose `cond` is `eq(path(<out>.parts["verdict"]), lit(halt_on_value))`
-(`or`-combined across every `halt_on` value when there's more than one — a
-stage's own `halt_on` field overrides the pipeline-wide default). The
-gate's `then` (halt) branch is `assign{at=halted_at, value=lit(stage_id)}`
-only — every remaining stage is skipped. The gate's `else` branch nests the
-rest of the pipeline (the following stage's step + its own gate, and so on);
-the innermost `else` (after the last stage's gate) is
-`assign{at=done, value=lit(true)}` when `done` was given, or an empty
-`seq{}` otherwise. `gate = false` on a stage record opts that one stage out
-of gate insertion entirely — its step Node is spliced directly into the
-enclosing `seq`, and the rest of the pipeline continues unconditionally
-(not nested under an `else`).
+A stage emits a verdict gate iff it opts in explicitly. The default is
+NO gate — pre-bafe47d4 every stage in a pipeline with pipeline-level
+`halt_on` picked up a gate whose `cond` compared against a verdict the
+stage never emitted, producing dead branches.
+
+Opt-in rules (any one triggers gate emission on that stage):
+
+- `gate = true` explicit on the stage record.
+- `halt_on = {...}` set on the stage record (declares halt values —
+  supersedes pipeline-level `halt_on` for the cond value list).
+- `retry = {...}` set on the stage record (the retry loop reads
+  verdict, so the post-retry gate makes sense).
+- `gate_default = "auto"` at the pipeline level restores the pre-fix
+  cascade for pipelines with a pipeline-level `halt_on` — every stage
+  whose own `gate` / `halt_on` / `retry` are all unset inherits the
+  cascade and emits a gate. Escape hatch for pre-bafe47d4 `.bp.lua`
+  sources; new authoring should stay on `"explicit"` (the default) and
+  opt in per stage.
+
+`gate = false` on a stage record overrides every opt-in signal — its
+`step` Node splices directly into the enclosing `seq`, and the rest of
+the pipeline continues unconditionally (not nested under an `else`).
+Useful when a verdict-emitting stage should not halt the pipeline
+regardless of what it returns.
+
+When a gate emits, its shape:
+
+- `cond`: `eq(path(<out>.parts["verdict"]), lit(halt_on_value))` —
+  `or`-combined across every value when there's more than one.
+- `then` (halt): `assign{at=halted_at, value=lit(stage_id)}` only —
+  every remaining stage is skipped.
+- `else`: the rest of the pipeline (following stage's step + its own
+  gate, and so on). The innermost `else` (after the last stage's gate)
+  is `assign{at=done, value=lit(true)}` when `done` was given, or an
+  empty `seq{}` otherwise.
 
 Because the gate always addresses `<out>.parts["verdict"]`, a stage whose
 verdict drives a `B.pipeline` gate must stage its verdict as a **named

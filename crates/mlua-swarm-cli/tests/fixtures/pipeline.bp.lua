@@ -60,6 +60,13 @@ local flow = B.pipeline({
   halt_on = { "BLOCKED" },
   halted_at = "$.halted_at",
   done = "$.pipeline_complete",
+  -- bafe47d4: the shipped `pipeline.json` snapshot expects the pre-fix
+  -- cascade shape (every stage emits a gate whose cond compares against
+  -- pipeline-level halt_on). Under the new opt-in default this fixture
+  -- would drop the dead branches on non-verdict stages and no longer
+  -- byte-match. `gate_default = "auto"` restores the legacy shape so the
+  -- JSON snapshot stays a stable regression fixture.
+  gate_default = "auto",
 })
 
 local agents = {
