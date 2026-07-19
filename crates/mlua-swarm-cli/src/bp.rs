@@ -736,6 +736,24 @@ pub(crate) enum LintReport {
     },
 }
 
+/// Tier 6 of the include cascade — the bundled `agent.md` samples
+/// shipped inside this crate's source tree
+/// (`src/mcp/resources/samples/agents/`). Resolved from
+/// `CARGO_MANIFEST_DIR` at compile time; returns `None` when that
+/// directory is not on disk at run time (e.g. the crate source tree
+/// was pruned after `cargo install` copied the binary out) so the
+/// linker simply skips the tier instead of erroring on a stale path.
+///
+/// This is a CLI-only wiring: the server binary does not ship
+/// authoring samples, so `mse serve`'s `seed_blueprint` never
+/// registers a bundled default (tier 6 stays unused server-side).
+/// The full cascade — and this tier's role in it — is documented in
+/// `mse://guides/blueprint-ref-paths`.
+fn bundled_agents_dir() -> Option<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/resources/samples/agents");
+    dir.is_dir().then_some(dir)
+}
+
 /// Step 2 of the module doc's pipeline: best-effort compile lint. Never
 /// hard-fails on an unresolved `$agent_md`/`$file` ref — that's the
 /// server's job at register time via its own `--blueprint-ref-base` —
@@ -743,8 +761,9 @@ pub(crate) enum LintReport {
 ///
 /// `cli_includes` are the `--include <DIR>` flag values from the outer
 /// `mse bp build` command (tier 4 of the include cascade). The lint
-/// itself also picks up in-bp `blueprint_ref_includes` (tier 2) and
-/// `MSE_BLUEPRINT_INCLUDES` (tier 3).
+/// itself also picks up in-bp `blueprint_ref_includes` (tier 2),
+/// `MSE_BLUEPRINT_INCLUDES` (tier 3), and the bundled samples dir
+/// (tier 6, see [`bundled_agents_dir`]).
 pub(crate) fn compile_lint(
     bp_value: &serde_json::Value,
     script_path: &Path,
@@ -759,7 +778,8 @@ pub(crate) fn compile_lint(
     let cfg = ResolveConfig::new(base.to_path_buf())
         .with_in_bp_includes(pre_read_in_bp_includes(bp_value))
         .with_env_includes(env_blueprint_includes())
-        .with_cli_includes(cli_includes.to_vec());
+        .with_cli_includes(cli_includes.to_vec())
+        .with_bundled_default(bundled_agents_dir());
     let expanded = match expand_file_refs_with_config(bp_value.clone(), &cfg, default_kind) {
         Ok(v) => v,
         Err(e) => {

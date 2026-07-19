@@ -358,6 +358,74 @@ return {
     );
 }
 
+/// Phase 7 (linker refactor 4c4e3eb8) tier-6 round-trip: `mse bp build`
+/// must resolve a `$agent_md = "researcher.md"` bare-name ref via the
+/// bundled samples/agents directory when no other cascade tier
+/// (bp.lua parent, in-bp includes, `MSE_BLUEPRINT_INCLUDES`, `--include`,
+/// or a server config) resolves it — exercises the CLI's
+/// `bundled_agents_dir()` wiring end-to-end, and guarantees the bundled
+/// fixtures stay resolvable by name.
+#[test]
+fn bp_build_resolves_bare_agent_md_ref_via_bundled_default_tier() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let script_path = tmp.path().join("bundled-tier.bp.lua");
+    let out_path = tmp.path().join("out.json");
+    fs::write(
+        &script_path,
+        r#"
+local F = require("flow_dsl")
+
+return {
+  id = "bundled-tier6-round-trip",
+  flow = F.step({ id = "solo", agent = "researcher", input = F.lit(""), out = F.p("$.solo") }),
+  agents = {
+    {
+      -- Bare filename: no `agents/` prefix, so tier 1 (this script's
+      -- parent = a fresh tempdir) misses. There are no in-bp includes,
+      -- no `MSE_BLUEPRINT_INCLUDES` set for this test, and no `--include`
+      -- flag on the command line — so the ref must resolve through the
+      -- tier-6 bundled default (`src/mcp/resources/samples/agents/`).
+      ["$agent_md"] = "researcher.md",
+      spec = { operator_ref = "main-ai" },
+    },
+  },
+  operators = { { name = "main-ai" } },
+  strategy = { strict_refs = true, strict_kind = true },
+}
+"#,
+    )
+    .expect("write bundled-tier fixture script");
+
+    // Explicitly clear MSE_BLUEPRINT_INCLUDES so a session-level env that
+    // happens to hit `researcher.md` does not mask the tier under test.
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .env_remove("MSE_BLUEPRINT_INCLUDES")
+        .args(["bp", "build"])
+        .arg(&script_path)
+        .args(["-o"])
+        .arg(&out_path)
+        .assert()
+        .success()
+        .stderr(contains("compile lint: OK"));
+
+    // Emit is the raw wire JSON — the `$agent_md` ref is preserved even
+    // though the linker resolved it during lint (design table §Behavior
+    // on unresolved refs: default `mse bp build` keeps the wire form so
+    // the server resolves at register time).
+    let out = fs::read_to_string(&out_path).expect("out.json written");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("out.json is valid JSON");
+    let agent = value
+        .get("agents")
+        .and_then(|a| a.get(0))
+        .expect("agents[0] present");
+    assert_eq!(
+        agent.get("$agent_md").and_then(|v| v.as_str()),
+        Some("researcher.md"),
+        "raw emit preserves the ref that tier-6 resolved during lint"
+    );
+}
+
 /// GH #62 Axis A CLI error path: an unknown template must exit non-zero
 /// with the accepted list named — closed set discoverable from the
 /// error rather than requiring the author to open the guide.

@@ -42,6 +42,7 @@
 //! | `mse://guides/dsl-authoring`                 | flow_dsl/bp_dsl authoring DSL: Expr/Node builders, pipeline conventions, JSON→DSL migration SOP. |
 //! | `mse://guides/worker-io-contract`            | Worker I/O contract: fetch-based IN, path-free tool-call OUT, server-side file materialization. |
 //! | `mse://guides/bp-dsl-templates`              | `mse bp new` / `bp_new` template inventory + flag surface (GH #62 Axis A). |
+//! | `mse://guides/blueprint-ref-paths`           | `$file` / `$agent_md` refs, the 6-tier include cascade, and the `--strict-embed` opt-in. |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
@@ -49,6 +50,7 @@
 //! | `mse://blueprints/samples/05-after-run-audit-agent-block` | GH #34 agent-block-backed after-run audit sample. |
 //! | `mse://blueprints/samples/06-dsl-verdict-loop` | Sample `.bp.lua` — flow_dsl verdict-loop reproduction. |
 //! | `mse://blueprints/samples/07-dsl-pipeline`   | Sample `.bp.lua` — bp_dsl verdict-gated pipeline.   |
+//! | `mse://blueprints/samples/08-bundled-refs`   | Sample `.bp.lua` — `$agent_md` refs into the bundled `samples/agents/` dir (include cascade). |
 //! | `mse://api/blueprint-schema`                 | Live Blueprint JSON Schema (generated per read).    |
 //! | `mse://api/http-endpoints`                   | Live HTTP wire-body JSON Schemas, keyed by endpoint (issue #19). |
 //! | `mse://api/mcp-tools`                        | Live schemars-generated MCP tool inputSchemas keyed by tool name (GH #24 sibling). |
@@ -101,6 +103,8 @@ const DSL_AUTHORING_GUIDE_BODY: &str = include_str!("./resources/guides/dsl-auth
 const WORKER_IO_CONTRACT_BODY: &str = include_str!("./resources/guides/worker-io-contract.md");
 const REPLAY_AND_RESUME_BODY: &str = include_str!("./resources/guides/replay-and-resume.md");
 const BP_DSL_TEMPLATES_BODY: &str = include_str!("./resources/guides/bp-dsl-templates.md");
+const BLUEPRINT_REF_PATHS_BODY: &str =
+    include_str!("./resources/guides/blueprint-ref-paths.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -114,6 +118,8 @@ const SAMPLE_06_DSL_VERDICT_LOOP_BODY: &str =
     include_str!("../../tests/fixtures/verdict_loop.bp.lua");
 const SAMPLE_07_DSL_PIPELINE_BODY: &str =
     include_str!("./resources/samples/07-dsl-pipeline.bp.lua");
+const SAMPLE_08_BUNDLED_REFS_BODY: &str =
+    include_str!("./resources/samples/08-bundled-refs.bp.lua");
 
 /// Static resource catalogue. Order is the order `list_resources` reports.
 pub const RESOURCES: &[ResourceEntry] = &[
@@ -188,6 +194,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         body: ResourceBody::Static(BP_DSL_TEMPLATES_BODY),
     },
     ResourceEntry {
+        uri: "mse://guides/blueprint-ref-paths",
+        title: "mse — Blueprint ref paths ($file / $agent_md, include cascade)",
+        description: "How the linker resolves `$file` and `$agent_md` refs: the 6-tier include cascade (bp.lua parent → in-bp includes → env → CLI `--include` → server config → bundled default), Warn-default behavior on unresolved refs, and the `--strict-embed` / `blueprint_strict_embed` opt-ins at each layer.",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(BLUEPRINT_REF_PATHS_BODY),
+    },
+    ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",
         title: "Sample Blueprint — pure ctx eval",
         description: "Zero-spawn pure ctx evaluation using Assign + And + Gt + Lt + Lit primitives.",
@@ -235,6 +248,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "B.pipeline{}-built three-stage pipeline: default in/out wiring derived from stage ids, automatic verdict gates, and a bounded fix-and-regate retry loop.",
         mime_type: "text/x-lua",
         body: ResourceBody::Static(SAMPLE_07_DSL_PIPELINE_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://blueprints/samples/08-bundled-refs",
+        title: "Sample .bp.lua — bundled `$agent_md` refs (include cascade)",
+        description: "Two-stage research→review pipeline whose agents are supplied by `$agent_md` refs against the bundled `samples/agents/*.md` files. Demonstrates tier 1 (bp.lua parent) and tier 6 (bundled default) of the Blueprint include cascade; see mse://guides/blueprint-ref-paths.",
+        mime_type: "text/x-lua",
+        body: ResourceBody::Static(SAMPLE_08_BUNDLED_REFS_BODY),
     },
     ResourceEntry {
         uri: "mse://api/blueprint-schema",
@@ -553,6 +573,46 @@ mod tests {
         }
     }
 
+    /// Every bundled `samples/agents/*.md` must parse via
+    /// `mlua_swarm_compile::agent_md::load_file` — they are the tier-6
+    /// (`bundled_default`) fallback the CLI linker walks when resolving
+    /// `$agent_md` refs. A frontmatter regression here would silently
+    /// break every `.bp.lua` that relies on the bundled tier (including
+    /// `mse://blueprints/samples/08-bundled-refs`).
+    #[test]
+    fn bundled_agents_parse_via_agent_md_loader() {
+        use mlua_swarm_compile::agent_md;
+        use std::path::PathBuf;
+
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp/resources/samples/agents");
+        // README.md is documentation, not an agent — skip it explicitly so
+        // this test asserts on the `*.md` entries the loader is meant to
+        // consume rather than on `dir_stream::load_dir`'s implicit skip
+        // behavior.
+        let agent_files = ["researcher.md", "reviewer.md"];
+        for name in agent_files {
+            let path = dir.join(name);
+            assert!(path.is_file(), "bundled agent missing: {}", path.display());
+            let def = agent_md::load_file(&path, mlua_swarm::blueprint::AgentKind::Operator)
+                .unwrap_or_else(|e| panic!("{}: agent_md parse failed: {e}", path.display()));
+            assert!(
+                !def.name.is_empty(),
+                "{}: parsed AgentDef must carry a name",
+                path.display()
+            );
+            let profile = def
+                .profile
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: parsed AgentDef must carry a profile", path.display()));
+            assert!(
+                !profile.system_prompt.is_empty(),
+                "{}: profile.system_prompt must be non-empty",
+                path.display()
+            );
+        }
+    }
+
     #[test]
     fn bp_lua_sample_bodies_build_via_dsl() {
         // Guards the shipped `.bp.lua` samples against DSL-surface drift:
@@ -563,6 +623,7 @@ mod tests {
         for uri in [
             "mse://blueprints/samples/06-dsl-verdict-loop",
             "mse://blueprints/samples/07-dsl-pipeline",
+            "mse://blueprints/samples/08-bundled-refs",
         ] {
             let entry = find_by_uri(uri).unwrap_or_else(|| panic!("sample must exist: {uri}"));
             let body = body_for(entry).expect("sample body must generate");

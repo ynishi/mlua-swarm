@@ -4,6 +4,14 @@
 -- stage declares a verdict contract and retries through a `fix` stage while
 -- it keeps returning BLOCKED (bounded); a stage that stays BLOCKED halts the
 -- pipeline and records where it stopped in `$.halted_at`.
+--
+-- Agents are declared inline (no `$agent_md` refs). For a sample that pulls
+-- agents from `.md` files via the Blueprint include cascade — bp.lua parent
+-- → in-bp `blueprint_ref_includes` → `MSE_BLUEPRINT_INCLUDES` → CLI
+-- `--include` → server config → bundled default — see
+-- `mse://blueprints/samples/08-bundled-refs`. Full cascade guide:
+-- `mse://guides/blueprint-ref-paths`. Strict opt-in (require every ref to
+-- embed at build time): `mse bp build --strict-embed <this-file>`.
 
 local F = require("flow_dsl")
 local B = require("bp_dsl")
