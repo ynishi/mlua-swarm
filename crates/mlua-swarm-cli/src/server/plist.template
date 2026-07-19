@@ -4,8 +4,8 @@
 <!--
   mse serve LaunchAgent template.
 
-  DO NOT install this file directly. Use the installer script:
-      scripts/launchd/install.sh
+  DO NOT install this file directly. Use the CLI subcommand:
+      mse server install
   It expands the placeholders below to concrete absolute paths and drops
   the result at ~/Library/LaunchAgents/com.mse.server.plist.
 
@@ -14,11 +14,11 @@
     {{CARGO_BIN}}     -> cargo install target dir (default: $HOME/.cargo/bin)
     {{PROJECT_ROOT}}  -> this repository's absolute path (WorkingDirectory)
 
-  Manual expand + install (if you don't want the script):
+  Manual expand + install (if you don't want the CLI subcommand):
     sed -e "s|{{HOME}}|$HOME|g" \
         -e "s|{{CARGO_BIN}}|$HOME/.cargo/bin|g" \
         -e "s|{{PROJECT_ROOT}}|$(pwd)|g" \
-        scripts/launchd/com.mse.server.plist.template \
+        crates/mlua-swarm-cli/src/server/plist.template \
       > ~/Library/LaunchAgents/com.mse.server.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mse.server.plist
 

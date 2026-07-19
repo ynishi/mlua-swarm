@@ -42,6 +42,7 @@
 //! | `mse://guides/dsl-authoring`                 | flow_dsl/bp_dsl authoring DSL: Expr/Node builders, pipeline conventions, JSON→DSL migration SOP. |
 //! | `mse://guides/worker-io-contract`            | Worker I/O contract: fetch-based IN, path-free tool-call OUT, server-side file materialization. |
 //! | `mse://guides/bp-dsl-templates`              | `mse bp new` / `bp_new` template inventory + flag surface (GH #62 Axis A). |
+//! | `mse://guides/server-management`             | `mse server` subcommand reference, MCP-tool ↔ subcmd mapping, and recovery SOPs (GH #69). |
 //! | `mse://guides/blueprint-ref-paths`           | `$file` / `$agent_md` refs, the 6-tier include cascade, and the `--strict-embed` opt-in. |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
@@ -103,6 +104,7 @@ const DSL_AUTHORING_GUIDE_BODY: &str = include_str!("./resources/guides/dsl-auth
 const WORKER_IO_CONTRACT_BODY: &str = include_str!("./resources/guides/worker-io-contract.md");
 const REPLAY_AND_RESUME_BODY: &str = include_str!("./resources/guides/replay-and-resume.md");
 const BP_DSL_TEMPLATES_BODY: &str = include_str!("./resources/guides/bp-dsl-templates.md");
+const SERVER_MANAGEMENT_BODY: &str = include_str!("./resources/guides/server-management.md");
 const BLUEPRINT_REF_PATHS_BODY: &str = include_str!("./resources/guides/blueprint-ref-paths.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
@@ -191,6 +193,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "GH #62 Axis A: `mse bp new` / `bp_new` MCP scaffolding — three templates (pipeline / single / verdict) that emit a compile-lint-legal `.bp.lua` with every currently-mandatory field pre-filled (halted_at, worker_binding, strict_refs/strict_kind). Prevention layer for the trap surface that GH #60 / GH #61 sibling fixes tightened.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(BP_DSL_TEMPLATES_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/server-management",
+        title: "mse — Server lifecycle management",
+        description: "GH #69: `mse server <subcmd>` reference for the full 9-subcommand launchd lifecycle family (install / uninstall / bootstrap / bootout / start / stop / restart / status / logs), the MCP-tool ↔ `mse server` mapping (7 `mlua_swarm_server_*` tools), and recovery SOPs for throttle-backoff / booted-out / uninstalled states. Recovery is closed under the MCP tool surface — no shell access required.",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(SERVER_MANAGEMENT_BODY),
     },
     ResourceEntry {
         uri: "mse://guides/blueprint-ref-paths",

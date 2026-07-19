@@ -8,17 +8,27 @@
 //!   task / blueprint / operator surface as MCP tools).
 //! - `mse bp build` — compile-lint + emit (+ optionally register) a
 //!   `.bp.lua` DSL script's built Blueprint JSON (see `bp` module doc).
+//! - `mse server <subcmd>` — control the `mse serve` daemon lifecycle via
+//!   launchd (`start` / `stop` / `restart` / `status`; see `server`
+//!   module doc). Additional lifecycle subcommands (`install` /
+//!   `uninstall` / `bootstrap` / `bootout` / `logs`) arrive in a
+//!   follow-up.
 //!
 //! Each subcommand carries its own flag surface (see `mse <cmd> --help`).
 
 mod bp;
 mod mcp;
 mod serve;
+mod server;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "mse", about = "mlua-swarm CLI (serve / mcp / bp).", version)]
+#[command(
+    name = "mse",
+    about = "mlua-swarm CLI (serve / mcp / bp / server).",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -32,6 +42,8 @@ enum Cmd {
     Mcp,
     /// Build a `.bp.lua` DSL script into Blueprint JSON.
     Bp(bp::BpArgs),
+    /// Control the `mse serve` daemon lifecycle (launchd-owned).
+    Server(server::Args),
 }
 
 #[tokio::main]
@@ -49,5 +61,6 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve(args) => serve::run(*args).await,
         Cmd::Mcp => mcp::run().await,
         Cmd::Bp(args) => bp::run(args).await,
+        Cmd::Server(args) => server::run(args).await,
     }
 }
