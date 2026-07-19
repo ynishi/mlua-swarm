@@ -604,6 +604,79 @@ enforcement of `fail` is a follow-up.
 
 ---
 
+## Operator naming: three layers, one string
+
+The BP's `OperatorDef.name`, the mint-time `roles: [...]` alias, and the
+engine's `register_operator(id, ...)` key are three separate layers that
+are only connected by **string equality**. Getting this wrong (or thinking
+`main-ai` is a hard-coded system name) is the usual source of "why can't
+I run two MainAIs in parallel?".
+
+```
+BP (design-time)                    Runtime (per Operator process)
+─────────────────────               ──────────────────────────────
+operators:                          POST /v1/operators
+  - name: "planner_bot"    ◄──┐       { roles: ["planner_bot"] }
+    kind: MainAi              │        → mints sid, reserves alias
+                              │
+agents:                       │     WS /v1/operators/:sid/ws
+  - name: impl-planner        │        → register_operator(
+    spec:                     │            "planner_bot", ws_session)
+      operator_ref: ──────────┘
+        "planner_bot"
+```
+
+Rules that fall out of this:
+
+1. **The name is arbitrary.** `"planner_bot"`, `"XXX"`, `"main-ai"` are
+   all valid — nothing in the engine treats `main-ai` specially. It only
+   became a convention because the default scaffold uses it.
+2. **The three sites must be the same literal.** `OperatorDef.name` ==
+   the mint's `roles[]` entry == the `register_operator` id. A typo in
+   any one of them silently falls through to the `Automate` default.
+3. **`kind: MainAi` is the *type*, not the *name*.** It says "when an
+   agent references this role, dispatch via the WS thin-path". Multiple
+   `OperatorDef`s can have `kind: MainAi` under different names.
+4. **The "1 role = 1 sid" exclusivity is per-alias, not global.**
+   `POST /v1/operators` returns `409 CONFLICT` only when the same alias
+   string is already claimed by a live session (`login.rs` role check
+   under `roles_to_sid`). Distinct alias strings never conflict.
+
+### Running multiple MainAI sessions in parallel
+
+The exclusivity above is the only structural constraint — split the role
+into per-lane aliases and each lane gets its own MainAI:
+
+```lua
+operators = {
+  { name = "phase_a_op", kind = "main_ai" },
+  { name = "phase_b_op", kind = "main_ai" },
+},
+agents = {
+  { name = "planner",  spec = { operator_ref = "phase_a_op" }, ... },
+  { name = "impl",     spec = { operator_ref = "phase_b_op" }, ... },
+},
+```
+
+Then two Operator processes join independently:
+
+```
+Process A:  mse_operator_join(roles = { "phase_a_op" })  → sid=S-aaa
+Process B:  mse_operator_join(roles = { "phase_b_op" })  → sid=S-bbb
+```
+
+Spawns on the `planner` agent land on process A; spawns on `impl` land
+on process B. No lock, no queue, no conflict — the two aliases are
+independent registry keys.
+
+Within **one** MainAI session, concurrent Spawns are already multiplexed
+over the single WS by `req_id` (see `WSOperatorSession.pending` in
+`session.rs`). The practical throughput limit there is on the client
+side: the reference `mse_pending_wait` loop pops one frame at a time
+(`operator_client.rs::pending_wait`), so if you want a single Operator
+to drive many concurrent spawns you need to fan out that pop loop
+yourself.
+
 ## Responsibility summary
 
 | Hop | Owner       | Reads from                     | Writes to                      |
@@ -620,3 +693,4 @@ enforcement of `fail` is a follow-up.
 - `mse://guides/id-lifecycle` — the five ID layers (Blueprint, Task, Run, Step, Attempt).
 - `mse://guides/agent-md-authoring` — SubAgent (agent.md) canonical shape, size targets, and the agent-side Output contract (inline body vs `@file:` sentinel).
 - `mse://guides/mcp-tool-reference` — `mse_operator_join` / `mse_pending_wait` / `mse_ack` details.
+- `mse://blueprints/samples/07-dsl-pipeline` — the scaffold shape (`operators = { { name = ..., kind = "main_ai" } }` + agents referencing it via `operator_ref`) the "Operator naming" section above generalizes from.
