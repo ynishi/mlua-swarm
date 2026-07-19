@@ -5,6 +5,4 @@
 //! `mlua_swarm_compile::agent_md` directly; this module re-exports the
 //! same surface so pre-migration call sites keep compiling.
 
-pub use mlua_swarm_compile::agent_md::{
-    compute_body_hash, load_dir, load_file, parse, LoadError,
-};
+pub use mlua_swarm_compile::agent_md::{compute_body_hash, load_dir, load_file, parse, LoadError};

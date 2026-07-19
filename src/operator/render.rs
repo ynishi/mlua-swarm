@@ -171,8 +171,8 @@ mod tests {
 
     #[test]
     fn supports_filter() {
-        let out = render_system("{{ name | upper }}", &json!({ "name": "shi" })).unwrap();
-        assert_eq!(out, "SHI");
+        let out = render_system("{{ name | upper }}", &json!({ "name": "foo" })).unwrap();
+        assert_eq!(out, "FOO");
     }
 
     #[test]

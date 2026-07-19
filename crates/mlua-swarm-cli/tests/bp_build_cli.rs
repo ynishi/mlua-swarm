@@ -243,6 +243,121 @@ fn bp_new_verdict_scaffold_round_trips_through_bp_build() {
         .stderr(contains("compile lint: OK"));
 }
 
+/// Linker include-cascade Warn/strict-embed:`mse bp build` on a `.bp.lua` whose
+/// `$agent_md` ref can not be resolved through the include cascade must
+/// still emit the raw wire JSON (refs preserved) and exit zero — the
+/// server resolves refs itself at register time. The lint report is
+/// `compile lint: WARN`. Regression guard for the Phase 4 → Phase 5
+/// default: an unresolved ref never silently degrades the emit path.
+#[test]
+fn bp_build_unresolved_ref_default_emits_raw_and_warns() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let script_path = tmp.path().join("unresolved.bp.lua");
+    let out_path = tmp.path().join("out.json");
+    // Reference an `agent.md` file that does not exist in the script's
+    // parent dir, in-bp includes, env includes, CLI includes, or the
+    // bundled default samples dir — so the include cascade hits none of
+    // the 6 tiers and the linker returns Err (→ LintReport::Warn).
+    fs::write(
+        &script_path,
+        r#"
+local F = require("flow_dsl")
+
+return {
+  id = "unresolved-ref-warn",
+  flow = F.step({ id = "solo", agent = "solo", input = F.lit(""), out = F.p("$.solo") }),
+  agents = {
+    {
+      name = "solo",
+      kind = "operator",
+      spec = { operator_ref = "main-ai" },
+      ["$agent_md"] = "definitely-not-present.md",
+    },
+  },
+  operators = { { name = "main-ai", kind = "main_ai" } },
+  strategy = { strict_refs = true, strict_kind = true },
+}
+"#,
+    )
+    .expect("write unresolved-ref fixture script");
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .args(["bp", "build"])
+        .arg(&script_path)
+        .args(["-o"])
+        .arg(&out_path)
+        .assert()
+        .success()
+        .stderr(contains("compile lint: WARN"))
+        .stderr(contains("could not resolve $file/$agent_md refs"));
+
+    let out = fs::read_to_string(&out_path).expect("out.json written");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("out.json is valid JSON");
+    // Raw wire JSON: the `$agent_md` ref is preserved verbatim on the
+    // agent entry — the server will resolve it at register time.
+    let agent = value
+        .get("agents")
+        .and_then(|a| a.get(0))
+        .expect("agents[0] present");
+    assert_eq!(
+        agent.get("$agent_md").and_then(|v| v.as_str()),
+        Some("definitely-not-present.md"),
+        "raw emit must preserve the unresolved $agent_md ref"
+    );
+}
+
+/// Linker include-cascade Warn/strict-embed:`--strict-embed` promotes the same
+/// unresolved-ref WARN to a hard failure — non-zero exit, no JSON
+/// emitted. Mirrors the CLI flag semantic ("require refs to be embedded
+/// at build time, hard-fail if any unresolved") and matches the design
+/// §Behavior on unresolved refs table (`mse bp build` strict opt-in).
+#[test]
+fn bp_build_unresolved_ref_strict_embed_hard_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let script_path = tmp.path().join("unresolved-strict.bp.lua");
+    let out_path = tmp.path().join("out.json");
+    fs::write(
+        &script_path,
+        r#"
+local F = require("flow_dsl")
+
+return {
+  id = "unresolved-ref-strict",
+  flow = F.step({ id = "solo", agent = "solo", input = F.lit(""), out = F.p("$.solo") }),
+  agents = {
+    {
+      name = "solo",
+      kind = "operator",
+      spec = { operator_ref = "main-ai" },
+      ["$agent_md"] = "definitely-not-present.md",
+    },
+  },
+  operators = { { name = "main-ai", kind = "main_ai" } },
+  strategy = { strict_refs = true, strict_kind = true },
+}
+"#,
+    )
+    .expect("write unresolved-strict fixture script");
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .args(["bp", "build", "--strict-embed"])
+        .arg(&script_path)
+        .args(["-o"])
+        .arg(&out_path)
+        .assert()
+        .failure()
+        .stderr(contains("compile lint: WARN"))
+        .stderr(contains("--strict-embed"))
+        .stderr(contains("refusing to emit"));
+
+    assert!(
+        !out_path.exists(),
+        "--strict-embed must not write out.json when the linker fails"
+    );
+}
+
 /// GH #62 Axis A CLI error path: an unknown template must exit non-zero
 /// with the accepted list named — closed set discoverable from the
 /// error rather than requiring the author to open the guide.

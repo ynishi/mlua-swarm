@@ -10,9 +10,6 @@ use axum::{
     Json, Router,
 };
 use mlua_swarm::blueprint::loader::pre_read_default_agent_kind;
-use mlua_swarm_compile::{
-    env_blueprint_includes, expand_file_refs_with_config, pre_read_in_bp_includes, ResolveConfig,
-};
 use mlua_swarm::blueprint::store::{
     blueprint_version, BlueprintId, BlueprintStore, CommitMetadata,
 };
@@ -20,6 +17,9 @@ use mlua_swarm::blueprint::{default_global_agent_kind, AgentKind, Blueprint};
 use mlua_swarm::core::explain::{explain_agent_ctx, CtxTier};
 use mlua_swarm::core::step_naming::StepNaming;
 use mlua_swarm::operator::render::template_variables;
+use mlua_swarm_compile::{
+    env_blueprint_includes, expand_file_refs_with_config, pre_read_in_bp_includes, ResolveConfig,
+};
 use mlua_swarm_schema::{resolve_runner, Runner};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

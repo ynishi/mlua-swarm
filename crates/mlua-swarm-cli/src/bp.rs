@@ -92,6 +92,16 @@ struct BuildArgs {
     /// bundled default samples dir.
     #[arg(long = "include", action = clap::ArgAction::Append, value_name = "DIR")]
     include: Vec<PathBuf>,
+    /// Require every `$file` / `$agent_md` ref to embed at build time.
+    /// Default behavior on an unresolved ref: emit the raw wire JSON
+    /// (refs preserved) and print a WARN — the server resolves refs
+    /// itself at register time. With `--strict-embed`, an unresolved
+    /// ref hard-fails the build (non-zero exit, no JSON emitted). Name
+    /// mirrors "require refs to be embedded": not `--strict-refs`
+    /// (which would misleadingly suggest refs themselves are
+    /// disallowed).
+    #[arg(long = "strict-embed")]
+    strict_embed: bool,
 }
 
 #[derive(Debug, Args)]
@@ -174,6 +184,17 @@ async fn run_build(args: BuildArgs) -> Result<()> {
             );
             for w in &warnings {
                 eprintln!("  - {w}");
+            }
+            // `--strict-embed` promotes an unresolved-ref WARN to a
+            // hard failure (non-zero exit, no JSON emitted). Default
+            // stays "raw emit + Warn" so the wire layer can still
+            // carry refs to a server that resolves them itself — the
+            // layered wire/typed policy: typed BP is resolved-only,
+            // the wire layer is partial-preserve.
+            if args.strict_embed {
+                return Err(anyhow!(
+                    "compile lint: --strict-embed, refusing to emit Blueprint JSON with unresolved refs"
+                ));
             }
         }
         Err(e) => {

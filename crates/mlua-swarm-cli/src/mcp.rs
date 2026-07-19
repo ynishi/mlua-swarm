@@ -450,6 +450,14 @@ struct BpBuildReq {
     /// pretty-printed — same as the CLI's `-o`.
     #[serde(default)]
     out: Option<String>,
+    /// Require every `$file` / `$agent_md` ref to embed at build time.
+    /// Default false: on an unresolved ref the tool proceeds with raw
+    /// wire JSON and reports the lint as `warn (…)` — the server
+    /// resolves refs itself at register time. `true` mirrors the CLI's
+    /// `--strict-embed`: an unresolved ref returns `status: "error"`
+    /// with `stage: "lint"` and no register attempt is made.
+    #[serde(default)]
+    strict_embed: bool,
 }
 
 /// Default directory holding worker wrapper `.md` files, relative to the
@@ -2253,6 +2261,24 @@ impl MseServer {
                 reason,
                 warnings,
             }) => {
+                // `strict_embed=true` mirrors the CLI's `--strict-embed`,
+                // promoting the unresolved-ref WARN to a hard
+                // `stage: "lint"` error so the caller does not proceed
+                // to write_out / register with refs still in the wire
+                // JSON. Default (false) preserves wire-layer
+                // partial-preserve behavior — the server resolves refs
+                // at register time.
+                if req.strict_embed {
+                    return json_result(&serde_json::json!({
+                        "status": "error",
+                        "stage": "lint",
+                        "script_path": req.script_path,
+                        "error": format!("strict_embed: {reason}"),
+                        "warnings": warnings,
+                        "fix_hint": serde_json::Value::Null,
+                        "blueprint": bp_value,
+                    }));
+                }
                 let warn_lines = if warnings.is_empty() {
                     String::new()
                 } else {

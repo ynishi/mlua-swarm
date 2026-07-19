@@ -339,13 +339,12 @@ pub fn expand_file_refs_with_config(
                     .get("kind")
                     .and_then(|v| serde_json::from_value::<AgentKind>(v.clone()).ok())
                     .unwrap_or_else(|| default_kind.clone());
-                let def =
-                    crate::agent_md::load_file(&full, resolved_kind).map_err(|e| {
-                        LoadError::FileRef {
-                            path: full.clone(),
-                            msg: format!("agent_md parse: {e}"),
-                        }
-                    })?;
+                let def = crate::agent_md::load_file(&full, resolved_kind).map_err(|e| {
+                    LoadError::FileRef {
+                        path: full.clone(),
+                        msg: format!("agent_md parse: {e}"),
+                    }
+                })?;
                 let mut def_v = serde_json::to_value(&def).map_err(|e| LoadError::FileRef {
                     path: full.clone(),
                     msg: format!("agent_md serialize: {e}"),
@@ -526,10 +525,8 @@ You are a researcher. Focus on XX/YY sites.\n";
         let cli_a = TempDir::new().unwrap();
         let cli_b = TempDir::new().unwrap();
 
-        let cfg = ResolveConfig::new(base_dir.path().to_path_buf()).with_cli_includes(vec![
-            cli_a.path().to_path_buf(),
-            cli_b.path().to_path_buf(),
-        ]);
+        let cfg = ResolveConfig::new(base_dir.path().to_path_buf())
+            .with_cli_includes(vec![cli_a.path().to_path_buf(), cli_b.path().to_path_buf()]);
         let bp = json!({ "$file": "prompts/missing.md" });
         let err = expand_file_refs_with_config(bp, &cfg, AgentKind::Operator)
             .expect_err("miss reports cascade");
