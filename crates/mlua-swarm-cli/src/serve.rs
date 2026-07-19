@@ -135,6 +135,16 @@ pub struct Args {
     /// and before the config file's `blueprint_ref_includes` list.
     #[arg(long = "include", action = clap::ArgAction::Append, value_name = "DIR")]
     blueprint_ref_includes: Vec<std::path::PathBuf>,
+    /// Reject `POST /v1/blueprints/:id` bodies that still carry raw
+    /// `$file` / `$agent_md` refs (Phase 6, issue 4c4e3eb8). Design
+    /// table row 3, strict opt-in — pushes ref resolution onto the
+    /// client (`mse bp build --strict-embed`) so the server only ever
+    /// sees pre-embedded Blueprint JSON. A pure switch: absent = no
+    /// override (defers to the config file / built-in default `false`,
+    /// which keeps the linker running server-side for
+    /// backward-compat); passing it always forces `true`.
+    #[arg(long)]
+    blueprint_strict_embed: bool,
     /// The (2) CLI override layer of the 4-tier cascade. Falls back when the BP
     /// top-level `default_agent_kind` JSON literal is absent; if that is also
     /// absent, the Schema-impl `Default` = `Operator` is used. The value is the
@@ -199,6 +209,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         },
         blueprint_ref_base: args.blueprint_ref_base.clone(),
         blueprint_ref_includes: args.blueprint_ref_includes.clone(),
+        blueprint_strict_embed: if args.blueprint_strict_embed {
+            Some(true)
+        } else {
+            None
+        },
         git_store_path: args.git_store_path.clone(),
         issue_store_path: args.issue_store_path.clone(),
         enhance_setting_store_path: args.enhance_setting_store_path.clone(),
@@ -469,6 +484,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             cfg.blueprint_ref_base.clone(),
             cfg.blueprint_ref_includes.clone(),
             default_agent_kind,
+            cfg.blueprint_strict_embed,
         ))
         .merge(build_enhance_log_router(log_store.clone()))
         .merge(build_enhance_settings_router(

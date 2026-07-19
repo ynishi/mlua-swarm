@@ -44,11 +44,26 @@ pub struct BlueprintsState {
     pub ref_includes: Vec<PathBuf>,
     /// CLI-level `default_agent_kind` override (layer (2) of the 4-tier cascade).
     pub cli_default_agent_kind: Option<AgentKind>,
+    /// Server-side strict-embed switch (design table row 3, Phase 6 —
+    /// issue 4c4e3eb8). When `true`, `POST /v1/blueprints/:id`
+    /// refuses raw bodies that still carry `$file` / `$agent_md` refs
+    /// (returns 400 with a hint pointing at `mse bp build
+    /// --strict-embed`), so ref resolution is pushed onto the client
+    /// and the server only ever sees pre-embedded Blueprint JSON.
+    /// Default `false` = the server runs the linker itself
+    /// (backward-compat). Wired from
+    /// [`crate::config::ResolvedConfig::blueprint_strict_embed`] via
+    /// the CLI `--blueprint-strict-embed` flag or the config-file
+    /// `blueprint_strict_embed` key.
+    pub strict_embed: bool,
 }
 
-/// Minimal entry: no `ref_base` (ref expansion skipped) and no CLI default kind override.
+/// Minimal entry: no `ref_base` (ref expansion skipped), no CLI default
+/// kind override, and `strict_embed = false` (backward-compat = the
+/// server accepts raw refs and runs the linker itself when `ref_base` is
+/// set).
 pub fn build_blueprints_router(store: Arc<dyn BlueprintStore>) -> Router {
-    build_blueprints_router_with_refs(store, None, Vec::new(), None)
+    build_blueprints_router_with_refs(store, None, Vec::new(), None, false)
 }
 
 /// When `ref_base` is set, `seed_blueprint` resolves `{"$file": ...}` /
@@ -65,12 +80,14 @@ pub fn build_blueprints_router_with_refs(
     ref_base: Option<PathBuf>,
     ref_includes: Vec<PathBuf>,
     cli_default_agent_kind: Option<AgentKind>,
+    strict_embed: bool,
 ) -> Router {
     let state = BlueprintsState {
         store,
         ref_base,
         ref_includes,
         cli_default_agent_kind,
+        strict_embed,
     };
     Router::new()
         .route("/v1/blueprints/:id/head", get(get_head))
@@ -154,6 +171,59 @@ fn parse_error_with_schema_hint(e: &serde_json::Error) -> String {
     )
 }
 
+/// Walk the raw seed body and collect the relative paths of every
+/// `{"$file": "..."}` / `{"$agent_md": "..."}` ref still present.
+/// Returns `None` when the body is already fully embedded (= no refs
+/// left), `Some(paths)` otherwise. Used by [`seed_blueprint`] to gate
+/// the `strict_embed` opt-in (design table row 3 — server-side strict
+/// mode refuses raw refs so clients must `mse bp build --strict-embed`
+/// upstream).
+fn collect_unembedded_refs(val: &serde_json::Value) -> Option<Vec<String>> {
+    let mut acc: Vec<String> = Vec::new();
+    walk_refs(val, &mut acc);
+    if acc.is_empty() {
+        None
+    } else {
+        Some(acc)
+    }
+}
+
+fn walk_refs(val: &serde_json::Value, acc: &mut Vec<String>) {
+    match val {
+        serde_json::Value::Object(map) => {
+            for key in ["$file", "$agent_md"] {
+                if let Some(serde_json::Value::String(rel)) = map.get(key) {
+                    acc.push(format!("{key}={rel}"));
+                }
+            }
+            for v in map.values() {
+                walk_refs(v, acc);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                walk_refs(v, acc);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Format the ref-expand failure with an include-cascade fix hint. The
+/// underlying [`mlua_swarm_compile::LoadError::FileRef`] message already
+/// names every searched dir (see `linker.rs::resolve_ref_path`); this
+/// wrapper appends the actionable knobs so authors know which tier to
+/// extend.
+fn ref_expand_error_with_fix_hint(e: &mlua_swarm_compile::LoadError) -> String {
+    format!(
+        "ref expand: {e} \
+         (fix: extend the include cascade — add the containing directory via CLI \
+         `--include <DIR>` on `mse serve`, env `MSE_BLUEPRINT_INCLUDES`, config-file \
+         `blueprint_ref_includes`, or in-bp top-level `blueprint_ref_includes = {{...}}`; \
+         or pre-embed refs client-side via `mse bp build --strict-embed`)"
+    )
+}
+
 /// `POST /v1/blueprints/:id` — register / re-register a Blueprint.
 ///
 /// Semantics:
@@ -181,6 +251,24 @@ async fn seed_blueprint(
     Path(id): Path<String>,
     Json(raw_body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    // Design table row 3, Phase 6 (issue 4c4e3eb8): strict-embed
+    // pre-check. When enabled, refuse any raw body that still carries
+    // `$file` / `$agent_md` refs — ref resolution is pushed onto the
+    // client. Runs before the ref-base branch so it catches raw refs
+    // even when the server has no `ref_base` configured.
+    if state.strict_embed {
+        if let Some(refs) = collect_unembedded_refs(&raw_body) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "strict_embed: raw body carries unembedded refs ({}); \
+                     pre-embed client-side via `mse bp build --strict-embed` \
+                     and POST the fully-resolved Blueprint JSON",
+                    refs.join(", ")
+                ),
+            ));
+        }
+    }
     let body: Blueprint = if let Some(base) = state.ref_base.as_ref() {
         // Four-tier cascade for the kind resolution: (3) BP JSON top-level
         // `default_agent_kind` → (2) CLI value → (1) Schema impl Default =
@@ -207,7 +295,7 @@ async fn seed_blueprint(
             .with_env_includes(env_blueprint_includes())
             .with_config_includes(state.ref_includes.clone());
         let expanded = expand_file_refs_with_config(raw_body, &cfg, default_kind)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("ref expand: {e}")))?;
+            .map_err(|e| (StatusCode::BAD_REQUEST, ref_expand_error_with_fix_hint(&e)))?;
         serde_json::from_value(expanded)
             .map_err(|e| (StatusCode::BAD_REQUEST, parse_error_with_schema_hint(&e)))?
     } else {
@@ -927,6 +1015,7 @@ mod explain_agent_tests {
             ref_base: None,
             ref_includes: Vec::new(),
             cli_default_agent_kind: None,
+            strict_embed: false,
         }
     }
 
@@ -1351,5 +1440,248 @@ mod explain_agent_tests {
             .expect_err("expected 404");
 
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Phase 6 (issue 4c4e3eb8) — `seed_blueprint`: strict_embed pre-check
+// + include-cascade fix hint on ref-expand failure. Design table row 3.
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod seed_strict_embed_tests {
+    use super::*;
+    use mlua_swarm::blueprint::store::InMemoryBlueprintStore;
+    use serde_json::json;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// The minimal `agent.md` the `$agent_md` refs in these tests
+    /// resolve to. Same shape the `linker.rs` unit tests use.
+    const AGENT_MD: &str = "---\n\
+name: writer\n\
+description: writes\n\
+model: sonnet\n\
+---\n\
+You write.\n";
+
+    fn write_md(dir: &std::path::Path, rel: &str, content: &str) -> PathBuf {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&p, content).unwrap();
+        p
+    }
+
+    /// A minimal valid Blueprint JSON body suitable for
+    /// `seed_blueprint` — `agents` list carries a single already-
+    /// resolved `AgentDef` object. Tests that need to exercise refs
+    /// substitute an entry manually.
+    fn minimal_bp_body(id: &str) -> serde_json::Value {
+        json!({
+            "schema_version": mlua_swarm::blueprint::current_schema_version(),
+            "id": id,
+            "flow": { "kind": "step", "ref": "writer",
+                      "in": {"op": "path", "at": "$.input"},
+                      "out": {"op": "path", "at": "$.out"} },
+            "agents": [
+                { "name": "writer", "kind": "rust_fn", "spec": { "fn_id": "writer" } }
+            ],
+            "operators": [],
+            "metas": [],
+            "hints": {},
+            "strategy": {},
+            "metadata": {},
+            "spawner_hints": {},
+            "default_agent_kind": "operator",
+            "default_agent_ctx": null,
+            "audits": [],
+            "runners": [],
+            "blueprint_ref_includes": []
+        })
+    }
+
+    fn state_for_test(
+        store: InMemoryBlueprintStore,
+        ref_base: Option<PathBuf>,
+        strict_embed: bool,
+    ) -> BlueprintsState {
+        BlueprintsState {
+            store: Arc::new(store),
+            ref_base,
+            ref_includes: Vec::new(),
+            cli_default_agent_kind: None,
+            strict_embed,
+        }
+    }
+
+    // (a) Default (strict_embed=false) + resolvable ref → 201 pass.
+    #[tokio::test]
+    async fn strict_embed_off_resolves_agent_md_ref_and_seeds() {
+        let dir = TempDir::new().unwrap();
+        write_md(dir.path(), "agents/writer.md", AGENT_MD);
+        let mut body = minimal_bp_body("strict-off-resolvable-bp");
+        body["agents"] = json!([ { "$agent_md": "agents/writer.md", "kind": "rust_fn" } ]);
+
+        let store = InMemoryBlueprintStore::new();
+        let state = state_for_test(store, Some(dir.path().to_path_buf()), false);
+
+        let (status, resp) = seed_blueprint(
+            State(state),
+            Path("strict-off-resolvable-bp".to_string()),
+            Json(body),
+        )
+        .await
+        .expect("seed ok");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.0["seeded"], json!(true));
+    }
+
+    // (b) Default (strict_embed=false) + unresolvable ref → 400 with
+    //     fix hint (must name include-cascade knobs).
+    #[tokio::test]
+    async fn strict_embed_off_unresolvable_ref_returns_400_with_include_cascade_hint() {
+        let dir = TempDir::new().unwrap();
+        // Do NOT write the file — force cascade miss.
+        let mut body = minimal_bp_body("strict-off-unresolvable-bp");
+        body["agents"] = json!([ { "$agent_md": "agents/missing.md", "kind": "rust_fn" } ]);
+
+        let store = InMemoryBlueprintStore::new();
+        let state = state_for_test(store, Some(dir.path().to_path_buf()), false);
+
+        let err = seed_blueprint(
+            State(state),
+            Path("strict-off-unresolvable-bp".to_string()),
+            Json(body),
+        )
+        .await
+        .expect_err("expected 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let msg = err.1;
+        // Underlying linker error names the searched dirs.
+        assert!(
+            msg.contains("cascade") && msg.contains(dir.path().to_str().unwrap()),
+            "linker cascade error must name searched dirs: {msg}"
+        );
+        // Wrapper adds the include-cascade fix hint pointing at the
+        // configurable knobs (server CLI / env / config / in-bp).
+        assert!(msg.contains("--include"), "hint names CLI flag: {msg}");
+        assert!(
+            msg.contains("MSE_BLUEPRINT_INCLUDES"),
+            "hint names env var: {msg}"
+        );
+        assert!(
+            msg.contains("blueprint_ref_includes"),
+            "hint names config-file / in-bp key: {msg}"
+        );
+        assert!(
+            msg.contains("mse bp build --strict-embed"),
+            "hint suggests client-side pre-embed as escape hatch: {msg}"
+        );
+    }
+
+    // (c) strict_embed=true + raw ref present → 400 with pre-embed hint.
+    //     Runs even with no ref_base configured (pre-check is
+    //     unconditional on strict_embed).
+    #[tokio::test]
+    async fn strict_embed_on_refuses_body_with_agent_md_ref() {
+        let mut body = minimal_bp_body("strict-on-refs-present-bp");
+        body["agents"] = json!([ { "$agent_md": "agents/anything.md", "kind": "rust_fn" } ]);
+
+        let store = InMemoryBlueprintStore::new();
+        // ref_base=None on purpose: strict-embed rejects raw refs
+        // whether or not the server could resolve them.
+        let state = state_for_test(store, None, true);
+
+        let err = seed_blueprint(
+            State(state),
+            Path("strict-on-refs-present-bp".to_string()),
+            Json(body),
+        )
+        .await
+        .expect_err("expected 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let msg = err.1;
+        assert!(
+            msg.starts_with("strict_embed:"),
+            "verdict tag must namespace the error: {msg}"
+        );
+        assert!(
+            msg.contains("$agent_md=agents/anything.md"),
+            "message must name every unembedded ref: {msg}"
+        );
+        assert!(
+            msg.contains("mse bp build --strict-embed"),
+            "message must point at client-side pre-embed: {msg}"
+        );
+    }
+
+    // (c-2) strict_embed=true + `$file` ref present → same reject
+    //       (walker covers both ref kinds).
+    #[tokio::test]
+    async fn strict_embed_on_refuses_body_with_file_ref_deep_in_object() {
+        let mut body = minimal_bp_body("strict-on-file-ref-bp");
+        // Nest the `$file` ref inside a Step directive so we exercise
+        // the recursive walker (not just the top-level path).
+        body["flow"] = json!({
+            "kind": "step",
+            "ref": "writer",
+            "in": {"op": "lit", "value": { "$file": "prompts/deep.md" } },
+            "out": {"op": "path", "at": "$.out"}
+        });
+
+        let store = InMemoryBlueprintStore::new();
+        let state = state_for_test(store, None, true);
+
+        let err = seed_blueprint(
+            State(state),
+            Path("strict-on-file-ref-bp".to_string()),
+            Json(body),
+        )
+        .await
+        .expect_err("expected 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.contains("$file=prompts/deep.md"),
+            "walker must find nested `$file` refs: {}",
+            err.1
+        );
+    }
+
+    // (d) strict_embed=true + fully-embedded body (no refs) → 201 pass.
+    #[tokio::test]
+    async fn strict_embed_on_accepts_fully_embedded_body() {
+        let body = minimal_bp_body("strict-on-embedded-bp");
+
+        let store = InMemoryBlueprintStore::new();
+        let state = state_for_test(store, None, true);
+
+        let (status, resp) = seed_blueprint(
+            State(state),
+            Path("strict-on-embedded-bp".to_string()),
+            Json(body),
+        )
+        .await
+        .expect("embedded body seeds ok");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.0["seeded"], json!(true));
+    }
+
+    // Direct helper unit test — walker must return `None` on an
+    // already-embedded value and `Some(refs)` on a body with refs.
+    #[test]
+    fn walker_finds_refs_in_arrays_and_nested_objects() {
+        let embedded = json!({ "id": "x", "agents": [ { "name": "a", "kind": "rust_fn" } ] });
+        assert!(collect_unembedded_refs(&embedded).is_none());
+
+        let with_refs = json!({
+            "id": "x",
+            "agents": [ { "$agent_md": "a.md" } ],
+            "flow": { "in": { "value": { "$file": "p.md" } } }
+        });
+        let refs = collect_unembedded_refs(&with_refs).expect("some refs");
+        assert!(refs.iter().any(|s| s == "$agent_md=a.md"));
+        assert!(refs.iter().any(|s| s == "$file=p.md"));
     }
 }

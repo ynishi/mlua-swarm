@@ -90,6 +90,15 @@ pub struct FileConfig {
     /// `--include` list and before the bundled default. `None` = no
     /// server-config includes.
     pub blueprint_ref_includes: Option<Vec<PathBuf>>,
+    /// Server-side strict-embed switch (design table row 3 — the
+    /// strict opt-in for the register layer). When `true`, `POST
+    /// /v1/blueprints/:id` refuses any raw body that still carries
+    /// `$file` / `$agent_md` refs (returns 400 with a hint pointing at
+    /// `mse bp build --strict-embed`), so ref resolution is pushed onto
+    /// the client. Default `false` = the server runs the linker itself
+    /// (backward-compat). `None` = fall back to the built-in default
+    /// `false`.
+    pub blueprint_strict_embed: Option<bool>,
     /// Root path for the git-backed `BlueprintStore` (when using the git2 backend).
     pub git_store_path: Option<PathBuf>,
     /// Path to the SQLite database file backing the `IssueStore`. `None` = fall
@@ -165,6 +174,9 @@ pub struct CliOverrides {
     /// `--include` values (repeatable). Merged with the file config's
     /// `blueprint_ref_includes` (CLI wins on conflict — see [`resolve`]).
     pub blueprint_ref_includes: Vec<PathBuf>,
+    /// `--blueprint-strict-embed` flag (mirrors
+    /// [`FileConfig::blueprint_strict_embed`]).
+    pub blueprint_strict_embed: Option<bool>,
     /// `--git-store-path` value.
     pub git_store_path: Option<PathBuf>,
     /// `--issue-store-path` value (mirrors [`FileConfig::issue_store_path`]).
@@ -210,6 +222,12 @@ pub struct ResolvedConfig {
     /// `blueprint_ref_includes`) — tier 4+5 of the include cascade.
     /// Always set (may be empty).
     pub blueprint_ref_includes: Vec<PathBuf>,
+    /// Server-side strict-embed switch (design table row 3). Always
+    /// set — defaults to `false` when neither CLI nor config file
+    /// provides one (backward-compat: the server runs the linker
+    /// itself). When `true`, `POST /v1/blueprints/:id` refuses raw
+    /// bodies that still carry `$file` / `$agent_md` refs.
+    pub blueprint_strict_embed: bool,
     /// Root path for the git-backed `BlueprintStore`. Always set — defaults
     /// to [`default_store_path`] (`~/.mse/store`) when neither CLI nor config
     /// file provides one.
@@ -264,6 +282,7 @@ impl Default for ResolvedConfig {
             enable_enhance_flow: false,
             blueprint_ref_base: None,
             blueprint_ref_includes: Vec::new(),
+            blueprint_strict_embed: false,
             git_store_path: default_store_path(),
             issue_store_path: None,
             enhance_setting_store_path: None,
@@ -338,6 +357,10 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             merged.extend(file.blueprint_ref_includes.unwrap_or_default());
             merged
         },
+        blueprint_strict_embed: cli
+            .blueprint_strict_embed
+            .or(file.blueprint_strict_embed)
+            .unwrap_or(default.blueprint_strict_embed),
         git_store_path: cli
             .git_store_path
             .or(file.git_store_path)
@@ -717,6 +740,53 @@ mod tests {
             CheckPolicy::Silent,
             "cli check_policy must win over file"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Phase 6 (issue 4c4e3eb8): `blueprint_strict_embed` resolution cascade
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_blueprint_strict_embed_default_false_when_cli_and_file_absent() {
+        let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
+        assert!(
+            !resolved.blueprint_strict_embed,
+            "default blueprint_strict_embed = false (backward-compat: linker runs server-side)"
+        );
+    }
+
+    #[test]
+    fn resolve_blueprint_strict_embed_file_wins_over_default() {
+        let file = FileConfig {
+            blueprint_strict_embed: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file).expect("resolve");
+        assert!(resolved.blueprint_strict_embed);
+    }
+
+    #[test]
+    fn resolve_blueprint_strict_embed_cli_wins_over_file() {
+        let cli = CliOverrides {
+            blueprint_strict_embed: Some(false),
+            ..Default::default()
+        };
+        let file = FileConfig {
+            blueprint_strict_embed: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).expect("resolve");
+        assert!(
+            !resolved.blueprint_strict_embed,
+            "cli blueprint_strict_embed=false must win over file=true"
+        );
+    }
+
+    #[test]
+    fn file_config_deserializes_blueprint_strict_embed() {
+        let toml_text = "blueprint_strict_embed = true\n";
+        let cfg: FileConfig = toml::from_str(toml_text).expect("parse");
+        assert_eq!(cfg.blueprint_strict_embed, Some(true));
     }
 
     #[test]
