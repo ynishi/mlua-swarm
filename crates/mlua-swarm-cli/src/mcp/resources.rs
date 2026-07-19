@@ -590,7 +590,7 @@ mod tests {
         // this test asserts on the `*.md` entries the loader is meant to
         // consume rather than on `dir_stream::load_dir`'s implicit skip
         // behavior.
-        let agent_files = ["researcher.md", "reviewer.md"];
+        let agent_files = ["bp-review.md", "researcher.md", "reviewer.md"];
         for name in agent_files {
             let path = dir.join(name);
             assert!(path.is_file(), "bundled agent missing: {}", path.display());
