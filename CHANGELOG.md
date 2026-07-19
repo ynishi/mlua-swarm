@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/ynishi/mlua-swarm/compare/v0.12.3...v0.13.0) - 2026-07-19
+
+### Added
+
+- *(cli)* expand `mse server` to full launchd lifecycle family (GH #69, part 2)
+- *(cli)* add `--strict-embed` to `mse bp build`
+- *(server)* add `blueprint_strict_embed` config + include-cascade fix hint on register
+- *(cli)* add `mse server <subcmd>` skeleton + relocate launchd module (GH #69, part 1)
+- *(cli)* bundle bp-review sample agent (issue 86d97e6b)
+- *(cli)* bundle sample agents/*.md + tier-6 default + ref-paths guide
+- *(cli)* add `mse bp lint` subcommand + LintReport::Warn variant
+
+### Fixed
+
+- *(cli)* gate macOS-only server helpers behind `cfg(target_os = "macos")` for CI
+- *(cli)* recognise macOS 15 launchctl error 5 EIO on already-loaded bootstrap (GH #69 follow-up)
+- *(dsl)* invert B.pipeline verdict-gate default to opt-in (bafe47d4)
+- *(cli)* surface cancel_requested on swarm_status after cancel
+
+### Other
+
+- *(cli)* retire shell installer + bundle `mse://guides/server-management` (GH #69, part 4)
+- *(mse)* split linker into mlua-swarm-dsl / mlua-swarm-compile crates + include cascade
+- *(schema)* sync Blueprint doctest literals with `blueprint_ref_includes`
+- *(cli)* scrub internal ST / subtask literals from server rustdoc (GH #69 audience sweep)
+- *(cli)* apply `cargo fmt` to server subcommand modules
+- *(cli)* thin MCP forwarders + add `mlua_swarm_server_{bootstrap,install,uninstall}` (GH #69, part 3)
+- update
+- *(cli)* document $agent_md loader frontmatter parsing
+
 ## [0.12.3](https://github.com/ynishi/mlua-swarm/compare/v0.12.2...v0.12.3) - 2026-07-18
 
 ### Added
