@@ -394,7 +394,9 @@ pub async fn shutdown(bind: &str) -> Result<StopOutcome, ServerError> {
 
 /// `mse server bootout`-subcommand entry point — alias for [`shutdown`]
 /// (semantics identical: bootout + healthz-down confirmation, missing-
-/// job idempotent).
+/// job idempotent). CLI-only (macOS); MCP callers use
+/// [`shutdown`] via the `mlua_swarm_server_shutdown` tool.
+#[cfg(target_os = "macos")]
 pub async fn bootout(bind: &str) -> Result<StopOutcome, ServerError> {
     shutdown(bind).await
 }
@@ -586,7 +588,9 @@ pub async fn uninstall() -> Result<UninstallOutcome, ServerError> {
 /// (`/tmp/mse-server.stdout` / `/tmp/mse-server.stderr`). Missing files
 /// surface as empty `stdout_tail` / `stderr_tail`, not an `Err` — the
 /// user just hasn't started the server yet. `tail` defaults to 20 lines;
-/// `--follow` is not implemented (may arrive in a follow-up).
+/// `--follow` is not implemented (may arrive in a follow-up). CLI-only
+/// (macOS); there is no MCP tool for tailing logs.
+#[cfg(target_os = "macos")]
 pub async fn logs(tail: Option<usize>) -> Result<LogsOutcome, ServerError> {
     let stdout_path = PathBuf::from("/tmp/mse-server.stdout");
     let stderr_path = PathBuf::from("/tmp/mse-server.stderr");
@@ -601,6 +605,7 @@ pub async fn logs(tail: Option<usize>) -> Result<LogsOutcome, ServerError> {
     })
 }
 
+#[cfg(target_os = "macos")]
 async fn read_tail(path: &Path, n: usize) -> Vec<String> {
     match tokio::fs::read_to_string(path).await {
         Ok(text) => {
@@ -714,7 +719,9 @@ pub struct UninstallOutcome {
     pub plist_path: PathBuf,
 }
 
-/// Outcome of a successful [`logs`] operation.
+/// Outcome of a successful [`logs`] operation. macOS-only (mirrors the
+/// [`logs`] fn scope).
+#[cfg(target_os = "macos")]
 #[derive(serde::Serialize)]
 pub struct LogsOutcome {
     /// Absolute path of the stdout log sink (`/tmp/mse-server.stdout`).

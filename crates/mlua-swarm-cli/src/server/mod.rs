@@ -20,6 +20,7 @@ pub mod launchd;
 
 use anyhow::Result;
 use clap::Subcommand;
+#[cfg(target_os = "macos")]
 use serde::Serialize;
 
 /// `mse server <subcommand>`.
@@ -164,6 +165,7 @@ async fn run_macos(args: Args) -> Result<()> {
 /// Serialize `outcome` as pretty JSON when `json` is `true`, otherwise
 /// print the pre-rendered one-line human summary. Both flavors go to
 /// stdout; trace / diagnostics stay on stderr via `tracing`.
+#[cfg(target_os = "macos")]
 fn emit<T: Serialize>(outcome: &T, json: bool, human: String) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(outcome)?);
