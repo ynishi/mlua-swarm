@@ -2247,7 +2247,21 @@ impl MseServer {
             Ok(crate::bp::LintReport::Ok { agents, operators }) => {
                 format!("ok ({agents} agent(s), {operators} operator(s) checked)")
             }
-            Ok(crate::bp::LintReport::Skipped { reason }) => format!("skipped: {reason}"),
+            Ok(crate::bp::LintReport::Warn {
+                agents,
+                operators,
+                reason,
+                warnings,
+            }) => {
+                let warn_lines = if warnings.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", warnings.join("; "))
+                };
+                format!(
+                    "warn ({agents} agent(s), {operators} operator(s) checked): {reason}{warn_lines}"
+                )
+            }
             Err(e) => {
                 // GH #62 Axis B.1: attach a structured `fix_hint` when
                 // the Compiler error matches a known lint kind. `null`

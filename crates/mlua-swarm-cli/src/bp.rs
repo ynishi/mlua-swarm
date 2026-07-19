@@ -57,6 +57,12 @@ enum BpCmd {
     /// Build a `.bp.lua` DSL script into Blueprint JSON (compile-lint +
     /// emit, optionally register with a running `mse serve`).
     Build(BuildArgs),
+    /// Lint a `.bp.lua` script — resolve refs via the include cascade,
+    /// run the compile lint, and print a structured verdict (OK / WARN /
+    /// ERROR). Does not emit Blueprint JSON. Independent from `bp build`
+    /// (precedent: `cargo check`, `tsc --noEmit`, `eslint`).
+    /// `--strict` exits non-zero on any WARN/ERROR (CI use).
+    Lint(LintArgs),
     /// Scaffold a minimal `.bp.lua` from a bundled template with all
     /// currently-mandatory fields pre-filled (`halted_at`, `worker_binding`,
     /// `strict_refs`/`strict_kind`). GH #62 Axis A. See
@@ -86,6 +92,22 @@ struct BuildArgs {
     /// bundled default samples dir.
     #[arg(long = "include", action = clap::ArgAction::Append, value_name = "DIR")]
     include: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct LintArgs {
+    /// Path to the `.bp.lua` DSL script.
+    script: PathBuf,
+    /// Additional directory to search when resolving `$agent_md` /
+    /// `$file` refs. Repeatable (tier 4 of the include cascade — see
+    /// `mlua-swarm-compile::ResolveConfig`).
+    #[arg(long = "include", action = clap::ArgAction::Append, value_name = "DIR")]
+    include: Vec<PathBuf>,
+    /// Exit non-zero on any WARN or ERROR verdict. Default is exit 0 on
+    /// WARN, non-zero only on ERROR. Precedent: `mypy --strict`,
+    /// `eslint --max-warnings 0`, `cargo clippy -- -D warnings`.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Debug, Args)]
@@ -126,6 +148,7 @@ const DEFAULT_SERVER: &str = "127.0.0.1:7777";
 pub async fn run(args: BpArgs) -> Result<()> {
     match args.cmd {
         BpCmd::Build(build_args) => run_build(build_args).await,
+        BpCmd::Lint(lint_args) => run_lint(lint_args),
         BpCmd::New(new_args) => run_new(new_args),
     }
 }
@@ -140,8 +163,18 @@ async fn run_build(args: BuildArgs) -> Result<()> {
         Ok(LintReport::Ok { agents, operators }) => {
             eprintln!("compile lint: OK ({agents} agent(s), {operators} operator(s) checked)");
         }
-        Ok(LintReport::Skipped { reason }) => {
-            eprintln!("compile lint: skipped — {reason}");
+        Ok(LintReport::Warn {
+            agents,
+            operators,
+            reason,
+            warnings,
+        }) => {
+            eprintln!(
+                "compile lint: WARN ({agents} agent(s), {operators} operator(s) checked) — {reason}"
+            );
+            for w in &warnings {
+                eprintln!("  - {w}");
+            }
         }
         Err(e) => {
             // GH #62 Axis B.1: on a lint failure, render a structured
@@ -186,6 +219,70 @@ async fn run_build(args: BuildArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `mse bp lint` entry — independent from `mse bp build`. Runs the same
+/// [`compile_lint`] pipeline (include-cascade linker + [`Compiler`]) but
+/// does not emit Blueprint JSON. Prints a structured verdict:
+///
+/// ```text
+/// bp lint: OK    (N agent(s), M operator(s) checked)
+/// bp lint: WARN  (…, some refs unresolved) → non-zero with --strict
+/// bp lint: ERROR (…, compile lint failed)  → always non-zero
+/// ```
+///
+/// Precedent: `cargo check`, `tsc --noEmit`, `eslint`, `ruff check`.
+/// `--strict` mirrors `mypy --strict` / `cargo clippy -- -D warnings`
+/// (promote WARN to non-zero exit for CI use).
+fn run_lint(args: LintArgs) -> Result<()> {
+    let script = std::fs::read_to_string(&args.script)
+        .with_context(|| format!("reading {}", args.script.display()))?;
+    let bp_value = dsl::build_bp_from_script(&script)
+        .with_context(|| format!("building Blueprint from {}", args.script.display()))?;
+
+    match compile_lint(&bp_value, &args.script, &args.include) {
+        Ok(LintReport::Ok { agents, operators }) => {
+            eprintln!("bp lint: OK ({agents} agent(s), {operators} operator(s) checked)");
+            Ok(())
+        }
+        Ok(LintReport::Warn {
+            agents,
+            operators,
+            reason,
+            warnings,
+        }) => {
+            eprintln!(
+                "bp lint: WARN ({agents} agent(s), {operators} operator(s) checked) — {reason}"
+            );
+            for w in &warnings {
+                eprintln!("  - {w}");
+            }
+            if args.strict {
+                Err(anyhow!("bp lint: --strict, exiting non-zero on WARN"))
+            } else {
+                Ok(())
+            }
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            eprintln!("bp lint: ERROR — {msg}");
+            if let Some(hint) = fix_hint_from_compile_error(&msg) {
+                eprintln!();
+                eprintln!("fix hint ({}):", hint.kind);
+                eprintln!("  {}", hint.reason);
+                eprintln!();
+                eprintln!("  suggested patch:");
+                for line in hint.patch_suggestion.lines() {
+                    eprintln!("    {line}");
+                }
+                if let Some(docs) = &hint.docs_ref {
+                    eprintln!();
+                    eprintln!("  see: {docs}");
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// GH #62 Axis A default `worker_binding` — the Claude Code catch-all
@@ -601,9 +698,21 @@ fn extract_between<'a>(s: &'a str, prefix: &str, suffix: &str) -> Option<&'a str
 pub(crate) enum LintReport {
     /// The full compile lint ran against the resolved Blueprint.
     Ok { agents: usize, operators: usize },
-    /// `$file`/`$agent_md` refs could not be resolved locally, so only the
-    /// static DSL shape was validated (never a silent skip).
-    Skipped { reason: String },
+    /// The compile lint ran, but the linker only partially resolved the
+    /// Blueprint (e.g. some `$file`/`$agent_md` refs were unresolvable
+    /// against the include cascade so only the static DSL shape was
+    /// validated). Not a hard failure — `mse bp lint` reports this as
+    /// verdict `WARN` (exit 0 unless `--strict`), and `mse bp build`
+    /// emits the raw wire JSON (Phase 5 `--strict-embed` promotes this
+    /// to a hard error). Carries a structured `warnings` list in
+    /// addition to `reason` — Phase 4 replacement for the legacy
+    /// `Skipped` variant (removed).
+    Warn {
+        agents: usize,
+        operators: usize,
+        reason: String,
+        warnings: Vec<String>,
+    },
 }
 
 /// Step 2 of the module doc's pipeline: best-effort compile lint. Never
@@ -633,13 +742,24 @@ pub(crate) fn compile_lint(
     let expanded = match expand_file_refs_with_config(bp_value.clone(), &cfg, default_kind) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(LintReport::Skipped {
-                reason: format!(
-                    "could not resolve $file/$agent_md refs relative to {} ({e}). Only the \
-                     static DSL shape was validated; the server resolves these refs against \
-                     its own --blueprint-ref-base at register time.",
-                    base.display()
-                ),
+            // Phase 4: promoted the legacy `Skipped` semantic to the
+            // structured `Warn` variant. `mse bp lint` reports this as
+            // verdict `WARN` (exit 0 unless `--strict`); `mse bp build`
+            // still emits the raw wire JSON (Phase 5's `--strict-embed`
+            // promotes this to a hard error). The `Skipped` variant is
+            // kept in the enum for MCP-caller back-compat but is no
+            // longer emitted from this codepath.
+            let reason = format!(
+                "could not resolve $file/$agent_md refs relative to {} ({e}). Only the \
+                 static DSL shape was validated; the server resolves these refs against \
+                 its own include cascade at register time.",
+                base.display()
+            );
+            return Ok(LintReport::Warn {
+                agents: 0,
+                operators: 0,
+                reason,
+                warnings: vec![format!("unresolved refs: {e}")],
             });
         }
     };
@@ -782,7 +902,7 @@ mod tests {
                 assert_eq!(agents, DEFAULT_PIPELINE_STAGES.len());
                 assert_eq!(operators, 1);
             }
-            LintReport::Skipped { reason } => panic!("expected Ok, got Skipped: {reason}"),
+            LintReport::Warn { reason, .. } => panic!("expected Ok, got Warn: {reason}"),
         }
     }
 
