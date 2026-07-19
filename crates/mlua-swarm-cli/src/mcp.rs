@@ -3061,7 +3061,7 @@ impl MseServer {
             .unwrap_or_else(|| server_control::DEFAULT_BIND.to_string());
         match server_control::start(&bind).await {
             Ok(outcome) => json_result(&outcome),
-            Err(e) => Err(McpError::internal_error(e, None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -3114,7 +3114,7 @@ impl MseServer {
         }
         match server_control::shutdown(&bind).await {
             Ok(out) => json_result(&out),
-            Err(e) => Err(McpError::internal_error(e, None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
@@ -3153,7 +3153,7 @@ impl MseServer {
         }
         match server_control::restart(&bind).await {
             Ok(outcome) => json_result(&outcome),
-            Err(e) => Err(McpError::internal_error(e, None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
 
