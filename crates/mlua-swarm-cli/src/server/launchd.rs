@@ -15,8 +15,8 @@
 //! - `bootstrap` → `launchctl bootstrap gui/<uid> <plist>`.
 //! - `install` → render the baked plist template + write it to
 //!   `~/Library/LaunchAgents/com.mse.server.plist` + `bootstrap`.
-//!   Semantically identical to the legacy shell installer that used to
-//!   live under `scripts/launchd/`.
+//!   Semantically identical to the legacy shell installer that predates
+//!   the `mse server` subcommand family (retired in GH #69).
 //! - `uninstall` → `bootout` (idempotent) + `remove_file` the installed
 //!   plist (missing plist tolerated).
 //! - `logs` → tail the `/tmp/mse-server.{stdout,stderr}` sinks.
@@ -47,13 +47,12 @@ const POLL_STEP: Duration = Duration::from_millis(500);
 const HEALTHZ_TIMEOUT: Duration = Duration::from_millis(500);
 const SHUTDOWN_POLL_TOTAL: Duration = Duration::from_secs(10);
 
-/// Compile-time-baked plist template. Kept byte-identical to the shell
-/// installer's copy at `scripts/launchd/com.mse.server.plist.template`
-/// until that copy is retired; `include_str!` is source-file relative
-/// so this string is resolved from
-/// `crates/mlua-swarm-cli/src/server/plist.template`. The three
-/// placeholders `{{HOME}}` / `{{CARGO_BIN}}` / `{{PROJECT_ROOT}}` are
-/// expanded by [`render`].
+/// Compile-time-baked plist template. `include_str!` is source-file
+/// relative so this string is resolved from
+/// `crates/mlua-swarm-cli/src/server/plist.template` — the single source
+/// of truth since the legacy shell-side copy was retired (GH #69). The
+/// three placeholders `{{HOME}}` / `{{CARGO_BIN}}` / `{{PROJECT_ROOT}}`
+/// are expanded by [`render`].
 pub const TEMPLATE: &str = include_str!("./plist.template");
 
 /// healthz check via reqwest. Treats HTTP 200 with body `ok` as healthy.
@@ -148,8 +147,8 @@ fn home_path() -> Result<PathBuf, ServerError> {
 }
 
 /// Absolute path of the installed LaunchAgent plist — `$HOME/Library/
-/// LaunchAgents/com.mse.server.plist`. Same location `scripts/launchd/
-/// install.sh` writes to (L24).
+/// LaunchAgents/com.mse.server.plist`. Same location the legacy shell
+/// installer wrote to before the `mse server` family (GH #69).
 pub fn installed_plist_path() -> Result<PathBuf, ServerError> {
     let home = home_path()?;
     Ok(home.join("Library/LaunchAgents/com.mse.server.plist"))
@@ -848,37 +847,6 @@ com.mse.server = {
     }
 
     #[test]
-    fn install_produces_byte_identical_plist_to_shell_installer() {
-        // The baked TEMPLATE is the byte-for-byte copy of the shell
-        // installer's source template — this locks that in and guards
-        // against copy-drift between the two files while both live in the
-        // tree (Subtask 3 removes the shell-side copy).
-        const ORIGINAL_TEMPLATE: &str =
-            include_str!("../../../../scripts/launchd/com.mse.server.plist.template");
-        assert_eq!(
-            TEMPLATE, ORIGINAL_TEMPLATE,
-            "baked plist template diverged from scripts/launchd/ source"
-        );
-
-        // And `render()` applies the same 3 `s|{{X}}|Y|g` substitutions the
-        // shell installer's `sed` pipeline does — so on identical inputs
-        // the output is byte-identical.
-        let home = Path::new("/H");
-        let cargo_bin = Path::new("/C");
-        let project_root = Path::new("/P");
-        let rendered = render(home, cargo_bin, project_root).expect("render succeeds");
-        let expected = ORIGINAL_TEMPLATE
-            .replace("{{HOME}}", "/H")
-            .replace("{{CARGO_BIN}}", "/C")
-            .replace("{{PROJECT_ROOT}}", "/P");
-        assert_eq!(
-            rendered.as_bytes(),
-            expected.as_bytes(),
-            "render() output diverged from sed-equivalent bytes"
-        );
-    }
-
-    #[test]
     fn install_hint_points_to_mse_server_install() {
         let hint = install_hint();
         assert!(
@@ -889,7 +857,7 @@ com.mse.server = {
         // source doesn't itself contain the forbidden path literal
         // (acceptance criterion: `rg <legacy>` on this file returns
         // zero hits).
-        let legacy = format!("{}/{}", "scripts/launchd", "install.sh");
+        let legacy = format!("{}/{}/{}", "scripts", "launchd", "install.sh");
         assert!(
             !hint.contains(&legacy),
             "install_hint still references the legacy shell installer: {hint}"
