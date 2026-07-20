@@ -835,7 +835,12 @@ pub struct RunRerunFromResponse {
 /// - `409` — the Run is `Running` / `Pending` (would race the in-flight
 ///   driver), OR a concurrent transition won the compare-and-set.
 /// - `422` — the Run has no recorded launch-input snapshot, OR `from_step`
-///   is not present in this Run's replay log.
+///   is not present in this Run's replay log, OR the run's replay log is
+///   empty next to a non-empty `RunRecord.step_entries` trace (a prior
+///   `rerun-from` reached the truncate stage and consumed the log), OR
+///   the current-head Blueprint fails to compile (unresolved
+///   `operator_ref` etc.) — the deterministic pre-flight gate that keeps
+///   the replay log untouched on a compile-fail.
 /// - `202 Accepted` — accepted; the flow re-runs in a detached background
 ///   task (same `tokio::spawn` + run-TTL ceiling shape as [`run_resume`]).
 ///   Poll `GET /v1/runs/:id` for the terminal status.
@@ -845,18 +850,27 @@ pub struct RunRerunFromResponse {
 /// The compare-and-set runs BEFORE the `delete_from` on purpose: a losing
 /// cas returns `409` without ever touching the store, so a lost race can
 /// never leave the store truncated while the status stayed at its old
-/// terminal value.
+/// terminal value. The compile pre-check runs BEFORE the compare-and-set
+/// for the same reason: a deterministic compile failure fires a `422`
+/// that leaves both `status` and the replay log untouched, so the caller
+/// can fix the Blueprint and retry against the same run.
 ///
 /// 1. 404 check.
 /// 2. Status gate (fast 409 for `Running` / `Pending`).
 /// 3. Decode launch snapshot (fast 400 / 422).
 /// 4. Compute cut index via `list_by_run` + `.position(step_ref == from_step)`
-///    (fast 422 when the step is not present).
-/// 5. Atomic transition `<current terminal> -> Running` (409 on loss).
-/// 6. Physical `delete_from(cut)` on the replay store — safe now because we
+///    (fast 422 when the step is not present, with a distinct message when
+///    the log is empty but `RunRecord.step_entries` shows the run did
+///    trace steps — a consumed log from a prior `rerun-from`).
+/// 5. Pre-flight compile check via `TaskApplication::precompile` against
+///    the launch snapshot's Blueprint (fast 422 on any `CompileError`).
+///    Prevents compile-fail-inside-`tokio::spawn` from consuming the
+///    replay log via step 7's `delete_from`.
+/// 6. Atomic transition `<current terminal> -> Running` (409 on loss).
+/// 7. Physical `delete_from(cut)` on the replay store — safe now because we
 ///    won the cas and own the Run.
-/// 7. Build `ReplayCursor` from the truncated entries.
-/// 8. Detached dispatch, same `tokio::spawn` + `default_run_ttl` shape as
+/// 8. Build `ReplayCursor` from the truncated entries.
+/// 9. Detached dispatch, same `tokio::spawn` + `default_run_ttl` shape as
 ///    [`run_resume`].
 ///
 /// # Known limitations (Layer A)
@@ -940,12 +954,50 @@ pub async fn run_rerun_from(
         .iter()
         .position(|e| e.step_ref == req.from_step)
         .ok_or_else(|| {
-            ApiError::unprocessable(format!(
-                "run {run_id}: from_step {:?} not present in this run's replay log \
-                 (nothing to rerun-from)",
-                req.from_step
-            ))
+            // Distinguish two shapes of miss: (a) the log carries entries
+            // but none match `from_step` (typo or wrong step name); (b) the
+            // log is empty while `RunRecord.step_entries` still traces
+            // steps — which means a prior `rerun-from` reached the
+            // `delete_from` stage and consumed the log, and no further
+            // `rerun-from` against the same run is recoverable. `run.
+            // step_entries` and `replay_store` are physically separate
+            // tables (the dispatcher writes to both), so an empty log next
+            // to a non-empty trace is the reliable tell.
+            if entries.is_empty() && !run.step_entries.is_empty() {
+                ApiError::unprocessable(format!(
+                    "run {run_id}: replay log is empty but {} step entries are traced \
+                     on the RunRecord — the log was consumed by a prior rerun-from \
+                     that reached the truncate stage. This run can no longer be \
+                     rerun-from; start a fresh run via POST /v1/tasks.",
+                    run.step_entries.len()
+                ))
+            } else {
+                ApiError::unprocessable(format!(
+                    "run {run_id}: from_step {:?} not present in this run's replay log \
+                     (nothing to rerun-from)",
+                    req.from_step
+                ))
+            }
         })?;
+
+    // Pre-flight compile check against the current-head Blueprint the
+    // rerun will actually launch against. Compile is deterministic — an
+    // `UnresolvedOperatorRef` / `UnresolvedMetaRef` / `UnresolvedAuditAgent`
+    // / verdict-cond shape violation fails the same way every attempt —
+    // so surfacing it here as a 422, BEFORE the compare-and-set and
+    // BEFORE `delete_from`, converts an otherwise irrecoverable replay-
+    // loss (compile fails INSIDE the detached `tokio::spawn` AFTER the
+    // truncation has physically dropped the pre-cut rows) into a fast
+    // rejection that leaves the run's status and replay log entirely
+    // untouched. Runtime-only failures (spawner error, worker submit
+    // failure) are still able to consume the log — inherent to any
+    // path that can only be discovered mid-dispatch — but that class
+    // needs a different fix (Layer B territory).
+    if let Err(e) = state.task_app.precompile(&snapshot.blueprint).await {
+        return Err(ApiError::unprocessable(format!(
+            "run {run_id} cannot be rerun: current-head Blueprint fails to compile — {e}"
+        )));
+    }
 
     // Atomically flip the current terminal status -> Running. A racing
     // rerun (or a boot-time recovery sweep, or a concurrent resume) loses

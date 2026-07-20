@@ -20,7 +20,8 @@ use mlua_swarm::blueprint::{
 use mlua_swarm::core::config::EngineCfg;
 use mlua_swarm::core::engine::Engine;
 use mlua_swarm::store::replay::{InMemoryReplayStore, ReplayEntry, ReplayStore};
-use mlua_swarm::store::run::{InMemoryRunStore, RunRecord, RunStatus, RunStore};
+use mlua_swarm::store::run::{InMemoryRunStore, RunRecord, RunStatus, RunStore, StepEntry};
+use mlua_swarm::types::StepId;
 use mlua_swarm::{RunId, TaskId};
 use serde_json::json;
 use std::sync::Arc;
@@ -92,6 +93,28 @@ fn two_step_blueprint() -> Blueprint {
         check_policy: None,
         blueprint_ref_includes: Vec::new(),
     }
+}
+
+/// Variant of `two_step_blueprint` whose `agent-b` is a `kind = Operator`
+/// referencing an `operator_ref` that isn't declared in
+/// `Blueprint.operators`. `Compiler::compile` rejects this with
+/// `CompileError::UnresolvedOperatorRef` — deterministic, and the exact
+/// class of failure that used to consume the replay log inside the
+/// rerun-from `tokio::spawn` before the pre-flight compile check landed.
+fn two_step_blueprint_with_unbound_operator() -> Blueprint {
+    let mut bp = two_step_blueprint();
+    bp.agents[1] = AgentDef {
+        name: "agent-b".into(),
+        kind: AgentKind::Operator,
+        spec: json!({ "operator_ref": "nonexistent-operator" }),
+        profile: None,
+        meta: None,
+        runner: None,
+        runner_ref: None,
+        verdict: None,
+    };
+    // `bp.operators` stays empty — that's the whole point.
+    bp
 }
 
 async fn spawn_server(run_store: Arc<dyn RunStore>, replay_store: Arc<dyn ReplayStore>) -> String {
@@ -406,4 +429,135 @@ async fn rerun_from_happy_path_truncates_and_completes() {
         vec!["agent-a".to_string(), "agent-b".to_string()],
         "post-rerun replay log carries the fresh agent-b row, not the ghost: {refs_after:?}"
     );
+}
+
+/// A rerun-from against a snapshot whose Blueprint no longer compiles
+/// (unresolved `operator_ref`) must fast-fail 422 in the handler — BEFORE
+/// the status flip and BEFORE `delete_from` — so the caller can fix the
+/// Blueprint and try again against the same run. Regression guard for the
+/// pre-fix behavior where the compile failure fired inside the detached
+/// `tokio::spawn` and left the replay log physically truncated.
+#[tokio::test]
+async fn rerun_from_compile_fail_leaves_replay_intact() {
+    let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+    let replay_store: Arc<dyn ReplayStore> = Arc::new(InMemoryReplayStore::new());
+    let run_id = RunId::new();
+    let task_id = TaskId::new();
+    let bp = two_step_blueprint_with_unbound_operator();
+    run_store
+        .create(seed_run(
+            &run_id,
+            &task_id,
+            RunStatus::Done,
+            Some(snapshot_json_for(&bp)),
+        ))
+        .await
+        .expect("seed run");
+
+    // Seed two replay entries so `from_step: "agent-b"` locates a cut
+    // point at index 1 — reaching the compile pre-check requires the
+    // step-lookup 422 to NOT fire.
+    let ctx_a = mlua_swarm::core::ctx::Ctx::new(StepId::new(), 1, "agent-a");
+    replay_store
+        .append(
+            ReplayEntry::from_completion(run_id.clone(), "agent-a", "h", 0, &ctx_a, &json!({}))
+                .expect("entry build"),
+        )
+        .await
+        .expect("seed replay a");
+    let ctx_b = mlua_swarm::core::ctx::Ctx::new(StepId::new(), 1, "agent-b");
+    replay_store
+        .append(
+            ReplayEntry::from_completion(run_id.clone(), "agent-b", "h", 0, &ctx_b, &json!({}))
+                .expect("entry build"),
+        )
+        .await
+        .expect("seed replay b");
+
+    let base = spawn_server(run_store.clone(), replay_store.clone()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/runs/{run_id}/rerun-from"))
+        .json(&json!({ "from_step": "agent-b" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("fails to compile"),
+        "422 body must name the compile failure so the caller can fix the BP: {body}"
+    );
+
+    // Run stays Done — the pre-check fires before the compare-and-set.
+    let after = run_store.get(&run_id).await.expect("run present");
+    assert_eq!(after.status, RunStatus::Done);
+    // Replay log untouched — the pre-check fires before `delete_from`.
+    let entries_after = replay_store.list_by_run(&run_id).await.expect("list");
+    let refs_after: Vec<String> = entries_after.iter().map(|e| e.step_ref.clone()).collect();
+    assert_eq!(
+        refs_after,
+        vec!["agent-a".to_string(), "agent-b".to_string()],
+        "compile-fail 422 must not truncate the replay log: {refs_after:?}"
+    );
+}
+
+/// A run whose replay log has been consumed by a prior `rerun-from` (the
+/// pre-fix bug's failure state, still reachable for any run in the wild
+/// that hit it) must surface a distinct 422 message that names the
+/// consumed-log condition — not the generic "step not present" message,
+/// which would misdirect the caller into thinking the step name was
+/// typo'd. `RunRecord.step_entries` is the reliable tell: the replay log
+/// is empty but the dispatch trace is not.
+#[tokio::test]
+async fn rerun_from_after_consumed_log_returns_helpful_422() {
+    let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+    let replay_store: Arc<dyn ReplayStore> = Arc::new(InMemoryReplayStore::new());
+    let run_id = RunId::new();
+    let task_id = TaskId::new();
+    let bp = two_step_blueprint();
+    run_store
+        .create(seed_run(
+            &run_id,
+            &task_id,
+            RunStatus::Done,
+            Some(snapshot_json_for(&bp)),
+        ))
+        .await
+        .expect("seed run");
+    // Simulate a run that dispatched two steps (so `step_entries` is
+    // non-empty) whose replay log was subsequently emptied — the exact
+    // shape a Bug-1-hit run leaves behind.
+    for name in ["agent-a", "agent-b"] {
+        run_store
+            .append_step_entry(
+                &run_id,
+                StepEntry {
+                    step_id: StepId::new(),
+                    step_ref: Some(name.into()),
+                    status: Some("passed".into()),
+                    at: 0,
+                },
+            )
+            .await
+            .expect("seed step entry");
+    }
+    // replay_store stays empty — no entries appended.
+
+    let base = spawn_server(run_store.clone(), replay_store.clone()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/runs/{run_id}/rerun-from"))
+        .json(&json!({ "from_step": "agent-b" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("consumed by a prior rerun-from"),
+        "422 body must name the consumed-log condition rather than the \
+         generic \"not present\" message: {body}"
+    );
+    // Run stays Done.
+    let after = run_store.get(&run_id).await.expect("run present");
+    assert_eq!(after.status, RunStatus::Done);
 }

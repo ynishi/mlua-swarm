@@ -265,6 +265,33 @@ impl TaskApplication {
         }
     }
 
+    /// Pre-flight compile check: resolve `bp_ref` and drive it through
+    /// `Compiler::compile` without launching. Returns `Ok(())` when the
+    /// Blueprint would compile cleanly (every `operator_ref` /
+    /// `meta_ref` / `audits[].agent` / verdict cond shape resolves), or
+    /// the same `TaskApplicationError` variants
+    /// [`Self::handle_with_run`] would surface for a resolve or compile
+    /// failure. No engine attach, no spawn, no `RunRecord` mutation.
+    ///
+    /// Used by `POST /v1/runs/:id/rerun-from` (GH #71 Layer A) as a
+    /// fast-fail gate: a deterministic compile-time failure — the
+    /// canonical case is an unbound `operator_ref` after an operator was
+    /// removed from `Blueprint.operators` between the original dispatch
+    /// and the rerun — surfaces as a `422` here BEFORE the handler
+    /// physically truncates the replay log via
+    /// `ReplayStore::delete_from`. Without this pre-check the same
+    /// failure fires later inside the detached `tokio::spawn`, after the
+    /// truncation has already consumed the pre-cut entries and left the
+    /// caller with no replay log to retry against.
+    pub async fn precompile(&self, bp_ref: &BlueprintRef) -> Result<(), TaskApplicationError> {
+        let (bp, _v) = self.resolve(bp_ref).await?;
+        self.launch
+            .compiler()
+            .compile(&bp)
+            .map_err(TaskLaunchError::from)?;
+        Ok(())
+    }
+
     /// Resolve the `BlueprintRef` (Inline / Id) and run the flow to
     /// completion through `TaskLaunchService::launch`, threading `run_ctx`
     /// (issue #13 run_id propagation) into the launch input.
