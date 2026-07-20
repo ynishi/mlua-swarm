@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1](https://github.com/ynishi/mlua-swarm/compare/v0.14.0...v0.14.1) - 2026-07-20
+
+### Fixed
+
+- *(server)* pre-compile-check rerun-from + distinct 422 on consumed replay log — GH #71 Layer A
+
 ## [0.14.0](https://github.com/ynishi/mlua-swarm/compare/v0.13.0...v0.14.0) - 2026-07-19
 
 ### Added
