@@ -58,11 +58,11 @@ clap = { version = "4", features = ["derive"] }
 rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
 nix = { version = "0.29", features = ["user"] }
 
-mlua-swarm = { path = ".", version = "0.14.0" }
-mlua-swarm-schema = { path = "crates/mlua-swarm-schema", version = "0.14.0" }
+mlua-swarm = { path = ".", version = "0.14.1" }
+mlua-swarm-schema = { path = "crates/mlua-swarm-schema", version = "0.14.1" }
 mlua-swarm-dsl = { path = "crates/mlua-swarm-dsl", version = "0.12.3" }
-mlua-swarm-compile = { path = "crates/mlua-swarm-compile", version = "0.12.5" }
-mlua-swarm-server = { path = "crates/mlua-swarm-server", version = "0.14.0" }
+mlua-swarm-compile = { path = "crates/mlua-swarm-compile", version = "0.12.6" }
+mlua-swarm-server = { path = "crates/mlua-swarm-server", version = "0.14.1" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -75,7 +75,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package]
 name = "mlua-swarm"
-version = "0.14.0"
+version = "0.14.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

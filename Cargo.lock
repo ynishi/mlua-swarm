@@ -1690,7 +1690,7 @@ dependencies = [
 
 [[package]]
 name = "mlua-swarm"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "agent-block-core",
  "agent-block-types",
@@ -1724,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "mlua-swarm-cli"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1760,7 +1760,7 @@ dependencies = [
 
 [[package]]
 name = "mlua-swarm-compile"
-version = "0.12.5"
+version = "0.12.6"
 dependencies = [
  "blake3",
  "mlua-swarm-schema",
@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "mlua-swarm-schema"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "mlua-flow-ir",
  "schemars",
@@ -1794,7 +1794,7 @@ dependencies = [
 
 [[package]]
 name = "mlua-swarm-server"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
