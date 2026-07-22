@@ -124,9 +124,10 @@ pub use blueprint::compiler::{
 };
 pub use blueprint::loader::{expand_file_refs, load_blueprint_from_path, LoadError};
 pub use blueprint::{
-    current_schema_version, AgentDef, AgentKind, AgentMeta, Blueprint, BlueprintMetadata,
-    BlueprintOrigin, CompilerHints, CompilerStrategy, EngineDispatcher, SpawnerHints,
-    CURRENT_SCHEMA_VERSION,
+    current_schema_version, AgentDef, AgentKind, AgentMeta, AgentProviderCapability,
+    AgentProviderManifest, BindReceipt, BindRequest, BindingAttestation, BindingBackend,
+    BindingDigest, Blueprint, BlueprintMetadata, BlueprintOrigin, CompilerHints, CompilerStrategy,
+    EngineDispatcher, SpawnerHints, CURRENT_SCHEMA_VERSION,
 };
 pub use core::config::{EngineCfg, LongHoldConfig};
 pub use core::ctx::{

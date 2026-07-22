@@ -55,6 +55,6 @@
     "strict_kind": true
   },
   "metadata": {
-    "description": "GH #34 reference sample — operator-backed after-run audit. `worker` runs the flow's only step; `auditor` (declared in `audits`) is auto-kicked after `worker` settles, receiving an ordinary Spawn frame whose directive asks it to audit that step instead of doing the step's own work. Findings persist as an `audit:worker` artifact on the worker step's own output tail — observational only, never gates the flow. Both agents point at the \"main-ai\" logical operator role; join with mse_operator_join(roles=[\"main-ai\"]) before dispatch."
+    "description": "GH #34 reference sample — operator-backed after-run audit. `worker` runs the flow's only step; `auditor` (declared in `audits`) is auto-kicked after `worker` settles, receiving an ordinary Spawn frame whose directive asks it to audit that step instead of doing the step's own work. Findings persist as an `audit:worker` artifact on the worker step's own output tail — observational only, never gates the flow. Both agents point at the \"main-ai\" logical operator role; join with mse_operator_join using that role and a capability_manifest covering the declared variants before dispatch."
   }
 }

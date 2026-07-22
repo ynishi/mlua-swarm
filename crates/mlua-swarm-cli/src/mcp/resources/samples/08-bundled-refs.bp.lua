@@ -58,6 +58,6 @@ return {
   },
   strategy = { strict_refs = true, strict_kind = true },
   metadata = {
-    description = "Two-stage research-then-review pipeline whose agents are pulled from the bundled `samples/agents/*.md` files via `$agent_md` refs. Seed with init_ctx={\"d\":{\"research\":\"<your topic>\"}}. Both agents point at the \"main-ai\" logical role; join with mse_operator_join(roles=[\"main-ai\"]) before dispatch.",
+    description = "Two-stage research-then-review pipeline whose agents are pulled from the bundled `samples/agents/*.md` files via `$agent_md` refs. Seed with init_ctx={\"d\":{\"research\":\"<your topic>\"}}. Both agents point at the \"main-ai\" logical role; join with mse_operator_join using that role and a capability_manifest covering the declared variants before dispatch.",
   },
 }

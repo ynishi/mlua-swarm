@@ -5,7 +5,9 @@
 //! [`AgentBindingProvider`] and report what they can actually enforce; an
 //! official platform adapter is one implementation of this same interface.
 
-use crate::blueprint::{BindReceipt, BindRequest, BindingAttestation, BoundAgent, Runner};
+use crate::blueprint::{
+    BindReceipt, BindRequest, BindingAttestation, BindingBackend, BoundAgent, Runner,
+};
 use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use thiserror::Error;
@@ -106,15 +108,28 @@ pub fn binding_requests(bound_agents: &[BoundAgent]) -> Vec<BindRequest> {
         .iter()
         .filter_map(|bound| {
             let runner = bound.runner.as_ref()?;
-            let (requested_tools, launch_variant) = match runner {
-                Runner::WsClaudeCode { variant, tools } => {
-                    (canonical_tools(tools), Some(variant.clone()))
-                }
-                Runner::AgentBlockInProcess { tools } => (canonical_tools(tools), None),
+            let (backend, requested_tools, launch_variant) = match runner {
+                Runner::WsClaudeCode { variant, tools } => (
+                    BindingBackend::WsClaudeCode,
+                    canonical_tools(tools),
+                    Some(variant.clone()),
+                ),
+                Runner::AgentBlockInProcess { tools } => (
+                    BindingBackend::AgentBlockInProcess,
+                    canonical_tools(tools),
+                    None,
+                ),
             };
             Some(BindRequest {
                 agent: bound.agent.name.clone(),
                 request_digest: bound.binding_digest.clone(),
+                backend,
+                binding_target: bound
+                    .agent
+                    .spec
+                    .get("operator_ref")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
                 requested_model: bound
                     .agent
                     .profile
@@ -300,7 +315,7 @@ mod tests {
         bp.agents.push(AgentDef {
             name: "coder".to_string(),
             kind: AgentKind::Operator,
-            spec: json!({}),
+            spec: json!({ "operator_ref": "main-ai" }),
             profile: Some(AgentProfile {
                 model: Some("sonnet".to_string()),
                 ..Default::default()
@@ -335,6 +350,8 @@ mod tests {
         let requests = binding_requests(&bound);
         assert_eq!(requests[0].agent, "coder");
         assert_eq!(requests[0].request_digest, bound[0].binding_digest);
+        assert_eq!(requests[0].backend, BindingBackend::WsClaudeCode);
+        assert_eq!(requests[0].binding_target.as_deref(), Some("main-ai"));
         assert_eq!(requests[0].requested_model.as_deref(), Some("sonnet"));
         assert_eq!(requests[0].requested_tools, ["Read", "Write"]);
         assert_eq!(requests[0].launch_variant.as_deref(), Some("mse-coder"));

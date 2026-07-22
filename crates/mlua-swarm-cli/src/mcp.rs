@@ -892,6 +892,10 @@ struct OperatorJoinReq {
     /// conflict). Omitted/empty = no alias claimed.
     #[serde(default)]
     roles: Option<Vec<String>>,
+    /// Effective model/tool/variant capabilities enforced by this
+    /// Operator/MainAI. Required for fail-closed Runner binding.
+    #[serde(default)]
+    capability_manifest: Option<mlua_swarm::AgentProviderManifest>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1261,7 +1265,7 @@ struct SwarmCancelReq {
 #[tool_router]
 impl MseServer {
     #[tool(
-        description = "Join as an Operator session: POST /v1/operators (mint sid+token) then connect WS /v1/operators/:sid/ws with the returned Bearer token. The token stays process-local (never returned to the caller). Returns {sid, roles}. Use `sid` with mse_pending_wait / mse_ack / mse_operator_leave."
+        description = "Join as an Operator session: POST /v1/operators (mint sid+token and submit capability_manifest) then connect WS /v1/operators/:sid/ws with the returned Bearer token. The token stays process-local (never returned to the caller). Runner-backed launches resolve the manifest fail-closed by logical role, launch_variant, model, and tools. Returns {sid, roles}. Use `sid` with mse_pending_wait / mse_ack / mse_operator_leave."
     )]
     async fn mse_operator_join(
         &self,
@@ -1270,7 +1274,7 @@ impl MseServer {
         let roles = req.roles.unwrap_or_default();
         let (sid, roles) = self
             .op_client
-            .join(roles)
+            .join(roles, req.capability_manifest)
             .await
             .map_err(client_error_to_mcp)?;
         json_result(&serde_json::json!({ "sid": sid, "roles": roles }))

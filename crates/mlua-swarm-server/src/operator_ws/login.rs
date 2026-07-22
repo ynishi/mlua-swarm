@@ -7,10 +7,12 @@
 //! ## Login flow
 //!
 //! ```text
-//! POST /v1/operators { roles?: ["main-ai"] }
+//! POST /v1/operators { roles?: ["main-ai"], capability_manifest?: {...} }
 //!   → 409 if any role already owns a live entry (roles alias exclusivity,
 //!     v1.md §Auth session flow)
 //!   → { sid: "S-<hex>", token: "<10-hex>", roles: [...] }
+//!   The manifest is pinned to this session and later resolved through the
+//!   Core `AgentBindingProvider` interface before any Runner-backed spawn.
 //!
 //! WS /v1/operators/:sid/ws
 //!   Authorization: Bearer <token>   (mandatory — no empty-string default)
@@ -44,7 +46,7 @@ use axum::{
     Json,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use mlua_swarm::{Operator, SeniorBridge, SessionId, SpawnHook};
+use mlua_swarm::{AgentProviderManifest, Operator, SeniorBridge, SessionId, SpawnHook};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -66,6 +68,8 @@ pub struct OperatorSessionEntry {
     pub token: String,
     /// Role aliases claimed by this session (roles-exclusivity set).
     pub roles: Vec<String>,
+    /// Provider-owned effective capability manifest submitted at join.
+    pub capability_manifest: Option<AgentProviderManifest>,
     /// The live 3-trait session object once a WS has connected; `None` before first connect.
     pub ws_session: Mutex<Option<Arc<WSOperatorSession>>>,
 }
@@ -78,6 +82,9 @@ pub struct OperatorsCreateReq {
     /// Role aliases to claim exclusively (empty = no exclusivity claimed).
     #[serde(default)]
     pub roles: Vec<String>,
+    /// Effective execution capabilities supplied by the Operator/MainAI.
+    #[serde(default)]
+    pub capability_manifest: Option<AgentProviderManifest>,
 }
 
 /// Response for `POST /v1/operators`.
@@ -106,6 +113,7 @@ pub async fn operators_create(
     Json(req): Json<OperatorsCreateReq>,
 ) -> Response {
     let roles = req.roles;
+    let capability_manifest = req.capability_manifest;
     // The sid is the operator-session identity, so it mints in the same
     // `SessionId` shape (`S-<hex>`) as the engine-side session id — one
     // session-id form across the system (issue #11 observation 2; the old
@@ -138,6 +146,7 @@ pub async fn operators_create(
         sid: sid.clone(),
         token: token.clone(),
         roles: roles.clone(),
+        capability_manifest,
         ws_session: Mutex::new(None),
     });
     state
@@ -416,6 +425,9 @@ pub struct OperatorsInfoResp {
     pub sid: SessionId,
     /// Role aliases held by this session.
     pub roles: Vec<String>,
+    /// Capability manifest pinned when this session joined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_manifest: Option<AgentProviderManifest>,
     /// Whether a WS is currently attached (not merely that the session ever connected).
     pub connected: bool,
 }
@@ -454,6 +466,7 @@ pub async fn operators_info(
         Json(OperatorsInfoResp {
             sid: entry.sid.clone(),
             roles: entry.roles.clone(),
+            capability_manifest: entry.capability_manifest.clone(),
             connected,
         }),
     )
@@ -500,5 +513,33 @@ mod tests {
             HeaderValue::from_static("Basic dXNlcjpwYXNz"),
         );
         assert!(extract_bearer_token_required(&h).is_err());
+    }
+
+    #[test]
+    fn operators_create_request_accepts_capability_manifest() {
+        let req: OperatorsCreateReq = serde_json::from_value(serde_json::json!({
+            "roles": ["main-ai"],
+            "capability_manifest": {
+                "provider_id": "main-ai-self-report",
+                "capabilities": [{
+                    "launch_variant": "mse-coder",
+                    "resolved_model": "claude-sonnet-4",
+                    "effective_tools": ["Read", "Edit"]
+                }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(req.roles, ["main-ai"]);
+        assert_eq!(
+            req.capability_manifest.unwrap().provider_id,
+            "main-ai-self-report"
+        );
+    }
+
+    #[test]
+    fn operators_create_request_keeps_manifest_optional_on_wire() {
+        let req: OperatorsCreateReq =
+            serde_json::from_value(serde_json::json!({ "roles": [] })).unwrap();
+        assert!(req.capability_manifest.is_none());
     }
 }

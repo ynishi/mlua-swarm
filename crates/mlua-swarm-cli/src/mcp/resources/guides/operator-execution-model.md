@@ -616,8 +616,9 @@ I run two MainAIs in parallel?".
 BP (design-time)                    Runtime (per Operator process)
 ─────────────────────               ──────────────────────────────
 operators:                          POST /v1/operators
-  - name: "planner_bot"    ◄──┐       { roles: ["planner_bot"] }
-    kind: MainAi              │        → mints sid, reserves alias
+  - name: "planner_bot"    ◄──┐       { roles: ["planner_bot"],
+    kind: MainAi              │         capability_manifest: {...} }
+                              │        → mints sid, reserves alias + manifest
                               │
 agents:                       │     WS /v1/operators/:sid/ws
   - name: impl-planner        │        → register_operator(
@@ -633,7 +634,8 @@ Rules that fall out of this:
    became a convention because the default scaffold uses it.
 2. **The three sites must be the same literal.** `OperatorDef.name` ==
    the mint's `roles[]` entry == the `register_operator` id. A typo in
-   any one of them silently falls through to the `Automate` default.
+   the binding target is rejected before Spawn because no manifest-owning
+   session can be resolved for that role.
 3. **`kind: MainAi` is the *type*, not the *name*.** It says "when an
    agent references this role, dispatch via the WS thin-path". Multiple
    `OperatorDef`s can have `kind: MainAi` under different names.
@@ -641,6 +643,35 @@ Rules that fall out of this:
    `POST /v1/operators` returns `409 CONFLICT` only when the same alias
    string is already claimed by a live session (`login.rs` role check
    under `roles_to_sid`). Distinct alias strings never conflict.
+
+### Capability manifest at join
+
+The Operator/MainAI also submits what its execution environment can actually
+enforce. This is not copied blindly into a Run. The Server selects exactly one
+capability by role alias and `launch_variant`, returns a `BindReceipt`, and
+Core checks the requested tool subset, model presence, variant equality, and
+request digest before creating the final `BindingAttestation`.
+
+```json
+{
+  "roles": ["planner_bot"],
+  "capability_manifest": {
+    "provider_id": "main-ai-self-report",
+    "provider_revision": "2026-07-22",
+    "capabilities": [{
+      "launch_variant": "mse-worker-coder",
+      "resolved_model": "claude-sonnet-4",
+      "effective_tools": ["Read", "Edit"]
+    }]
+  }
+}
+```
+
+The manifest is owned by the joining execution environment; Swarm does not
+read platform wrapper files from the Server filesystem. A missing manifest,
+missing variant, insufficient tool grant, or stale receipt fails before
+Spawn. The accepted attestation is persisted in the Run's `BoundAgent`
+snapshot, so resume never re-resolves mutable capabilities.
 
 ### Running multiple MainAI sessions in parallel
 
@@ -661,8 +692,8 @@ agents = {
 Then two Operator processes join independently:
 
 ```
-Process A:  mse_operator_join(roles = { "phase_a_op" })  → sid=S-aaa
-Process B:  mse_operator_join(roles = { "phase_b_op" })  → sid=S-bbb
+Process A:  mse_operator_join(roles={"phase_a_op"}, capability_manifest={...}) → sid=S-aaa
+Process B:  mse_operator_join(roles={"phase_b_op"}, capability_manifest={...}) → sid=S-bbb
 ```
 
 Spawns on the `planner` agent land on process A; spawns on `impl` land

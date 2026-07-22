@@ -80,6 +80,6 @@ return {
   },
   strategy = { strict_refs = true, strict_kind = true },
   metadata = {
-    description = "Verdict-gated three-stage pipeline built with bp_dsl's B.pipeline{} sugar: analyze -> review (retries a bounded fix-and-regate loop while its staged verdict part reads BLOCKED) -> publish. Seed with init_ctx={\"d\":{\"analyze\":\"issue\"}}. All operator agents point at the \"main-ai\" logical role; join with mse_operator_join(roles=[\"main-ai\"]) before dispatch.",
+    description = "Verdict-gated three-stage pipeline built with bp_dsl's B.pipeline{} sugar: analyze -> review (retries a bounded fix-and-regate loop while its staged verdict part reads BLOCKED) -> publish. Seed with init_ctx={\"d\":{\"analyze\":\"issue\"}}. All operator agents point at the \"main-ai\" logical role; join with mse_operator_join using that role and a capability_manifest covering the declared variants before dispatch.",
   },
 }

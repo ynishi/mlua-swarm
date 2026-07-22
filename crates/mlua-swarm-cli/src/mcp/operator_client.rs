@@ -347,14 +347,21 @@ impl OperatorClientState {
     /// `POST /v1/operators` (mint sid+token) then `WS /v1/operators/:sid/ws`
     /// (Bearer). The token stays in-process (`SessionEntry.token`) — never
     /// returned to the caller. Returns `(sid, roles)`.
-    pub async fn join(&self, roles: Vec<String>) -> Result<(String, Vec<String>), ClientError> {
+    pub async fn join(
+        &self,
+        roles: Vec<String>,
+        capability_manifest: Option<mlua_swarm::AgentProviderManifest>,
+    ) -> Result<(String, Vec<String>), ClientError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| ClientError::Http(e.to_string()))?;
         let resp = client
             .post(format!("{}/v1/operators", self.http_base))
-            .json(&serde_json::json!({ "roles": roles }))
+            .json(&serde_json::json!({
+                "roles": roles,
+                "capability_manifest": capability_manifest,
+            }))
             .send()
             .await
             .map_err(|e| ClientError::Http(e.to_string()))?;
@@ -833,7 +840,7 @@ mod tests {
     #[tokio::test]
     async fn join_unreachable_host_returns_http_error_not_panic() {
         let state = OperatorClientState::with_http_base("http://127.0.0.1:1");
-        let err = state.join(vec![]).await.unwrap_err();
+        let err = state.join(vec![], None).await.unwrap_err();
         assert!(matches!(err, ClientError::Http(_)), "got: {err:?}");
     }
 

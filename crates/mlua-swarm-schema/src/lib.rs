@@ -1138,6 +1138,12 @@ pub struct BindRequest {
     pub agent: String,
     /// Digest of the declaration-only [`BoundAgent`] snapshot.
     pub request_digest: BindingDigest,
+    /// Runner backend family Core resolved for this agent.
+    pub backend: BindingBackend,
+    /// Provider-specific routing key. For Operator-backed runners this is
+    /// the logical `operator_ref`, never a runtime session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_target: Option<String>,
     /// Requested model name or tier from [`AgentProfile::model`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
@@ -1147,6 +1153,16 @@ pub struct BindRequest {
     /// Platform launch variant requested by the resolved [`Runner`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_variant: Option<String>,
+}
+
+/// Backend family a binding provider must resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingBackend {
+    /// Claude Code wrapper dispatched through an Operator WebSocket.
+    WsClaudeCode,
+    /// AgentBlock registry enforced in the Server process.
+    AgentBlockInProcess,
 }
 
 /// Provider report describing the effective runtime binding for one agent.
@@ -1205,6 +1221,42 @@ pub struct BindingAttestation {
     /// Optional digest of provider-owned capability evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_digest: Option<BindingDigest>,
+}
+
+/// One effective capability advertised by an execution-environment
+/// provider. Operator manifests normally publish one entry per wrapper
+/// variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProviderCapability {
+    /// Platform launch variant this capability serves. `None` is reserved
+    /// for backends without a variant axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_variant: Option<String>,
+    /// Effective model selected by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    /// Effective tool grant enforced by the provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_tools: Vec<String>,
+    /// Optional digest of provider-owned capability evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_digest: Option<BindingDigest>,
+}
+
+/// Capability manifest supplied by an Operator/MainAI or an official
+/// execution-platform plugin when joining the Server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProviderManifest {
+    /// Stable provider implementation identifier.
+    pub provider_id: String,
+    /// Provider or adapter revision used to inspect capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_revision: Option<String>,
+    /// Effective capabilities available through this provider instance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<AgentProviderCapability>,
 }
 
 /// Immutable, Run-scoped result of binding the Runner / Agent / Context
@@ -2948,5 +3000,28 @@ mod tests {
             msg.contains("check_policy") || msg.contains("loud") || msg.contains("variant"),
             "error should point at the bad check_policy value: {msg}"
         );
+    }
+
+    #[test]
+    fn agent_provider_manifest_round_trips_and_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "provider_id": "main-ai-self-report",
+            "provider_revision": "1",
+            "capabilities": [{
+                "launch_variant": "mse-coder",
+                "resolved_model": "claude-sonnet-4",
+                "effective_tools": ["Read", "Edit"]
+            }]
+        });
+        let manifest: AgentProviderManifest =
+            serde_json::from_value(json.clone()).expect("manifest deserializes");
+        assert_eq!(serde_json::to_value(manifest).unwrap(), json);
+
+        let invalid = serde_json::json!({
+            "provider_id": "main-ai-self-report",
+            "capabilities": [],
+            "platform_secret": true
+        });
+        assert!(serde_json::from_value::<AgentProviderManifest>(invalid).is_err());
     }
 }

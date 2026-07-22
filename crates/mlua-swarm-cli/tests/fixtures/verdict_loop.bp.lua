@@ -79,6 +79,6 @@ return {
   },
   strategy = { strict_refs = true, strict_kind = true },
   metadata = {
-    description = "Verdict retry loop with a self-managed counter. Seed with init_ctx={\"verdict\":\"BLOCKED\"}. All operator agents point at the \"main-ai\" logical role; join with mse_operator_join(roles=[\"main-ai\"]) before dispatch. Declares check_policy=\"strict\" at the top level (cascade tier 2: launch request > blueprint > server config), so submit-time projection fail-open conditions surface as errors.",
+    description = "Verdict retry loop with a self-managed counter. Seed with init_ctx={\"verdict\":\"BLOCKED\"}. All operator agents point at the \"main-ai\" logical role; join with mse_operator_join using that role and a capability_manifest covering the declared variants before dispatch. Declares check_policy=\"strict\" at the top level (cascade tier 2: launch request > blueprint > server config), so submit-time projection fail-open conditions surface as errors.",
   },
 }

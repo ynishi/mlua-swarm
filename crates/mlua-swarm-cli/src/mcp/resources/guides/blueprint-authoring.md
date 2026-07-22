@@ -563,7 +563,10 @@ The Runner's `tools` remain requested/declarative for `ws_claude_code` until
 an injected `AgentBindingProvider` attests the execution environment's
 effective grant. The generic path is for the Operator/MainAI to implement
 that interface; platform-specific official plugins may implement the same
-interface when a host needs a stabilizing adapter. Core validates one receipt
+interface when a host needs a stabilizing adapter. The standard Server maps
+`AgentDef.spec.operator_ref` to the role claimed by `mse_operator_join` and
+resolves the submitted `capability_manifest`; it never reads wrapper files
+from the Server filesystem. Core validates one receipt
 per requested agent, requires every requested tool and the exact launch
 variant, then pins the accepted model, tools, provider revision, and optional
 evidence digest as `BindingAttestation`. That attestation is included in the

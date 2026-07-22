@@ -58,6 +58,7 @@
 
 #![warn(missing_docs)]
 
+pub mod binding;
 /// HTTP surface for inspecting/registering Blueprint state (`/v1/blueprints/*`).
 pub mod blueprints;
 /// Server config file support (`~/.mse/config.toml`, CLI > file > default merge).
@@ -319,8 +320,16 @@ pub fn build_router_full(
     replay_store: Option<Arc<dyn ReplayStore>>,
     sync_timeout_secs: u64,
 ) -> Router {
+    let operator_sessions = Arc::new(Mutex::new(HashMap::new()));
+    let roles_to_sid = Arc::new(Mutex::new(HashMap::new()));
     let compiler = Compiler::new(registry);
-    let launch = Arc::new(TaskLaunchService::new(engine.clone(), compiler));
+    let binding_provider = Arc::new(binding::OperatorSessionBindingProvider::new(
+        operator_sessions.clone(),
+        roles_to_sid.clone(),
+    ));
+    let launch = Arc::new(
+        TaskLaunchService::new(engine.clone(), compiler).with_binding_provider(binding_provider),
+    );
     let task_app = Arc::new(match store {
         Some(s) => TaskApplication::new(launch, s),
         None => TaskApplication::new_inline_only(launch),
@@ -356,8 +365,8 @@ pub fn build_router_full(
         task_app,
         ws_operator_factory,
         data_store,
-        operator_sessions: Arc::new(Mutex::new(HashMap::new())),
-        roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
+        operator_sessions,
+        roles_to_sid,
         task_store,
         run_store,
         replay_store,
