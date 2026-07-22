@@ -12,6 +12,8 @@
 //!   pair. A body-less request (or one that omits both fields) preserves the
 //!   pre-#19 rekick behavior byte-for-byte.
 //! - `GET  /v1/runs/:id`       — a single `RunRecord` (`step_entries` trace included).
+//! - `GET  /v1/runs/:id/bindings` — requested/effective binding explain from
+//!   the immutable launch snapshot (never from the current Blueprint).
 //! - `POST /v1/runs/:id/resume` — resume an `Interrupted` Run under the SAME
 //!   `run_id` (replay cursor + stored launch-input snapshot).
 //! - `POST /v1/runs/:id/rerun-from` — GH #71 Layer A. Rerun a terminal Run
@@ -40,6 +42,7 @@ use axum::{
 use mlua_swarm::application::{
     BlueprintRef, TaskApplicationError, TaskApplicationInput, TaskApplicationOutput,
 };
+use mlua_swarm::blueprint::{BindRequest, BindingAttestation, BoundAgent};
 use mlua_swarm::core::config::CheckPolicy;
 use mlua_swarm::service::merge_init_ctx_3layer;
 use mlua_swarm::store::replay::ReplayCursor;
@@ -1112,6 +1115,162 @@ pub async fn run_get(
     Ok(Json(run))
 }
 
+/// Whether a Run-scoped binding has only a declaration or also carries a
+/// provider attestation accepted by Core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunBindingStatus {
+    /// No provider attestation was recorded; `requested` is still the exact
+    /// declaration pinned at launch time.
+    DeclarationOnly,
+    /// Core accepted and pinned the provider's effective capability report.
+    Attested,
+}
+
+/// Mechanical requested/effective comparison for one immutable binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct RunBindingDifference {
+    /// Whether the requested model string and resolved model string differ.
+    pub model_changed: bool,
+    /// Requested tools absent from the effective grant. Accepted attestations
+    /// normally leave this empty because launch validation is fail-closed.
+    pub missing_requested_tools: Vec<String>,
+    /// Effective tools not present in the minimum requested grant.
+    pub additional_effective_tools: Vec<String>,
+    /// Whether the requested and effective launch variants differ.
+    pub launch_variant_changed: bool,
+}
+
+/// Explain view for one agent, derived exclusively from the persisted Run
+/// snapshot rather than from the current Blueprint registry.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct RunBindingExplainEntry {
+    /// Logical agent name.
+    pub agent: String,
+    /// Declaration tier that selected the Runner.
+    pub runner_source: mlua_swarm::blueprint::RunnerResolutionSource,
+    /// Provider-attestation state.
+    pub status: RunBindingStatus,
+    /// Exact platform-neutral request reconstructed from the pinned snapshot.
+    pub requested: Option<BindRequest>,
+    /// Core-validated provider report, when one was accepted at launch.
+    pub effective: Option<BindingAttestation>,
+    /// Mechanical difference between `requested` and `effective`; absent for
+    /// declaration-only bindings.
+    pub difference: Option<RunBindingDifference>,
+    /// Final immutable replay identity, including the attestation when present.
+    pub binding_digest: mlua_swarm::blueprint::BindingDigest,
+}
+
+/// Response body for `GET /v1/runs/:id/bindings`.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct RunBindingsExplainResponse {
+    /// Run whose launch snapshot was inspected.
+    #[schemars(with = "String")]
+    pub run_id: RunId,
+    /// Owning Task recorded on that Run.
+    #[schemars(with = "String")]
+    pub task_id: TaskId,
+    /// Every agent snapshot in Blueprint declaration order.
+    pub bindings: Vec<RunBindingExplainEntry>,
+}
+
+fn requested_binding(bound: &BoundAgent) -> Option<BindRequest> {
+    mlua_swarm::binding_request_for_snapshot(bound)
+}
+
+fn binding_difference(
+    requested: &BindRequest,
+    effective: &BindingAttestation,
+) -> RunBindingDifference {
+    let missing_requested_tools = requested
+        .requested_tools
+        .iter()
+        .filter(|tool| !effective.effective_tools.contains(tool))
+        .cloned()
+        .collect();
+    let additional_effective_tools = effective
+        .effective_tools
+        .iter()
+        .filter(|tool| !requested.requested_tools.contains(tool))
+        .cloned()
+        .collect();
+    RunBindingDifference {
+        model_changed: requested.requested_model != effective.resolved_model,
+        missing_requested_tools,
+        additional_effective_tools,
+        launch_variant_changed: requested.launch_variant != effective.launch_variant,
+    }
+}
+
+/// `GET /v1/runs/:id/bindings`. Explains the exact immutable agent bindings
+/// used by this Run. The handler never reads or resolves the current Blueprint;
+/// old Runs without a binding snapshot return `422` instead of guessed state.
+pub async fn run_bindings_explain(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<RunBindingsExplainResponse>, ApiError> {
+    let run_id =
+        RunId::parse(id).map_err(|e| ApiError::bad_request(format!("invalid run id: {e}")))?;
+    let run = state
+        .run_store
+        .get(&run_id)
+        .await
+        .map_err(map_run_store_err)?;
+    let input_json = run.input_json.as_deref().ok_or_else(|| {
+        ApiError::unprocessable(format!(
+            "run {run_id} has no launch snapshot; binding explain is unavailable"
+        ))
+    })?;
+    let snapshot: Value = serde_json::from_str(input_json).map_err(|e| {
+        ApiError::unprocessable(format!(
+            "run {run_id} launch snapshot is invalid JSON; binding explain is unavailable: {e}"
+        ))
+    })?;
+    let bound_value = snapshot.get("bound_agents").ok_or_else(|| {
+        ApiError::unprocessable(format!(
+            "run {run_id} predates immutable binding snapshots; current Blueprint state was not consulted"
+        ))
+    })?;
+    let bound_agents: Vec<BoundAgent> =
+        serde_json::from_value(bound_value.clone()).map_err(|e| {
+            ApiError::unprocessable(format!(
+                "run {run_id} contains an invalid binding snapshot: {e}"
+            ))
+        })?;
+
+    let bindings = bound_agents
+        .into_iter()
+        .map(|bound| {
+            let requested = requested_binding(&bound);
+            let effective = bound.attestation.clone();
+            let difference = requested
+                .as_ref()
+                .zip(effective.as_ref())
+                .map(|(request, attestation)| binding_difference(request, attestation));
+            RunBindingExplainEntry {
+                agent: bound.agent.name,
+                runner_source: bound.runner_source,
+                status: if effective.is_some() {
+                    RunBindingStatus::Attested
+                } else {
+                    RunBindingStatus::DeclarationOnly
+                },
+                requested,
+                effective,
+                difference,
+                binding_digest: bound.binding_digest,
+            }
+        })
+        .collect();
+
+    Ok(Json(RunBindingsExplainResponse {
+        run_id: run.id,
+        task_id: run.task_id,
+        bindings,
+    }))
+}
+
 /// `pub(crate)` so `crate::projection`'s `GET /v1/tasks/:id/ctx` handler can
 /// reuse this module's existing-Task-existence-check error mapping (same
 /// 404-vs-500 split `task_get` already applies).
@@ -1139,7 +1298,7 @@ mod tests {
     use mlua_swarm::application::BlueprintRef;
     use mlua_swarm::blueprint::{
         current_schema_version, AgentDef, AgentKind, Blueprint, BlueprintMetadata, CompilerHints,
-        CompilerStrategy,
+        CompilerStrategy, Runner,
     };
     use mlua_swarm::core::config::EngineCfg;
     use mlua_swarm::core::engine::Engine;
@@ -2220,6 +2379,110 @@ mod tests {
             Ok(_) => panic!("expected 404 for an unknown run"),
             Err(e) => assert_eq!(e.status, StatusCode::NOT_FOUND),
         }
+    }
+
+    #[tokio::test]
+    async fn run_bindings_explain_reports_pinned_requested_effective_diff() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req("binding explain")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+        let run = state
+            .run_store
+            .get(&posted.run_id)
+            .await
+            .expect("stored run");
+        let mut snapshot: Value = serde_json::from_str(run.input_json.as_deref().unwrap()).unwrap();
+        let mut bound_agents: Vec<BoundAgent> =
+            serde_json::from_value(snapshot["bound_agents"].clone()).unwrap();
+        let bound = &mut bound_agents[0];
+        bound.runner = Some(Runner::WsClaudeCode {
+            variant: "coder".to_string(),
+            tools: vec!["Read".to_string()],
+        });
+        bound.recompute_binding_digest().unwrap();
+        let request_digest = bound.binding_digest.clone();
+        bound
+            .set_attestation(BindingAttestation {
+                request_digest: request_digest.clone(),
+                provider_id: "operator-manifest".to_string(),
+                provider_revision: Some("claude-code-1.2".to_string()),
+                resolved_model: Some("claude-sonnet-4".to_string()),
+                effective_tools: vec!["Bash".to_string(), "Read".to_string()],
+                launch_variant: Some("coder".to_string()),
+                evidence_digest: Some(mlua_swarm::blueprint::BindingDigest::sha256(b"manifest-v1")),
+            })
+            .unwrap();
+        snapshot["bound_agents"] = serde_json::to_value(&bound_agents).unwrap();
+        state
+            .run_store
+            .set_input_json(&posted.run_id, serde_json::to_string(&snapshot).unwrap())
+            .await
+            .unwrap();
+
+        let explained = run_bindings_explain(State(state), Path(posted.run_id.to_string()))
+            .await
+            .expect("binding explain")
+            .0;
+        let entry = &explained.bindings[0];
+        assert_eq!(entry.status, RunBindingStatus::Attested);
+        assert_eq!(
+            entry.requested.as_ref().unwrap().request_digest,
+            request_digest
+        );
+        assert_eq!(
+            entry
+                .effective
+                .as_ref()
+                .unwrap()
+                .provider_revision
+                .as_deref(),
+            Some("claude-code-1.2")
+        );
+        assert_eq!(
+            entry
+                .difference
+                .as_ref()
+                .unwrap()
+                .additional_effective_tools,
+            vec!["Bash"]
+        );
+        assert!(entry
+            .difference
+            .as_ref()
+            .unwrap()
+            .missing_requested_tools
+            .is_empty());
+        assert_ne!(entry.binding_digest, request_digest);
+    }
+
+    #[tokio::test]
+    async fn run_bindings_explain_never_guesses_for_legacy_snapshot() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req("legacy binding explain")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+        state
+            .run_store
+            .set_input_json(&posted.run_id, "{}".to_string())
+            .await
+            .unwrap();
+
+        let error = run_bindings_explain(State(state), Path(posted.run_id.to_string()))
+            .await
+            .expect_err("legacy run must not be re-resolved");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error
+            .message
+            .contains("current Blueprint state was not consulted"));
     }
 
     #[tokio::test]

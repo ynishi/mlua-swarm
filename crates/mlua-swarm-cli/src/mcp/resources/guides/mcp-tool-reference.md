@@ -20,7 +20,11 @@ One kick flows through five identity layers:
 worker ctx (`ctx.meta.runtime.run_id`), pending-wait payload, and spawn
 directive, so wire frames and outputs correlate back to one Run. Server
 drill-down: `GET /v1/tasks` → `GET /v1/tasks/:id` (runs included) →
-`GET /v1/runs/:id` (step trace); `POST /v1/tasks/:id/runs` re-kicks an
+`GET /v1/runs/:id` (step trace). `GET /v1/runs/:id/bindings` explains the
+immutable Runner request and Core-validated provider result, including
+provider revision, evidence digest, and a mechanical requested/effective
+difference. It reads only the Run launch snapshot and returns `422` for older
+Runs instead of consulting a changed Blueprint. `POST /v1/tasks/:id/runs` re-kicks an
 existing Task with a fresh `RunId`, while `POST /v1/runs/:id/resume`
 resumes an `Interrupted` Run under the *same* `RunId` via the
 Ctx-snapshot replay log (state-driven: `404` unknown / `409` wrong
@@ -29,7 +33,8 @@ narrative including store config, schema versioning, boot recovery
 sweep, and the resumable-log hint: `mse://guides/replay-and-resume`.
 Full ID inventory (sid / worker_handle / req_id / capability_token
 included): `mse://guides/id-lifecycle`. HTTP wire body schemas for the
-`POST /v1/tasks` / `GET /v1/tasks/:id` / `POST /v1/tasks/:id/runs`
+`POST /v1/tasks` / `GET /v1/tasks/:id` / `POST /v1/tasks/:id/runs` /
+`GET /v1/runs/:id/bindings`
 request/response shapes above (and `POST /v1/blueprints/:id`):
 `mse://api/http-endpoints`.
 

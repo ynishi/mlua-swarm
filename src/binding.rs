@@ -106,40 +106,52 @@ pub enum BindingProviderError {
 pub fn binding_requests(bound_agents: &[BoundAgent]) -> Vec<BindRequest> {
     bound_agents
         .iter()
-        .filter_map(|bound| {
-            let runner = bound.runner.as_ref()?;
-            let (backend, requested_tools, launch_variant) = match runner {
-                Runner::WsClaudeCode { variant, tools } => (
-                    BindingBackend::WsClaudeCode,
-                    canonical_tools(tools),
-                    Some(variant.clone()),
-                ),
-                Runner::AgentBlockInProcess { tools } => (
-                    BindingBackend::AgentBlockInProcess,
-                    canonical_tools(tools),
-                    None,
-                ),
-            };
-            Some(BindRequest {
-                agent: bound.agent.name.clone(),
-                request_digest: bound.binding_digest.clone(),
-                backend,
-                binding_target: bound
-                    .agent
-                    .spec
-                    .get("operator_ref")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string),
-                requested_model: bound
-                    .agent
-                    .profile
-                    .as_ref()
-                    .and_then(|profile| profile.model.clone()),
-                requested_tools,
-                launch_variant,
-            })
-        })
+        .filter_map(binding_request_for_snapshot)
         .collect()
+}
+
+/// Reconstruct the platform-neutral request pinned by one immutable snapshot.
+///
+/// Before attestation, the snapshot's `binding_digest` is the declaration
+/// request digest. After attestation changes the final replay identity, the
+/// original request digest remains pinned inside the accepted attestation.
+/// This makes the helper safe for both launch-time provider calls and
+/// after-the-fact Run explain surfaces.
+pub fn binding_request_for_snapshot(bound: &BoundAgent) -> Option<BindRequest> {
+    let runner = bound.runner.as_ref()?;
+    let (backend, requested_tools, launch_variant) = match runner {
+        Runner::WsClaudeCode { variant, tools } => (
+            BindingBackend::WsClaudeCode,
+            canonical_tools(tools),
+            Some(variant.clone()),
+        ),
+        Runner::AgentBlockInProcess { tools } => (
+            BindingBackend::AgentBlockInProcess,
+            canonical_tools(tools),
+            None,
+        ),
+    };
+    Some(BindRequest {
+        agent: bound.agent.name.clone(),
+        request_digest: bound.attestation.as_ref().map_or_else(
+            || bound.binding_digest.clone(),
+            |attestation| attestation.request_digest.clone(),
+        ),
+        backend,
+        binding_target: bound
+            .agent
+            .spec
+            .get("operator_ref")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        requested_model: bound
+            .agent
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.model.clone()),
+        requested_tools,
+        launch_variant,
+    })
 }
 
 /// Ask `provider` to bind all Runner-backed agents, validate every receipt,

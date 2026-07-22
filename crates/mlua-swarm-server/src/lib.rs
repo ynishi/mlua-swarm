@@ -26,6 +26,8 @@
 //!   (`projection-adapter` ST5 — replaces the ST2/ST4 single-value `GET
 //!   /v1/tasks/:id/ctx`).
 //! - `GET /v1/runs/:id` — a single `RunRecord` (its `step_entries` trace included).
+//! - `GET /v1/runs/:id/bindings` — immutable requested/effective AgentProvider
+//!   binding explain for that Run.
 //! - `POST /v1/runs/:id/resume` — resume an `Interrupted` Run under the same `run_id`.
 //! - `POST /v1/runs/:id/rerun-from` — GH #71 Layer A. Rerun a terminal Run from
 //!   a caller-specified step under the same `run_id` (physically truncates the
@@ -100,7 +102,10 @@ pub use operator_ws::{
     OperatorSessionEntry, ServerMsg, WSOperatorSession,
 };
 pub use projection::{McpQueryAdapter, ProjectionSource, StepList, StepPathQuery, StepSummary};
-pub use tasks::{RunKickRequest, RunKickResponse, RunResumeResponse, TaskDetailResponse};
+pub use tasks::{
+    RunBindingDifference, RunBindingExplainEntry, RunBindingStatus, RunBindingsExplainResponse,
+    RunKickRequest, RunKickResponse, RunResumeResponse, TaskDetailResponse,
+};
 pub use worker::{
     worker_artifact, worker_prompt, worker_result, ArtifactQuery, PromptQuery, WorkerResultReq,
 };
@@ -395,6 +400,7 @@ pub fn build_router_full(
             get(projection::step_content),
         )
         .route("/v1/runs/:id", get(tasks::run_get))
+        .route("/v1/runs/:id/bindings", get(tasks::run_bindings_explain))
         // Resume an Interrupted Run under the SAME run_id (replay cursor +
         // stored launch-input snapshot); see `tasks::run_resume`.
         .route("/v1/runs/:id/resume", post(tasks::run_resume))

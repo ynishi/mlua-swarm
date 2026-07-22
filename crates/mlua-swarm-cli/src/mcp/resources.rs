@@ -325,6 +325,9 @@ pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Er
     let run_kick_request = serde_json::to_value(&run_kick_request_schema)?;
     let run_kick_response_schema = schemars::schema_for!(mlua_swarm_server::RunKickResponse);
     let run_kick_response = serde_json::to_value(&run_kick_response_schema)?;
+    let run_bindings_response_schema =
+        schemars::schema_for!(mlua_swarm_server::RunBindingsExplainResponse);
+    let run_bindings_response = serde_json::to_value(&run_bindings_response_schema)?;
     let worker_payload_schema = schemars::schema_for!(mlua_swarm::WorkerPayload);
     let worker_payload = serde_json::to_value(&worker_payload_schema)?;
 
@@ -349,6 +352,10 @@ pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Er
             "POST /v1/tasks/:id/runs": {
                 "request": run_kick_request,
                 "response": run_kick_response,
+            },
+            "GET /v1/runs/:id/bindings": {
+                "$comment": "Run-scoped AgentProvider explain. Reads only the immutable bound_agents launch snapshot; never re-resolves the current Blueprint. Returns 422 for legacy Runs without that snapshot.",
+                "response": run_bindings_response,
             },
             "GET /v1/worker/prompt": {
                 "$comment": "Worker self-fetch. Query: `task_id=<StepId>`. Auth: `Authorization: Bearer <worker_handle>` (short handle from the Spawn frame, or full capability_token). Response body = WorkerPayload; `context` carries the AgentContextView (GH #20 Contract C) when AgentContextMiddleware was layered; exactly one of `system` / `system_ref` is populated when a system_prompt was baked (GH #31).",
@@ -463,6 +470,7 @@ mod tests {
             "POST /v1/tasks",
             "GET /v1/tasks/:id",
             "POST /v1/tasks/:id/runs",
+            "GET /v1/runs/:id/bindings",
             "GET /v1/worker/prompt",
         ] {
             assert!(
