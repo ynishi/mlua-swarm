@@ -1041,6 +1041,227 @@ pub fn resolve_runner(
     Ok(None)
 }
 
+/// Which declaration tier supplied a [`BoundAgent`]'s resolved Runner.
+/// Kept in the immutable snapshot so explain surfaces can distinguish a
+/// first-class binding from the Claude Code compatibility fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerResolutionSource {
+    /// `AgentDef.runner`.
+    AgentInline,
+    /// `AgentDef.runner_ref` resolved through `Blueprint.runners`.
+    AgentRef,
+    /// Deprecated `AgentProfile.worker_binding` compatibility path.
+    LegacyWorkerBinding,
+    /// `Blueprint.default_runner` resolved through `Blueprint.runners`.
+    BlueprintDefault,
+    /// No Runner applies to this in-process or otherwise unbound agent.
+    None,
+}
+
+/// Strongly typed identity of one immutable [`BoundAgent`] snapshot.
+/// Transparent serde keeps the public JSON wire form a plain string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct BindingDigest(String);
+
+impl BindingDigest {
+    /// Compute the canonical `sha256:<lowercase-hex>` digest of `bytes`.
+    pub fn sha256(bytes: impl AsRef<[u8]>) -> Self {
+        use sha2::Digest as _;
+        Self(format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(bytes.as_ref()))
+        ))
+    }
+
+    /// Borrow the stable wire representation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BindingDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for BindingDigest {
+    type Err = BindingDigestParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let Some(hex_part) = value.strip_prefix("sha256:") else {
+            return Err(BindingDigestParseError::InvalidFormat(value.to_string()));
+        };
+        let canonical = hex_part.len() == 64
+            && hex_part
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !canonical {
+            return Err(BindingDigestParseError::InvalidFormat(value.to_string()));
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+
+impl<'de> Deserialize<'de> for BindingDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use std::str::FromStr as _;
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Rejection returned when an external binding digest is not in canonical
+/// `sha256:<64 lowercase hex>` form.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BindingDigestParseError {
+    /// Unsupported algorithm prefix, wrong length, uppercase, or non-hex.
+    #[error("invalid binding digest '{0}'; expected sha256:<64 lowercase hex>")]
+    InvalidFormat(String),
+}
+
+/// Immutable, Run-scoped result of binding the Runner / Agent / Context
+/// layers for one logical agent.
+///
+/// This is derived state, not a fourth authoring source of truth. The full
+/// [`AgentDef`] is retained deliberately: resume/replay must not re-read a
+/// changed role prompt or result contract from a mutable Blueprint registry.
+/// Capability attestation is adapter-owned and is therefore not guessed here;
+/// the resolved [`Runner`] remains a declaration until an adapter records its
+/// requested/effective comparison.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoundAgent {
+    /// Logical agent definition pinned for the Run.
+    pub agent: AgentDef,
+    /// Runner selected by [`resolve_runner`], if this agent needs one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<Runner>,
+    /// Effective static Context policy (`AgentMeta.context_policy` wins over
+    /// `Blueprint.default_context_policy`). Runtime context values are not
+    /// embedded here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_policy: Option<ContextPolicy>,
+    /// Declaration tier that supplied `runner`.
+    pub runner_source: RunnerResolutionSource,
+    /// SHA-256 over the other fields of this snapshot, prefixed with
+    /// `sha256:`. This is replay identity and an observability correlation
+    /// key, not a signature.
+    pub binding_digest: BindingDigest,
+}
+
+/// Failure while constructing immutable [`BoundAgent`] snapshots.
+#[derive(Debug, thiserror::Error)]
+pub enum BoundAgentResolveError {
+    /// A Runner reference did not resolve.
+    #[error(transparent)]
+    Runner(#[from] RunnerResolveError),
+    /// The snapshot input could not be serialized for deterministic hashing.
+    #[error("bound agent '{agent}' could not be serialized for digest: {source}")]
+    Digest {
+        /// Logical agent name.
+        agent: String,
+        /// Serialization failure.
+        source: serde_json::Error,
+    },
+    /// Strict binding rejected the deprecated Claude Code compatibility
+    /// declaration instead of silently accepting it.
+    #[error(
+        "agent '{agent}' uses deprecated profile.worker_binding; strict binding requires runner or runner_ref"
+    )]
+    LegacyWorkerBindingDisabled {
+        /// Logical agent that must be migrated.
+        agent: String,
+    },
+}
+
+#[derive(Serialize)]
+struct BoundAgentDigestInput<'a> {
+    agent: &'a AgentDef,
+    runner: &'a Option<Runner>,
+    context_policy: &'a Option<ContextPolicy>,
+    runner_source: RunnerResolutionSource,
+}
+
+/// Resolve every `Blueprint.agents` entry into an immutable Run snapshot.
+/// Output order follows `Blueprint.agents`, making persistence and explain
+/// responses stable without a second sort.
+pub fn resolve_bound_agents(bp: &Blueprint) -> Result<Vec<BoundAgent>, BoundAgentResolveError> {
+    resolve_bound_agents_with_legacy(bp, true)
+}
+
+/// Strict counterpart to [`resolve_bound_agents`]: rejects the deprecated
+/// `profile.worker_binding` fallback. This is the migration gate for callers
+/// that require every binding to use the platform-neutral Runner contract.
+pub fn resolve_bound_agents_strict(
+    bp: &Blueprint,
+) -> Result<Vec<BoundAgent>, BoundAgentResolveError> {
+    resolve_bound_agents_with_legacy(bp, false)
+}
+
+fn resolve_bound_agents_with_legacy(
+    bp: &Blueprint,
+    allow_legacy: bool,
+) -> Result<Vec<BoundAgent>, BoundAgentResolveError> {
+    bp.agents
+        .iter()
+        .map(|agent| {
+            let runner = resolve_runner(bp, agent)?;
+            let runner_source = if agent.runner.is_some() {
+                RunnerResolutionSource::AgentInline
+            } else if agent.runner_ref.is_some() {
+                RunnerResolutionSource::AgentRef
+            } else if agent
+                .profile
+                .as_ref()
+                .and_then(|p| p.worker_binding.as_ref())
+                .is_some()
+            {
+                RunnerResolutionSource::LegacyWorkerBinding
+            } else if bp.default_runner.is_some() {
+                RunnerResolutionSource::BlueprintDefault
+            } else {
+                RunnerResolutionSource::None
+            };
+            if !allow_legacy && runner_source == RunnerResolutionSource::LegacyWorkerBinding {
+                return Err(BoundAgentResolveError::LegacyWorkerBindingDisabled {
+                    agent: agent.name.clone(),
+                });
+            }
+            let context_policy = agent
+                .meta
+                .as_ref()
+                .and_then(|m| m.context_policy.clone())
+                .or_else(|| bp.default_context_policy.clone());
+            let digest_input = BoundAgentDigestInput {
+                agent,
+                runner: &runner,
+                context_policy: &context_policy,
+                runner_source,
+            };
+            let bytes = serde_json::to_vec(&digest_input).map_err(|source| {
+                BoundAgentResolveError::Digest {
+                    agent: agent.name.clone(),
+                    source,
+                }
+            })?;
+            let binding_digest = BindingDigest::sha256(bytes);
+            Ok(BoundAgent {
+                agent: agent.clone(),
+                runner,
+                context_policy,
+                runner_source,
+                binding_digest,
+            })
+        })
+        .collect()
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // OperatorDef / OperatorKind
 // ──────────────────────────────────────────────────────────────────────────
@@ -2366,6 +2587,95 @@ mod tests {
                 available: vec!["registry-entry".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn bound_agent_digest_is_stable_and_tracks_runner_changes() {
+        let agent = agent_with_runner(
+            "coder",
+            None,
+            Some(ws_runner("worker-a", vec!["Read"])),
+            None,
+        );
+        let mut bp = minimal_bp(None);
+        bp.agents = vec![agent];
+
+        let first = resolve_bound_agents(&bp).expect("binds");
+        let second = resolve_bound_agents(&bp).expect("binds again");
+        assert_eq!(first[0].binding_digest, second[0].binding_digest);
+        assert!(first[0].binding_digest.as_str().starts_with("sha256:"));
+        assert_eq!(first[0].binding_digest.as_str().len(), 71);
+        assert_eq!(first[0].runner_source, RunnerResolutionSource::AgentInline);
+
+        bp.agents[0].runner = Some(ws_runner("worker-b", vec!["Read"]));
+        let changed = resolve_bound_agents(&bp).expect("binds changed runner");
+        assert_ne!(first[0].binding_digest, changed[0].binding_digest);
+    }
+
+    #[test]
+    fn bound_agent_pins_effective_context_policy_and_full_agent() {
+        let mut agent = agent_with_runner("scout", None, None, None);
+        agent.profile = Some(AgentProfile {
+            system_prompt: "inspect carefully".to_string(),
+            ..Default::default()
+        });
+        let mut bp = minimal_bp(None);
+        bp.default_context_policy = Some(ContextPolicy {
+            include: Some(vec!["task".to_string()]),
+            ..Default::default()
+        });
+        bp.agents = vec![agent];
+
+        let bound = resolve_bound_agents(&bp).expect("binds").remove(0);
+        assert_eq!(
+            bound.agent.profile.unwrap().system_prompt,
+            "inspect carefully"
+        );
+        assert_eq!(
+            bound.context_policy.unwrap().include,
+            Some(vec!["task".to_string()])
+        );
+        assert_eq!(bound.runner_source, RunnerResolutionSource::None);
+    }
+
+    #[test]
+    fn strict_bound_agent_resolution_rejects_legacy_worker_binding() {
+        let profile = AgentProfile {
+            worker_binding: Some("legacy-worker".to_string()),
+            ..Default::default()
+        };
+        let mut bp = minimal_bp(None);
+        bp.agents = vec![agent_with_runner("coder", Some(profile), None, None)];
+
+        let err = resolve_bound_agents_strict(&bp).expect_err("legacy must fail closed");
+        assert!(matches!(
+            err,
+            BoundAgentResolveError::LegacyWorkerBindingDisabled { agent } if agent == "coder"
+        ));
+    }
+
+    #[test]
+    fn binding_digest_is_a_validated_transparent_string() {
+        use std::str::FromStr as _;
+
+        let digest = BindingDigest::sha256(b"same snapshot");
+        let json = serde_json::to_value(&digest).expect("serializes");
+        assert_eq!(json, serde_json::Value::String(digest.to_string()));
+        assert_eq!(
+            serde_json::from_value::<BindingDigest>(json).expect("deserializes"),
+            digest
+        );
+        for invalid in [
+            "deadbeef",
+            "sha256:abc",
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(
+                BindingDigest::from_str(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     // ──────────────────────────────────────────────────────────────

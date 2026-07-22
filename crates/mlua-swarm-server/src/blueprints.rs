@@ -20,7 +20,9 @@ use mlua_swarm::operator::render::template_variables;
 use mlua_swarm_compile::{
     env_blueprint_includes, expand_file_refs_with_config, pre_read_in_bp_includes, ResolveConfig,
 };
-use mlua_swarm_schema::{resolve_runner, Runner};
+use mlua_swarm_schema::{
+    resolve_bound_agents, resolve_runner, BindingDigest, Runner, RunnerResolutionSource,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -579,6 +581,10 @@ struct ExplainRunner {
     /// `agent_block`). `None` when the pairing is consistent, or when
     /// [`Self::resolved`] is `None`.
     warning: Option<String>,
+    /// Declaration tier selected by the immutable binding resolver.
+    source: Option<RunnerResolutionSource>,
+    /// Run/replay correlation digest over Agent, Runner, and Context policy.
+    binding_digest: Option<BindingDigest>,
 }
 
 /// GH #46 M2 doctor check: does the resolved Runner's backend agree with
@@ -727,6 +733,9 @@ async fn explain_agent(
     // an error-level finding; a resolved-but-mismatched backend/kind pair
     // is a warn-level finding. Both are purely observational (see
     // `ExplainRunner`'s doc) — this never gates compile / dispatch.
+    let bound = resolve_bound_agents(&bp)
+        .ok()
+        .and_then(|all| all.into_iter().find(|b| b.agent.name == agent_def.name));
     let runner = match resolve_runner(&bp, agent_def) {
         Ok(resolved) => {
             let warning = resolved
@@ -736,12 +745,16 @@ async fn explain_agent(
                 resolved,
                 error: None,
                 warning,
+                source: bound.as_ref().map(|b| b.runner_source),
+                binding_digest: bound.as_ref().map(|b| b.binding_digest.clone()),
             }
         }
         Err(e) => ExplainRunner {
             resolved: None,
             error: Some(e.to_string()),
             warning: None,
+            source: None,
+            binding_digest: None,
         },
     };
 

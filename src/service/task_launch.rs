@@ -19,8 +19,10 @@
 //! one-Step flow, and we do not want two interfaces for the same
 //! shape.
 
-use crate::blueprint::compiler::{CompileError, Compiler};
-use crate::blueprint::{AuditDef, Blueprint, EngineDispatcher};
+use crate::blueprint::compiler::{materialize_bound_blueprint, CompileError, Compiler};
+use crate::blueprint::{
+    resolve_bound_agents, AuditDef, Blueprint, BoundAgent, EngineDispatcher, Runner,
+};
 use crate::core::agent_context::ContextPolicy;
 use crate::core::config::CheckPolicy;
 use crate::core::ctx::OperatorKind;
@@ -69,22 +71,87 @@ use thiserror::Error;
 /// (`OperatorDelegateMiddleware`) can resolve the binding via `ctx.agent`
 /// like every other agent-keyed table (`CompiledAgentTable.routes` idiom).
 /// Agents without a declared binding are simply absent (no silent default).
+#[cfg(test)]
 pub(crate) fn derive_worker_bindings(blueprint: &Blueprint) -> HashMap<String, WorkerBinding> {
-    blueprint
-        .agents
+    // Kept as a test-facing compatibility name. Production resolves once
+    // and calls `worker_bindings_from_bound_agents` with that snapshot.
+    let bound_agents = resolve_bound_agents(blueprint)
+        .expect("derive_worker_bindings requires a Blueprint with resolvable Runner refs");
+    worker_bindings_from_bound_agents(&bound_agents)
+}
+
+fn worker_bindings_from_bound_agents(
+    bound_agents: &[BoundAgent],
+) -> HashMap<String, WorkerBinding> {
+    bound_agents
         .iter()
-        .filter_map(|ad| {
-            let profile = ad.profile.as_ref()?;
-            let variant = profile.worker_binding.as_ref()?;
-            Some((
-                ad.name.clone(),
+        .filter_map(|bound| match &bound.runner {
+            Some(Runner::WsClaudeCode { variant, tools }) => Some((
+                bound.agent.name.clone(),
                 WorkerBinding {
                     variant: variant.clone(),
-                    tools: profile.tools.clone(),
+                    tools: tools.clone(),
                 },
-            ))
+            )),
+            _ => None,
         })
         .collect()
+}
+
+async fn load_or_resolve_bound_agents(
+    blueprint: &Blueprint,
+    run_ctx: Option<&RunContext>,
+) -> Result<Vec<BoundAgent>, TaskLaunchError> {
+    let Some(run_ctx) = run_ctx else {
+        return resolve_bound_agents(blueprint)
+            .map_err(CompileError::from)
+            .map_err(TaskLaunchError::from);
+    };
+
+    let record = run_ctx
+        .run_store
+        .get(&run_ctx.run_id)
+        .await
+        .map_err(|e| TaskLaunchError::PreDispatch(format!("load Run binding snapshot: {e}")))?;
+    if let Some(input_json) = record.input_json.as_deref() {
+        let snapshot: Value = serde_json::from_str(input_json).map_err(|e| {
+            TaskLaunchError::PreDispatch(format!("decode Run launch snapshot: {e}"))
+        })?;
+        if let Some(value) = snapshot.get("bound_agents") {
+            return serde_json::from_value(value.clone()).map_err(|e| {
+                TaskLaunchError::PreDispatch(format!("decode Run BoundAgent snapshot: {e}"))
+            });
+        }
+    }
+
+    let bound_agents = resolve_bound_agents(blueprint).map_err(CompileError::from)?;
+    if let Some(input_json) = record.input_json {
+        let mut snapshot: Value = serde_json::from_str(&input_json).map_err(|e| {
+            TaskLaunchError::PreDispatch(format!("decode Run launch snapshot: {e}"))
+        })?;
+        let object = snapshot.as_object_mut().ok_or_else(|| {
+            TaskLaunchError::PreDispatch("Run launch snapshot must be a JSON object".to_string())
+        })?;
+        object.insert(
+            "bound_agents".to_string(),
+            serde_json::to_value(&bound_agents).map_err(|e| {
+                TaskLaunchError::PreDispatch(format!("encode Run BoundAgent snapshot: {e}"))
+            })?,
+        );
+        run_ctx
+            .run_store
+            .set_input_json(
+                &run_ctx.run_id,
+                serde_json::to_string(&snapshot).map_err(|e| {
+                    TaskLaunchError::PreDispatch(format!("encode Run launch snapshot: {e}"))
+                })?,
+            )
+            .await
+            .map_err(|e| {
+                TaskLaunchError::PreDispatch(format!("persist Run BoundAgent snapshot: {e}"))
+            })?;
+    }
+    Ok(bound_agents)
 }
 
 /// GH #34 — extract the Blueprint-declared after-run audit hooks
@@ -532,7 +599,7 @@ impl TaskLaunchService {
     ///   propagate.
     pub async fn launch(
         &self,
-        input: TaskLaunchInput,
+        mut input: TaskLaunchInput,
     ) -> Result<TaskLaunchOutput, TaskLaunchError> {
         // After the stateless-executor refactor, the
         // caller (Service) does compile + link +
@@ -542,7 +609,19 @@ impl TaskLaunchService {
         // `LayerRegistry` resolution + `SpawnerStack` wrapping) is
         // concentrated inside `service::linker::link` — Service
         // scatter is intentionally prevented.
-        let compiled = self.compiler.compile(&input.blueprint)?;
+        let bound_agents =
+            load_or_resolve_bound_agents(&input.blueprint, input.run_ctx.as_ref()).await?;
+        let binding_digests: HashMap<String, crate::blueprint::BindingDigest> = bound_agents
+            .iter()
+            .map(|bound| (bound.agent.name.clone(), bound.binding_digest.clone()))
+            .collect();
+        if let Some(run_ctx) = input.run_ctx.take() {
+            input.run_ctx = Some(run_ctx.with_binding_digests(binding_digests.clone()));
+        }
+        input.blueprint = materialize_bound_blueprint(&input.blueprint, &bound_agents);
+        let compiled = self
+            .compiler
+            .compile_bound(&input.blueprint, &bound_agents)?;
         // GH #50 (Subtask 2 follow-up): merge this Blueprint's compiled
         // `AgentDef.verdict` contracts into the engine's runtime registry —
         // see `Engine::register_verdict_contracts`'s doc for the additive
@@ -600,7 +679,7 @@ impl TaskLaunchService {
         // Layer the Blueprint-baked worker bindings (same ctx.meta.runtime
         // inject shape as the alias layer above) so the delegate axis can
         // resolve per-agent variants — see `derive_worker_bindings`.
-        let worker_bindings = derive_worker_bindings(&input.blueprint);
+        let worker_bindings = worker_bindings_from_bound_agents(&bound_agents);
         let spawner = if worker_bindings.is_empty() {
             spawner
         } else {
@@ -723,6 +802,7 @@ impl TaskLaunchService {
         // Unconditional — an empty map (every pre-#21-Phase-2 Blueprint)
         // is a no-op, matching `EngineDispatcher::with_spawner`'s default.
         let dispatcher = dispatcher.with_step_metas(derive_step_metas(&input.blueprint));
+        let dispatcher = dispatcher.with_binding_digests(binding_digests);
         // GH #23: attach the `StepNaming` table `Compiler::compile` already
         // built once for this Blueprint (the sole construction site — see
         // `core::step_naming::StepNaming::from_blueprint`'s doc).
@@ -1630,7 +1710,7 @@ mod tests {
                 degradations: Vec::new(),
                 operator_sid: None,
                 result_ref: None,
-                input_json: None,
+                input_json: Some("{}".to_string()),
                 created_at: 0,
                 updated_at: 0,
             })
@@ -1652,8 +1732,60 @@ mod tests {
         );
         assert_eq!(run.step_entries[0].step_ref, Some("upper".to_string()));
         assert_eq!(run.step_entries[0].status, Some("passed".to_string()));
+        assert!(run.step_entries[0].binding_digest.is_some());
         assert_eq!(run.step_entries[1].step_ref, Some("suffix".to_string()));
         assert_eq!(run.step_entries[1].status, Some("passed".to_string()));
+        assert!(run.step_entries[1].binding_digest.is_some());
+        let snapshot: Value = serde_json::from_str(run.input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot["bound_agents"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_snapshot_reuses_bound_agent_after_blueprint_mutation() {
+        use crate::store::run::{InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore};
+        use crate::types::{RunId, TaskId};
+
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = RunId::new();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: Some("{}".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .unwrap();
+        let run_ctx = RunContext::new(run_id, run_store);
+        let mut original_agent = agent("worker", "worker");
+        original_agent.profile = Some(crate::blueprint::AgentProfile {
+            system_prompt: "original role".to_string(),
+            ..Default::default()
+        });
+        let mut blueprint = bp(
+            step("worker", path("$.input"), path("$.out")),
+            vec![original_agent],
+        );
+
+        let original = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx))
+            .await
+            .unwrap();
+        blueprint.agents[0].profile.as_mut().unwrap().system_prompt = "mutated role".to_string();
+        let restored = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx))
+            .await
+            .unwrap();
+
+        assert_eq!(restored[0].binding_digest, original[0].binding_digest);
+        assert_eq!(
+            restored[0].agent.profile.as_ref().unwrap().system_prompt,
+            "original role"
+        );
     }
 
     #[tokio::test]

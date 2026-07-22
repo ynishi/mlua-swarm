@@ -27,7 +27,10 @@
 //! implementations. Layer wrapping is not part of this module — it lives
 //! in `service::linker::link`.
 
-use crate::blueprint::{AgentDef, AgentKind, Blueprint, BlueprintMetadata};
+use crate::blueprint::{
+    resolve_bound_agents, AgentDef, AgentKind, AgentProfile, Blueprint, BlueprintMetadata,
+    BoundAgent, BoundAgentResolveError, Runner,
+};
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
 use crate::core::projection_placement::{ProjectionPlacement, ProjectionPlacementError};
@@ -51,6 +54,9 @@ use thiserror::Error;
 /// `Blueprint` into a `CompiledBlueprint`.
 #[derive(Debug, Error)]
 pub enum CompileError {
+    /// Runner / Agent / Context binding failed before any spawner was built.
+    #[error("bound agent resolution: {0}")]
+    BoundAgent(#[from] BoundAgentResolveError),
     /// An `AgentDef.kind` has no matching entry in the `SpawnerRegistry`
     /// and `Blueprint.strategy.strict_kind` is set.
     #[error("unknown agent kind in SpawnerRegistry: {0:?}")]
@@ -325,6 +331,43 @@ pub struct CompiledBlueprint {
     pub projection_placement: Arc<ProjectionPlacement>,
 }
 
+fn project_bound_agent_for_legacy_factories(bound: &BoundAgent) -> AgentDef {
+    let mut agent = bound.agent.clone();
+    match &bound.runner {
+        Some(Runner::WsClaudeCode { variant, tools }) => {
+            let profile = agent.profile.get_or_insert_with(AgentProfile::default);
+            profile.worker_binding = Some(variant.clone());
+            profile.tools = tools.clone();
+        }
+        Some(Runner::AgentBlockInProcess { tools }) => {
+            let profile = agent.profile.get_or_insert_with(AgentProfile::default);
+            profile.worker_binding = None;
+            profile.tools = tools.clone();
+        }
+        None => {}
+    }
+    let meta = agent.meta.get_or_insert_with(Default::default);
+    meta.context_policy = bound.context_policy.clone();
+    agent
+}
+
+/// Rebuild a Blueprint's Agent/Context layers from an immutable binding
+/// snapshot while leaving its flow and non-binding metadata untouched.
+pub(crate) fn materialize_bound_blueprint(
+    bp: &Blueprint,
+    bound_agents: &[BoundAgent],
+) -> Blueprint {
+    let mut effective = bp.clone();
+    effective.agents = bound_agents
+        .iter()
+        .map(project_bound_agent_for_legacy_factories)
+        .collect();
+    // Each effective policy is now pinned on its AgentDef; retaining a
+    // mutable BP-global default would reintroduce registry drift on resume.
+    effective.default_context_policy = None;
+    effective
+}
+
 impl Compiler {
     /// Build a `Compiler` around the given `SpawnerRegistry`, with no
     /// default spawner (unresolved flow refs are an error unless
@@ -349,6 +392,24 @@ impl Compiler {
     /// and return the routing table alongside the untouched flow and
     /// metadata.
     pub fn compile(&self, bp: &Blueprint) -> Result<CompiledBlueprint, CompileError> {
+        let bound_agents = resolve_bound_agents(bp)?;
+        self.compile_bound(bp, &bound_agents)
+    }
+
+    /// Compile with an already-resolved immutable binding snapshot. Resume
+    /// paths use this entry point so a mutable Blueprint registry cannot
+    /// silently change the Runner, prompt, contract, or static context policy
+    /// between the original Run and its continuation.
+    pub fn compile_bound(
+        &self,
+        bp: &Blueprint,
+        bound_agents: &[BoundAgent],
+    ) -> Result<CompiledBlueprint, CompileError> {
+        let effective = materialize_bound_blueprint(bp, bound_agents);
+        self.compile_resolved(&effective)
+    }
+
+    fn compile_resolved(&self, bp: &Blueprint) -> Result<CompiledBlueprint, CompileError> {
         let mut routes: HashMap<String, Arc<dyn SpawnerAdapter>> = HashMap::new();
         let mut seen: HashMap<String, ()> = HashMap::new();
         // GH #50: `AgentDef.name` → declared `VerdictContract`, collected

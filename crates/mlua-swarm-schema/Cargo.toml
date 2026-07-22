@@ -23,3 +23,5 @@ semver.workspace = true
 schemars.workspace = true
 mlua-flow-ir.workspace = true
 thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true

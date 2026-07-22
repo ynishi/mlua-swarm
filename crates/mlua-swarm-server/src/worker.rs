@@ -1158,6 +1158,7 @@ mod tests {
             step_id: step_id.clone(),
             step_ref: Some(step_ref.to_string()),
             status: Some("passed".to_string()),
+            binding_digest: None,
             at: 0,
         }
     }

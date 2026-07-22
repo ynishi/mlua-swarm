@@ -135,6 +135,17 @@ impl RunStore for InMemoryRunStore {
         Ok(())
     }
 
+    async fn set_input_json(&self, id: &RunId, input_json: String) -> Result<(), RunStoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner
+            .records
+            .get_mut(id)
+            .ok_or_else(|| RunStoreError::NotFound(id.clone()))?;
+        record.input_json = Some(input_json);
+        record.updated_at = crate::types::now_unix();
+        Ok(())
+    }
+
     async fn list_running(&self) -> Result<Vec<RunRecord>, RunStoreError> {
         let inner = self.inner.lock().unwrap();
         let records: Vec<RunRecord> = inner
@@ -232,6 +243,7 @@ mod tests {
                 step_id: crate::types::StepId::parse("ST-1").unwrap(),
                 step_ref: Some("step-a".into()),
                 status: Some("dispatched".into()),
+                binding_digest: None,
                 at: 101,
             },
         )
@@ -243,6 +255,7 @@ mod tests {
                 step_id: crate::types::StepId::parse("ST-2").unwrap(),
                 step_ref: Some("step-b".into()),
                 status: Some("passed".into()),
+                binding_digest: None,
                 at: 102,
             },
         )
@@ -315,6 +328,7 @@ mod tests {
                     step_id: crate::types::StepId::parse("ST-1").unwrap(),
                     step_ref: None,
                     status: None,
+                    binding_digest: None,
                     at: 1,
                 },
             )

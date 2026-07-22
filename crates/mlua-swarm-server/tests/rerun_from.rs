@@ -535,6 +535,7 @@ async fn rerun_from_after_consumed_log_returns_helpful_422() {
                     step_id: StepId::new(),
                     step_ref: Some(name.into()),
                     status: Some("passed".into()),
+                    binding_digest: None,
                     at: 0,
                 },
             )

@@ -17,6 +17,7 @@
 //!   relationally.
 //! - Other persistent backends (Git / mini-app / …) are future carries.
 
+use crate::blueprint::BindingDigest;
 use crate::store::replay::{ReplayCursor, ReplayStore};
 use crate::types::{RunId, StepId, TaskId};
 use async_trait::async_trait;
@@ -98,6 +99,10 @@ pub struct StepEntry {
     /// Free-form status label for this step at the time the entry was
     /// recorded (e.g. `"dispatched"`, `"passed"`, `"blocked"`).
     pub status: Option<String>,
+    /// Immutable Runner/Agent/Context snapshot digest used for this step.
+    /// `None` for rows created before BoundAgent launch wiring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_digest: Option<BindingDigest>,
     /// Unix epoch seconds — when this entry was recorded.
     pub at: u64,
 }
@@ -194,6 +199,8 @@ pub struct RunContext {
     /// Adapter spawn — this is the replay-hit path. `None` (the default)
     /// disables replay entirely.
     pub replay_cursor: Option<Arc<Mutex<ReplayCursor>>>,
+    /// Run-pinned replay identity component, keyed by logical agent name.
+    pub binding_digests: Arc<HashMap<String, BindingDigest>>,
 }
 
 impl RunContext {
@@ -207,6 +214,7 @@ impl RunContext {
             run_store,
             replay_store: None,
             replay_cursor: None,
+            binding_digests: Arc::new(HashMap::new()),
         }
     }
 
@@ -221,6 +229,13 @@ impl RunContext {
     /// consults for a hit before dispatching each step.
     pub fn with_replay_cursor(mut self, cursor: Arc<Mutex<ReplayCursor>>) -> Self {
         self.replay_cursor = Some(cursor);
+        self
+    }
+
+    /// Attach immutable binding digests so replay keys distinguish the same
+    /// step/input executed under different Runner/Agent/Context snapshots.
+    pub fn with_binding_digests(mut self, digests: HashMap<String, BindingDigest>) -> Self {
+        self.binding_digests = Arc::new(digests);
         self
     }
 }
@@ -240,6 +255,7 @@ impl std::fmt::Debug for RunContext {
                 &self.replay_store.as_ref().map(|s| s.name()),
             )
             .field("replay_cursor", &self.replay_cursor.is_some())
+            .field("binding_digests", &self.binding_digests.len())
             .finish()
     }
 }
@@ -306,6 +322,10 @@ pub trait RunStore: Send + Sync {
         id: &RunId,
         result_ref: serde_json::Value,
     ) -> Result<(), RunStoreError>;
+
+    /// Replace the opaque launch snapshot after pre-dispatch binding has
+    /// enriched it (for example with immutable `bound_agents`).
+    async fn set_input_json(&self, id: &RunId, input_json: String) -> Result<(), RunStoreError>;
 
     /// List every Run currently `Running` (issue #35 ST2 boot sweep +
     /// ST4 occupancy check reuse this). No ordering guarantee.

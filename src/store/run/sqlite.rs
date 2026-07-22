@@ -495,6 +495,27 @@ impl RunStore for SqliteRunStore {
         }
     }
 
+    async fn set_input_json(&self, id: &RunId, input_json: String) -> Result<(), RunStoreError> {
+        let id_str = id.to_string();
+        let id_for_notfound = id.clone();
+        let updated_at = crate::types::now_unix() as i64;
+        let n = self
+            .isle
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE runs SET input_json = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![input_json, updated_at, id_str],
+                )
+            })
+            .await
+            .map_err(map_isle_err)?;
+        if n == 0 {
+            Err(RunStoreError::NotFound(id_for_notfound))
+        } else {
+            Ok(())
+        }
+    }
+
     async fn list_running(&self) -> Result<Vec<RunRecord>, RunStoreError> {
         let status_json = serde_json::to_string(&RunStatus::Running)
             .map_err(|e| RunStoreError::Other(format!("encode status: {e}")))?;
@@ -624,6 +645,7 @@ mod tests {
                 step_id: crate::types::StepId::parse("ST-1").unwrap(),
                 step_ref: Some("step-a".into()),
                 status: Some("dispatched".into()),
+                binding_digest: None,
                 at: 101,
             },
         )
@@ -635,6 +657,7 @@ mod tests {
                 step_id: crate::types::StepId::parse("ST-2").unwrap(),
                 step_ref: Some("step-b".into()),
                 status: Some("passed".into()),
+                binding_digest: None,
                 at: 102,
             },
         )
@@ -658,6 +681,7 @@ mod tests {
                     step_id: crate::types::StepId::parse("ST-1").unwrap(),
                     step_ref: None,
                     status: None,
+                    binding_digest: None,
                     at: 1,
                 },
             )
@@ -763,6 +787,7 @@ mod tests {
                     step_id: crate::types::StepId::parse("ST-1").unwrap(),
                     step_ref: Some("step-a".into()),
                     status: Some("dispatched".into()),
+                    binding_digest: None,
                     at: 43,
                 },
             )

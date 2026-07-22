@@ -1650,7 +1650,13 @@ impl Engine {
         //    once per dispatch, so a loop that re-visits the same step
         //    with the same input gets 0, 1, 2, … distinct rows).
         let step_ref = agent.clone();
-        let input_hash = hash_input_value(&initial_directive);
+        let input_hash = match run_ctx.and_then(|rc| rc.binding_digests.get(&step_ref)) {
+            Some(binding_digest) => hash_input_value(&serde_json::json!({
+                "input": initial_directive,
+                "binding_digest": binding_digest,
+            })),
+            None => hash_input_value(&initial_directive),
+        };
         let (replay_hit_value, occurrence) = if let Some(rc) = run_ctx {
             if let Some(cursor) = &rc.replay_cursor {
                 let mut guard = cursor.lock().expect("replay cursor mutex poisoned");

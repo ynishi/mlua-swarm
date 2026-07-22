@@ -1784,11 +1784,13 @@ dependencies = [
 name = "mlua-swarm-schema"
 version = "0.14.1"
 dependencies = [
+ "hex",
  "mlua-flow-ir",
  "schemars",
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
 ]
 

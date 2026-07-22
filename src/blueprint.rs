@@ -50,10 +50,12 @@ use std::sync::Arc;
 /// `mlua_swarm_schema` directly.
 pub use mlua_swarm_schema::OperatorKind as SchemaOperatorKind;
 pub use mlua_swarm_schema::{
-    current_schema_version, default_global_agent_kind, resolve_runner, AgentDef, AgentKind,
-    AgentMeta, AgentProfile, AuditDef, AuditMode, Blueprint, BlueprintMetadata, BlueprintOrigin,
-    CompilerHints, CompilerStrategy, MetaDef, OperatorDef, ProjectionPlacementSpec, Runner,
-    RunnerDef, RunnerResolveError, SpawnerHints, WorkerModel, CURRENT_SCHEMA_VERSION,
+    current_schema_version, default_global_agent_kind, resolve_bound_agents,
+    resolve_bound_agents_strict, resolve_runner, AgentDef, AgentKind, AgentMeta, AgentProfile,
+    AuditDef, AuditMode, BindingDigest, BindingDigestParseError, Blueprint, BlueprintMetadata,
+    BlueprintOrigin, BoundAgent, BoundAgentResolveError, CompilerHints, CompilerStrategy, MetaDef,
+    OperatorDef, ProjectionPlacementSpec, Runner, RunnerDef, RunnerResolutionSource,
+    RunnerResolveError, SpawnerHints, WorkerModel, CURRENT_SCHEMA_VERSION,
 };
 
 /// Bridges `mlua_flow_ir::AsyncDispatcher` to the engine's
@@ -104,6 +106,7 @@ pub struct EngineDispatcher {
     step_metas: HashMap<String, Value>,
     step_naming: Option<Arc<StepNaming>>,
     projection_placement: Option<Arc<ProjectionPlacement>>,
+    binding_digests: HashMap<String, BindingDigest>,
     /// The resolved `check_policy` cascade value
     /// (`launch request > blueprint > server config`, collapsed exactly once
     /// in `TaskLaunchService::launch`). Threaded into EVERY spawned step's
@@ -133,6 +136,7 @@ impl EngineDispatcher {
             step_metas: HashMap::new(),
             step_naming: None,
             projection_placement: None,
+            binding_digests: HashMap::new(),
             check_policy: None,
         }
     }
@@ -153,6 +157,13 @@ impl EngineDispatcher {
     /// loudly, same as a Blueprint that never declares `Blueprint.metas`.
     pub fn with_step_metas(mut self, step_metas: HashMap<String, Value>) -> Self {
         self.step_metas = step_metas;
+        self
+    }
+
+    /// Attach the immutable `AgentDef.name -> BoundAgent.binding_digest`
+    /// table used to correlate persisted step traces with launch bindings.
+    pub fn with_binding_digests(mut self, binding_digests: HashMap<String, BindingDigest>) -> Self {
+        self.binding_digests = binding_digests;
         self
     }
 
@@ -458,6 +469,7 @@ impl AsyncDispatcher for EngineDispatcher {
                 step_id: tid.clone(),
                 step_ref: Some(ref_.to_string()),
                 status: Some(status.to_string()),
+                binding_digest: self.binding_digests.get(ref_).cloned(),
                 at: now_unix(),
             };
             if let Err(e) = rc.run_store.append_step_entry(&rc.run_id, entry).await {

@@ -550,9 +550,18 @@ already follows (agent-level declarations always beat BP-global ones).
 }
 ```
 
-This Milestone (M2) only adds the schema, registry, and resolver — wiring
-the resolved Runner into the launch path is a later Milestone; today's
-launch path still reads `profile.worker_binding` directly.
+At Run start MSE resolves this cascade once into an immutable `BoundAgent`
+snapshot. The snapshot pins the full Agent definition (including role prompt
+and verdict contract), the resolved Runner, and the effective static context
+policy. Its `binding_digest` is persisted with the Run launch snapshot and
+copied onto each step trace; replay keys include the digest, so identical
+step input under a different binding is not treated as the same execution.
+
+The legacy `profile.worker_binding` tier is projected only at the Claude Code
+compatibility boundary. New Blueprints should use `runner` or `runner_ref`.
+The Runner's `tools` remain requested/declarative for `ws_claude_code` until
+the platform adapter attests the wrapper's effective grant; MSE does not
+misreport declaration data as an enforced capability.
 
 ## Versioning
 
