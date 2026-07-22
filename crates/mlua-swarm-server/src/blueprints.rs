@@ -577,8 +577,8 @@ struct ExplainRunner {
     error: Option<String>,
     /// Warn-level finding: `Some(msg)` when the resolved Runner's backend
     /// disagrees with `AgentDef.kind` (`agent_block_in_process` paired
-    /// with a non-`agent_block` kind, or `ws_claude_code` paired with
-    /// `agent_block`). `None` when the pairing is consistent, or when
+    /// with a non-`agent_block` kind, or a WebSocket Operator backend paired
+    /// with `agent_block`). `None` when the pairing is consistent, or when
     /// [`Self::resolved`] is `None`.
     warning: Option<String>,
     /// Declaration tier selected by the immutable binding resolver.
@@ -602,6 +602,10 @@ fn runner_kind_mismatch_warning(
             "agent '{agent_name}' resolves to Runner::AgentBlockInProcess but AgentDef.kind = \
              {other:?} (expected AgentBlock)"
         )),
+        (Runner::WsOperator { .. }, AgentKind::AgentBlock) => Some(format!(
+            "agent '{agent_name}' resolves to Runner::WsOperator but AgentDef.kind = AgentBlock"
+        )),
+        (Runner::WsOperator { .. }, _) => None,
         (Runner::WsClaudeCode { .. }, AgentKind::AgentBlock) => Some(format!(
             "agent '{agent_name}' resolves to Runner::WsClaudeCode but AgentDef.kind = AgentBlock"
         )),

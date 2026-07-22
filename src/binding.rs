@@ -6,7 +6,8 @@
 //! official platform adapter is one implementation of this same interface.
 
 use crate::blueprint::{
-    BindReceipt, BindRequest, BindingAttestation, BindingBackend, BoundAgent, Runner,
+    AgentProviderManifest, BindReceipt, BindRequest, BindingAttestation, BindingBackend,
+    BoundAgent, Runner,
 };
 use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -21,6 +22,78 @@ pub trait AgentBindingProvider: Send + Sync {
         &self,
         requests: &[BindRequest],
     ) -> Result<Vec<BindReceipt>, BindingProviderError>;
+}
+
+/// Reference provider backed by an execution-environment capability manifest.
+///
+/// Claude Code, Codex, and other official plugins can inspect their own
+/// platform state, construct [`AgentProviderManifest`], and delegate the common
+/// request-to-receipt mapping here. Core still validates every returned receipt
+/// through [`attest_bound_agents`].
+#[derive(Debug, Clone)]
+pub struct ManifestBindingProvider {
+    manifest: AgentProviderManifest,
+}
+
+impl ManifestBindingProvider {
+    /// Wrap one provider-owned capability manifest.
+    pub fn new(manifest: AgentProviderManifest) -> Self {
+        Self { manifest }
+    }
+
+    /// Borrow the provider-owned manifest used for resolution.
+    pub fn manifest(&self) -> &AgentProviderManifest {
+        &self.manifest
+    }
+
+    fn receipt_for(&self, request: &BindRequest) -> Result<BindReceipt, BindingProviderError> {
+        if request.backend == BindingBackend::AgentBlockInProcess {
+            return Err(BindingProviderError::Provider(format!(
+                "manifest provider '{}' cannot bind in-process agent '{}'",
+                self.manifest.provider_id, request.agent
+            )));
+        }
+        let mut matches = self
+            .manifest
+            .capabilities
+            .iter()
+            .filter(|capability| capability.launch_variant == request.launch_variant);
+        let capability = matches.next().ok_or_else(|| {
+            BindingProviderError::Provider(format!(
+                "manifest provider '{}' has no capability for launch variant {:?} requested by agent '{}'",
+                self.manifest.provider_id, request.launch_variant, request.agent
+            ))
+        })?;
+        if matches.next().is_some() {
+            return Err(BindingProviderError::Provider(format!(
+                "manifest provider '{}' declares duplicate capabilities for launch variant {:?}",
+                self.manifest.provider_id, request.launch_variant
+            )));
+        }
+        Ok(BindReceipt {
+            agent: request.agent.clone(),
+            request_digest: request.request_digest.clone(),
+            provider_id: self.manifest.provider_id.clone(),
+            provider_revision: self.manifest.provider_revision.clone(),
+            resolved_model: capability.resolved_model.clone(),
+            effective_tools: capability.effective_tools.clone(),
+            launch_variant: capability.launch_variant.clone(),
+            evidence_digest: capability.evidence_digest.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl AgentBindingProvider for ManifestBindingProvider {
+    async fn bind(
+        &self,
+        requests: &[BindRequest],
+    ) -> Result<Vec<BindReceipt>, BindingProviderError> {
+        requests
+            .iter()
+            .map(|request| self.receipt_for(request))
+            .collect()
+    }
 }
 
 /// Failure reported by a provider or by Core's receipt validation.
@@ -120,6 +193,11 @@ pub fn binding_requests(bound_agents: &[BoundAgent]) -> Vec<BindRequest> {
 pub fn binding_request_for_snapshot(bound: &BoundAgent) -> Option<BindRequest> {
     let runner = bound.runner.as_ref()?;
     let (backend, requested_tools, launch_variant) = match runner {
+        Runner::WsOperator { variant, tools } => (
+            BindingBackend::WsOperator,
+            canonical_tools(tools),
+            Some(variant.clone()),
+        ),
         Runner::WsClaudeCode { variant, tools } => (
             BindingBackend::WsClaudeCode,
             canonical_tools(tools),

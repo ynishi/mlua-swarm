@@ -509,12 +509,14 @@ JSON tree (e.g. externalizing a large prompt out of a `Step.in` literal).
 
 A `Runner` declares the execution shell an agent's Worker IMPL dispatches
 into — tool grant, model selection, and runtime capabilities for the
-backend it targets. Two variants exist today: `ws_claude_code` (Claude
-Code subagent wrapper; `variant` = the wrapper's `subagent_type`, `tools`
-mirrors the wrapper frontmatter) and `agent_block_in_process`
+backend it targets. Three variants exist today: `ws_operator` (the
+platform-neutral standard for a Claude Code, Codex, or other joined MainAI;
+`variant` is provider-defined and `tools` is the minimum requested grant),
+`ws_claude_code` (the compatibility backend for existing Claude Code wrapper
+Blueprints), and `agent_block_in_process`
 (agent-block in-process runtime; `tools` is the effective, enforced tool
 set). `AgentDef.kind = agent_block` pairs with an `agent_block_in_process`
-Runner; every other `AgentDef.kind` pairs with `ws_claude_code`.
+Runner; every other `AgentDef.kind` normally pairs with `ws_operator`.
 
 Runners are declared through a named, BP-level registry
 (`Blueprint.runners: [{ "name": ..., "runner": {...} }]`) — the same
@@ -539,13 +541,13 @@ already follows (agent-level declarations always beat BP-global ones).
 ```jsonc
 {
   "runners": [
-    { "name": "claude-worker", "runner": {
-        "backend": "ws_claude_code", "variant": "mse-worker-coder", "tools": ["Read", "Edit"]
+    { "name": "review-worker", "runner": {
+        "backend": "ws_operator", "variant": "mse-worker-reviewer", "tools": ["Read", "Grep"]
     } }
   ],
-  "default_runner": "claude-worker",
+  "default_runner": "review-worker",
   "agents": [
-    { "name": "coder", "kind": "operator", "spec": { "operator_ref": "role-a" }, "runner_ref": "claude-worker" }
+    { "name": "reviewer", "kind": "operator", "spec": { "operator_ref": "main-ai" }, "runner_ref": "review-worker" }
   ]
 }
 ```
@@ -559,11 +561,14 @@ step input under a different binding is not treated as the same execution.
 
 The legacy `profile.worker_binding` tier is projected only at the Claude Code
 compatibility boundary. New Blueprints should use `runner` or `runner_ref`.
-The Runner's `tools` remain requested/declarative for `ws_claude_code` until
+The Runner's `tools` remain requested/declarative for `ws_operator` and
+`ws_claude_code` until
 an injected `AgentBindingProvider` attests the execution environment's
 effective grant. The generic path is for the Operator/MainAI to implement
-that interface; platform-specific official plugins may implement the same
-interface when a host needs a stabilizing adapter. The standard Server maps
+that interface. `ManifestBindingProvider` is the reusable reference
+implementation: Claude Code and Codex plugins inspect only their own
+environment, produce `AgentProviderManifest`, and delegate the common
+request-to-receipt mapping to it. The standard Server maps
 `AgentDef.spec.operator_ref` to the role claimed by `mse_operator_join` and
 resolves the submitted `capability_manifest`; it never reads wrapper files
 from the Server filesystem. Core validates one receipt

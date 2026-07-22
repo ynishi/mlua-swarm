@@ -7,7 +7,8 @@
 use crate::operator_ws::login::OperatorSessionEntry;
 use async_trait::async_trait;
 use mlua_swarm::{
-    AgentBindingProvider, BindReceipt, BindRequest, BindingBackend, BindingProviderError, SessionId,
+    AgentBindingProvider, BindReceipt, BindRequest, BindingBackend, BindingProviderError,
+    ManifestBindingProvider, SessionId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,8 +39,8 @@ impl OperatorSessionBindingProvider {
     ) -> Result<BindReceipt, BindingProviderError> {
         let target = request.binding_target.as_deref().ok_or_else(|| {
             BindingProviderError::Provider(format!(
-                "agent '{}' uses ws_claude_code but declares no logical binding target",
-                request.agent
+                "agent '{}' uses {:?} but declares no logical binding target",
+                request.agent, request.backend
             ))
         })?;
         let sid = self
@@ -70,37 +71,16 @@ impl OperatorSessionBindingProvider {
                 "Operator session '{sid}' for binding target '{target}' supplied no capability_manifest"
             ))
         })?;
-        let matches: Vec<_> = manifest
-            .capabilities
-            .iter()
-            .filter(|capability| capability.launch_variant == request.launch_variant)
-            .collect();
-        let capability = match matches.as_slice() {
-            [capability] => *capability,
-            [] => {
-                return Err(BindingProviderError::Provider(format!(
-                    "Operator provider '{}' has no capability for launch variant {:?} requested by agent '{}'",
-                    manifest.provider_id, request.launch_variant, request.agent
-                )))
-            }
-            _ => {
-                return Err(BindingProviderError::Provider(format!(
-                    "Operator provider '{}' declares duplicate capabilities for launch variant {:?}",
-                    manifest.provider_id, request.launch_variant
-                )))
-            }
-        };
-
-        Ok(BindReceipt {
-            agent: request.agent.clone(),
-            request_digest: request.request_digest.clone(),
-            provider_id: manifest.provider_id.clone(),
-            provider_revision: manifest.provider_revision.clone(),
-            resolved_model: capability.resolved_model.clone(),
-            effective_tools: capability.effective_tools.clone(),
-            launch_variant: capability.launch_variant.clone(),
-            evidence_digest: capability.evidence_digest.clone(),
-        })
+        ManifestBindingProvider::new(manifest.clone())
+            .bind(std::slice::from_ref(request))
+            .await?
+            .pop()
+            .ok_or_else(|| {
+                BindingProviderError::Provider(format!(
+                    "Operator provider '{}' returned no receipt for agent '{}'",
+                    manifest.provider_id, request.agent
+                ))
+            })
     }
 }
 
@@ -113,7 +93,9 @@ impl AgentBindingProvider for OperatorSessionBindingProvider {
         let mut receipts = Vec::with_capacity(requests.len());
         for request in requests {
             let receipt = match request.backend {
-                BindingBackend::WsClaudeCode => self.bind_operator(request).await?,
+                BindingBackend::WsOperator | BindingBackend::WsClaudeCode => {
+                    self.bind_operator(request).await?
+                }
                 BindingBackend::AgentBlockInProcess => BindReceipt {
                     agent: request.agent.clone(),
                     request_digest: request.request_digest.clone(),
@@ -140,7 +122,7 @@ mod tests {
         BindRequest {
             agent: "coder".to_string(),
             request_digest: BindingDigest::sha256("request"),
-            backend: BindingBackend::WsClaudeCode,
+            backend: BindingBackend::WsOperator,
             binding_target: Some("main-ai".to_string()),
             requested_model: Some("sonnet".to_string()),
             requested_tools: vec!["Read".to_string()],

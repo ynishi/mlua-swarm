@@ -87,7 +87,8 @@ fn worker_bindings_from_bound_agents(
     bound_agents
         .iter()
         .filter_map(|bound| match &bound.runner {
-            Some(Runner::WsClaudeCode { variant, tools }) => Some((
+            Some(Runner::WsOperator { variant, tools })
+            | Some(Runner::WsClaudeCode { variant, tools }) => Some((
                 bound.agent.name.clone(),
                 WorkerBinding {
                     variant: variant.clone(),
@@ -2398,5 +2399,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ws_operator_runner_projects_into_the_existing_spawn_binding() {
+        let mut blueprint = bp(
+            step("reviewer", path("$.in"), path("$.out")),
+            vec![agent("reviewer", "echo")],
+        );
+        blueprint.agents[0].runner = Some(Runner::WsOperator {
+            variant: "mse-reviewer".to_string(),
+            tools: vec!["Read".to_string(), "Grep".to_string()],
+        });
+
+        let derived = derive_worker_bindings(&blueprint);
+        let binding = derived
+            .get("reviewer")
+            .expect("ws_operator must feed the canonical spawn binding path");
+        assert_eq!(binding.variant, "mse-reviewer");
+        assert_eq!(binding.tools, ["Read", "Grep"]);
     }
 }

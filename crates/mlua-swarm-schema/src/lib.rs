@@ -879,9 +879,22 @@ pub enum VerdictChannel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Runner {
+    /// Platform-neutral WebSocket Operator backend. The joined execution
+    /// environment may be Claude Code, Codex, or another MainAI/plugin that
+    /// implements the common binding and spawn contracts.
+    WsOperator {
+        /// Provider-defined launch variant selected by the execution environment.
+        variant: String,
+        /// Minimum tool grant the provider must enforce.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
+    },
     /// WS backend: Claude Code subagent wrapper. `variant` is the
     /// wrapper's subagent_type; `tools` mirrors the wrapper frontmatter =
     /// enforced grant.
+    ///
+    /// Kept as a compatibility backend for existing Blueprints. New
+    /// platform-neutral declarations should use [`Self::WsOperator`].
     WsClaudeCode {
         /// The wrapper's `subagent_type` (= `WorkerBinding.variant` in the
         /// `mlua-swarm` core crate).
@@ -896,8 +909,8 @@ pub enum Runner {
     /// (enforced) tool set for the in-process registry.
     AgentBlockInProcess {
         /// Effective (enforced) tool set passed to the agent-block
-        /// runtime's registry — unlike `WsClaudeCode::tools`, this list is
-        /// not merely informational.
+        /// runtime's registry — unlike WebSocket Runner tool requests, this
+        /// list is not merely informational.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tools: Vec<String>,
     },
@@ -1159,6 +1172,8 @@ pub struct BindRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BindingBackend {
+    /// Platform-neutral Operator/MainAI WebSocket execution.
+    WsOperator,
     /// Claude Code wrapper dispatched through an Operator WebSocket.
     WsClaudeCode,
     /// AgentBlock registry enforced in the Server process.
@@ -2554,6 +2569,20 @@ mod tests {
         let json = serde_json::to_value(&runner).expect("serializes");
         assert_eq!(json["backend"], "ws_claude_code");
         assert_eq!(json["variant"], "mse-worker-coder");
+        assert_eq!(json["tools"], serde_json::json!(["Read", "Grep"]));
+        let back: Runner = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, runner);
+    }
+
+    #[test]
+    fn runner_ws_operator_roundtrips_through_json_and_tags_backend() {
+        let runner = Runner::WsOperator {
+            variant: "mse-worker-reviewer".to_string(),
+            tools: vec!["Read".to_string(), "Grep".to_string()],
+        };
+        let json = serde_json::to_value(&runner).expect("serializes");
+        assert_eq!(json["backend"], "ws_operator");
+        assert_eq!(json["variant"], "mse-worker-reviewer");
         assert_eq!(json["tools"], serde_json::json!(["Read", "Grep"]));
         let back: Runner = serde_json::from_value(json).expect("deserializes");
         assert_eq!(back, runner);

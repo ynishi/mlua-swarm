@@ -334,7 +334,8 @@ pub struct CompiledBlueprint {
 fn project_bound_agent_for_legacy_factories(bound: &BoundAgent) -> AgentDef {
     let mut agent = bound.agent.clone();
     match &bound.runner {
-        Some(Runner::WsClaudeCode { variant, tools }) => {
+        Some(Runner::WsOperator { variant, tools })
+        | Some(Runner::WsClaudeCode { variant, tools }) => {
             let profile = agent.profile.get_or_insert_with(AgentProfile::default);
             profile.worker_binding = Some(variant.clone());
             profile.tools = tools.clone();

@@ -683,6 +683,15 @@ missing variant, insufficient tool grant, or stale receipt fails before
 Spawn. The accepted attestation is persisted in the Run's `BoundAgent`
 snapshot, so resume never re-resolves mutable capabilities.
 
+New cross-platform Blueprints use `runner.backend = "ws_operator"` rather
+than naming either host. `ManifestBindingProvider` is the reference
+implementation of the same `AgentBindingProvider` IF used by the Server:
+a Claude Code plugin may derive its manifest from wrapper frontmatter, while
+a Codex plugin may derive it from the active model/tool sandbox. Both return
+the same `BindReceipt` shape and pass through the same Core validation. The
+logical Agent, role prompt, verdict/result contract, and BindRequest therefore
+stay identical; only provider provenance and effective platform values differ.
+
 ### Running multiple MainAI sessions in parallel
 
 The exclusivity above is the only structural constraint — split the role

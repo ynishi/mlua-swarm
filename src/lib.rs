@@ -115,7 +115,7 @@ pub use application::{
 };
 pub use binding::{
     attest_bound_agents, binding_request_for_snapshot, binding_requests, AgentBindingProvider,
-    BindingProviderError,
+    BindingProviderError, ManifestBindingProvider,
 };
 pub use blueprint::compiler::{
     CompileError, CompiledAgentTable, CompiledBlueprint, Compiler, HostBridge,
