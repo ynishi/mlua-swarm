@@ -560,8 +560,16 @@ step input under a different binding is not treated as the same execution.
 The legacy `profile.worker_binding` tier is projected only at the Claude Code
 compatibility boundary. New Blueprints should use `runner` or `runner_ref`.
 The Runner's `tools` remain requested/declarative for `ws_claude_code` until
-the platform adapter attests the wrapper's effective grant; MSE does not
-misreport declaration data as an enforced capability.
+an injected `AgentBindingProvider` attests the execution environment's
+effective grant. The generic path is for the Operator/MainAI to implement
+that interface; platform-specific official plugins may implement the same
+interface when a host needs a stabilizing adapter. Core validates one receipt
+per requested agent, requires every requested tool and the exact launch
+variant, then pins the accepted model, tools, provider revision, and optional
+evidence digest as `BindingAttestation`. That attestation is included in the
+final `binding_digest` and persisted in the Run snapshot. Resume and replay
+reuse it without asking the provider to resolve mutable environment state
+again. MSE does not misreport declaration data as an enforced capability.
 
 ## Versioning
 

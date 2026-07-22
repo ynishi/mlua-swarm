@@ -19,6 +19,7 @@
 //! one-Step flow, and we do not want two interfaces for the same
 //! shape.
 
+use crate::binding::{attest_bound_agents, AgentBindingProvider};
 use crate::blueprint::compiler::{materialize_bound_blueprint, CompileError, Compiler};
 use crate::blueprint::{
     resolve_bound_agents, AuditDef, Blueprint, BoundAgent, EngineDispatcher, Runner,
@@ -101,11 +102,16 @@ fn worker_bindings_from_bound_agents(
 async fn load_or_resolve_bound_agents(
     blueprint: &Blueprint,
     run_ctx: Option<&RunContext>,
+    binding_provider: Option<&dyn AgentBindingProvider>,
 ) -> Result<Vec<BoundAgent>, TaskLaunchError> {
     let Some(run_ctx) = run_ctx else {
-        return resolve_bound_agents(blueprint)
-            .map_err(CompileError::from)
-            .map_err(TaskLaunchError::from);
+        let mut bound_agents = resolve_bound_agents(blueprint).map_err(CompileError::from)?;
+        if let Some(provider) = binding_provider {
+            attest_bound_agents(provider, &mut bound_agents)
+                .await
+                .map_err(|error| TaskLaunchError::PreDispatch(error.to_string()))?;
+        }
+        return Ok(bound_agents);
     };
 
     let record = run_ctx
@@ -124,7 +130,12 @@ async fn load_or_resolve_bound_agents(
         }
     }
 
-    let bound_agents = resolve_bound_agents(blueprint).map_err(CompileError::from)?;
+    let mut bound_agents = resolve_bound_agents(blueprint).map_err(CompileError::from)?;
+    if let Some(provider) = binding_provider {
+        attest_bound_agents(provider, &mut bound_agents)
+            .await
+            .map_err(|error| TaskLaunchError::PreDispatch(error.to_string()))?;
+    }
     if let Some(input_json) = record.input_json {
         let mut snapshot: Value = serde_json::from_str(&input_json).map_err(|e| {
             TaskLaunchError::PreDispatch(format!("decode Run launch snapshot: {e}"))
@@ -556,6 +567,9 @@ pub struct TaskLaunchService {
     /// `ExternError`); hosts opt in via [`Self::with_externs`] with an
     /// `ExternMap` of pure value-shape functions.
     externs: Arc<dyn Externs + Send + Sync>,
+    /// Optional execution-environment binding implementation. When present,
+    /// fresh Run snapshots require a complete, Core-validated receipt set.
+    binding_provider: Option<Arc<dyn AgentBindingProvider>>,
 }
 
 impl TaskLaunchService {
@@ -565,6 +579,7 @@ impl TaskLaunchService {
             engine,
             compiler,
             externs: Arc::new(NoExterns),
+            binding_provider: None,
         }
     }
 
@@ -573,6 +588,14 @@ impl TaskLaunchService {
     /// belongs to `Step` / agents, not externs (flow-ir canonical contract).
     pub fn with_externs(mut self, externs: Arc<dyn Externs + Send + Sync>) -> Self {
         self.externs = externs;
+        self
+    }
+
+    /// Inject the execution-environment binding provider. Platform plugins
+    /// and Operator/MainAI implementations use this same interface; Core
+    /// retains receipt validation and digest ownership.
+    pub fn with_binding_provider(mut self, provider: Arc<dyn AgentBindingProvider>) -> Self {
+        self.binding_provider = Some(provider);
         self
     }
 
@@ -609,8 +632,12 @@ impl TaskLaunchService {
         // `LayerRegistry` resolution + `SpawnerStack` wrapping) is
         // concentrated inside `service::linker::link` — Service
         // scatter is intentionally prevented.
-        let bound_agents =
-            load_or_resolve_bound_agents(&input.blueprint, input.run_ctx.as_ref()).await?;
+        let bound_agents = load_or_resolve_bound_agents(
+            &input.blueprint,
+            input.run_ctx.as_ref(),
+            self.binding_provider.as_deref(),
+        )
+        .await?;
         let binding_digests: HashMap<String, crate::blueprint::BindingDigest> = bound_agents
             .iter()
             .map(|bound| (bound.agent.name.clone(), bound.binding_digest.clone()))
@@ -1773,11 +1800,11 @@ mod tests {
             vec![original_agent],
         );
 
-        let original = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx))
+        let original = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx), None)
             .await
             .unwrap();
         blueprint.agents[0].profile.as_mut().unwrap().system_prompt = "mutated role".to_string();
-        let restored = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx))
+        let restored = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx), None)
             .await
             .unwrap();
 
@@ -1786,6 +1813,79 @@ mod tests {
             restored[0].agent.profile.as_ref().unwrap().system_prompt,
             "original role"
         );
+    }
+
+    #[tokio::test]
+    async fn run_snapshot_calls_binding_provider_only_on_first_resolution() {
+        use crate::binding::{AgentBindingProvider, BindingProviderError};
+        use crate::blueprint::{BindReceipt, BindRequest};
+        use crate::store::run::{InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore};
+        use crate::types::{RunId, TaskId};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingProvider(AtomicUsize);
+
+        #[async_trait::async_trait]
+        impl AgentBindingProvider for CountingProvider {
+            async fn bind(
+                &self,
+                requests: &[BindRequest],
+            ) -> Result<Vec<BindReceipt>, BindingProviderError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(requests
+                    .iter()
+                    .map(|request| BindReceipt {
+                        agent: request.agent.clone(),
+                        request_digest: request.request_digest.clone(),
+                        provider_id: "operator-main-ai".to_string(),
+                        provider_revision: Some("test".to_string()),
+                        resolved_model: request.requested_model.clone(),
+                        effective_tools: request.requested_tools.clone(),
+                        launch_variant: request.launch_variant.clone(),
+                        evidence_digest: None,
+                    })
+                    .collect())
+            }
+        }
+
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = RunId::new();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: Some("{}".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .unwrap();
+        let run_ctx = RunContext::new(run_id, run_store);
+        let mut blueprint = bp(
+            step("worker", path("$.input"), path("$.out")),
+            vec![agent("worker", "worker")],
+        );
+        blueprint.agents[0].runner = Some(Runner::WsClaudeCode {
+            variant: "mse-worker".to_string(),
+            tools: vec!["Read".to_string()],
+        });
+        let provider = CountingProvider(AtomicUsize::new(0));
+
+        let first = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx), Some(&provider))
+            .await
+            .unwrap();
+        let restored = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx), Some(&provider))
+            .await
+            .unwrap();
+
+        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+        assert!(first[0].attestation.is_some());
+        assert_eq!(restored, first);
     }
 
     #[tokio::test]

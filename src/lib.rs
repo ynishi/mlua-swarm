@@ -95,6 +95,7 @@
 #![warn(missing_docs)]
 
 pub mod application;
+pub mod binding;
 pub mod blueprint;
 pub mod core;
 pub mod enhance;
@@ -111,6 +112,9 @@ pub use application::{
     Application, BlueprintRef, EnhanceApplication, EnhanceApplicationConfig,
     EnhanceApplicationError, EnhanceApplicationInput, TaskApplication, TaskApplicationError,
     TaskApplicationInput, TaskApplicationOutput, TickOutcome, VersionSelector,
+};
+pub use binding::{
+    attest_bound_agents, binding_requests, AgentBindingProvider, BindingProviderError,
 };
 pub use blueprint::compiler::{
     CompileError, CompiledAgentTable, CompiledBlueprint, Compiler, HostBridge,

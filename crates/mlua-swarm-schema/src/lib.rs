@@ -1125,6 +1125,88 @@ pub enum BindingDigestParseError {
     InvalidFormat(String),
 }
 
+/// Platform-neutral request sent to an [`AgentBindingProvider`](https://docs.rs/mlua-swarm)
+/// before a Run is dispatched.
+///
+/// The request contains only Swarm declarations. A provider may resolve
+/// platform aliases or inspect its own execution environment, but Swarm
+/// validates the returned [`BindReceipt`] before accepting it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BindRequest {
+    /// Logical agent name; the receipt correlation key.
+    pub agent: String,
+    /// Digest of the declaration-only [`BoundAgent`] snapshot.
+    pub request_digest: BindingDigest,
+    /// Requested model name or tier from [`AgentProfile::model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    /// Minimum tool grant declared by the resolved [`Runner`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_tools: Vec<String>,
+    /// Platform launch variant requested by the resolved [`Runner`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_variant: Option<String>,
+}
+
+/// Provider report describing the effective runtime binding for one agent.
+/// This value is untrusted until Swarm validates it against [`BindRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BindReceipt {
+    /// Logical agent name copied from the request.
+    pub agent: String,
+    /// Declaration digest copied from the request. Core rejects stale or
+    /// cross-request receipts even when the logical agent name matches.
+    pub request_digest: BindingDigest,
+    /// Stable provider implementation identifier.
+    pub provider_id: String,
+    /// Provider or adapter revision used to resolve the binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_revision: Option<String>,
+    /// Effective model after platform alias/tier resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    /// Effective tool grant enforced by the execution environment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_tools: Vec<String>,
+    /// Effective platform launch variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_variant: Option<String>,
+    /// Optional digest of provider-owned evidence such as a capability
+    /// manifest. The evidence body itself need not enter the Run snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_digest: Option<BindingDigest>,
+}
+
+/// Core-validated capability statement pinned into a [`BoundAgent`].
+///
+/// It deliberately omits the logical agent name because the containing
+/// snapshot already supplies that identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BindingAttestation {
+    /// Declaration-only digest the provider attested.
+    pub request_digest: BindingDigest,
+    /// Stable provider implementation identifier.
+    pub provider_id: String,
+    /// Provider or adapter revision used to resolve the binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_revision: Option<String>,
+    /// Effective model after platform alias/tier resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    /// Effective tool grant, canonicalized by Swarm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_tools: Vec<String>,
+    /// Effective platform launch variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_variant: Option<String>,
+    /// Optional digest of provider-owned capability evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_digest: Option<BindingDigest>,
+}
+
 /// Immutable, Run-scoped result of binding the Runner / Agent / Context
 /// layers for one logical agent.
 ///
@@ -1149,6 +1231,10 @@ pub struct BoundAgent {
     pub context_policy: Option<ContextPolicy>,
     /// Declaration tier that supplied `runner`.
     pub runner_source: RunnerResolutionSource,
+    /// Effective capability statement accepted from the injected binding
+    /// provider. `None` preserves the declaration-only compatibility path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<BindingAttestation>,
     /// SHA-256 over the other fields of this snapshot, prefixed with
     /// `sha256:`. This is replay identity and an observability correlation
     /// key, not a signature.
@@ -1186,6 +1272,37 @@ struct BoundAgentDigestInput<'a> {
     runner: &'a Option<Runner>,
     context_policy: &'a Option<ContextPolicy>,
     runner_source: RunnerResolutionSource,
+    attestation: &'a Option<BindingAttestation>,
+}
+
+impl BoundAgent {
+    /// Replace the effective capability attestation and recompute replay
+    /// identity over the complete immutable snapshot.
+    pub fn set_attestation(
+        &mut self,
+        attestation: BindingAttestation,
+    ) -> Result<(), BoundAgentResolveError> {
+        self.attestation = Some(attestation);
+        self.recompute_binding_digest()
+    }
+
+    /// Recompute `binding_digest` after a trusted snapshot mutation.
+    pub fn recompute_binding_digest(&mut self) -> Result<(), BoundAgentResolveError> {
+        let digest_input = BoundAgentDigestInput {
+            agent: &self.agent,
+            runner: &self.runner,
+            context_policy: &self.context_policy,
+            runner_source: self.runner_source,
+            attestation: &self.attestation,
+        };
+        let bytes =
+            serde_json::to_vec(&digest_input).map_err(|source| BoundAgentResolveError::Digest {
+                agent: self.agent.name.clone(),
+                source,
+            })?;
+        self.binding_digest = BindingDigest::sha256(bytes);
+        Ok(())
+    }
 }
 
 /// Resolve every `Blueprint.agents` entry into an immutable Run snapshot.
@@ -1243,6 +1360,7 @@ fn resolve_bound_agents_with_legacy(
                 runner: &runner,
                 context_policy: &context_policy,
                 runner_source,
+                attestation: &None,
             };
             let bytes = serde_json::to_vec(&digest_input).map_err(|source| {
                 BoundAgentResolveError::Digest {
@@ -1256,6 +1374,7 @@ fn resolve_bound_agents_with_legacy(
                 runner,
                 context_policy,
                 runner_source,
+                attestation: None,
                 binding_digest,
             })
         })
