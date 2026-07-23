@@ -46,7 +46,7 @@ use mlua_swarm::blueprint::{BindRequest, BindingAttestation, BoundAgent};
 use mlua_swarm::core::config::CheckPolicy;
 use mlua_swarm::service::merge_init_ctx_3layer;
 use mlua_swarm::store::replay::ReplayCursor;
-use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStoreError};
+use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStoreError, SnapshotOrigin};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStoreError};
 use mlua_swarm::{
     validate_bound_agent_snapshots, OperatorKind, Role, RunId, TaskId, TaskInputSpec,
@@ -727,10 +727,13 @@ pub async fn run_resume(
     let cursor = ReplayCursor::from_entries(entries);
 
     // RunContext for the SAME run_id — run_store + replay_store +
-    // replay_cursor all wired. No new RunRecord is minted.
+    // replay_cursor all wired. No new RunRecord is minted. `with_resume()`
+    // marks this as a resume so any binding backfill is stamped
+    // `resume_backfill` (and, D2, keeps legacy replay keys).
     let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone())
         .with_replay_store(state.replay_store.clone())
-        .with_replay_cursor(Arc::new(Mutex::new(cursor)));
+        .with_replay_cursor(Arc::new(Mutex::new(cursor)))
+        .with_resume();
 
     let input = snapshot.into_input();
     let task_id = run.task_id.clone();
@@ -1048,9 +1051,13 @@ pub async fn run_rerun_from(
     let replayed_steps = kept.len();
     let cursor = ReplayCursor::from_entries(kept);
 
+    // `with_resume()` — a rerun-from re-derives its snapshot from the current
+    // Blueprint exactly like resume, so a binding backfill here is stamped
+    // `resume_backfill` (and keeps legacy replay keys, D2).
     let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone())
         .with_replay_store(state.replay_store.clone())
-        .with_replay_cursor(Arc::new(Mutex::new(cursor)));
+        .with_replay_cursor(Arc::new(Mutex::new(cursor)))
+        .with_resume();
 
     let input = snapshot.into_input();
     let task_id = run.task_id.clone();
@@ -1185,6 +1192,14 @@ pub struct RunBindingsExplainResponse {
     /// Owning Task recorded on that Run.
     #[schemars(with = "String")]
     pub task_id: TaskId,
+    /// Provenance of the inspected `bound_agents` snapshot. `launch` means the
+    /// bindings were pinned at the Run's initial launch; `resume_backfill`
+    /// means they were re-derived from the current Blueprint when a
+    /// pre-binding-snapshot Run was resumed/reran — so they carry no
+    /// launch-time pin guarantee. A snapshot that carries `bound_agents` but
+    /// no origin marker reports `resume_backfill` (the safe side — see
+    /// [`SnapshotOrigin::from_snapshot`]).
+    pub snapshot_origin: SnapshotOrigin,
     /// Every agent snapshot in Blueprint declaration order.
     pub bindings: Vec<RunBindingExplainEntry>,
 }
@@ -1296,6 +1311,7 @@ pub async fn run_bindings_explain(
     Ok(Json(RunBindingsExplainResponse {
         run_id: run.id,
         task_id: run.task_id,
+        snapshot_origin: SnapshotOrigin::from_snapshot(&snapshot),
         bindings,
     }))
 }
@@ -2489,6 +2505,56 @@ mod tests {
             .missing_requested_tools
             .is_empty());
         assert_ne!(entry.binding_digest, request_digest);
+    }
+
+    #[tokio::test]
+    async fn run_bindings_explain_reports_snapshot_origin() {
+        let state = test_state();
+        let posted =
+            crate::tasks_start(State(state.clone()), Json(post_tasks_req("origin explain")))
+                .await
+                .expect("tasks_start")
+                .0;
+
+        // An initial launch pins `origin = launch`.
+        let explained = run_bindings_explain(State(state.clone()), Path(posted.run_id.to_string()))
+            .await
+            .expect("binding explain")
+            .0;
+        assert_eq!(explained.snapshot_origin, SnapshotOrigin::Launch);
+
+        // Flip the persisted marker to `resume_backfill` → explain reflects it.
+        let run = state.run_store.get(&posted.run_id).await.unwrap();
+        let mut snapshot: Value = serde_json::from_str(run.input_json.as_deref().unwrap()).unwrap();
+        snapshot["bound_agents_origin"] = serde_json::json!("resume_backfill");
+        state
+            .run_store
+            .set_input_json(&posted.run_id, serde_json::to_string(&snapshot).unwrap())
+            .await
+            .unwrap();
+        let explained = run_bindings_explain(State(state.clone()), Path(posted.run_id.to_string()))
+            .await
+            .expect("binding explain")
+            .0;
+        assert_eq!(explained.snapshot_origin, SnapshotOrigin::ResumeBackfill);
+
+        // A snapshot with `bound_agents` but NO origin marker maps to the
+        // safe side (`resume_backfill`) and still returns 200 — the 422 is
+        // reserved for snapshots lacking `bound_agents` entirely.
+        snapshot
+            .as_object_mut()
+            .unwrap()
+            .remove("bound_agents_origin");
+        state
+            .run_store
+            .set_input_json(&posted.run_id, serde_json::to_string(&snapshot).unwrap())
+            .await
+            .unwrap();
+        let explained = run_bindings_explain(State(state), Path(posted.run_id.to_string()))
+            .await
+            .expect("explain still 200 without an origin marker")
+            .0;
+        assert_eq!(explained.snapshot_origin, SnapshotOrigin::ResumeBackfill);
     }
 
     #[tokio::test]

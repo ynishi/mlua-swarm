@@ -39,7 +39,7 @@ use crate::middleware::worker_binding::WorkerBindingMiddleware;
 use crate::middleware::{AfterRunAuditMiddleware, SpawnerStack};
 use crate::operator::WorkerBinding;
 use crate::service::linker;
-use crate::store::run::RunContext;
+use crate::store::run::{RunContext, SnapshotOrigin};
 use crate::types::{CapToken, Role};
 use mlua_flow_ir::{Externs, NoExterns};
 use serde::{Deserialize, Serialize};
@@ -231,6 +231,16 @@ async fn load_or_resolve_bound_agents(
 
     let mut bound_agents = resolve_fresh().map_err(CompileError::from)?;
     attest_or_gate_fresh(&mut bound_agents, binding_provider, strict, Some(run_ctx)).await?;
+    // [Crux D1-b] The origin is decided by the RunContext's explicit `resume`
+    // flag ALONE — never inferred from replay-cursor / step-entry presence,
+    // whose wiring is free to change. A resume / rerun-from re-derives the
+    // snapshot from the current Blueprint (no launch-time pin); an initial
+    // launch persists the authoritative pin.
+    let origin = if run_ctx.resume {
+        SnapshotOrigin::ResumeBackfill
+    } else {
+        SnapshotOrigin::Launch
+    };
     if let Some(input_json) = record.input_json {
         let mut snapshot: Value = serde_json::from_str(&input_json).map_err(|e| {
             TaskLaunchError::PreDispatch(format!("decode Run launch snapshot: {e}"))
@@ -238,10 +248,20 @@ async fn load_or_resolve_bound_agents(
         let object = snapshot.as_object_mut().ok_or_else(|| {
             TaskLaunchError::PreDispatch("Run launch snapshot must be a JSON object".to_string())
         })?;
+        // [Crux D1-a] `bound_agents` and its `bound_agents_origin` marker are
+        // written into the SAME snapshot object and persisted in the SAME
+        // `set_input_json` call — never two writes, so no intermediate state
+        // can carry one without the other.
         object.insert(
             "bound_agents".to_string(),
             serde_json::to_value(&bound_agents).map_err(|e| {
                 TaskLaunchError::PreDispatch(format!("encode Run BoundAgent snapshot: {e}"))
+            })?,
+        );
+        object.insert(
+            crate::store::run::BOUND_AGENTS_ORIGIN_KEY.to_string(),
+            serde_json::to_value(origin).map_err(|e| {
+                TaskLaunchError::PreDispatch(format!("encode Run BoundAgent origin: {e}"))
             })?,
         );
         run_ctx
@@ -257,7 +277,51 @@ async fn load_or_resolve_bound_agents(
                 TaskLaunchError::PreDispatch(format!("persist Run BoundAgent snapshot: {e}"))
             })?;
     }
+    // A resume that had to backfill its bindings is an observed degradation
+    // (the binding identity is no longer a launch-time pin). Append-only,
+    // never fails the launch — mirrors `record_unbound_degradation`.
+    if origin == SnapshotOrigin::ResumeBackfill {
+        record_backfill_degradation(run_ctx, blueprint.id.as_str()).await;
+    }
     Ok(bound_agents)
+}
+
+/// Record one binding backfill: a pre-binding-snapshot Run was resumed (or
+/// reran) and its `bound_agents` were re-derived from the current Blueprint
+/// rather than restored from a launch-time pin. Same append-only,
+/// never-fail-the-launch posture as [`record_unbound_degradation`] — a failed
+/// append is logged and swallowed (the launch has already committed to
+/// running).
+async fn record_backfill_degradation(run_ctx: &RunContext, blueprint_id: &str) {
+    tracing::warn!(
+        run_id = %run_ctx.run_id,
+        blueprint = %blueprint_id,
+        "binding_backfill: resumed Run had no binding snapshot; bound_agents \
+         re-derived from the current Blueprint (not a launch-time pin)"
+    );
+    let entry = crate::store::run::DegradationEntry {
+        tool: "binding".to_string(),
+        error: "run resumed without a launch-pinned binding snapshot".to_string(),
+        fallback: "resume_backfill".to_string(),
+        note: Some(format!(
+            "run '{}' backfilled bound_agents from Blueprint '{}' at resume time",
+            run_ctx.run_id, blueprint_id
+        )),
+        step_ref: None,
+        attempt: None,
+        at: crate::types::now_unix(),
+    };
+    if let Err(error) = run_ctx
+        .run_store
+        .append_degradation(&run_ctx.run_id, entry)
+        .await
+    {
+        tracing::warn!(
+            run_id = %run_ctx.run_id,
+            %error,
+            "binding_backfill: failed to record degradation entry"
+        );
+    }
 }
 
 /// GH #34 — extract the Blueprint-declared after-run audit hooks
@@ -2035,6 +2099,130 @@ mod tests {
         assert_eq!(provider.0.load(Ordering::SeqCst), 1);
         assert!(first[0].attestation.is_some());
         assert_eq!(restored, first);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // D1: snapshot origin marker (`bound_agents_origin`)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// An initial launch (RunContext `resume == false`) that has to resolve
+    /// fresh persists `bound_agents_origin: "launch"` alongside
+    /// `bound_agents`, and records NO backfill degradation — a first-time
+    /// pin is not a degradation.
+    #[tokio::test]
+    async fn fresh_resolve_on_launch_persists_launch_origin_no_degradation() {
+        use crate::store::run::{
+            InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore, BOUND_AGENTS_ORIGIN_KEY,
+        };
+        use crate::types::{RunId, TaskId};
+
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = RunId::new();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: Some("{}".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .unwrap();
+        // No `.with_resume()` — this is an initial launch.
+        let run_ctx = RunContext::new(run_id.clone(), run_store.clone());
+        let blueprint = bp(
+            step("worker", path("$.input"), path("$.out")),
+            vec![agent("worker", "worker")],
+        );
+
+        load_or_resolve_bound_agents(
+            &blueprint,
+            Some(&run_ctx),
+            None,
+            LegacyWorkerBindingPolicy::Allow,
+        )
+        .await
+        .expect("launch resolve ok");
+
+        let run = run_store.get(&run_id).await.expect("run present");
+        let snapshot: Value = serde_json::from_str(run.input_json.as_deref().unwrap()).unwrap();
+        assert!(
+            snapshot["bound_agents"].is_array(),
+            "bound_agents must be persisted"
+        );
+        assert_eq!(snapshot[BOUND_AGENTS_ORIGIN_KEY], json!("launch"));
+        assert_eq!(
+            SnapshotOrigin::from_snapshot(&snapshot),
+            SnapshotOrigin::Launch
+        );
+        assert!(
+            run.degradations.is_empty(),
+            "an initial-launch resolve is not a degradation"
+        );
+    }
+
+    /// A resume (RunContext `resume == true`) that has to backfill a
+    /// pre-binding-snapshot Run persists `bound_agents_origin:
+    /// "resume_backfill"` and appends exactly one backfill degradation
+    /// (`fallback: "resume_backfill"`).
+    #[tokio::test]
+    async fn backfill_on_resume_persists_resume_origin_and_records_degradation() {
+        use crate::store::run::{
+            InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore, BOUND_AGENTS_ORIGIN_KEY,
+        };
+        use crate::types::{RunId, TaskId};
+
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = RunId::new();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: Some("{}".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .unwrap();
+        let run_ctx = RunContext::new(run_id.clone(), run_store.clone()).with_resume();
+        let blueprint = bp(
+            step("worker", path("$.input"), path("$.out")),
+            vec![agent("worker", "worker")],
+        );
+
+        load_or_resolve_bound_agents(
+            &blueprint,
+            Some(&run_ctx),
+            None,
+            LegacyWorkerBindingPolicy::Allow,
+        )
+        .await
+        .expect("resume backfill ok");
+
+        let run = run_store.get(&run_id).await.expect("run present");
+        let snapshot: Value = serde_json::from_str(run.input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot[BOUND_AGENTS_ORIGIN_KEY], json!("resume_backfill"));
+        assert_eq!(
+            SnapshotOrigin::from_snapshot(&snapshot),
+            SnapshotOrigin::ResumeBackfill
+        );
+        assert_eq!(
+            run.degradations.len(),
+            1,
+            "a resume backfill must record exactly one degradation"
+        );
+        assert_eq!(run.degradations[0].tool, "binding");
+        assert_eq!(run.degradations[0].fallback, "resume_backfill");
     }
 
     // ──────────────────────────────────────────────────────────────────

@@ -167,6 +167,52 @@ pub enum RunStoreError {
     Other(String),
 }
 
+/// The provenance of a Run snapshot's `bound_agents` array.
+///
+/// Persisted as the [`BOUND_AGENTS_ORIGIN_KEY`] sibling of `bound_agents`
+/// inside the opaque [`RunRecord::input_json`] blob. This is Run-store
+/// metadata, **not** a schema-crate Blueprint wire type: it never enters
+/// [`crate::blueprint::BoundAgent`], `BoundAgentDigestInput`, or any digest
+/// computation. It lives here beside [`RunContext`] — rather than in
+/// `crate::service::task_launch` — because both the domain launch service
+/// (which writes it) and the server crate's bindings-explain handler (which
+/// reads it) consume it, and both already depend on this module; parking it
+/// in the service module would force the server crate to reach into a
+/// service-private type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotOrigin {
+    /// `bound_agents` were resolved and pinned at the Run's initial launch —
+    /// the binding identity is the launch-time pin.
+    Launch,
+    /// `bound_agents` were backfilled from the current Blueprint when a
+    /// pre-binding-snapshot Run was resumed or reran. The binding identity
+    /// carries no launch-time pin guarantee.
+    ResumeBackfill,
+}
+
+/// JSON key the [`SnapshotOrigin`] is persisted under, beside `bound_agents`,
+/// in [`RunRecord::input_json`].
+pub const BOUND_AGENTS_ORIGIN_KEY: &str = "bound_agents_origin";
+
+impl SnapshotOrigin {
+    /// Read the origin marker from a decoded launch snapshot. An absent (or
+    /// unparseable) [`BOUND_AGENTS_ORIGIN_KEY`] maps to
+    /// [`SnapshotOrigin::ResumeBackfill`] — the safe side: a snapshot whose
+    /// `bound_agents` were persisted before this marker existed cannot prove
+    /// they were pinned at launch, so it must not be reported as a launch pin
+    /// and (on the replay axis) must not have binding digests mixed into its
+    /// replay keys. Only test artifacts hit this case in practice — the
+    /// strict-binding series is unreleased, so no real snapshot predates the
+    /// marker.
+    pub fn from_snapshot(snapshot: &serde_json::Value) -> Self {
+        snapshot
+            .get(BOUND_AGENTS_ORIGIN_KEY)
+            .and_then(|v| serde_json::from_value::<SnapshotOrigin>(v.clone()).ok())
+            .unwrap_or(SnapshotOrigin::ResumeBackfill)
+    }
+}
+
 /// Pairs a [`RunId`] with the [`RunStore`] used to persist its trace.
 ///
 /// Threaded from the server entry points (`POST /v1/tasks`, `POST
@@ -201,6 +247,13 @@ pub struct RunContext {
     pub replay_cursor: Option<Arc<Mutex<ReplayCursor>>>,
     /// Run-pinned replay identity component, keyed by logical agent name.
     pub binding_digests: Arc<HashMap<String, BindingDigest>>,
+    /// Whether this dispatch is a resume / rerun-from of an existing Run
+    /// rather than an initial launch. `false` (the default) marks an initial
+    /// launch. Set to `true` ONLY by the server's resume and rerun-from
+    /// handlers — it is the sole, explicit signal that decides a backfilled
+    /// snapshot's [`SnapshotOrigin`] (never inferred from replay-cursor or
+    /// step-entry state, whose wiring is free to change).
+    pub resume: bool,
 }
 
 impl RunContext {
@@ -215,6 +268,7 @@ impl RunContext {
             replay_store: None,
             replay_cursor: None,
             binding_digests: Arc::new(HashMap::new()),
+            resume: false,
         }
     }
 
@@ -238,6 +292,15 @@ impl RunContext {
         self.binding_digests = Arc::new(digests);
         self
     }
+
+    /// Builder-style setter: mark this dispatch as a resume / rerun-from of
+    /// an existing Run (see [`Self::resume`]). Called only by the server's
+    /// resume and rerun-from handlers; every other construction site leaves
+    /// the default `false` (initial launch).
+    pub fn with_resume(mut self) -> Self {
+        self.resume = true;
+        self
+    }
 }
 
 impl std::fmt::Debug for RunContext {
@@ -256,6 +319,7 @@ impl std::fmt::Debug for RunContext {
             )
             .field("replay_cursor", &self.replay_cursor.is_some())
             .field("binding_digests", &self.binding_digests.len())
+            .field("resume", &self.resume)
             .finish()
     }
 }
