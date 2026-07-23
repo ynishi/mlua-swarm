@@ -1110,6 +1110,8 @@ mod tests {
         mlua_swarm::WorkerBinding {
             variant: "test-variant".into(),
             tools: vec![],
+            request_digest: None,
+            requested_model: None,
         }
     }
 

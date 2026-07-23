@@ -54,6 +54,20 @@ pub struct WorkerBinding {
     /// for the MainAI / observability; the SubAgent's own frontmatter
     /// is what actually grants tools).
     pub tools: Vec<String>,
+    /// Digest of the immutable declaration-only `BoundAgent` snapshot this
+    /// binding was resolved from (`sha256:<hex>`). Carried into the spawn
+    /// frame so a non-strict Operator can correlate the request and self-check
+    /// its own environment against it. Like `tools`, this is informational —
+    /// a self-check input for the Operator, not a Server-enforced gate. `None`
+    /// on construction sites that have no snapshot (compile-time / test paths).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<crate::blueprint::BindingDigest>,
+    /// Model name or tier declared in `AgentDef.profile.model`, forwarded so
+    /// the Operator can compare the requested model against what its
+    /// environment actually runs. Informational (self-check input), not an
+    /// enforcement field. `None` when the profile declares no model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
 }
 
 /// The `Operator` trait: takes a spawn request and returns a

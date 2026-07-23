@@ -1833,6 +1833,11 @@ impl SpawnerFactory for OperatorSpawnerFactory {
                     .as_ref()
                     .map(|p| p.tools.clone())
                     .unwrap_or_default(),
+                // Compile-time path: no immutable BoundAgent snapshot exists
+                // here (the launch path resolves the digest). Self-check
+                // inputs are supplied on the launch axis only.
+                request_digest: None,
+                requested_model: None,
             });
         if op.requires_worker_binding() && worker_binding.is_none() {
             // Issue #9: the two Blueprint authoring paths (direct JSON

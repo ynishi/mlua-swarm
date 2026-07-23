@@ -1139,6 +1139,8 @@ mod operator_delegate_worker_binding_tests {
             serde_json::to_value(WorkerBinding {
                 variant: "mse-worker-coder".to_string(),
                 tools: vec!["Edit".to_string()],
+                request_digest: None,
+                requested_model: None,
             })
             .unwrap(),
         );

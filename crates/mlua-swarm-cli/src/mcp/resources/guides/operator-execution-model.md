@@ -699,6 +699,28 @@ the same `BindReceipt` shape and pass through the same Core validation. The
 logical Agent, role prompt, verdict/result contract, and BindRequest therefore
 stay identical; only provider provenance and effective platform values differ.
 
+### Operator self-check (non-strict mode)
+
+When the Blueprint is not `strict_binding`, the Server does **not** pre-verify
+the Operator's environment: a missing manifest leaves the agent
+`DeclarationOnly` and the Spawn still lands. In that mode the requesting side's
+declaration is instead carried into the spawn frame so the Operator can check
+itself. The `WorkerBinding` on `ctx.meta.runtime` (see Hop 1) now also carries:
+
+- `request_digest` — the immutable declaration-only `BoundAgent` snapshot
+  digest (`sha256:<hex>`), a correlation key back to what Core resolved.
+- `requested_model` — the model declared in `AgentProfile.model`.
+
+alongside the existing `variant` and `tools`. These are informational
+self-check inputs — the Server enforces nothing off them. The Operator SHOULD
+compare the spawn frame's requested `variant` / `tools` / `requested_model`
+against what its own environment actually runs and, on a mismatch, report it
+through the existing degradation channel (`RunRecord.degradations`, see
+[Worker degradation reporting](#worker-degradation-reporting)) rather than
+silently running a substitute. A receipt that *exists* and contradicts the
+request still fails under both strict and non-strict — strictness only controls
+whether an absent attestation is tolerated.
+
 ### Running multiple MainAI sessions in parallel
 
 The exclusivity above is the only structural constraint — split the role

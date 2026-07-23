@@ -96,6 +96,8 @@ fn worker_bindings_from_bound_agents(
                 WorkerBinding {
                     variant: variant.clone(),
                     tools: tools.clone(),
+                    request_digest: Some(bound.binding_digest.clone()),
+                    requested_model: bound.agent.profile.as_ref().and_then(|p| p.model.clone()),
                 },
             )),
             _ => None,
@@ -2197,6 +2199,50 @@ mod tests {
             bound[0].attestation.is_some(),
             "a correctly attested agent must carry its attestation"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // C2: spawn-frame self-check inputs (request_digest / requested_model)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// The launch-path `WorkerBinding` map carries the requesting side's
+    /// self-check inputs: the immutable snapshot's `binding_digest` and the
+    /// profile's declared model, so a non-strict Operator can compare the
+    /// spawn frame against its own environment.
+    #[test]
+    fn worker_bindings_carry_request_digest_and_model() {
+        let mut blueprint = runner_blueprint(false);
+        blueprint.agents[0].profile = Some(AgentProfile {
+            model: Some("claude-sonnet".to_string()),
+            ..Default::default()
+        });
+        let bound = resolve_bound_agents(&blueprint).expect("resolvable Runner refs");
+        let bindings = worker_bindings_from_bound_agents(&bound);
+
+        let wb = bindings.get("worker").expect("worker binding present");
+        assert_eq!(
+            wb.request_digest.as_ref(),
+            Some(&bound[0].binding_digest),
+            "the spawn frame must carry the immutable snapshot digest"
+        );
+        assert!(wb
+            .request_digest
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .starts_with("sha256:"));
+        assert_eq!(wb.requested_model.as_deref(), Some("claude-sonnet"));
+    }
+
+    /// A Runner-backed agent whose profile declares no model leaves
+    /// `requested_model` `None` while still carrying the digest.
+    #[test]
+    fn worker_bindings_omit_model_when_profile_has_none() {
+        let bound = resolve_bound_agents(&runner_blueprint(false)).expect("resolvable Runner refs");
+        let bindings = worker_bindings_from_bound_agents(&bound);
+        let wb = bindings.get("worker").expect("worker binding present");
+        assert!(wb.request_digest.is_some());
+        assert!(wb.requested_model.is_none());
     }
 
     #[tokio::test]

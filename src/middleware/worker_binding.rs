@@ -142,6 +142,12 @@ mod tests {
             WorkerBinding {
                 variant: "mse-worker-knowledge".to_string(),
                 tools: vec!["Read".to_string()],
+                request_digest: Some(
+                    "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                        .parse()
+                        .unwrap(),
+                ),
+                requested_model: Some("claude-sonnet".to_string()),
             },
         );
         let (stack, seen) = probe_stack(map);
@@ -163,6 +169,31 @@ mod tests {
         let wb: WorkerBinding = serde_json::from_value(v.clone()).expect("round-trip");
         assert_eq!(wb.variant, "mse-worker-knowledge");
         assert_eq!(wb.tools, vec!["Read".to_string()]);
+        // The requesting side's self-check inputs survive the ctx.meta.runtime
+        // round-trip so the Operator can correlate and compare its environment.
+        assert!(wb
+            .request_digest
+            .as_ref()
+            .expect("request_digest present")
+            .as_str()
+            .starts_with("sha256:"));
+        assert_eq!(wb.requested_model.as_deref(), Some("claude-sonnet"));
+    }
+
+    /// Wire compatibility: a binding with both self-check fields `None` omits
+    /// the keys entirely, so the serialized frame matches the pre-C2 shape.
+    #[test]
+    fn omits_self_check_fields_when_none() {
+        let json = serde_json::to_value(WorkerBinding {
+            variant: "v".to_string(),
+            tools: vec![],
+            request_digest: None,
+            requested_model: None,
+        })
+        .expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert!(!obj.contains_key("request_digest"));
+        assert!(!obj.contains_key("requested_model"));
     }
 
     #[tokio::test]
