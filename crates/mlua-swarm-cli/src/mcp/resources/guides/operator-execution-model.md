@@ -638,7 +638,7 @@ operators:                          POST /v1/operators
                               │        → mints sid, reserves alias (+ manifest if sent)
                               │
 agents:                       │     WS /v1/operators/:sid/ws
-  - name: impl-planner        │        → register_operator(
+  - name: task-planner        │        → register_operator(
     spec:                     │            "planner_bot", ws_session)
       operator_ref: ──────────┘
         "planner_bot"

@@ -1697,7 +1697,7 @@ impl crate::worker::Worker for RustFnWorker {
 ///   `spec.operator_ref`; at `compile()` time the `Arc<dyn Operator>` is
 ///   baked into `routes[agent_name]`. Because the `agent.md` loader
 ///   (`agent_md_loader`) defaults `kind` to `Operator`, agents that flow
-///   in through agent-profiles land here.
+///   in through external agent.md files land here.
 ///
 /// - **`OperatorDelegateMiddleware` — the Blueprint-global (session)
 ///   axis.** Delegates every agent to the same Operator backend. At
