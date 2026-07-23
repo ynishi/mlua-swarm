@@ -171,6 +171,6 @@
     "strict_kind": true
   },
   "metadata": {
-    "description": "Fn-override pattern: a BLOCKED verdict is overridden to ALLOW by an approver step, and Or([PASS, ALLOW]) lets the commit branch proceed. All operator agents point at the \"main-ai\" logical role; join with mse_operator_join using that role and a capability_manifest covering the declared variants before dispatch."
+    "description": "Fn-override pattern: a BLOCKED verdict is overridden to ALLOW by an approver step, and Or([PASS, ALLOW]) lets the commit branch proceed. All operator agents point at the \"main-ai\" logical role; join with mse_operator_join using that role. A capability_manifest covering the declared variants is optional — recommended for verification, required only under strict_binding; without one the operator agents bind declaration-only and dispatch still proceeds."
   }
 }

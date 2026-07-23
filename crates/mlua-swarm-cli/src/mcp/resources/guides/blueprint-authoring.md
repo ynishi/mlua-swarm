@@ -583,6 +583,59 @@ final `binding_digest` and persisted in the Run snapshot. Resume and replay
 reuse it without asking the provider to resolve mutable environment state
 again. MSE does not misreport declaration data as an enforced capability.
 
+### Execution assurance: `strategy.strict_binding`
+
+Runner-backed agents describe *requested* capabilities; whether MSE demands
+a Core-validated provider attestation for them before the Run may launch is
+one Blueprint-level switch, `strategy.strict_binding` (default **false**):
+
+- **`strict_binding = false` (default)** — the Blueprint runs without any
+  capability manifest at all. An agent whose provider offers no attestation
+  (no manifest, the role never joined, or the manifest declares no matching
+  launch variant) stays `DeclarationOnly` — its `runner.tools` / `model`
+  remain requested/declarative, the Run launches, and the unattested state is
+  recorded on `RunRecord.degradations` for after-the-fact observation. The
+  requesting side's declaration is carried into the spawn frame so the
+  Operator can self-check its own environment (see
+  `mse://guides/operator-execution-model` § Operator self-check).
+- **`strict_binding = true`** — launch requires a Core-validated provider
+  attestation for **every** Runner-backed agent. A missing manifest, a missing
+  variant, an insufficient tool grant, or no provider at all fails the launch
+  before any Spawn, and the error names the agent plus the requested
+  variant/tools it could not satisfy.
+
+This default is deliberately the opposite of `strict_refs` / `strict_kind`
+(both default `true`): those guard the Blueprint's *structural* integrity,
+which is always resolvable at compile time, whereas binding attestation is an
+*execution-assurance opt-in* that needs a live execution environment to attest
+against — not available for embed-only or manifest-less launches.
+
+```jsonc
+{
+  "strategy": { "strict_refs": true, "strict_kind": true, "strict_binding": true }
+}
+```
+
+Whichever mode a Blueprint is in, the semantics rule is the same: **attestation
+is optional, but never wrong** — a receipt that *exists* and contradicts the
+request (a tool short of the grant, the wrong launch variant, a digest or model
+mismatch) fails in both modes. `strict_binding` controls only whether an
+*absent* attestation is tolerated, never whether a *contradicting* one is.
+
+Two tools discover what a Blueprint's Runner-backed agents require, so an
+operator can build (or audit) a manifest before launch:
+
+- **Requirements introspection** — `GET /v1/blueprints/:id/binding-requirements`
+  returns `{blueprint_id, strict_binding, requirements: [BindRequest, …]}`, one
+  entry per Runner-backed agent with its declared variant / tools / model (the
+  reverse lookup an operator machine-generates a manifest from).
+- **`bp_doctor` `binding_lint` family** — the static pass surfaces
+  `binding_requirements_info` (INFO: what each Runner-backed agent requests),
+  `strict_binding_without_runners` (WARN: `strict_binding = true` with no
+  Runner-backed agent — a no-op strict), and `legacy_worker_binding` (WARN:
+  `profile.worker_binding` in use) on the top-level `binding_lint.findings`
+  array. See `mse://guides/mcp-tool-reference`.
+
 ## Versioning
 
 `metadata.version_label` is an optional free-form SemVer string (e.g.

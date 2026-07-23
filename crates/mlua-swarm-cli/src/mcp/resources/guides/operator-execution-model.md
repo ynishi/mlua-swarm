@@ -634,8 +634,8 @@ BP (design-time)                    Runtime (per Operator process)
 ─────────────────────               ──────────────────────────────
 operators:                          POST /v1/operators
   - name: "planner_bot"    ◄──┐       { roles: ["planner_bot"],
-    kind: MainAi              │         capability_manifest: {...} }
-                              │        → mints sid, reserves alias + manifest
+    kind: MainAi              │         capability_manifest: {...} }  # optional
+                              │        → mints sid, reserves alias (+ manifest if sent)
                               │
 agents:                       │     WS /v1/operators/:sid/ws
   - name: impl-planner        │        → register_operator(
@@ -650,9 +650,12 @@ Rules that fall out of this:
    all valid — nothing in the engine treats `main-ai` specially. It only
    became a convention because the default scaffold uses it.
 2. **The three sites must be the same literal.** `OperatorDef.name` ==
-   the mint's `roles[]` entry == the `register_operator` id. A typo in
-   the binding target is rejected before Spawn because no manifest-owning
-   session can be resolved for that role.
+   the mint's `roles[]` entry == the `register_operator` id. Under
+   `strict_binding = true` a typo in the binding target is rejected before
+   Spawn (no manifest-owning session resolves for that role). In the default
+   non-strict mode the mismatch is not a pre-Spawn gate — the agent binds
+   `DeclarationOnly`, and the missing role instead surfaces when the Spawn's
+   own routing finds no session claiming it.
 3. **`kind: MainAi` is the *type*, not the *name*.** It says "when an
    agent references this role, dispatch via the WS thin-path". Multiple
    `OperatorDef`s can have `kind: MainAi` under different names.
@@ -663,11 +666,21 @@ Rules that fall out of this:
 
 ### Capability manifest at join
 
-The Operator/MainAI also submits what its execution environment can actually
-enforce. This is not copied blindly into a Run. The Server selects exactly one
-capability by role alias and `launch_variant`, returns a `BindReceipt`, and
-Core checks the requested tool subset, model presence, variant equality, and
-request digest before creating the final `BindingAttestation`.
+The manifest is **OPTIONAL**. An Operator/MainAI *may* submit what its
+execution environment can actually enforce, but the default Blueprint
+(`strategy.strict_binding = false`, see
+`mse://guides/blueprint-authoring` § Execution assurance) never requires it:
+without a manifest, Runner-backed spawns proceed **declaration-only** — the
+`runner.tools` / `model` stay requested/declarative and the Operator
+self-checks its own environment (§ Operator self-check below). The manifest
+becomes **mandatory** only when the Blueprint sets `strict_binding = true`;
+there a missing or insufficient manifest fails the launch before any Spawn.
+
+When a manifest *is* submitted it is not copied blindly into a Run. The Server
+selects exactly one capability by role alias and `launch_variant`, returns a
+`BindReceipt`, and Core checks the requested tool subset, model presence,
+variant equality, and request digest before creating the final
+`BindingAttestation`.
 
 ```json
 {
@@ -685,10 +698,23 @@ request digest before creating the final `BindingAttestation`.
 ```
 
 The manifest is owned by the joining execution environment; Swarm does not
-read platform wrapper files from the Server filesystem. A missing manifest,
-missing variant, insufficient tool grant, or stale receipt fails before
-Spawn. The accepted attestation is persisted in the Run's `BoundAgent`
-snapshot, so resume never re-resolves mutable capabilities.
+read platform wrapper files from the Server filesystem. The resolution chain
+per Runner-backed agent is compact:
+
+- **manifest present & consistent** → validated `BindingAttestation`.
+- **manifest absent** (or no matching variant / role not joined) →
+  `DeclarationOnly`; the Run launches and the unattested state is recorded on
+  `RunRecord.degradations`. Under `strict_binding = true` this absence is
+  instead a launch error before Spawn, naming the agent and its requested
+  variant/tools.
+- **manifest present & contradicting** (a tool short of the grant, wrong
+  variant, digest or model mismatch) → **always an error, in both modes**.
+
+That last line is the invariant: **attestation is optional, but never wrong —
+a receipt that contradicts the request fails in both modes.** `strict_binding`
+controls only whether an *absent* attestation is tolerated. Any accepted
+attestation is persisted in the Run's `BoundAgent` snapshot, so resume never
+re-resolves mutable capabilities.
 
 New cross-platform Blueprints use `runner.backend = "ws_operator"` rather
 than naming either host. `ManifestBindingProvider` is the reference
