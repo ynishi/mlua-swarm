@@ -2,6 +2,8 @@ workspace
 .worktrees
 .claude
 .mcp.json
+.codex
+AGENTS.md
 target
 .ryo
 
