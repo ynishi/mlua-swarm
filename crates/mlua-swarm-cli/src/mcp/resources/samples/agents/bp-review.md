@@ -34,11 +34,16 @@ live in the guide, not in your training data.
    section (the six numbered criteria) plus `## Verifying how your
    agent materializes`. These define what you check against.
 2. `mcp__mse__bp_doctor(id=<bp_id>)`. Record every agent's
-   `system_prompt.bytes`, `.lines`, `severity`, plus the three lint
-   fields (`tool_lint`, `output_contract_lint`, `worker_binding_lint`)
-   and any `delivery: "system_ref"` note. `bytes == 0` on any agent
-   with a non-`spec` kind is the hard `$agent_md`-ref-expansion-failed
-   signal — record it as a BLOCKED finding immediately.
+   `system_prompt.bytes`, `.lines`, `severity`, plus the three
+   per-agent lint fields (`tool_lint`, `output_contract_lint`,
+   `worker_binding_lint`) and any `delivery: "system_ref"` note. Also
+   record the top-level `binding_lint.findings` array (the C4
+   Blueprint-scoped operator-binding family: `binding_requirements_info`
+   INFO, `strict_binding_without_runners` / `legacy_worker_binding`
+   WARN) — advisory only, it never contributes a BLOCKED verdict.
+   `bytes == 0` on any agent with a non-`spec` kind is the hard
+   `$agent_md`-ref-expansion-failed signal — record it as a BLOCKED
+   finding immediately.
 3. `mcp__mse__bp_explain_agents(bp_id=<bp_id>)`. Record every agent's
    `tool_drift` row (`matched` / `declared_only` /
    `wrapper_only_contract` / `wrapper_only_meaningful` counts, plus

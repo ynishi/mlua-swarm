@@ -23,12 +23,14 @@ use std::time::Duration;
 use anyhow::Result;
 use mlua_swarm::application::{BlueprintRef, TaskApplication, TaskApplicationInput};
 use mlua_swarm::blueprint::store::{BlueprintStore, InMemoryBlueprintStore};
-use mlua_swarm::blueprint::Blueprint;
+use mlua_swarm::blueprint::{resolve_bound_agents, Blueprint, RunnerResolutionSource};
 use mlua_swarm::store::run::{
     InMemoryRunStore, RunContext, RunRecord, RunStatus as StoreRunStatus, RunStore,
 };
 use mlua_swarm::types::{RunId, StepId, TaskId};
-use mlua_swarm::{Compiler, Engine, EngineCfg, OperatorKind, Role, TaskLaunchService};
+use mlua_swarm::{
+    binding_requests, Compiler, Engine, EngineCfg, OperatorKind, Role, TaskLaunchService,
+};
 use operator_client::{ClientError, OperatorClientState};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -399,6 +401,14 @@ struct BpDoctorReq {
     /// requires it).
     #[serde(default)]
     disable_worker_binding_lint: Option<bool>,
+    /// C4 binding_lint family (default enabled): when true, skip the
+    /// Blueprint-level operator-binding advisories
+    /// (`binding_requirements_info` / `strict_binding_without_runners` /
+    /// `legacy_worker_binding`). Set true to omit the top-level
+    /// `binding_lint` section when auditing a Blueprint whose binding
+    /// requirements are already understood.
+    #[serde(default)]
+    disable_binding_lint: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -717,6 +727,97 @@ fn classify_worker_binding_lint(
                        `worker_binding: <subagent-type>` to the agent .md frontmatter.",
         })
     }
+}
+
+/// C4 `binding_lint` family: resolves the Blueprint's Runner-backed agents
+/// and emits advisory operator-binding findings. Three checks, all report-only
+/// (INFO / WARN — never BLOCK), matching the sibling `tool_lint` /
+/// `output_contract_lint` / `worker_binding_lint` posture:
+///
+/// - `binding_requirements_info` (INFO): one finding per Runner-backed agent
+///   listing the launch variant / tools / model a joining operator's
+///   `capability_manifest` must cover — the same declarations `GET
+///   /v1/blueprints/:id/binding-requirements` returns (built here from the
+///   identical `resolve_bound_agents` + `binding_requests` pair).
+/// - `strict_binding_without_runners` (WARN): `strategy.strict_binding` is
+///   `true` but no agent resolves to a Runner, so strict binding is a no-op
+///   (there is nothing for a provider to attest).
+/// - `legacy_worker_binding` (WARN): an agent's Runner came from the
+///   deprecated `profile.worker_binding` fallback
+///   ([`RunnerResolutionSource::LegacyWorkerBinding`]); points at `runner` /
+///   `runner_ref` as the migration target. A legacy agent is still
+///   Runner-backed, so it also appears once under `binding_requirements_info`
+///   — the two findings are complementary (what to attest vs. migrate away
+///   from the fallback).
+///
+/// Pure over the resolved Blueprint (no I/O), unit-testable. Uses the
+/// legacy-permissive [`resolve_bound_agents`] (same as the explain endpoint) so
+/// the `bp_doctor` advisory never fails on a Blueprint the server accepted; a
+/// resolution failure (an unresolvable `runner_ref` — near-impossible for an
+/// already-registered Blueprint) degrades to a single WARN note rather than
+/// aborting the whole tool.
+fn classify_binding_lint(bp: &Blueprint) -> serde_json::Value {
+    let bound = match resolve_bound_agents(bp) {
+        Ok(bound) => bound,
+        Err(e) => {
+            return serde_json::json!({
+                "findings": [{
+                    "check": "binding_resolution_error",
+                    "severity": "WARN",
+                    "message": format!("could not resolve Runner bindings: {e}"),
+                }],
+            });
+        }
+    };
+
+    let mut findings: Vec<serde_json::Value> = Vec::new();
+
+    // Check 1 — binding_requirements_info (INFO): one per Runner-backed agent.
+    let requests = binding_requests(&bound);
+    for req in &requests {
+        findings.push(serde_json::json!({
+            "check": "binding_requirements_info",
+            "severity": "INFO",
+            "agent": req.agent,
+            "launch_variant": req.launch_variant,
+            "tools": req.requested_tools,
+            "model": req.requested_model,
+            "message": format!(
+                "agent '{}' needs a capability_manifest entry covering launch variant {:?}, \
+                 tools {:?}, model {:?}",
+                req.agent, req.launch_variant, req.requested_tools, req.requested_model
+            ),
+        }));
+    }
+
+    // Check 2 — strict_binding_without_runners (WARN): Blueprint-level.
+    if bp.strategy.strict_binding && requests.is_empty() {
+        findings.push(serde_json::json!({
+            "check": "strict_binding_without_runners",
+            "severity": "WARN",
+            "message": "strategy.strict_binding is true but no agent resolves to a Runner; \
+                        strict binding is a no-op (there is nothing for a provider to attest).",
+        }));
+    }
+
+    // Check 3 — legacy_worker_binding (WARN): one per legacy-resolved agent.
+    for bound_agent in &bound {
+        if bound_agent.runner_source == RunnerResolutionSource::LegacyWorkerBinding {
+            findings.push(serde_json::json!({
+                "check": "legacy_worker_binding",
+                "severity": "WARN",
+                "agent": bound_agent.agent.name,
+                "message": format!(
+                    "agent '{}' resolves its Runner from the deprecated profile.worker_binding \
+                     fallback; migrate to an explicit `runner` (inline) or `runner_ref` \
+                     declaration.",
+                    bound_agent.agent.name
+                ),
+            }));
+        }
+    }
+
+    serde_json::json!({ "findings": findings })
 }
 
 /// Tools every mse-worker wrapper carries regardless of author intent
@@ -2445,7 +2546,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Per-Blueprint agent.md size check plus GH #45 contract lints and GH #61 worker_binding lint. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline. GH #45: each agent entry also carries `tool_lint` (phantom MCP tool refs — profile.tools entries with the `mcp__mse__` prefix are compared against the live `mse://api/mcp-tools` registry; unknown names surface as WARN with the unknown tool list) and `output_contract_lint` (absent or malformed `profile.extras.expected_output` under the GH #44 convention surfaces as WARN with a specific reason). GH #61: each operator-kind agent additionally carries `worker_binding_lint` (missing `profile.worker_binding` surfaces as WARN — same fail-loud condition `Compiler::compile` enforces at dispatch, retroactively surfaced on already-registered Blueprints); non-operator kinds are OK and carry `kind_requires_binding: false`. Any family can be disabled per call via `disable_tool_lint` / `disable_output_contract_lint` / `disable_worker_binding_lint`; the disabled family's field is omitted entirely from each entry (not `null`) so a caller cannot mistake a disabled family for a passed check. The aggregate verdict folds size + tool + contract + worker_binding severities via the same OK/WARN/BLOCK precedence."
+        description = "Per-Blueprint agent.md size check plus GH #45 contract lints and GH #61 worker_binding lint. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline. GH #45: each agent entry also carries `tool_lint` (phantom MCP tool refs — profile.tools entries with the `mcp__mse__` prefix are compared against the live `mse://api/mcp-tools` registry; unknown names surface as WARN with the unknown tool list) and `output_contract_lint` (absent or malformed `profile.extras.expected_output` under the GH #44 convention surfaces as WARN with a specific reason). GH #61: each operator-kind agent additionally carries `worker_binding_lint` (missing `profile.worker_binding` surfaces as WARN — same fail-loud condition `Compiler::compile` enforces at dispatch, retroactively surfaced on already-registered Blueprints); non-operator kinds are OK and carry `kind_requires_binding: false`. Any per-agent family can be disabled per call via `disable_tool_lint` / `disable_output_contract_lint` / `disable_worker_binding_lint`; the disabled family's field is omitted entirely from each entry (not `null`) so a caller cannot mistake a disabled family for a passed check. C4: a Blueprint-scoped `binding_lint` family (default enabled; disable via `disable_binding_lint`) is attached as a top-level `binding_lint.findings` array (omitted entirely when disabled) — advisory operator-binding checks: `binding_requirements_info` (INFO — one finding per Runner-backed agent listing the launch variant / tools / model a joining operator's capability_manifest must cover, identical to GET /v1/blueprints/:id/binding-requirements), `strict_binding_without_runners` (WARN — strategy.strict_binding is true but no agent resolves to a Runner, so strict is a no-op), and `legacy_worker_binding` (WARN — an agent's Runner came from the deprecated profile.worker_binding fallback; migrate to runner / runner_ref). The aggregate verdict folds size + tool + contract + worker_binding + binding_lint-WARN severities via the same OK/WARN/BLOCK precedence (binding_lint INFO findings never escalate the verdict)."
     )]
     async fn bp_doctor(
         &self,
@@ -2500,6 +2601,7 @@ impl MseServer {
         let disable_tool_lint = req.disable_tool_lint.unwrap_or(false);
         let disable_output_contract_lint = req.disable_output_contract_lint.unwrap_or(false);
         let disable_worker_binding_lint = req.disable_worker_binding_lint.unwrap_or(false);
+        let disable_binding_lint = req.disable_binding_lint.unwrap_or(false);
 
         let mut per_agent = Vec::with_capacity(bp.agents.len());
         let mut severities: Vec<&'static str> = Vec::with_capacity(bp.agents.len());
@@ -2609,22 +2711,48 @@ impl MseServer {
 
             per_agent.push(entry);
         }
-        // GH #45 / #61: fold the three lint families into the aggregate
+
+        // C4: the binding_lint family is Blueprint-scoped (one resolution
+        // over all agents), not per-agent, so it runs once after the loop
+        // and attaches as a top-level section rather than an `agents[]`
+        // field. When disabled, the section is omitted entirely (matching
+        // the per-agent families' conditional-presence convention). Its
+        // WARN findings feed the aggregate verdict; INFO findings do not
+        // (they are informational manifest requirements, not defects).
+        let binding_lint = (!disable_binding_lint).then(|| classify_binding_lint(&bp));
+        let binding_lint_severities: Vec<String> = binding_lint
+            .as_ref()
+            .and_then(|b| b.get("findings"))
+            .and_then(|f| f.as_array())
+            .map(|findings| {
+                findings
+                    .iter()
+                    .filter_map(|f| f.get("severity").and_then(|s| s.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // GH #45 / #61 + C4: fold the four lint families into the aggregate
         // verdict. `aggregate_agent_md_verdict` already implements the
         // BLOCK-dominates-WARN-dominates-OK precedence — reuse it by
         // pushing each family's severities into a single flattened
         // vector so an agent with a passing size-check and a
         // phantom-tool WARN still surfaces at the top-level verdict.
+        // `binding_lint`'s INFO findings fall through to OK (they contain
+        // neither "WARN" nor "BLOCK"), so only its WARN findings escalate.
         let mut all_severities: Vec<&str> = Vec::with_capacity(
             severities.len()
                 + tool_lint_severities.len()
                 + output_contract_lint_severities.len()
-                + worker_binding_lint_severities.len(),
+                + worker_binding_lint_severities.len()
+                + binding_lint_severities.len(),
         );
         all_severities.extend(severities.iter().copied());
         all_severities.extend(tool_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(output_contract_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(worker_binding_lint_severities.iter().map(|s| s.as_str()));
+        all_severities.extend(binding_lint_severities.iter().map(|s| s.as_str()));
         let verdict = aggregate_agent_md_verdict(&all_severities);
         let over_threshold_count = severities.iter().filter(|s| **s != "OK").count();
         let tool_lint_warn_count = tool_lint_severities
@@ -2639,8 +2767,14 @@ impl MseServer {
             .iter()
             .filter(|s| s.as_str() != "OK")
             .count();
+        // Only WARN findings count here — INFO (`binding_requirements_info`)
+        // is an informational manifest requirement, never a defect.
+        let binding_lint_warn_count = binding_lint_severities
+            .iter()
+            .filter(|s| s.as_str() == "WARN")
+            .count();
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "bp_id": req.id,
             "bind": bind,
             "http_status": status.as_u16(),
@@ -2650,6 +2784,7 @@ impl MseServer {
             "tool_lint_warn_count": tool_lint_warn_count,
             "output_contract_lint_warn_count": output_contract_lint_warn_count,
             "worker_binding_lint_warn_count": worker_binding_lint_warn_count,
+            "binding_lint_warn_count": binding_lint_warn_count,
             "thresholds": {
                 "warn_bytes": thresholds.warn_bytes,
                 "warn_lines": thresholds.warn_lines,
@@ -2661,10 +2796,21 @@ impl MseServer {
                 "tool_lint_enabled": !disable_tool_lint,
                 "output_contract_lint_enabled": !disable_output_contract_lint,
                 "worker_binding_lint_enabled": !disable_worker_binding_lint,
+                "binding_lint_enabled": !disable_binding_lint,
             },
             "agents": per_agent,
             "guide_ref": "mse://guides/agent-md-authoring",
         });
+        // C4: Blueprint-scoped operator-binding advisories. Inserted only
+        // when the family is enabled — omitted entirely (not `null`) when
+        // disabled, matching the per-agent families' conditional-presence
+        // convention (the `lint_families.binding_lint_enabled` flag stays
+        // the single disabled/enabled signal).
+        if let Some(binding_lint) = binding_lint {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("binding_lint".to_string(), binding_lint);
+            }
+        }
         json_result(&body)
     }
 
@@ -3418,8 +3564,8 @@ mod tests {
     use super::*;
     use mlua_flow_ir::{Expr, Node as FlowNode};
     use mlua_swarm::blueprint::{
-        current_schema_version, AgentDef, AgentKind, AgentMeta, AuditDef, AuditMode,
-        BlueprintMetadata, CompilerHints, CompilerStrategy,
+        current_schema_version, AgentDef, AgentKind, AgentMeta, AgentProfile, AuditDef, AuditMode,
+        BlueprintMetadata, CompilerHints, CompilerStrategy, Runner,
     };
 
     fn identity_blueprint() -> Blueprint {
@@ -5122,6 +5268,167 @@ mod tests {
                 "kind={kind:?} unexpectedly carries `present`"
             );
         }
+    }
+
+    // ─── C4: bp_doctor binding_lint family ─────────────────────
+
+    /// Single-agent Blueprint fixture — the binding_lint family reads only
+    /// the agent's Runner wiring and the Blueprint's `strict_binding` flag,
+    /// so the base flow/metadata (from `identity_blueprint`) is irrelevant.
+    fn binding_lint_bp(agent: AgentDef, strict_binding: bool) -> Blueprint {
+        let mut bp = identity_blueprint();
+        bp.agents = vec![agent];
+        bp.strategy = CompilerStrategy {
+            strict_binding,
+            ..CompilerStrategy::default()
+        };
+        bp
+    }
+
+    /// Operator agent with an inline `WsOperator` Runner (resolution source
+    /// `AgentInline`) — Runner-backed, not legacy.
+    fn agent_with_inline_runner() -> AgentDef {
+        AgentDef {
+            name: "worker".into(),
+            kind: AgentKind::Operator,
+            spec: serde_json::json!({}),
+            profile: Some(AgentProfile {
+                model: Some("sonnet".into()),
+                ..AgentProfile::default()
+            }),
+            meta: None,
+            runner: Some(Runner::WsOperator {
+                variant: "ws-operator".into(),
+                tools: vec!["mcp__mse__mse_worker_fetch".into()],
+            }),
+            runner_ref: None,
+            verdict: None,
+        }
+    }
+
+    /// Operator agent whose Runner resolves through the deprecated
+    /// `profile.worker_binding` fallback (resolution source
+    /// `LegacyWorkerBinding`) — still Runner-backed.
+    fn agent_with_legacy_worker_binding() -> AgentDef {
+        AgentDef {
+            name: "legacy".into(),
+            kind: AgentKind::Operator,
+            spec: serde_json::json!({}),
+            profile: Some(AgentProfile {
+                worker_binding: Some("claude".into()),
+                tools: vec!["Read".into()],
+                ..AgentProfile::default()
+            }),
+            meta: None,
+            runner: None,
+            runner_ref: None,
+            verdict: None,
+        }
+    }
+
+    /// RustFn agent with no Runner wiring at all — resolves to no Runner.
+    fn agent_no_runner() -> AgentDef {
+        AgentDef {
+            name: "plain".into(),
+            kind: AgentKind::RustFn,
+            spec: serde_json::json!({"fn_id": "plain"}),
+            profile: None,
+            meta: None,
+            runner: None,
+            runner_ref: None,
+            verdict: None,
+        }
+    }
+
+    fn binding_findings(bp: &Blueprint) -> Vec<serde_json::Value> {
+        classify_binding_lint(bp)["findings"]
+            .as_array()
+            .cloned()
+            .expect("binding_lint always carries a `findings` array")
+    }
+
+    fn find_binding_check<'a>(
+        findings: &'a [serde_json::Value],
+        check: &str,
+    ) -> Option<&'a serde_json::Value> {
+        findings.iter().find(|f| f["check"] == check)
+    }
+
+    #[test]
+    fn binding_lint_requirements_info_fires_for_a_runner_backed_agent() {
+        let bp = binding_lint_bp(agent_with_inline_runner(), false);
+        let findings = binding_findings(&bp);
+        let info = find_binding_check(&findings, "binding_requirements_info")
+            .expect("a Runner-backed agent must emit binding_requirements_info");
+        assert_eq!(info["severity"], "INFO");
+        assert_eq!(info["agent"], "worker");
+        assert_eq!(info["launch_variant"], "ws-operator");
+        assert_eq!(info["model"], "sonnet");
+        assert_eq!(
+            info["tools"],
+            serde_json::json!(["mcp__mse__mse_worker_fetch"])
+        );
+        // Message names the manifest coverage the finding is about.
+        assert!(info["message"]
+            .as_str()
+            .unwrap()
+            .contains("capability_manifest"));
+    }
+
+    #[test]
+    fn binding_lint_requirements_info_absent_when_no_agent_is_runner_backed() {
+        let bp = binding_lint_bp(agent_no_runner(), false);
+        let findings = binding_findings(&bp);
+        assert!(
+            find_binding_check(&findings, "binding_requirements_info").is_none(),
+            "a Blueprint with no Runner-backed agent must emit no binding_requirements_info"
+        );
+    }
+
+    #[test]
+    fn binding_lint_strict_without_runners_warns() {
+        let bp = binding_lint_bp(agent_no_runner(), true);
+        let findings = binding_findings(&bp);
+        let warn = find_binding_check(&findings, "strict_binding_without_runners")
+            .expect("strict_binding with no Runner-backed agent must warn");
+        assert_eq!(warn["severity"], "WARN");
+        assert!(warn["message"].as_str().unwrap().contains("no-op"));
+    }
+
+    #[test]
+    fn binding_lint_strict_with_a_runner_does_not_warn() {
+        // strict_binding is meaningful here (there is a Runner to attest),
+        // so the no-op warning must not fire.
+        let bp = binding_lint_bp(agent_with_inline_runner(), true);
+        let findings = binding_findings(&bp);
+        assert!(
+            find_binding_check(&findings, "strict_binding_without_runners").is_none(),
+            "strict_binding with a Runner-backed agent must not warn about a no-op"
+        );
+    }
+
+    #[test]
+    fn binding_lint_legacy_worker_binding_warns() {
+        let bp = binding_lint_bp(agent_with_legacy_worker_binding(), false);
+        let findings = binding_findings(&bp);
+        let warn = find_binding_check(&findings, "legacy_worker_binding")
+            .expect("an agent resolved via profile.worker_binding must warn");
+        assert_eq!(warn["severity"], "WARN");
+        assert_eq!(warn["agent"], "legacy");
+        // Message points at the migration target.
+        let msg = warn["message"].as_str().unwrap();
+        assert!(msg.contains("profile.worker_binding"));
+        assert!(msg.contains("runner_ref"));
+    }
+
+    #[test]
+    fn binding_lint_legacy_worker_binding_absent_for_a_first_class_runner() {
+        let bp = binding_lint_bp(agent_with_inline_runner(), false);
+        let findings = binding_findings(&bp);
+        assert!(
+            find_binding_check(&findings, "legacy_worker_binding").is_none(),
+            "an inline-Runner agent must not warn about a legacy worker_binding"
+        );
     }
 
     // ─── GH #34: mse_doctor audit_findings surfacing ───────────
