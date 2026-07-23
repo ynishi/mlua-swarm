@@ -27,9 +27,9 @@
 use crate::core::config::CheckPolicy;
 use crate::core::engine::Engine;
 use crate::core::projection_placement::ProjectionPlacement;
-use crate::core::state::{DispatchOutcome, TaskSpec};
+use crate::core::state::{wrap_skip_marker, DispatchOutcome, TaskSpec};
 use crate::core::step_naming::StepNaming;
-use crate::store::run::{RunContext, StepEntry};
+use crate::store::run::{LastFailure, RunContext, StepEntry};
 use crate::types::{now_unix, CapToken};
 use crate::worker::adapter::SpawnerAdapter;
 use async_trait::async_trait;
@@ -462,6 +462,11 @@ impl AsyncDispatcher for EngineDispatcher {
             let status = match &outcome {
                 Ok(DispatchOutcome::Pass(_)) => "passed",
                 Ok(DispatchOutcome::Blocked(_)) => "blocked",
+                // GH #76 Skip tier: Skip tier StepEntry status. Distinct from
+                // "passed" so post-run inspection of `RunRecord.step_entries`
+                // can distinguish flow-continuation-with-write from
+                // flow-continuation-without-write.
+                Ok(DispatchOutcome::Skip(_)) => "skipped",
                 Ok(DispatchOutcome::Suspended(_)) => "suspended",
                 Ok(DispatchOutcome::Cancelled) => "cancelled",
                 Ok(DispatchOutcome::Timeout) => "timeout",
@@ -486,10 +491,43 @@ impl AsyncDispatcher for EngineDispatcher {
 
         match outcome {
             Ok(DispatchOutcome::Pass(v)) => Ok(v),
-            Ok(DispatchOutcome::Blocked(v)) => Err(EvalError::DispatcherError {
-                ref_: ref_.to_string(),
-                msg: format!("blocked: {v}"),
-            }),
+            // GH #76 Skip tier: Skip tier is flow-continuation, not error. Map
+            // to `Ok(wrap_skip_marker(v))` — the sentinel Value the
+            // downstream binding-write path recognizes via
+            // [`crate::core::state::is_skip_marker`] to short-circuit the
+            // `$.<step_id>` write (short-circuit itself lands in a
+            // separate follow-up; the sentinel is the wire that carries
+            // the signal across the flow-ir boundary). MUST precede the
+            // wildcard `Ok(other) =>` arm below or Skip would be routed
+            // to `EvalError::DispatcherError` (the non-terminal fallback)
+            // and abort the flow — the exact failure mode this tier is
+            // meant to prevent.
+            Ok(DispatchOutcome::Skip(v)) => Ok(wrap_skip_marker(v)),
+            Ok(DispatchOutcome::Blocked(v)) => {
+                // GH #76 error surface: single-slot breadcrumb the surrounding
+                // `TaskLaunchService::launch` `map_err` closure reads to
+                // populate `TaskLaunchError::FlowEval { failed_step,
+                // verdict_value, .. }`. Written last-write-wins BEFORE the
+                // `EvalError::DispatcherError` return so flow-ir sees the
+                // exact same error the pre-error surface world raised — the
+                // breadcrumb is side-channel observability, never
+                // load-bearing on the abort itself. `run_ctx = None`
+                // (dispatchers built without `with_run`) is a no-op:
+                // there is nowhere to write, and every consumer already
+                // treats `partial_ctx: None` / `failed_step: None` as
+                // "not available".
+                if let Some(rc) = &self.run_ctx {
+                    rc.set_last_failure(LastFailure {
+                        step_id: tid.clone(),
+                        step_ref: Some(ref_.to_string()),
+                        verdict_value: v.clone(),
+                    });
+                }
+                Err(EvalError::DispatcherError {
+                    ref_: ref_.to_string(),
+                    msg: format!("blocked: {v}"),
+                })
+            }
             Ok(other) => Err(EvalError::DispatcherError {
                 ref_: ref_.to_string(),
                 msg: format!("non-terminal outcome: {:?}", other),
@@ -730,5 +768,174 @@ mod tests {
             json!("do the thing"),
             "the stored prompt must be the post-envelope directive, with no $step_meta leakage"
         );
+    }
+
+    /// GH #76 error surface: the dispatcher's Blocked arm writes the
+    /// `RunContext.last_failure` breadcrumb (step_id + step_ref +
+    /// verdict_value) BEFORE returning `EvalError::DispatcherError`. This
+    /// test drives a `WorkerResult { ok: false }` through the dispatcher
+    /// and asserts every breadcrumb field, including that step_ref matches
+    /// the dispatched Blueprint ref and verdict_value carries the full
+    /// value the worker returned (not a stringified summary).
+    #[tokio::test]
+    async fn dispatcher_blocked_records_last_failure_breadcrumb() {
+        use crate::blueprint::compiler::{RustFnInProcessSpawnerFactory, SpawnerFactory};
+        use crate::core::config::EngineCfg;
+        use crate::store::run::{InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore};
+        use crate::types::{Role, RunId, TaskId};
+        use crate::worker::adapter::WorkerResult;
+        use std::time::Duration;
+
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", |_inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "verdict": "BLOCKED", "reason": "not-applicable" }),
+                ok: false,
+            })
+        });
+        let def = AgentDef {
+            name: "gate".into(),
+            kind: AgentKind::RustFn,
+            spec: json!({ "fn_id": "echo" }),
+            profile: None,
+            meta: None,
+            runner: None,
+            runner_ref: None,
+            verdict: None,
+        };
+        let spawner = factory.build(&def, None).expect("build");
+
+        let engine = Engine::new(EngineCfg::default());
+        let token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = RunId::new();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: Some("{}".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed RunRecord");
+
+        let run_ctx = RunContext::new(run_id, run_store);
+        let dispatcher =
+            EngineDispatcher::with_spawner(engine, token, spawner).with_run(run_ctx.clone());
+
+        let err = dispatcher
+            .dispatch("gate", json!("go"))
+            .await
+            .expect_err("expected DispatcherError for Blocked outcome");
+        // The public `EvalError` surface is unchanged — same
+        // `DispatcherError` variant with the same `ref_` + `msg` shape.
+        assert!(
+            err.to_string().contains("blocked"),
+            "expected EvalError to mention blocked, got: {err}"
+        );
+
+        // Breadcrumb is populated by the same match arm that raised the
+        // error — reading it via the shared `Arc<Mutex<Option<_>>>` must
+        // succeed.
+        let breadcrumb = run_ctx
+            .last_failure
+            .lock()
+            .expect("last_failure mutex not poisoned")
+            .clone()
+            .expect("Blocked arm must have written LastFailure");
+        assert_eq!(
+            breadcrumb.step_ref,
+            Some("gate".to_string()),
+            "step_ref must be the Blueprint ref this dispatch was routed to"
+        );
+        assert_eq!(
+            breadcrumb.verdict_value,
+            json!({ "verdict": "BLOCKED", "reason": "not-applicable" }),
+            "verdict_value must be the exact value the worker returned"
+        );
+        // step_id is the freshly minted dispatch-time tid — its exact
+        // value is opaque, but it must be non-empty (StepId::to_string()
+        // never yields an empty string for a valid mint).
+        assert!(!breadcrumb.step_id.to_string().is_empty());
+    }
+
+    /// GH #76 error surface: `RunContext::snapshot_partial_ctx` reads the persisted
+    /// step_entry log and reconstructs a JSON `{ "steps": { <step_id>:
+    /// { step_ref, status, at, .. } } }` shape — metadata-level, not
+    /// value-level. Regression test for the reconstructor itself
+    /// (independent of the map_err closure).
+    #[tokio::test]
+    async fn run_context_snapshot_partial_ctx_reconstructs_step_entry_log() {
+        use crate::store::run::{
+            InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore, StepEntry,
+        };
+        use crate::types::{now_unix, RunId, StepId, TaskId};
+
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = RunId::new();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: Some("{}".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed RunRecord");
+        let sid1 = StepId::new();
+        let sid2 = StepId::new();
+        run_store
+            .append_step_entry(
+                &run_id,
+                StepEntry {
+                    step_id: sid1.clone(),
+                    step_ref: Some("stage-1".to_string()),
+                    status: Some("passed".to_string()),
+                    binding_digest: None,
+                    at: now_unix(),
+                },
+            )
+            .await
+            .expect("append 1");
+        run_store
+            .append_step_entry(
+                &run_id,
+                StepEntry {
+                    step_id: sid2.clone(),
+                    step_ref: Some("stage-2".to_string()),
+                    status: Some("blocked".to_string()),
+                    binding_digest: None,
+                    at: now_unix(),
+                },
+            )
+            .await
+            .expect("append 2");
+
+        let run_ctx = RunContext::new(run_id, run_store);
+        let snap = run_ctx.snapshot_partial_ctx().await;
+        let steps = snap
+            .get("steps")
+            .and_then(|v| v.as_object())
+            .expect("steps object");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[&sid1.to_string()]["step_ref"], json!("stage-1"));
+        assert_eq!(steps[&sid1.to_string()]["status"], json!("passed"));
+        assert_eq!(steps[&sid2.to_string()]["step_ref"], json!("stage-2"));
+        assert_eq!(steps[&sid2.to_string()]["status"], json!("blocked"));
     }
 }

@@ -154,15 +154,78 @@ impl TaskState {
     }
 }
 
+/// Reserved sentinel key used by [`wrap_skip_marker`] / [`is_skip_marker`]
+/// to encode a [`DispatchOutcome::Skip`] payload as a plain
+/// `serde_json::Value` (GH #76 Skip tier: Skip tier). Documented as a reserved
+/// key on the wire: an ordinary worker payload MUST NOT contain a
+/// top-level object field named `"__mse_skip"`.
+pub const SKIP_MARKER_KEY: &str = "__mse_skip";
+
+/// Wrap `v` in the reserved `{ "__mse_skip": true, "value": v }` sentinel
+/// shape produced by a [`SubmitOutcome::Skip`] submission and consumed by
+/// [`is_skip_marker`] / [`unwrap_skip_marker`] on the read side. See
+/// [`SKIP_MARKER_KEY`] for the reserved-key contract.
+pub fn wrap_skip_marker(v: Value) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert(SKIP_MARKER_KEY.to_string(), Value::Bool(true));
+    map.insert("value".to_string(), v);
+    Value::Object(map)
+}
+
+/// Return `true` when `v` is an object with `{ "__mse_skip": true }` set —
+/// the sentinel shape [`wrap_skip_marker`] produces. Used by the
+/// dispatcher (and the flow-ir binding boundary in future subtasks) to
+/// route a Skip completion out of the ordinary Pass/Blocked value path.
+pub fn is_skip_marker(v: &Value) -> bool {
+    v.as_object()
+        .and_then(|m| m.get(SKIP_MARKER_KEY))
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false)
+}
+
+/// If `v` is a skip-marker sentinel (see [`is_skip_marker`]), return the
+/// carried inner value cloned out of the `"value"` field (or `Value::Null`
+/// when the field is absent — a malformed sentinel is still a skip signal
+/// with no payload). Returns `None` otherwise, so the caller can fall back
+/// to the ordinary Pass/Blocked path.
+pub fn unwrap_skip_marker(v: &Value) -> Option<Value> {
+    if !is_skip_marker(v) {
+        return None;
+    }
+    Some(
+        v.as_object()
+            .and_then(|m| m.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+}
+
 /// Result of a `dispatch_attempt_with` call (or the conceptual outcome of
 /// a task attempt more broadly).
+///
+/// `#[non_exhaustive]` (GH #76 Skip tier) so future tier additions (e.g. a
+/// `Deferred` sibling of `Skip`) are additive — external crates cannot
+/// exhaustively match on this enum, and must include a `_` arm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum DispatchOutcome {
     /// The attempt completed with `ok = true`; carries the result value.
     Pass(Value),
     /// The attempt completed with `ok = false`, or dispatch itself failed;
     /// carries the result/error value.
     Blocked(Value),
+    /// GH #76 Skip tier: sibling tier of [`Self::Pass`] / [`Self::Blocked`]. The
+    /// worker completed successfully (`ok = true`) but declared its
+    /// output is NOT applicable to the surrounding flow — the enclosing
+    /// [`crate::blueprint::EngineDispatcher::dispatch`] treats this as
+    /// flow-continuation (does NOT propagate an error to flow-ir) while
+    /// short-circuiting the write to the step's declared `out` binding.
+    /// Carries the returning agent's verdict payload for observability
+    /// (`StepEntry.status = "skipped"`); downstream `$.<step_id>`
+    /// references see whatever pre-existing value the binding held
+    /// (typically absent). Mirrors `spawn_halt`'s "ok=true + marker" wire
+    /// pattern.
+    Skip(Value),
     /// The task suspended (e.g. via `query_senior`) before completing;
     /// carries the key needed to `resume` it.
     Suspended(ResumeKey),
@@ -170,6 +233,42 @@ pub enum DispatchOutcome {
     Cancelled,
     /// The attempt did not complete within the allotted time.
     Timeout,
+}
+
+/// GH #76 Skip tier: the completion tier a caller of
+/// [`crate::core::engine::Engine::submit_worker_result_trusted`] signals
+/// alongside its `value`. Sibling to `DispatchOutcome` (the engine-side
+/// outcome enum) — this one is the CALLER's intent enum, whereas
+/// [`DispatchOutcome`] is the reduced outcome the engine derives from the
+/// completed attempt.
+///
+/// Mapping into the wire shape stored in `EngineState.output_store`'s
+/// terminal `OutputEvent::Final`:
+///
+/// | outcome  | `Final.ok` | `Final.content`                                   |
+/// |----------|------------|---------------------------------------------------|
+/// | `Pass`   | `true`     | `value` verbatim                                  |
+/// | `Blocked`| `false`    | `value` verbatim                                  |
+/// | `Skip`   | `true`     | [`wrap_skip_marker(value)`](wrap_skip_marker)     |
+///
+/// `#[non_exhaustive]` so future tier additions stay additive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubmitOutcome {
+    /// Ordinary success — the worker's output is the step's value.
+    Pass,
+    /// Ordinary failure — the worker itself declared `ok = false`. Maps
+    /// to `DispatchOutcome::Blocked` at dispatch time; the
+    /// verdict-contract completion check is exempt (same "ok=false is
+    /// exempt" rule the pre-Skip world already applied).
+    Blocked,
+    /// Skip tier (GH #76): ok=true for flow-continuation purposes but the
+    /// value is wrapped in the skip-marker sentinel so the dispatcher can
+    /// route it to `DispatchOutcome::Skip` and downstream binding-write
+    /// paths can short-circuit. The verdict-contract completion check is
+    /// intentionally skipped — a Skip is the agent declaring "not
+    /// applicable", not a real verdict value.
+    Skip,
 }
 
 // ─── Session ───────────────────────────────────────────────────────────────

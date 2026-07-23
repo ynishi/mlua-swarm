@@ -73,6 +73,7 @@ use axum::{
     Json,
 };
 use mlua_swarm::core::agent_context::StepPointer;
+use mlua_swarm::core::state::SubmitOutcome;
 use mlua_swarm::core::step_naming::StepNaming;
 use mlua_swarm::store::run::{DegradationEntry, RunStatus, RunStoreError};
 use mlua_swarm::{CapToken, ContentRef, EngineError, OutputEvent, RunId, StepId, WorkerPayload};
@@ -578,6 +579,76 @@ pub struct SubmitQuery {
     /// (= normal success).
     #[serde(default)]
     pub ok: Option<bool>,
+    /// GH #76 HTTP wire: opt-in verdict tier selector. When absent, `ok` alone
+    /// drives the tier (pre-#76 byte-for-byte behavior:
+    /// `ok=true|absent → Pass`, `ok=false → Blocked`). When present, must
+    /// be one of `"pass"`, `"blocked"`, `"skip"` — anything else returns
+    /// 400. `verdict=skip` requires `ok` to be absent or `true`: an
+    /// explicit `verdict=skip&ok=false` is a conflicting signal and also
+    /// returns 400. `verdict=pass` / `verdict=blocked` semantics match
+    /// the corresponding `ok` boolean; a `verdict=pass&ok=false` or
+    /// `verdict=blocked&ok=true` combination is also a conflict → 400.
+    #[serde(default)]
+    pub verdict: Option<String>,
+}
+
+/// GH #76 HTTP wire: resolve the `(ok, verdict)` query-param pair into the
+/// [`SubmitOutcome`] the engine call takes. Kept as a plain free function
+/// (not a method on `SubmitQuery`) so the exhaustive match is unit-testable
+/// from `#[cfg(test)]` without threading an `AppState` through.
+///
+/// - `verdict` absent: `ok=true|None → Pass`, `ok=false → Blocked` (=
+///   pre-#76 wire, byte-for-byte).
+/// - `verdict=pass`: allowed with `ok=true|None`; conflicts with `ok=false`.
+/// - `verdict=blocked`: allowed with `ok=false|None`; conflicts with `ok=true`.
+/// - `verdict=skip`: allowed with `ok=true|None`; conflicts with `ok=false`.
+/// - `verdict` = anything else: `Err` with a message naming the valid set.
+fn resolve_submit_outcome(
+    verdict: Option<&str>,
+    ok: Option<bool>,
+) -> Result<SubmitOutcome, String> {
+    match verdict {
+        None => Ok(if ok.unwrap_or(true) {
+            SubmitOutcome::Pass
+        } else {
+            SubmitOutcome::Blocked
+        }),
+        Some(v) => match v {
+            "pass" => {
+                if ok == Some(false) {
+                    Err(
+                        "conflicting signal: verdict=pass with ok=false; drop one of them"
+                            .to_string(),
+                    )
+                } else {
+                    Ok(SubmitOutcome::Pass)
+                }
+            }
+            "blocked" => {
+                if ok == Some(true) {
+                    Err(
+                        "conflicting signal: verdict=blocked with ok=true; drop one of them"
+                            .to_string(),
+                    )
+                } else {
+                    Ok(SubmitOutcome::Blocked)
+                }
+            }
+            "skip" => {
+                if ok == Some(false) {
+                    Err(
+                        "conflicting signal: verdict=skip with ok=false; drop one of them"
+                            .to_string(),
+                    )
+                } else {
+                    Ok(SubmitOutcome::Skip)
+                }
+            }
+            other => Err(format!(
+                "verdict must be one of: pass, blocked, skip (got {other:?})"
+            )),
+        },
+    }
 }
 
 /// `POST /v1/worker/submit`. Simplified counterpart of [`worker_result`]:
@@ -635,19 +706,21 @@ pub async fn worker_submit(
     // validation, unchanged.
     let value = Value::String(body_str);
 
-    // The handle path = trusted internal API (= the server-minted handle is validated
-    // by the earlier lookup); the full-token path = existing verify-by-token API.
-    // Both are reflected identically into final + last_result.
-    // `?ok=false` in the query signals failure (= `DispatchOutcome::Blocked`,
-    // the flow.ir Try catch path).
-    let ok = q.ok.unwrap_or(true);
-    map_completion_result(
-        state
-            .engine
-            .submit_worker_result_trusted(&task_id, attempt, value, ok)
-            .await,
-        "submit_worker_result_trusted",
-    )?;
+    // GH #76 HTTP wire: resolve the `(ok, verdict)` query-param pair into the
+    // `SubmitOutcome` the engine call takes. The handle path = trusted
+    // internal API (= the server-minted handle is validated by the earlier
+    // lookup); the full-token path = existing verify-by-token API. Both are
+    // reflected identically into final + last_result. Absent `verdict`
+    // preserves the pre-#76 wire byte-for-byte (`ok=true|absent → Pass`,
+    // `ok=false → Blocked`); `verdict=skip` is the new opt-in third tier
+    // (see [`resolve_submit_outcome`] for the full truth table).
+    let outcome =
+        resolve_submit_outcome(q.verdict.as_deref(), q.ok).map_err(ApiError::bad_request)?;
+    let submit_result = state
+        .engine
+        .submit_worker_result_trusted(&task_id, attempt, value, outcome)
+        .await;
+    map_completion_result(submit_result, "submit_worker_result_trusted")?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1130,6 +1203,78 @@ mod tests {
             base_url: None,
             sync_timeout_secs: 300,
         }
+    }
+
+    // GH #76 HTTP wire — `resolve_submit_outcome` truth table. Guards the
+    // exhaustive `(verdict, ok)` mapping against silent regressions when
+    // future work adds new tiers under `#[non_exhaustive]` `SubmitOutcome`.
+    #[test]
+    fn resolve_submit_outcome_absent_verdict_preserves_pre_gh76_wire() {
+        // ok=None / ok=true / ok=false without verdict → Pass / Pass / Blocked.
+        assert!(matches!(
+            resolve_submit_outcome(None, None),
+            Ok(SubmitOutcome::Pass)
+        ));
+        assert!(matches!(
+            resolve_submit_outcome(None, Some(true)),
+            Ok(SubmitOutcome::Pass)
+        ));
+        assert!(matches!(
+            resolve_submit_outcome(None, Some(false)),
+            Ok(SubmitOutcome::Blocked)
+        ));
+    }
+
+    #[test]
+    fn resolve_submit_outcome_verdict_pass_and_blocked_match_ok_bool_or_default() {
+        assert!(matches!(
+            resolve_submit_outcome(Some("pass"), None),
+            Ok(SubmitOutcome::Pass)
+        ));
+        assert!(matches!(
+            resolve_submit_outcome(Some("pass"), Some(true)),
+            Ok(SubmitOutcome::Pass)
+        ));
+        assert!(resolve_submit_outcome(Some("pass"), Some(false)).is_err());
+
+        assert!(matches!(
+            resolve_submit_outcome(Some("blocked"), None),
+            Ok(SubmitOutcome::Blocked)
+        ));
+        assert!(matches!(
+            resolve_submit_outcome(Some("blocked"), Some(false)),
+            Ok(SubmitOutcome::Blocked)
+        ));
+        assert!(resolve_submit_outcome(Some("blocked"), Some(true)).is_err());
+    }
+
+    #[test]
+    fn resolve_submit_outcome_verdict_skip_is_ok_true_only() {
+        assert!(matches!(
+            resolve_submit_outcome(Some("skip"), None),
+            Ok(SubmitOutcome::Skip)
+        ));
+        assert!(matches!(
+            resolve_submit_outcome(Some("skip"), Some(true)),
+            Ok(SubmitOutcome::Skip)
+        ));
+        // The conflict case the HTTP wire HTTP handler surfaces as 400.
+        let err = resolve_submit_outcome(Some("skip"), Some(false))
+            .expect_err("skip + ok=false must be a conflict");
+        assert!(
+            err.contains("conflict") || err.contains("conflicting"),
+            "err should name the conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_submit_outcome_invalid_verdict_names_valid_set() {
+        let err = resolve_submit_outcome(Some("bogus"), None)
+            .expect_err("unknown verdict must be an error");
+        assert!(
+            err.contains("pass") && err.contains("blocked") && err.contains("skip"),
+            "err should enumerate the valid tier set: {err}"
+        );
     }
 
     async fn append_final(
@@ -2081,7 +2226,10 @@ mod tests {
         let err = worker_submit(
             State(state.clone()),
             bearer_headers(&handle),
-            Query(SubmitQuery { ok: None }),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
             axum::body::Bytes::from_static(b"LATE OUTPUT"),
         )
         .await
@@ -2393,7 +2541,10 @@ mod tests {
         let status = worker_submit(
             State(state.clone()),
             bearer_headers(&handle),
-            Query(SubmitQuery { ok: None }),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
             axum::body::Bytes::from(body),
         )
         .await
@@ -2438,7 +2589,10 @@ mod tests {
         let status = worker_submit(
             State(state.clone()),
             bearer_headers(&handle),
-            Query(SubmitQuery { ok: None }),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
             axum::body::Bytes::from_static(b"DONE yes=1 maybe=0 no=0"),
         )
         .await
@@ -2500,7 +2654,10 @@ mod tests {
         let err = worker_submit(
             State(state.clone()),
             bearer_headers(&handle),
-            Query(SubmitQuery { ok: None }),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
             axum::body::Bytes::from(body),
         )
         .await
@@ -2532,7 +2689,10 @@ mod tests {
         let err = worker_submit(
             State(state.clone()),
             bearer_headers(&handle),
-            Query(SubmitQuery { ok: None }),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
             axum::body::Bytes::from(body),
         )
         .await
@@ -2552,7 +2712,10 @@ mod tests {
         let err = worker_submit(
             State(state.clone()),
             bearer_headers(&handle),
-            Query(SubmitQuery { ok: None }),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
             axum::body::Bytes::from_static(b"@file:relative/path.md"),
         )
         .await
@@ -2575,7 +2738,10 @@ mod tests {
         let err = worker_submit(
             State(state.clone()),
             bearer_headers(&handle),
-            Query(SubmitQuery { ok: None }),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
             axum::body::Bytes::from_static(b"@file:/tmp/anywhere.md"),
         )
         .await
@@ -2655,7 +2821,10 @@ mod tests {
         let err = worker_submit(
             State(state.clone()),
             bearer_headers(&handle),
-            Query(SubmitQuery { ok: None }),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
             axum::body::Bytes::from(body),
         )
         .await
@@ -2698,7 +2867,10 @@ mod tests {
             let err = worker_submit(
                 State(state.clone()),
                 bearer_headers(&handle),
-                Query(SubmitQuery { ok: None }),
+                Query(SubmitQuery {
+                    ok: None,
+                    verdict: None,
+                }),
                 axum::body::Bytes::from(body),
             )
             .await
@@ -2748,7 +2920,10 @@ mod tests {
         let err = worker_submit(
             State(state.clone()),
             bearer_headers(&handle),
-            Query(SubmitQuery { ok: None }),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
             axum::body::Bytes::from("UNKNOWN"),
         )
         .await
@@ -2778,7 +2953,10 @@ mod tests {
         let status = worker_submit(
             State(state.clone()),
             bearer_headers(&handle),
-            Query(SubmitQuery { ok: None }),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
             axum::body::Bytes::from("PASS"),
         )
         .await
@@ -2801,7 +2979,10 @@ mod tests {
         let status = worker_submit(
             State(state.clone()),
             bearer_headers(&handle),
-            Query(SubmitQuery { ok: None }),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
             axum::body::Bytes::from("anything at all, no contract to violate"),
         )
         .await

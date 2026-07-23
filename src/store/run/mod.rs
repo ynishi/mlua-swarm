@@ -213,6 +213,32 @@ impl SnapshotOrigin {
     }
 }
 
+/// GH #76 error surface: single-slot breadcrumb the dispatcher writes when a step
+/// aborts the flow (currently: [`crate::core::state::DispatchOutcome::Blocked`]),
+/// so the surrounding [`crate::service::task_launch::TaskLaunchService::launch`]
+/// `map_err` closure can lift `failed_step` + `verdict_value` off the eval
+/// boundary into the structured [`crate::service::task_launch::TaskLaunchError::FlowEval`]
+/// variant. Sibling to `step_entries` (append-only per-step trace) — this
+/// slot is last-write-wins because only ONE aborting step matters for the
+/// eval's terminal error envelope, and flow-ir stops dispatching further
+/// steps after `EvalError::DispatcherError`.
+#[derive(Debug, Clone)]
+pub struct LastFailure {
+    /// The `StepId` (dispatch-time tid) the dispatcher assigned to the
+    /// aborting step.
+    pub step_id: StepId,
+    /// The Blueprint `Step.ref` that dispatched the aborting step, if
+    /// known (dispatcher fills this from its own `ref_` param — never `None`
+    /// on the current write path, but modeled `Option` because the
+    /// `LastFailure` shape is a public read surface and future breadcrumb
+    /// writers may not have a ref in hand).
+    pub step_ref: Option<String>,
+    /// The verdict value the aborting step carried
+    /// (e.g. `DispatchOutcome::Blocked(v)`'s `v`, cloned by the dispatcher
+    /// before mapping the outcome to `EvalError::DispatcherError`).
+    pub verdict_value: serde_json::Value,
+}
+
 /// Pairs a [`RunId`] with the [`RunStore`] used to persist its trace.
 ///
 /// Threaded from the server entry points (`POST /v1/tasks`, `POST
@@ -254,6 +280,19 @@ pub struct RunContext {
     /// snapshot's [`SnapshotOrigin`] (never inferred from replay-cursor or
     /// step-entry state, whose wiring is free to change).
     pub resume: bool,
+    /// GH #76 error surface: shared single-slot breadcrumb the dispatcher writes when
+    /// a step aborts the flow (`DispatchOutcome::Blocked` → `EvalError`).
+    /// Read by the enclosing [`crate::service::task_launch::TaskLaunchService::launch`]
+    /// `map_err` closure to populate the structured
+    /// [`crate::service::task_launch::TaskLaunchError::FlowEval`] variant's
+    /// `failed_step` / `verdict_value` fields. `None` (the default) means
+    /// no aborting step was recorded — either the run succeeded, or an
+    /// error path fired that does not go through the dispatcher's Blocked
+    /// arm (e.g. `EvalError` raised by flow-ir itself before dispatch).
+    /// Behind `std::sync::Mutex` to match the `replay_cursor` sibling
+    /// (same crate-level convention — dispatcher writes are short critical
+    /// sections, no `.await` held across).
+    pub last_failure: Arc<Mutex<Option<LastFailure>>>,
 }
 
 impl RunContext {
@@ -269,7 +308,74 @@ impl RunContext {
             replay_cursor: None,
             binding_digests: Arc::new(HashMap::new()),
             resume: false,
+            last_failure: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// GH #76 error surface: write the aborting-step breadcrumb (last-write-wins).
+    /// Called by [`crate::blueprint::EngineDispatcher::dispatch`]'s Blocked
+    /// arm BEFORE it maps the outcome to `EvalError::DispatcherError`.
+    /// Silently succeeds if the mutex is poisoned — this is an
+    /// observability breadcrumb, not a load-bearing invariant, and a
+    /// poisoned mutex here must never prevent the primary abort error
+    /// from propagating (same fail-open convention as the sibling
+    /// `append_step_entry` warn-and-swallow at
+    /// `EngineDispatcher::dispatch`).
+    pub fn set_last_failure(&self, failure: LastFailure) {
+        if let Ok(mut slot) = self.last_failure.lock() {
+            *slot = Some(failure);
+        }
+    }
+
+    /// GH #76 error surface: reconstruct a partial-ctx snapshot from the step-entry
+    /// trace persisted so far — the in-tree substitute for a full
+    /// `storage.snapshot()` from flow-ir (upstream carry).
+    ///
+    /// Shape: `{ "steps": { "<step_id>": { "step_ref": ..., "status": ...,
+    /// "binding_digest": ..., "at": ... } } }` — a JSON object keyed by
+    /// each dispatched `StepId` with its recorded [`StepEntry`] metadata.
+    /// This is metadata-level, NOT value-level (no `StepEntry` carries the
+    /// step's actual OUTPUT value; that requires upstream mlua-flow-ir
+    /// support to expose `storage.snapshot()` on error). Consumers who
+    /// need value-level partial ctx must wait for the upstream carry —
+    /// see the FlowEval `partial_ctx` field rustdoc.
+    ///
+    /// Returns `Value::Null` if the store lookup fails (e.g. the row was
+    /// deleted between dispatch and error surfacing) — the caller's
+    /// `partial_ctx: Option<Value>` field wraps this so `Null` is
+    /// distinguishable from "no snapshot attempt at all".
+    pub async fn snapshot_partial_ctx(&self) -> serde_json::Value {
+        let record = match self.run_store.get(&self.run_id).await {
+            Ok(r) => r,
+            Err(_) => return serde_json::Value::Null,
+        };
+        let mut steps = serde_json::Map::new();
+        for entry in &record.step_entries {
+            let mut fields = serde_json::Map::new();
+            if let Some(ref_) = &entry.step_ref {
+                fields.insert(
+                    "step_ref".to_string(),
+                    serde_json::Value::String(ref_.clone()),
+                );
+            }
+            if let Some(status) = &entry.status {
+                fields.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(status.clone()),
+                );
+            }
+            if let Some(digest) = &entry.binding_digest {
+                fields.insert(
+                    "binding_digest".to_string(),
+                    serde_json::Value::String(digest.to_string()),
+                );
+            }
+            fields.insert("at".to_string(), serde_json::Value::Number(entry.at.into()));
+            steps.insert(entry.step_id.to_string(), serde_json::Value::Object(fields));
+        }
+        let mut out = serde_json::Map::new();
+        out.insert("steps".to_string(), serde_json::Value::Object(steps));
+        serde_json::Value::Object(out)
     }
 
     /// Builder-style setter: attach a [`ReplayStore`] to log every
@@ -320,6 +426,10 @@ impl std::fmt::Debug for RunContext {
             .field("replay_cursor", &self.replay_cursor.is_some())
             .field("binding_digests", &self.binding_digests.len())
             .field("resume", &self.resume)
+            .field(
+                "last_failure",
+                &self.last_failure.lock().ok().and_then(|slot| slot.clone()),
+            )
             .finish()
     }
 }

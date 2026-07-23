@@ -409,6 +409,16 @@ struct BpDoctorReq {
     /// requirements are already understood.
     #[serde(default)]
     disable_binding_lint: Option<bool>,
+    /// GH #76 DSL sugar skip_on_lint family (default enabled): when true,
+    /// skip the Blueprint-level Skip-tier / `skip_on` DSL cross-check
+    /// (`skip_on_missing_for_skip_like_verdict_value` /
+    /// `skip_on_declared_but_no_matching_verdict_value` /
+    /// `skip_on_pattern_conflicts_with_halt_on`). The family is
+    /// BLOCK-disabled by default (WARN is the maximum severity ever
+    /// emitted); pass `disable_skip_on_lint=true` to omit the
+    /// top-level `skip_on_lint` section entirely.
+    #[serde(default)]
+    disable_skip_on_lint: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -815,6 +825,263 @@ fn classify_binding_lint(bp: &Blueprint) -> serde_json::Value {
                 ),
             }));
         }
+    }
+
+    serde_json::json!({ "findings": findings })
+}
+
+/// GH #76 DSL sugar `skip_on_lint` family: Blueprint-scoped advisory checks
+/// covering the DSL sugar `skip_on = { ... }` on a `B.stage` (which
+/// compiles to a `Branch{cond = in(verdict, skip_on_list), then =
+/// Seq{}, else = <stage body>}`) and its cross-reference against
+/// declared `agents[].verdict.values`.
+///
+/// Three checks, all report-only (WARN — never BLOCK), matching the
+/// sibling `binding_lint` family's posture. **BLOCK-disabled by
+/// default** — the family's maximum severity emitted is `WARN`, per
+/// the GH #76 DSL sugar spec: this lint surfaces DSL / verdict-value drift,
+/// never enforces a fix.
+///
+/// - `skip_on_missing_for_skip_like_verdict_value` (WARN): an agent
+///   declares a `verdict.values` entry that reads like a Skip signal
+///   (`SKIP` / `NOT_APPLICABLE` / `N/A`, case-insensitive), yet no
+///   `Branch` in the compiled flow uses that value in a `skip_on`
+///   `in(...)` list. Points at either a missing `skip_on = { ... }`
+///   or a stale verdict value.
+/// - `skip_on_declared_but_no_matching_verdict_value` (WARN): a
+///   compiled `skip_on` list carries a value that appears in no
+///   agent's `verdict.values`. Dead skip guard — the upstream verdict
+///   never produces that value, so the guard can never fire.
+/// - `skip_on_pattern_conflicts_with_halt_on` (WARN): the same value
+///   appears in a `skip_on` list AND in a `halt_on` / gate check in
+///   the flow. Only one of the two guards will fire on that verdict
+///   at run time; the overlap is at best redundant, at worst a logic
+///   bug.
+///
+/// Pure over the resolved Blueprint (no I/O), unit-testable. Detection
+/// is best-effort static: works against the `Branch{cond=In}` shape
+/// the DSL emits, and against `Branch{cond=Eq/Ne{path, lit}}` /
+/// `Branch{cond=Or{...eq...}}` for `halt_on` (the shape `bp_dsl`
+/// `gate_cond` emits). Other shapes (arithmetic conds / callee-side
+/// tests / hand-authored flow_dsl variants) are skipped silently
+/// (same posture as `Compiler::verify_verdict_conds`).
+fn classify_skip_on_lint(bp: &Blueprint) -> serde_json::Value {
+    use mlua_flow_ir::{Expr, Node as FlowNode};
+
+    /// Set of literal string values collected off the flow, tagged by
+    /// which guard family they came from.
+    #[derive(Default)]
+    struct GuardValues {
+        /// Every string appearing in a `Branch{cond = In{needle: Path
+        /// ending in .parts.verdict, haystack: Lit(Array<String>)}}` —
+        /// the shape `bp_dsl` `skip_on` emits.
+        skip_on: std::collections::BTreeSet<String>,
+        /// Every string appearing in a `Branch{cond = Eq/Ne{Path.verdict,
+        /// Lit(String)}}` or an `Or{args = [Eq..., Eq...]}` of that shape
+        /// — the shape `bp_dsl` `gate_cond` (halt_on) emits.
+        halt_on: std::collections::BTreeSet<String>,
+    }
+
+    /// A `Path`'s string form ends at `.parts["verdict"]` or
+    /// `.parts.verdict` (either bracket or dot notation is valid input
+    /// to the flow-ir Path parser — the runtime accepts both).
+    fn is_verdict_path(at: &mlua_flow_ir::Path) -> bool {
+        let s = at.to_string();
+        s.ends_with(".parts[\"verdict\"]") || s.ends_with(".parts.verdict")
+    }
+
+    fn collect_string_literals(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(items) => {
+                for it in items {
+                    collect_string_literals(it, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_expr_for_halt(expr: &Expr, out: &mut GuardValues) {
+        match expr {
+            Expr::Eq { lhs, rhs } | Expr::Ne { lhs, rhs } => {
+                let pair = match (lhs.as_ref(), rhs.as_ref()) {
+                    (Expr::Path { at }, Expr::Lit { value }) => Some((at, value)),
+                    (Expr::Lit { value }, Expr::Path { at }) => Some((at, value)),
+                    _ => None,
+                };
+                if let Some((at, value)) = pair {
+                    if is_verdict_path(at) {
+                        let mut lits = Vec::new();
+                        collect_string_literals(value, &mut lits);
+                        for s in lits {
+                            out.halt_on.insert(s);
+                        }
+                    }
+                }
+            }
+            Expr::And { args } | Expr::Or { args } => {
+                for a in args {
+                    walk_expr_for_halt(a, out);
+                }
+            }
+            Expr::Not { arg } => walk_expr_for_halt(arg, out),
+            _ => {}
+        }
+    }
+
+    fn walk_expr_for_skip(expr: &Expr, out: &mut GuardValues) {
+        match expr {
+            Expr::In { needle, haystack } => {
+                if let (
+                    Expr::Path { at },
+                    Expr::Lit {
+                        value: serde_json::Value::Array(items),
+                    },
+                ) = (needle.as_ref(), haystack.as_ref())
+                {
+                    if is_verdict_path(at) {
+                        for it in items {
+                            if let serde_json::Value::String(s) = it {
+                                out.skip_on.insert(s.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::And { args } | Expr::Or { args } => {
+                for a in args {
+                    walk_expr_for_skip(a, out);
+                }
+            }
+            Expr::Not { arg } => walk_expr_for_skip(arg, out),
+            _ => {}
+        }
+    }
+
+    fn walk_node(node: &FlowNode, out: &mut GuardValues) {
+        match node {
+            FlowNode::Branch { cond, then_, else_ } => {
+                // Distinguish skip guard vs halt guard by cond shape.
+                // `In{Path.verdict, Lit[array]}` = skip_on (the shape
+                // `bp_dsl` `skip_on` emits). `Eq/Ne{Path.verdict,
+                // Lit}` or `Or{Eq...Eq...}` = halt_on (the shape
+                // `gate_cond` emits). Both walkers are separate + skip
+                // shapes they don't recognize, so a hand-authored flow
+                // that combines both patterns still gets classified
+                // correctly.
+                walk_expr_for_skip(cond, out);
+                walk_expr_for_halt(cond, out);
+                walk_node(then_, out);
+                walk_node(else_, out);
+            }
+            FlowNode::Loop { cond, body, .. } => {
+                walk_expr_for_skip(cond, out);
+                walk_expr_for_halt(cond, out);
+                walk_node(body, out);
+            }
+            FlowNode::Seq { children } => {
+                for c in children {
+                    walk_node(c, out);
+                }
+            }
+            FlowNode::Fanout { body, .. } => walk_node(body, out),
+            FlowNode::Try { body, catch, .. } => {
+                walk_node(body, out);
+                walk_node(catch, out);
+            }
+            FlowNode::Step { .. } | FlowNode::Assign { .. } => {}
+        }
+    }
+
+    /// Case-insensitive membership of a verdict value in the fixed
+    /// skip-like pattern set.
+    fn is_skip_like(value: &str) -> bool {
+        matches!(
+            value.to_ascii_uppercase().as_str(),
+            "SKIP" | "NOT_APPLICABLE" | "N/A"
+        )
+    }
+
+    let mut guards = GuardValues::default();
+    walk_node(&bp.flow, &mut guards);
+
+    // Every declared verdict value across every agent, with the
+    // owning agent for message hints.
+    let mut declared_values: Vec<(String, String)> = Vec::new();
+    for agent in &bp.agents {
+        if let Some(contract) = &agent.verdict {
+            for v in &contract.values {
+                declared_values.push((agent.name.clone(), v.clone()));
+            }
+        }
+    }
+
+    let declared_value_set: std::collections::BTreeSet<&str> =
+        declared_values.iter().map(|(_, v)| v.as_str()).collect();
+
+    let mut findings: Vec<serde_json::Value> = Vec::new();
+
+    // Check 1 — skip_on_missing_for_skip_like_verdict_value (WARN):
+    // agent declares a skip-like verdict value, but no `skip_on` list
+    // in the flow captures that value. One finding per (agent, value)
+    // pair so a Blueprint declaring the pattern across N agents surfaces
+    // the full list, not just the first hit.
+    for (agent, value) in &declared_values {
+        if is_skip_like(value) && !guards.skip_on.contains(value) {
+            findings.push(serde_json::json!({
+                "check": "skip_on_missing_for_skip_like_verdict_value",
+                "severity": "WARN",
+                "agent": agent,
+                "value": value,
+                "message": format!(
+                    "agent '{agent}' declares verdict.values entry '{value}' which \
+                     reads like a Skip signal (SKIP / NOT_APPLICABLE / N/A, \
+                     case-insensitive), but no Branch in the flow uses it in a \
+                     `skip_on = {{ \"{value}\" }}` list. Add `skip_on = {{ \"{value}\" \
+                     }}` on the downstream stage that should opt out on this \
+                     verdict, or remove the value from the agent's verdict.values \
+                     if it is stale."
+                ),
+            }));
+        }
+    }
+
+    // Check 2 — skip_on_declared_but_no_matching_verdict_value (WARN):
+    // a `skip_on` list captures a value that no agent's verdict.values
+    // declares. Dead guard.
+    for skip_value in &guards.skip_on {
+        if !declared_value_set.contains(skip_value.as_str()) {
+            findings.push(serde_json::json!({
+                "check": "skip_on_declared_but_no_matching_verdict_value",
+                "severity": "WARN",
+                "value": skip_value,
+                "message": format!(
+                    "a `skip_on` list captures the value '{skip_value}', but no agent's \
+                     verdict.values declares it; the guard can never fire (dead branch). \
+                     Either add '{skip_value}' to an upstream agent's verdict.values, or \
+                     remove it from the skip_on list."
+                ),
+            }));
+        }
+    }
+
+    // Check 3 — skip_on_pattern_conflicts_with_halt_on (WARN): the
+    // same value appears in both a skip_on list and a halt_on cond.
+    // Overlap.
+    for value in guards.skip_on.intersection(&guards.halt_on) {
+        findings.push(serde_json::json!({
+            "check": "skip_on_pattern_conflicts_with_halt_on",
+            "severity": "WARN",
+            "value": value,
+            "message": format!(
+                "value '{value}' appears in both a `skip_on` list and a `halt_on` \
+                 (gate) cond in the flow. Only one of the two guards fires on this \
+                 verdict at run time — the overlap is at best redundant, at worst a \
+                 logic bug. Split the verdict values across skip_on / halt_on so \
+                 each value routes through exactly one guard."
+            ),
+        }));
     }
 
     serde_json::json!({ "findings": findings })
@@ -2602,6 +2869,7 @@ impl MseServer {
         let disable_output_contract_lint = req.disable_output_contract_lint.unwrap_or(false);
         let disable_worker_binding_lint = req.disable_worker_binding_lint.unwrap_or(false);
         let disable_binding_lint = req.disable_binding_lint.unwrap_or(false);
+        let disable_skip_on_lint = req.disable_skip_on_lint.unwrap_or(false);
 
         let mut per_agent = Vec::with_capacity(bp.agents.len());
         let mut severities: Vec<&'static str> = Vec::with_capacity(bp.agents.len());
@@ -2733,6 +3001,24 @@ impl MseServer {
             })
             .unwrap_or_default();
 
+        // GH #76 DSL sugar — Blueprint-scoped skip_on_lint (see
+        // `classify_skip_on_lint` doc for the 3 checks). Same
+        // conditional-presence convention as `binding_lint`: omitted
+        // entirely when the family is disabled.
+        let skip_on_lint = (!disable_skip_on_lint).then(|| classify_skip_on_lint(&bp));
+        let skip_on_lint_severities: Vec<String> = skip_on_lint
+            .as_ref()
+            .and_then(|b| b.get("findings"))
+            .and_then(|f| f.as_array())
+            .map(|findings| {
+                findings
+                    .iter()
+                    .filter_map(|f| f.get("severity").and_then(|s| s.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // GH #45 / #61 + C4: fold the four lint families into the aggregate
         // verdict. `aggregate_agent_md_verdict` already implements the
         // BLOCK-dominates-WARN-dominates-OK precedence — reuse it by
@@ -2746,13 +3032,15 @@ impl MseServer {
                 + tool_lint_severities.len()
                 + output_contract_lint_severities.len()
                 + worker_binding_lint_severities.len()
-                + binding_lint_severities.len(),
+                + binding_lint_severities.len()
+                + skip_on_lint_severities.len(),
         );
         all_severities.extend(severities.iter().copied());
         all_severities.extend(tool_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(output_contract_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(worker_binding_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(binding_lint_severities.iter().map(|s| s.as_str()));
+        all_severities.extend(skip_on_lint_severities.iter().map(|s| s.as_str()));
         let verdict = aggregate_agent_md_verdict(&all_severities);
         let over_threshold_count = severities.iter().filter(|s| **s != "OK").count();
         let tool_lint_warn_count = tool_lint_severities
@@ -2773,6 +3061,14 @@ impl MseServer {
             .iter()
             .filter(|s| s.as_str() == "WARN")
             .count();
+        // GH #76 DSL sugar — skip_on_lint findings are WARN-only (family is
+        // BLOCK-disabled by default), so this counts every finding
+        // that carries a severity string; if a future check emits
+        // INFO/OK, adjust here.
+        let skip_on_lint_warn_count = skip_on_lint_severities
+            .iter()
+            .filter(|s| s.as_str() == "WARN")
+            .count();
 
         let mut body = serde_json::json!({
             "bp_id": req.id,
@@ -2785,6 +3081,7 @@ impl MseServer {
             "output_contract_lint_warn_count": output_contract_lint_warn_count,
             "worker_binding_lint_warn_count": worker_binding_lint_warn_count,
             "binding_lint_warn_count": binding_lint_warn_count,
+            "skip_on_lint_warn_count": skip_on_lint_warn_count,
             "thresholds": {
                 "warn_bytes": thresholds.warn_bytes,
                 "warn_lines": thresholds.warn_lines,
@@ -2797,6 +3094,7 @@ impl MseServer {
                 "output_contract_lint_enabled": !disable_output_contract_lint,
                 "worker_binding_lint_enabled": !disable_worker_binding_lint,
                 "binding_lint_enabled": !disable_binding_lint,
+                "skip_on_lint_enabled": !disable_skip_on_lint,
             },
             "agents": per_agent,
             "guide_ref": "mse://guides/agent-md-authoring",
@@ -2809,6 +3107,15 @@ impl MseServer {
         if let Some(binding_lint) = binding_lint {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("binding_lint".to_string(), binding_lint);
+            }
+        }
+        // GH #76 DSL sugar — attach `skip_on_lint` when the family is enabled,
+        // mirroring `binding_lint`'s conditional-presence convention
+        // (the `lint_families.skip_on_lint_enabled` flag stays the
+        // single enabled/disabled signal).
+        if let Some(skip_on_lint) = skip_on_lint {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("skip_on_lint".to_string(), skip_on_lint);
             }
         }
         json_result(&body)
@@ -5428,6 +5735,208 @@ mod tests {
         assert!(
             find_binding_check(&findings, "legacy_worker_binding").is_none(),
             "an inline-Runner agent must not warn about a legacy worker_binding"
+        );
+    }
+
+    // ─── GH #76 DSL sugar: bp_doctor skip_on_lint family ─────────────
+
+    /// Build a minimal `Blueprint` fixture whose flow is the given
+    /// `FlowNode` and whose agents' `verdict.values` reflect the
+    /// declared token list per agent. Only fields `classify_skip_on_lint`
+    /// reads are populated (flow + agents' verdict); everything else
+    /// piggy-backs on `identity_blueprint`.
+    fn skip_on_bp(flow: FlowNode, agents_verdicts: &[(&str, &[&str])]) -> Blueprint {
+        let mut bp = identity_blueprint();
+        bp.flow = flow;
+        bp.agents = agents_verdicts
+            .iter()
+            .map(|(name, values)| AgentDef {
+                name: (*name).into(),
+                kind: AgentKind::Operator,
+                spec: serde_json::json!({}),
+                profile: None,
+                meta: Some(AgentMeta::default()),
+                runner: None,
+                runner_ref: None,
+                verdict: Some(mlua_swarm_schema::VerdictContract {
+                    channel: mlua_swarm_schema::VerdictChannel::Part,
+                    values: values.iter().map(|s| (*s).into()).collect(),
+                }),
+            })
+            .collect();
+        bp
+    }
+
+    /// Convenience: `path("$.<step>.parts.verdict") in Lit([v1, ...])`
+    /// — the shape `bp_dsl` `skip_on` emits (dot / bracket normalized
+    /// by the flow-ir Path parser).
+    fn skip_branch(upstream_step: &str, values: &[&str], body: FlowNode) -> FlowNode {
+        let path_at = format!("$.{upstream_step}.parts.verdict");
+        FlowNode::Branch {
+            cond: Expr::In {
+                needle: Box::new(Expr::Path {
+                    at: path_at.parse().expect("literal verdict path"),
+                }),
+                haystack: Box::new(Expr::Lit {
+                    value: serde_json::Value::Array(
+                        values
+                            .iter()
+                            .map(|s| serde_json::Value::String((*s).into()))
+                            .collect(),
+                    ),
+                }),
+            },
+            then_: Box::new(FlowNode::Seq { children: vec![] }),
+            else_: Box::new(body),
+        }
+    }
+
+    /// Convenience: `eq(path("$.<step>.parts.verdict"), Lit(value))`
+    /// — the shape `bp_dsl` `gate_cond` emits for a single halt_on value.
+    fn halt_branch(step: &str, value: &str, then_: FlowNode, else_: FlowNode) -> FlowNode {
+        let path_at = format!("$.{step}.parts.verdict");
+        FlowNode::Branch {
+            cond: Expr::Eq {
+                lhs: Box::new(Expr::Path {
+                    at: path_at.parse().expect("literal verdict path"),
+                }),
+                rhs: Box::new(Expr::Lit {
+                    value: serde_json::Value::String(value.into()),
+                }),
+            },
+            then_: Box::new(then_),
+            else_: Box::new(else_),
+        }
+    }
+
+    fn nop_step() -> FlowNode {
+        FlowNode::Seq { children: vec![] }
+    }
+
+    fn find_skip_check<'a>(
+        findings: &'a [serde_json::Value],
+        check: &str,
+    ) -> Option<&'a serde_json::Value> {
+        findings.iter().find(|f| f["check"] == check)
+    }
+
+    /// (a) `skip_on_missing_for_skip_like_verdict_value`: agent
+    /// declares a skip-like verdict value but no `skip_on` list in the
+    /// flow captures that value → WARN.
+    #[test]
+    fn skip_on_lints_warn_on_skip_like_verdict_without_skip_on() {
+        let bp = skip_on_bp(
+            nop_step(),
+            &[("triager", &["APPLICABLE", "NOT_APPLICABLE"])],
+        );
+        let lint = classify_skip_on_lint(&bp);
+        let findings = lint["findings"].as_array().expect("findings array");
+        let warn = find_skip_check(findings, "skip_on_missing_for_skip_like_verdict_value")
+            .expect("a skip-like verdict value without a matching skip_on list must WARN");
+        assert_eq!(warn["severity"], "WARN");
+        assert_eq!(warn["agent"], "triager");
+        assert_eq!(warn["value"], "NOT_APPLICABLE");
+        let msg = warn["message"].as_str().expect("message string");
+        assert!(msg.contains("NOT_APPLICABLE"));
+        assert!(msg.contains("skip_on"));
+    }
+
+    /// The check is case-insensitive on the skip-like pattern set.
+    /// Non-skip-like values (e.g. `"PASS"`, `"BLOCKED"`) do not
+    /// trigger this warning.
+    #[test]
+    fn skip_on_lint_case_insensitive_and_only_flags_skip_like_values() {
+        let bp = skip_on_bp(
+            nop_step(),
+            &[("mixed", &["Pass", "Blocked", "N/A", "skip"])],
+        );
+        let lint = classify_skip_on_lint(&bp);
+        let findings = lint["findings"].as_array().expect("findings array");
+        let missing: Vec<_> = findings
+            .iter()
+            .filter(|f| f["check"] == "skip_on_missing_for_skip_like_verdict_value")
+            .collect();
+        // Two skip-like values (`N/A`, `skip`), two non-skip
+        // (`Pass`, `Blocked`) — only the two skip-likes WARN.
+        assert_eq!(missing.len(), 2, "findings={findings:?}");
+        let flagged: std::collections::BTreeSet<&str> =
+            missing.iter().filter_map(|f| f["value"].as_str()).collect();
+        assert!(flagged.contains("N/A"));
+        assert!(flagged.contains("skip"));
+    }
+
+    /// (b) `skip_on_declared_but_no_matching_verdict_value`: a
+    /// `skip_on` list captures a value no agent declares → WARN.
+    #[test]
+    fn skip_on_lints_warn_on_dead_skip_on_declaration() {
+        // Flow has `skip_on = ["GHOST"]`; the sole agent's verdict.values
+        // is `["APPLICABLE"]` — nothing else can produce "GHOST", so
+        // the skip guard is dead.
+        let flow = skip_branch("triager", &["GHOST"], nop_step());
+        let bp = skip_on_bp(flow, &[("triager", &["APPLICABLE"])]);
+        let lint = classify_skip_on_lint(&bp);
+        let findings = lint["findings"].as_array().expect("findings array");
+        let warn = find_skip_check(findings, "skip_on_declared_but_no_matching_verdict_value")
+            .expect("a skip_on list capturing an undeclared value must WARN");
+        assert_eq!(warn["severity"], "WARN");
+        assert_eq!(warn["value"], "GHOST");
+        let msg = warn["message"].as_str().expect("message string");
+        assert!(msg.contains("GHOST"));
+        assert!(msg.contains("dead branch"));
+    }
+
+    /// (c) `skip_on_pattern_conflicts_with_halt_on`: the same value
+    /// appears in both a skip_on list and a halt_on cond → WARN.
+    #[test]
+    fn skip_on_lints_warn_on_halt_on_skip_on_overlap() {
+        // Flow has:  branch{ eq(triager.verdict, "OVERLAP") ->
+        //              branch{ in(triager.verdict, ["OVERLAP"]) -> ...
+        //                                                       else ... }
+        //            else ... }.
+        let inner = skip_branch("triager", &["OVERLAP"], nop_step());
+        let flow = halt_branch("triager", "OVERLAP", nop_step(), inner);
+        let bp = skip_on_bp(flow, &[("triager", &["OVERLAP"])]);
+        let lint = classify_skip_on_lint(&bp);
+        let findings = lint["findings"].as_array().expect("findings array");
+        let warn = find_skip_check(findings, "skip_on_pattern_conflicts_with_halt_on")
+            .expect("a value appearing in both skip_on and halt_on must WARN");
+        assert_eq!(warn["severity"], "WARN");
+        assert_eq!(warn["value"], "OVERLAP");
+        let msg = warn["message"].as_str().expect("message string");
+        assert!(msg.contains("OVERLAP"));
+        assert!(msg.contains("halt_on"));
+    }
+
+    /// A well-formed skip_on Blueprint (skip-like value declared AND
+    /// captured by a `skip_on = { ... }` list, no halt_on overlap)
+    /// emits no findings.
+    #[test]
+    fn skip_on_lint_no_findings_on_well_formed_blueprint() {
+        let flow = skip_branch("triager", &["NOT_APPLICABLE"], nop_step());
+        let bp = skip_on_bp(flow, &[("triager", &["APPLICABLE", "NOT_APPLICABLE"])]);
+        let lint = classify_skip_on_lint(&bp);
+        let findings = lint["findings"].as_array().expect("findings array");
+        assert!(
+            findings.is_empty(),
+            "well-formed skip_on Blueprint must emit no findings: {findings:?}"
+        );
+    }
+
+    /// The bundled `samples/bp/skip-on-example.bp.lua` must produce
+    /// zero skip_on_lint findings — it is the canonical illustration
+    /// of the DSL sugar and must not itself trigger any of the three
+    /// checks (would defeat the guide's purpose).
+    #[test]
+    fn bundled_sample_skip_on_example_has_no_skip_on_lint_findings() {
+        let body = include_str!("./mcp/resources/samples/bp/skip-on-example.bp.lua");
+        let value = mlua_swarm_cli::dsl::build_bp_from_script(body)
+            .expect("bundled sample must build via dsl::build_bp_from_script");
+        let bp: Blueprint = serde_json::from_value(value).expect("valid Blueprint");
+        let lint = classify_skip_on_lint(&bp);
+        let findings = lint["findings"].as_array().expect("findings array");
+        assert!(
+            findings.is_empty(),
+            "canonical sample must emit zero skip_on_lint findings, got: {findings:?}"
         );
     }
 

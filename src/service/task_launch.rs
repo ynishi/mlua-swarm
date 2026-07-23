@@ -548,8 +548,42 @@ pub enum TaskLaunchError {
     Engine(#[from] EngineError),
     /// A `Step` inside `flow.ir`'s `eval_async` produced a dispatcher
     /// error, or a sub-flow raised.
-    #[error("flow eval: {0}")]
-    FlowEval(String),
+    ///
+    /// GH #76 error surface: struct variant carrying structured failure detail lifted
+    /// off the eval boundary — `failed_step` / `verdict_value` come from
+    /// the [`crate::store::run::RunContext::last_failure`] breadcrumb the
+    /// dispatcher's Blocked arm writes; `partial_ctx` comes from the same
+    /// `RunContext`'s [`crate::store::run::RunContext::snapshot_partial_ctx`]
+    /// reconstruction of the step-entry trace persisted so far. All three
+    /// new fields are `Option` because dispatch may error via a path that
+    /// does not go through the Blocked arm (upstream flow-ir eval errors,
+    /// e.g. a malformed AST or an unresolved `CallExtern` — `run_ctx`
+    /// itself may be `None`, or the flow may fail before any step was
+    /// dispatched). `Display` preserves the pre-#76 `"flow eval: {message}"`
+    /// prefix byte-for-byte for backwards-compatible stringification.
+    #[error("flow eval: {message}")]
+    FlowEval {
+        /// The stringified underlying error (`EvalError::to_string()` on
+        /// the current write path). Preserves the pre-#76 message text.
+        message: String,
+        /// The `Step.ref` of the step whose Blocked outcome aborted the
+        /// flow, when the dispatcher's Blocked arm was the abort site.
+        /// `None` for abort paths that do not go through the dispatcher
+        /// (see the enum variant doc).
+        failed_step: Option<String>,
+        /// The verdict `Value` the aborting step carried
+        /// (`DispatchOutcome::Blocked(v)`'s `v`). `None` for the same
+        /// reasons as `failed_step`.
+        verdict_value: Option<Value>,
+        /// In-tree partial_ctx surfaces step-entry log (step_id →
+        /// status/binding_digest). Full value-level partial_ctx requires
+        /// upstream mlua-flow-ir support to expose `storage.snapshot()`
+        /// on error. See [`crate::store::run::RunContext::snapshot_partial_ctx`]
+        /// for the reconstructed JSON shape. `None` when `run_ctx` was
+        /// unavailable at the map_err site (e.g. `TaskLaunchService::launch`
+        /// called without a `RunContext`).
+        partial_ctx: Option<Value>,
+    },
     /// Pre-dispatch validation failed: the launch was rejected before any
     /// step was dispatched. Raised when the effective check_policy
     /// (launch request > blueprint > server config) is Strict and the
@@ -1014,6 +1048,14 @@ impl TaskLaunchService {
         let dispatcher =
             EngineDispatcher::with_spawner(self.engine.clone(), token.clone(), spawner);
         let dispatcher = dispatcher.with_check_policy(resolved_check_policy);
+        // GH #76 error surface: clone the `RunContext` (cheap — every field is either
+        // `Arc<...>` or a scalar) so the eval-boundary `map_err` closure
+        // can still read `last_failure` / call `snapshot_partial_ctx()`
+        // after the original is moved into the dispatcher. Sibling to the
+        // existing `token.clone()` pattern above — the `map_err`
+        // structured-error lift is now a co-owner of the RunContext state
+        // the dispatcher writes to.
+        let map_err_run_ctx = input.run_ctx.clone();
         let dispatcher = match input.run_ctx {
             Some(run_ctx) => dispatcher.with_run(run_ctx),
             None => dispatcher,
@@ -1044,14 +1086,60 @@ impl TaskLaunchService {
         // this preserves today's behavior byte-for-byte.
         let merged_init_ctx =
             merge_init_ctx(input.blueprint.default_init_ctx.as_ref(), &input.init_ctx);
-        let final_ctx = mlua_flow_ir::eval_async_externs(
+        let eval_result = mlua_flow_ir::eval_async_externs(
             &input.blueprint.flow,
             merged_init_ctx,
             &dispatcher,
             &*self.externs,
         )
-        .await
-        .map_err(|e| TaskLaunchError::FlowEval(e.to_string()))?;
+        .await;
+        let final_ctx = match eval_result {
+            Ok(v) => v,
+            Err(e) => {
+                // GH #76 error surface: lift the eval error into the structured
+                // `TaskLaunchError::FlowEval { .. }` variant. `message`
+                // preserves the pre-#76 stringified error byte-for-byte
+                // (the `Display` impl still emits `"flow eval: {message}"`,
+                // so callers that only match on the stringified error keep
+                // working). `failed_step` + `verdict_value` are lifted off
+                // the `RunContext.last_failure` breadcrumb the dispatcher's
+                // Blocked arm wrote (see `EngineDispatcher::dispatch` for
+                // the write side); `partial_ctx` is reconstructed from the
+                // step-entry trace persisted so far via
+                // `RunContext::snapshot_partial_ctx` — see that method's
+                // doc for the "metadata-level, not value-level" caveat
+                // and the upstream mlua-flow-ir carry.
+                //
+                // Every new field is `None` when `run_ctx` was not
+                // supplied by the caller (a legacy `TaskLaunchService::launch`
+                // call site with no run tracing), or when the abort path
+                // did not go through the dispatcher's Blocked arm (e.g.
+                // flow-ir raised `EvalError` before dispatch).
+                let (failed_step, verdict_value) = match &map_err_run_ctx {
+                    Some(rc) => {
+                        let slot = rc.last_failure.lock().ok().and_then(|g| g.clone());
+                        match slot {
+                            Some(lf) => (
+                                lf.step_ref.clone().or_else(|| Some(lf.step_id.to_string())),
+                                Some(lf.verdict_value.clone()),
+                            ),
+                            None => (None, None),
+                        }
+                    }
+                    None => (None, None),
+                };
+                let partial_ctx = match &map_err_run_ctx {
+                    Some(rc) => Some(rc.snapshot_partial_ctx().await),
+                    None => None,
+                };
+                return Err(TaskLaunchError::FlowEval {
+                    message: e.to_string(),
+                    failed_step,
+                    verdict_value,
+                    partial_ctx,
+                });
+            }
+        };
         Ok(TaskLaunchOutput { token, final_ctx })
     }
 }
@@ -1741,7 +1829,7 @@ mod tests {
             .await
             .expect_err("expected fail");
         match err {
-            TaskLaunchError::FlowEval(msg) => {
+            TaskLaunchError::FlowEval { message: msg, .. } => {
                 assert!(
                     msg.contains("boom") || msg.contains("intentional"),
                     "expected error to mention worker failure, got: {msg}"
@@ -1804,7 +1892,7 @@ mod tests {
             .await
             .expect_err("expected fail");
         match err {
-            TaskLaunchError::FlowEval(msg) => {
+            TaskLaunchError::FlowEval { message: msg, .. } => {
                 assert!(msg.contains("extern"), "expected extern error, got: {msg}");
             }
             other => panic!("expected FlowEval error, got {other:?}"),
@@ -3172,5 +3260,268 @@ mod tests {
         let run = run_store.get(&launch_run).await.expect("run present");
         let snap: Value = serde_json::from_str(run.input_json.as_deref().unwrap()).unwrap();
         assert_eq!(SnapshotOrigin::from_snapshot(&snap), SnapshotOrigin::Launch);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #76 error surface: TaskLaunchError::FlowEval struct variant + partial_ctx
+    // ──────────────────────────────────────────────────────────────────
+
+    /// The tuple → struct variant swap must keep the Display prefix
+    /// (`"flow eval: <msg>"`) byte-for-byte, so callers that only match on
+    /// the stringified error keep working.
+    #[test]
+    fn task_launch_error_flow_eval_struct_variant_display_preserves_prefix() {
+        let err = TaskLaunchError::FlowEval {
+            message: "dispatcher error at ref foo".to_string(),
+            failed_step: Some("foo".to_string()),
+            verdict_value: Some(json!({"verdict": "BLOCKED"})),
+            partial_ctx: Some(json!({"steps": {}})),
+        };
+        assert_eq!(err.to_string(), "flow eval: dispatcher error at ref foo");
+
+        // All-`None` shape (upstream flow-ir eval error before dispatch)
+        // must render identically to the previous tuple form for the same
+        // message.
+        let err_bare = TaskLaunchError::FlowEval {
+            message: "unresolved extern".to_string(),
+            failed_step: None,
+            verdict_value: None,
+            partial_ctx: None,
+        };
+        assert_eq!(err_bare.to_string(), "flow eval: unresolved extern");
+    }
+
+    /// End-to-end via `TaskLaunchService::launch`: a `WorkerResult { ok: false }`
+    /// step drives the dispatcher's Blocked arm, which writes the
+    /// `RunContext.last_failure` breadcrumb. The map_err closure lifts it
+    /// into `TaskLaunchError::FlowEval { failed_step, verdict_value, .. }`.
+    #[tokio::test]
+    async fn task_launch_flow_eval_error_carries_failed_step_and_verdict_value() {
+        use crate::store::run::{InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore};
+        use crate::types::{RunId, TaskId};
+
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("gate", |_inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "verdict": "BLOCKED", "reason": "not applicable" }),
+                ok: false,
+            })
+        });
+        let svc = build_service(factory);
+        let blueprint = bp(
+            step("gate", path("$.input"), path("$.out")),
+            vec![agent("gate", "gate")],
+        );
+
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = RunId::new();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: Some("{}".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed RunRecord");
+
+        let mut input = launch_input(blueprint, json!({ "input": "hi" }));
+        input.run_ctx = Some(RunContext::new(run_id, run_store));
+
+        let err = svc.launch(input).await.expect_err("expected FlowEval");
+        match err {
+            TaskLaunchError::FlowEval {
+                message,
+                failed_step,
+                verdict_value,
+                partial_ctx,
+            } => {
+                assert!(
+                    message.contains("blocked"),
+                    "expected message to mention blocked, got: {message}"
+                );
+                assert_eq!(
+                    failed_step,
+                    Some("gate".to_string()),
+                    "failed_step should be the Blueprint step ref, not the opaque StepId"
+                );
+                let vv = verdict_value.expect("verdict_value must be Some for Blocked");
+                assert_eq!(vv["verdict"], "BLOCKED");
+                assert_eq!(vv["reason"], "not applicable");
+                // With a RunContext supplied, partial_ctx is always Some
+                // (may be an empty steps map if no step_entry was appended
+                // yet, but the reconstruction ran).
+                assert!(
+                    partial_ctx.is_some(),
+                    "partial_ctx must be Some when a RunContext was supplied"
+                );
+            }
+            other => panic!("expected FlowEval, got {other:?}"),
+        }
+    }
+
+    /// 3-stage chain, stage 2 blocks. The reconstructed `partial_ctx` from
+    /// the run_store's step-entry log must include the stage 1 (passed)
+    /// entry AND the stage 2 (blocked) entry — proving that the
+    /// dispatcher's step-entry writes are visible to the eval-boundary
+    /// snapshot regardless of subsequent abort.
+    #[tokio::test]
+    async fn task_launch_flow_eval_error_partial_ctx_reconstructs_from_run_store() {
+        use crate::store::run::{InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore};
+        use crate::types::{RunId, TaskId};
+
+        let factory = RustFnInProcessSpawnerFactory::new()
+            .register_fn("upper", |inv| async move {
+                Ok(WorkerResult {
+                    value: json!(inv.prompt.to_uppercase()),
+                    ok: true,
+                })
+            })
+            .register_fn("gate", |_inv| async move {
+                Ok(WorkerResult {
+                    value: json!({ "verdict": "BLOCKED" }),
+                    ok: false,
+                })
+            })
+            .register_fn("never", |inv| async move {
+                Ok(WorkerResult {
+                    value: json!(inv.prompt),
+                    ok: true,
+                })
+            });
+        let svc = build_service(factory);
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("upper", path("$.in"), path("$.s1")),
+                step("gate", path("$.s1"), path("$.s2")),
+                step("never", path("$.s2"), path("$.s3")),
+            ],
+        };
+        let blueprint = bp(
+            flow,
+            vec![
+                agent("upper", "upper"),
+                agent("gate", "gate"),
+                agent("never", "never"),
+            ],
+        );
+
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = RunId::new();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: Some("{}".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed RunRecord");
+
+        let mut input = launch_input(blueprint, json!({ "in": "hi" }));
+        input.run_ctx = Some(RunContext::new(run_id.clone(), run_store.clone()));
+
+        let err = svc.launch(input).await.expect_err("expected FlowEval");
+        let partial_ctx = match err {
+            TaskLaunchError::FlowEval { partial_ctx, .. } => {
+                partial_ctx.expect("partial_ctx must be Some")
+            }
+            other => panic!("expected FlowEval, got {other:?}"),
+        };
+        let steps = partial_ctx
+            .get("steps")
+            .and_then(|v| v.as_object())
+            .expect("partial_ctx.steps object");
+        // stage 1 (upper) passed + stage 2 (gate) blocked: two entries.
+        // stage 3 (never) is never dispatched because flow-ir stops after
+        // the Blocked arm's `EvalError::DispatcherError`.
+        assert_eq!(
+            steps.len(),
+            2,
+            "expected 2 step_entries (upper passed + gate blocked), got: {steps:?}"
+        );
+        let mut status_by_ref: HashMap<String, String> = HashMap::new();
+        for (_step_id, entry) in steps {
+            let step_ref = entry
+                .get("step_ref")
+                .and_then(|v| v.as_str())
+                .expect("step_ref present")
+                .to_string();
+            let status = entry
+                .get("status")
+                .and_then(|v| v.as_str())
+                .expect("status present")
+                .to_string();
+            status_by_ref.insert(step_ref, status);
+        }
+        assert_eq!(
+            status_by_ref.get("upper").map(String::as_str),
+            Some("passed")
+        );
+        assert_eq!(
+            status_by_ref.get("gate").map(String::as_str),
+            Some("blocked")
+        );
+        assert!(
+            !status_by_ref.contains_key("never"),
+            "step 'never' must not appear — flow-ir stops dispatching after Blocked abort"
+        );
+    }
+
+    /// When `TaskLaunchService::launch` is called WITHOUT a `RunContext`
+    /// (the legacy path), the map_err closure must still return a
+    /// well-formed `FlowEval` — every new field is `None` because there is
+    /// no breadcrumb source nor snapshot source. Regression test for the
+    /// null-object path.
+    #[tokio::test]
+    async fn task_launch_flow_eval_error_without_run_ctx_has_none_fields() {
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("gate", |_inv| async move {
+            Ok(WorkerResult {
+                value: json!({ "verdict": "BLOCKED" }),
+                ok: false,
+            })
+        });
+        let svc = build_service(factory);
+        let blueprint = bp(
+            step("gate", path("$.input"), path("$.out")),
+            vec![agent("gate", "gate")],
+        );
+        let err = svc
+            .launch(launch_input(blueprint, json!({ "input": "hi" })))
+            .await
+            .expect_err("expected FlowEval");
+        match err {
+            TaskLaunchError::FlowEval {
+                failed_step,
+                verdict_value,
+                partial_ctx,
+                ..
+            } => {
+                assert_eq!(
+                    failed_step, None,
+                    "failed_step must be None without run_ctx"
+                );
+                assert_eq!(
+                    verdict_value, None,
+                    "verdict_value must be None without run_ctx"
+                );
+                assert_eq!(
+                    partial_ctx, None,
+                    "partial_ctx must be None without run_ctx"
+                );
+            }
+            other => panic!("expected FlowEval, got {other:?}"),
+        }
     }
 }

@@ -58,12 +58,20 @@ function M.from(stage_id)
   return setmetatable({ stage_id = stage_id }, Placeholder)
 end
 
---- `B.stage "id" { agent=, input=, out=, gate=, halt_on=, retry= }` —
+--- `B.stage "id" { agent=, input=, out=, gate=, halt_on=, skip_on=, retry= }` —
 --- curried 2-arg stage constructor. Returns a plain "stage record" table
 --- (NOT an AST Node yet — `B.pipeline` expands stage records into
 --- flow.ir Nodes, applying the default-wiring + gate + retry rules
 --- below). `halt_on` here overrides `B.pipeline`'s pipeline-wide default
---- for this stage only.
+--- for this stage only. `skip_on = { "SKIP", ... }` (GH #76 DSL sugar) wraps
+--- the stage's own body in a pre-emptive `Branch` guard against the
+--- stage's INPUT verdict path (`<input>.parts["verdict"]`): if that
+--- upstream verdict is in the skip list, the stage's body is not
+--- executed (the enclosing pipeline continues to the next stage), else
+--- the body runs unchanged. `skip_on` may coexist with `halt_on` /
+--- `retry` / `gate` — the skip guard nests OUTSIDE the retry loop but
+--- INSIDE the enclosing gate/rest chain so a skipped stage does not
+--- prevent later stages from running.
 function M.stage(id)
   return function(t)
     t.id = id
@@ -103,6 +111,21 @@ local function gate_cond(out_path, halt_on_values)
     eqs[i] = F.p(verdict_path):eq(v)
   end
   return F.any(eqs)
+end
+
+-- The skip-guard condition for one stage: `in(<verdict>, lit(skip_on))`
+-- (GH #76 DSL sugar). `verdict_path` is the upstream verdict address this
+-- stage is inspecting — by convention `<input_path>.parts["verdict"]`
+-- (the stage's own INPUT path, so a chained pipeline reads the previous
+-- stage's verdict), which in the non-chained R1-default case yields a
+-- lookup against a config-time input where a `.parts.verdict` key is
+-- typically absent (missing needle -> `in` false -> guard never fires,
+-- safe by construction). Emits `{op="in", needle=path(verdict_path),
+-- haystack=lit([v1, v2, ...])}` — the reverse-argument shape of the
+-- `Expr:contains` builder (haystack is `self`), which is why this
+-- helper builds the wrapper via `F.lit(...):contains(F.p(...))`.
+local function skip_cond(verdict_path, skip_on_values)
+  return F.lit(skip_on_values):contains(F.p(verdict_path))
 end
 
 -- Resolve a stage's `input` field to a path string: `B.from "x"`
@@ -226,6 +249,28 @@ end
 --- Resolved against every stage's `out` path (including retry `fix`
 --- stages) before any Node is assembled, so forward references work; an
 --- unresolved reference is an `error()`.
+---
+--- ## `skip_on` (GH #76 DSL sugar)
+---
+--- `skip_on = { "SKIP", "NOT_APPLICABLE", ... }` on a stage record wraps
+--- the stage's own body (`step` + optional retry `loop`) with a
+--- pre-emptive `Branch` whose `cond` is `in(<input>.parts["verdict"],
+--- <skip_on_list>)`. When the check hits, the stage body is elided
+--- (`then` = empty `Seq{}`); when it misses, the body runs unchanged
+--- (`else` = the original stage body). The gate + rest chain sits
+--- OUTSIDE the skip guard so a skipped stage does not prevent later
+--- stages from running (the follow-on gate reads the current stage's
+--- own `out`, which stays absent when skipped — the `eq` cond against
+--- `halt_on` therefore evaluates false and cleanly threads through to
+--- `rest`). Sibling to `halt_on`: `skip_on` skips just this stage but
+--- continues, whereas `halt_on` halts the whole pipeline; the two may
+--- coexist on the same stage. `skip_on = {}` is a no-op (equivalent to
+--- omitting the option). The runtime-path Skip (agent submits
+--- `--verdict=skip`) coexists with this DSL sugar — both paths land on
+--- `DispatchOutcome::Skip`; the sugar is the *pre-emptive* path (skip
+--- BEFORE dispatch based on an upstream verdict) and the runtime path
+--- is the *self-declared* path (agent runs, then declares its own
+--- output non-applicable).
 function M.pipeline(spec)
   local halt_on = spec.halt_on or {}
   -- Default `halted_at` so a pipeline without an explicit halt-site knob
@@ -287,19 +332,49 @@ function M.pipeline(spec)
     local step_node = build_step(rec, outs, chain_default)
     local rest = build_from(idx + 1, rest_else)
 
-    local children = { step_node }
+    -- GH #76 DSL sugar: `skip_on` wraps the stage's OWN body (step + optional
+    -- retry loop) with a pre-emptive Branch. Empty / nil list is a
+    -- no-op (unset case). The verdict path defaults to
+    -- `<input_path>.parts["verdict"]`, which in a chained pipeline
+    -- (chain=true, or explicit `input = B.from "prev"`) resolves to
+    -- the previous stage's own verdict; in the R1-default case the
+    -- input is `$.d.<stage_id>` where `.parts.verdict` is typically
+    -- absent -> `in` false -> guard never fires (safe default).
+    local skip_on = rec.skip_on
+    local wants_skip_guard = skip_on ~= nil and #skip_on > 0
+    local skip_verdict_path
+    if wants_skip_guard then
+      local input_path =
+        resolve_input_path(rec.input, rec.id, outs, chain_default)
+      skip_verdict_path = input_path .. '.parts["verdict"]'
+    end
+
+    local body_children = { step_node }
 
     if rec.retry ~= nil then
       local fix_step = build_step(rec.retry.fix, outs)
       local max = rec.retry.max
       local counter_path = rec.retry.counter or default_counter_path(rec.id)
       local loop_cond = F.p(counter_path):lt(max):And(gate_cond(rec._out, this_halt_on))
-      children[#children + 1] = F.loop_({
+      body_children[#body_children + 1] = F.loop_({
         counter = F.p(counter_path),
         cond = loop_cond,
         max = max + 1,
         body = F.seq({ fix_step, step_node }),
       })
+    end
+
+    local children
+    if wants_skip_guard then
+      children = {
+        F.branch({
+          cond = skip_cond(skip_verdict_path, skip_on),
+          on_true = F.seq({}),
+          on_false = F.seq(body_children),
+        }),
+      }
+    else
+      children = body_children
     end
 
     -- bafe47d4: opt-in gate decision. Order matters — `gate = false`

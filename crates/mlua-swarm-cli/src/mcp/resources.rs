@@ -52,6 +52,8 @@
 //! | `mse://blueprints/samples/06-dsl-verdict-loop` | Sample `.bp.lua` — flow_dsl verdict-loop reproduction. |
 //! | `mse://blueprints/samples/07-dsl-pipeline`   | Sample `.bp.lua` — bp_dsl verdict-gated pipeline.   |
 //! | `mse://blueprints/samples/08-bundled-refs`   | Sample `.bp.lua` — `$agent_md` refs into the bundled `samples/agents/` dir (include cascade). |
+//! | `mse://blueprints/samples/09-skip-on-example`| Sample `.bp.lua` — GH #76 DSL sugar `skip_on` DSL sugar (Skip tier). |
+//! | `mse://guides/skip-tier-and-skip-on`         | Skip tier semantics + `skip_on = { ... }` DSL surface + `bp_doctor` `skip_on_lint` family + error surface (GH #76). |
 //! | `mse://api/blueprint-schema`                 | Live Blueprint JSON Schema (generated per read).    |
 //! | `mse://api/http-endpoints`                   | Live HTTP wire-body JSON Schemas, keyed by endpoint (issue #19). |
 //! | `mse://api/mcp-tools`                        | Live schemars-generated MCP tool inputSchemas keyed by tool name (GH #24 sibling). |
@@ -106,6 +108,8 @@ const REPLAY_AND_RESUME_BODY: &str = include_str!("./resources/guides/replay-and
 const BP_DSL_TEMPLATES_BODY: &str = include_str!("./resources/guides/bp-dsl-templates.md");
 const SERVER_MANAGEMENT_BODY: &str = include_str!("./resources/guides/server-management.md");
 const BLUEPRINT_REF_PATHS_BODY: &str = include_str!("./resources/guides/blueprint-ref-paths.md");
+const SKIP_TIER_AND_SKIP_ON_BODY: &str =
+    include_str!("./resources/guides/skip-tier-and-skip-on.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -121,6 +125,8 @@ const SAMPLE_07_DSL_PIPELINE_BODY: &str =
     include_str!("./resources/samples/07-dsl-pipeline.bp.lua");
 const SAMPLE_08_BUNDLED_REFS_BODY: &str =
     include_str!("./resources/samples/08-bundled-refs.bp.lua");
+const SAMPLE_09_SKIP_ON_EXAMPLE_BODY: &str =
+    include_str!("./resources/samples/bp/skip-on-example.bp.lua");
 
 /// Static resource catalogue. Order is the order `list_resources` reports.
 pub const RESOURCES: &[ResourceEntry] = &[
@@ -263,6 +269,20 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "Two-stage research→review pipeline whose agents are supplied by `$agent_md` refs against the bundled `samples/agents/*.md` files. Demonstrates tier 1 (bp.lua parent) and tier 6 (bundled default) of the Blueprint include cascade; see mse://guides/blueprint-ref-paths.",
         mime_type: "text/x-lua",
         body: ResourceBody::Static(SAMPLE_08_BUNDLED_REFS_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://blueprints/samples/09-skip-on-example",
+        title: "Sample .bp.lua — Skip tier + `skip_on` DSL sugar (GH #76 DSL sugar)",
+        description: "Three-stage analyst chain (triage -> analyze -> summarize) whose middle stage uses `skip_on = { \"NOT_APPLICABLE\" }` to pre-emptively elide its body when triage's staged verdict part reads NOT_APPLICABLE, letting the pipeline continue to summarize. Runnable via `mse bp build` (embed the agents inline). Full semantics: mse://guides/skip-tier-and-skip-on.",
+        mime_type: "text/x-lua",
+        body: ResourceBody::Static(SAMPLE_09_SKIP_ON_EXAMPLE_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/skip-tier-and-skip-on",
+        title: "mse — Skip tier & `skip_on` DSL sugar (GH #76)",
+        description: "Skip tier semantics (engine + wire), the two entry paths (runtime `mse_worker_submit --verdict=skip` vs. pre-emptive `skip_on = { ... }` on a `B.stage`), the `bp_doctor` `skip_on_lint` family (BLOCK-disabled by default), and the structured `TaskLaunchError::FlowEval` error surface.",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(SKIP_TIER_AND_SKIP_ON_BODY),
     },
     ResourceEntry {
         uri: "mse://api/blueprint-schema",
@@ -642,6 +662,7 @@ mod tests {
             "mse://blueprints/samples/06-dsl-verdict-loop",
             "mse://blueprints/samples/07-dsl-pipeline",
             "mse://blueprints/samples/08-bundled-refs",
+            "mse://blueprints/samples/09-skip-on-example",
         ] {
             let entry = find_by_uri(uri).unwrap_or_else(|| panic!("sample must exist: {uri}"));
             let body = body_for(entry).expect("sample body must generate");
@@ -649,6 +670,28 @@ mod tests {
                 panic!("{uri}: does not build via dsl::build_bp_from_script: {e}")
             });
         }
+    }
+
+    /// GH #76 DSL sugar: the bundled skip_on sample must additionally parse
+    /// as a valid Blueprint (once through the DSL builder) — guards
+    /// against a well-formed `.bp.lua` that emits a shape rejected by
+    /// the Blueprint schema (e.g. a missing halted_at, an agent
+    /// without a runner). Subtask verify: `bundled_sample_skip_on_example_parses_via_bp_build`.
+    #[test]
+    fn bundled_sample_skip_on_example_parses_via_bp_build() {
+        let uri = "mse://blueprints/samples/09-skip-on-example";
+        let entry = find_by_uri(uri).unwrap_or_else(|| panic!("sample must exist: {uri}"));
+        let body = body_for(entry).expect("sample body must generate");
+        let value = mlua_swarm_cli::dsl::build_bp_from_script(&body)
+            .unwrap_or_else(|e| panic!("{uri}: does not build via dsl::build_bp_from_script: {e}"));
+        let bp: Blueprint = serde_json::from_value(value)
+            .unwrap_or_else(|e| panic!("{uri}: DSL output is not a valid Blueprint: {e}"));
+        assert_eq!(bp.id.as_str(), "sample-skip-on-example");
+        assert_eq!(
+            bp.agents.len(),
+            3,
+            "sample must declare triager / analyzer / summarizer"
+        );
     }
 
     /// GH #34: the two reference auditor samples must actually declare

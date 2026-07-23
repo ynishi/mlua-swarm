@@ -13,8 +13,9 @@ use crate::core::config::EngineCfg;
 use crate::core::ctx::{Ctx, OperatorInfo, OperatorKind, SeniorBridge, SpawnHook};
 use crate::core::errors::EngineError;
 use crate::core::state::{
-    CapTokenRecord, DispatchOutcome, EngineState, Event, EventStream, OperatorSession, ResumeKey,
-    ResumePending, TaskSpec, TaskState, TaskStatus,
+    unwrap_skip_marker, wrap_skip_marker, CapTokenRecord, DispatchOutcome, EngineState, Event,
+    EventStream, OperatorSession, ResumeKey, ResumePending, SubmitOutcome, TaskSpec, TaskState,
+    TaskStatus,
 };
 use crate::store::replay::{hash_input_value, ReplayEntry};
 use crate::store::run::RunContext;
@@ -681,13 +682,39 @@ impl Engine {
     /// `task_id` via `task_id_from_handle` — the handle's presence in
     /// `worker_handles` means it was minted server-side and is therefore
     /// trusted.
+    ///
+    /// # GH #76 Skip tier: `outcome: SubmitOutcome`
+    ///
+    /// The `outcome` parameter (replacing the pre-#76 `ok: bool`) is the
+    /// caller's tier declaration:
+    ///
+    /// | outcome  | `Final.ok` | `Final.content`                | verdict-contract check |
+    /// |----------|------------|--------------------------------|------------------------|
+    /// | `Pass`   | `true`     | `value` verbatim               | fires                  |
+    /// | `Blocked`| `false`    | `value` verbatim               | exempt (`ok=false`)    |
+    /// | `Skip`   | `true`     | `wrap_skip_marker(value)`      | exempt (Skip opt-out)  |
+    ///
+    /// The Skip tier is opt-out from the verdict-contract completion check
+    /// on the same rationale [`crate::core::state::SubmitOutcome::Skip`]'s
+    /// doc records: the agent explicitly declared "not applicable", so
+    /// the payload is not a real verdict value to gate.
     pub async fn submit_worker_result_trusted(
         &self,
         task_id: &StepId,
         attempt: u32,
         value: Value,
-        ok: bool,
+        outcome: SubmitOutcome,
     ) -> Result<(), EngineError> {
+        // Resolve outcome into the wire-level (value, ok, run_contract)
+        // triple exactly once, then reuse it below. Keeping the mapping
+        // literal in one place makes the "Skip wraps + skips contract"
+        // invariant grep-visible.
+        let (wire_value, wire_ok, run_contract_check) = match outcome {
+            SubmitOutcome::Pass => (value, true, true),
+            SubmitOutcome::Blocked => (value, false, false),
+            SubmitOutcome::Skip => (wrap_skip_marker(value), true, false),
+        };
+
         // GH #51 — completion-time verdict-contract enforcement, embedded
         // choke point 1 of 2 (see `Self::verdict_contract_completion_check`'s
         // doc). This path always submits a `Final` by construction (there
@@ -698,20 +725,27 @@ impl Engine {
         // write. Runs BEFORE the `output_tail` write immediately below:
         // on `Err`, this returns immediately and neither `with_state` call
         // in this function executes.
-        let comparable_value =
-            content_ref_to_comparable_string(crate::worker::output::ContentRef::Inline {
-                value: value.clone(),
-            });
-        self.verdict_contract_completion_check(task_id, attempt, ok, &comparable_value)
-            .await?;
+        //
+        // GH #76 Skip tier: gated on `run_contract_check` — Skip is opt-out
+        // (see the outcome mapping table above), Blocked stays exempt via
+        // `verdict_contract_completion_check`'s existing `ok=false`
+        // early return (redundant flag here for grep locality).
+        if run_contract_check {
+            let comparable_value =
+                content_ref_to_comparable_string(crate::worker::output::ContentRef::Inline {
+                    value: wire_value.clone(),
+                });
+            self.verdict_contract_completion_check(task_id, attempt, wire_ok, &comparable_value)
+                .await?;
+        }
         let task_id_for_apply = task_id.clone();
-        let value_for_event = value.clone();
+        let value_for_event = wire_value.clone();
         self.with_state("submit_worker_result_trusted.output", move |s| {
             let ev = crate::worker::output::OutputEvent::Final {
                 content: crate::worker::output::ContentRef::Inline {
                     value: value_for_event,
                 },
-                ok,
+                ok: wire_ok,
             };
             s.output_store
                 .entry((task_id_for_apply.clone(), attempt))
@@ -725,7 +759,7 @@ impl Engine {
         })
         .await?;
         let task_id_for_result = task_id.clone();
-        let value_for_result = value.clone();
+        let value_for_result = wire_value.clone();
         self.with_state("submit_worker_result_trusted.last_result", move |s| {
             if let Some(t) = s.tasks.get_mut(&task_id_for_result) {
                 t.last_result = Some(value_for_result);
@@ -739,8 +773,8 @@ impl Engine {
         // `materialize_final_submission`'s doc and `submit_output`'s
         // Invariants (fail-open, never turns a would-have-succeeded submit
         // into a failure).
-        let content = crate::worker::output::ContentRef::Inline { value };
-        self.materialize_final_submission(task_id, attempt, &content, ok)
+        let content = crate::worker::output::ContentRef::Inline { value: wire_value };
+        self.materialize_final_submission(task_id, attempt, &content, wire_ok)
             .await?;
         Ok(())
     }
@@ -1517,6 +1551,15 @@ impl Engine {
                 }
                 match value_ok {
                     Ok((value, ok)) => {
+                        // GH #76 Skip tier: a Final with ok=true carrying the
+                        // skip-marker sentinel is a Skip tier completion,
+                        // not an ordinary Pass. TaskStatus stays `Pass`
+                        // (the worker itself completed successfully);
+                        // the Skip signal rides on DispatchOutcome so
+                        // EngineDispatcher::dispatch can route it to
+                        // the flow-continuation-without-binding-write
+                        // sentinel path.
+                        let skip_inner = if ok { unwrap_skip_marker(&value) } else { None };
                         let pass = ok;
                         {
                             let task = s.tasks.get_mut(&task_id).unwrap();
@@ -1533,7 +1576,13 @@ impl Engine {
                             attempt,
                             result: value.clone(),
                         });
-                        if pass {
+                        if let Some(inner) = skip_inner {
+                            s.push_event(Event::TaskPass {
+                                task_id: task_id.clone(),
+                                result: value.clone(),
+                            });
+                            Ok::<_, EngineError>(DispatchOutcome::Skip(inner))
+                        } else if pass {
                             s.push_event(Event::TaskPass {
                                 task_id: task_id.clone(),
                                 result: value.clone(),
@@ -1562,7 +1611,9 @@ impl Engine {
             task_id: task_id.clone(),
             attempt,
             result: match &outcome {
-                DispatchOutcome::Pass(v) | DispatchOutcome::Blocked(v) => v.clone(),
+                DispatchOutcome::Pass(v)
+                | DispatchOutcome::Blocked(v)
+                | DispatchOutcome::Skip(v) => v.clone(),
                 _ => Value::Null,
             },
         });
@@ -1743,6 +1794,11 @@ impl Engine {
                 }
                 match value_ok {
                     Ok((value, ok)) => {
+                        // GH #76 Skip tier: Skip tier detection — same shape
+                        // as the sibling `dispatch_attempt_with` apply
+                        // arm above. See that arm's comment for the
+                        // TaskStatus / Event / DispatchOutcome contract.
+                        let skip_inner = if ok { unwrap_skip_marker(&value) } else { None };
                         let pass = ok;
                         {
                             let task = s.tasks.get_mut(&task_id).unwrap();
@@ -1759,7 +1815,13 @@ impl Engine {
                             attempt,
                             result: value.clone(),
                         });
-                        if pass {
+                        if let Some(inner) = skip_inner {
+                            s.push_event(Event::TaskPass {
+                                task_id: task_id.clone(),
+                                result: value.clone(),
+                            });
+                            Ok::<_, EngineError>(DispatchOutcome::Skip(inner))
+                        } else if pass {
                             s.push_event(Event::TaskPass {
                                 task_id: task_id.clone(),
                                 result: value.clone(),
@@ -1830,7 +1892,9 @@ impl Engine {
             task_id: task_id.clone(),
             attempt,
             result: match &outcome {
-                DispatchOutcome::Pass(v) | DispatchOutcome::Blocked(v) => v.clone(),
+                DispatchOutcome::Pass(v)
+                | DispatchOutcome::Blocked(v)
+                | DispatchOutcome::Skip(v) => v.clone(),
                 _ => Value::Null,
             },
         });
@@ -4477,7 +4541,12 @@ mod submit_time_projection_sink_tests {
         engine.set_output_store(data_store.clone());
 
         engine
-            .submit_worker_result_trusted(&task_id, 1, serde_json::json!("trusted-value"), true)
+            .submit_worker_result_trusted(
+                &task_id,
+                1,
+                serde_json::json!("trusted-value"),
+                SubmitOutcome::Pass,
+            )
             .await
             .expect("submit_worker_result_trusted");
 
@@ -5282,5 +5351,386 @@ mod verdict_contract_completion_tests {
     async fn staged_verdict_value_for_returns_none_when_nothing_staged() {
         let (engine, _token, task_id) = seeded_task_with_worker_token("gate").await;
         assert_eq!(engine.staged_verdict_value_for(&task_id, 1).await, None);
+    }
+}
+
+// ─── GH #76 Skip tier: DispatchOutcome::Skip tier + SubmitOutcome API ────────────
+#[cfg(test)]
+mod skip_tier_tests {
+    use super::*;
+    use crate::blueprint::compiler::{RustFnInProcessSpawnerFactory, SpawnerFactory};
+    use crate::blueprint::EngineDispatcher;
+    use crate::core::state::{
+        is_skip_marker, unwrap_skip_marker, wrap_skip_marker, SubmitOutcome, SKIP_MARKER_KEY,
+    };
+    use crate::store::run::{InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore};
+    use crate::types::{RunId, TaskId};
+    use crate::worker::adapter::WorkerResult;
+    use mlua_flow_ir::AsyncDispatcher;
+    use mlua_swarm_schema::{AgentDef, AgentKind};
+    use serde_json::json;
+
+    /// `DispatchOutcome::Skip(v)` roundtrips through serde JSON without
+    /// loss — the enum is serialized with the default externally-tagged
+    /// form (same as `Pass`/`Blocked`), so no `#[serde(...)]` tuning is
+    /// needed for the new variant.
+    #[test]
+    fn dispatch_outcome_skip_variant_serializes_roundtrip() {
+        let outcome = DispatchOutcome::Skip(json!({ "verdict": "SKIP", "reason": "n/a" }));
+        let serialized = serde_json::to_string(&outcome).expect("serialize");
+        let round: DispatchOutcome = serde_json::from_str(&serialized).expect("deserialize");
+        match round {
+            DispatchOutcome::Skip(v) => {
+                assert_eq!(v, json!({ "verdict": "SKIP", "reason": "n/a" }));
+            }
+            other => panic!("expected Skip after roundtrip, got {other:?}"),
+        }
+    }
+
+    /// The `is_skip_marker` / `unwrap_skip_marker` / `wrap_skip_marker`
+    /// helper triangle round-trips consistently and rejects plain
+    /// payloads. Pinning the reserved-key contract in a unit test guards
+    /// against a future edit accidentally renaming the sentinel key
+    /// (which would silently break every downstream reader).
+    #[test]
+    fn skip_marker_helpers_wrap_detect_and_unwrap() {
+        assert!(!is_skip_marker(&json!("plain string")));
+        assert!(!is_skip_marker(&json!({ "verdict": "PASS" })));
+        assert!(!is_skip_marker(&json!(null)));
+
+        let inner = json!({ "reason": "not applicable" });
+        let wrapped = wrap_skip_marker(inner.clone());
+        assert!(is_skip_marker(&wrapped));
+        assert_eq!(wrapped[SKIP_MARKER_KEY], json!(true));
+        assert_eq!(unwrap_skip_marker(&wrapped), Some(inner));
+
+        // A malformed sentinel (marker key present but `value` absent) is
+        // still a Skip signal, defaulting the carried payload to Null so
+        // downstream match arms never observe `None` on a marker match.
+        let malformed = json!({ SKIP_MARKER_KEY: true });
+        assert!(is_skip_marker(&malformed));
+        assert_eq!(unwrap_skip_marker(&malformed), Some(Value::Null));
+
+        // Plain payloads → `unwrap_skip_marker` returns `None` (the
+        // caller falls back to the ordinary Pass/Blocked path).
+        assert_eq!(unwrap_skip_marker(&json!("plain")), None);
+    }
+
+    /// The `SubmitOutcome::Skip` mapping wraps the payload in the
+    /// skip-marker sentinel AND records `Final.ok = true` — matching the
+    /// invariant in the outcome mapping table in
+    /// `submit_worker_result_trusted`'s doc. This is the wire shape
+    /// `dispatch_attempt_with*` reads back to route into
+    /// `DispatchOutcome::Skip`.
+    #[tokio::test]
+    async fn submit_worker_result_trusted_skip_outcome_records_final_ok_true_with_sentinel() {
+        use crate::worker::output::OutputEvent;
+        let engine = Engine::new(EngineCfg::default());
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let task_id = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: "analyst".into(),
+                    initial_directive: json!("go"),
+                    step_ctx: None,
+                    check_policy: None,
+                },
+            )
+            .await
+            .expect("start_task");
+
+        let inner_verdict = json!({ "verdict": "SKIP", "reason": "migration=no" });
+        engine
+            .submit_worker_result_trusted(&task_id, 1, inner_verdict.clone(), SubmitOutcome::Skip)
+            .await
+            .expect("submit with Skip outcome");
+
+        let tail = engine.output_tail(&task_id, 1).await;
+        let final_ev = tail
+            .iter()
+            .rev()
+            .find_map(|ev| match ev {
+                OutputEvent::Final { content, ok } => Some((content.clone(), *ok)),
+                _ => None,
+            })
+            .expect("Final present after Skip submit");
+        assert!(
+            final_ev.1,
+            "Skip records Final.ok = true (flow-continuation)"
+        );
+        let stored_value = super::content_ref_to_value(final_ev.0);
+        assert!(
+            is_skip_marker(&stored_value),
+            "Skip wraps the payload in the sentinel: got {stored_value}"
+        );
+        assert_eq!(unwrap_skip_marker(&stored_value), Some(inner_verdict));
+    }
+
+    /// The new `SubmitOutcome::Pass` / `SubmitOutcome::Blocked` arms
+    /// preserve byte-for-byte the pre-#76 wire shape (Final.ok mirrors
+    /// the tier; the value is not wrapped). Regression against a future
+    /// edit that accidentally routes Pass/Blocked through the Skip
+    /// wrapper.
+    #[tokio::test]
+    async fn submit_worker_result_trusted_pass_and_blocked_wire_unchanged() {
+        use crate::worker::output::OutputEvent;
+        let engine = Engine::new(EngineCfg::default());
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+
+        // Pass path.
+        let pass_task = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: "worker".into(),
+                    initial_directive: json!("go"),
+                    step_ctx: None,
+                    check_policy: None,
+                },
+            )
+            .await
+            .expect("start_task pass");
+        engine
+            .submit_worker_result_trusted(&pass_task, 1, json!("pass-value"), SubmitOutcome::Pass)
+            .await
+            .expect("submit Pass");
+        let pass_tail = engine.output_tail(&pass_task, 1).await;
+        let (pass_content, pass_ok) = pass_tail
+            .iter()
+            .rev()
+            .find_map(|ev| match ev {
+                OutputEvent::Final { content, ok } => Some((content.clone(), *ok)),
+                _ => None,
+            })
+            .expect("Final present");
+        assert!(pass_ok);
+        assert_eq!(
+            super::content_ref_to_value(pass_content),
+            json!("pass-value"),
+            "Pass value must not be wrapped"
+        );
+
+        // Blocked path.
+        let blocked_task = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: "worker".into(),
+                    initial_directive: json!("go"),
+                    step_ctx: None,
+                    check_policy: None,
+                },
+            )
+            .await
+            .expect("start_task blocked");
+        engine
+            .submit_worker_result_trusted(
+                &blocked_task,
+                1,
+                json!("blocked-value"),
+                SubmitOutcome::Blocked,
+            )
+            .await
+            .expect("submit Blocked");
+        let blocked_tail = engine.output_tail(&blocked_task, 1).await;
+        let (blocked_content, blocked_ok) = blocked_tail
+            .iter()
+            .rev()
+            .find_map(|ev| match ev {
+                OutputEvent::Final { content, ok } => Some((content.clone(), *ok)),
+                _ => None,
+            })
+            .expect("Final present");
+        assert!(!blocked_ok);
+        assert_eq!(
+            super::content_ref_to_value(blocked_content),
+            json!("blocked-value"),
+            "Blocked value must not be wrapped"
+        );
+    }
+
+    /// End-to-end (engine layer): a worker that returns a skip-marker
+    /// sentinel value via `WorkerResult { value: wrap_skip_marker(inner),
+    /// ok: true }` — which is what a Skip-aware caller of
+    /// `submit_worker_result_trusted(..., SubmitOutcome::Skip)` places on
+    /// the wire — is folded by `dispatch_attempt_with_run_ctx` into
+    /// `DispatchOutcome::Skip(inner)`. Proves the sentinel → outcome
+    /// routing that the flow-ir binding boundary depends on.
+    #[tokio::test]
+    async fn dispatcher_folds_skip_sentinel_into_skip_outcome() {
+        let inner_verdict = json!({ "verdict": "SKIP", "reason": "not applicable" });
+        let inner_for_worker = inner_verdict.clone();
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("analyst", move |_inv| {
+            let value = wrap_skip_marker(inner_for_worker.clone());
+            async move { Ok(WorkerResult { value, ok: true }) }
+        });
+        let def = AgentDef {
+            name: "analyst".into(),
+            kind: AgentKind::RustFn,
+            spec: json!({ "fn_id": "analyst" }),
+            profile: None,
+            meta: None,
+            runner: None,
+            runner_ref: None,
+            verdict: None,
+        };
+        let spawner = factory.build(&def, None).expect("build");
+
+        let engine = Engine::new(EngineCfg::default());
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let task_id = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: "analyst".into(),
+                    initial_directive: json!("go"),
+                    step_ctx: None,
+                    check_policy: None,
+                },
+            )
+            .await
+            .expect("start_task");
+
+        let outcome = engine
+            .dispatch_attempt_with_run_ctx(&op_token, &task_id, &spawner, None)
+            .await
+            .expect("dispatch ok");
+
+        match outcome {
+            DispatchOutcome::Skip(v) => {
+                assert_eq!(v, inner_verdict, "Skip carries the unwrapped inner verdict");
+            }
+            other => panic!("expected DispatchOutcome::Skip, got {other:?}"),
+        }
+    }
+
+    /// `EngineDispatcher::dispatch` (the `AsyncDispatcher` impl flow-ir
+    /// invokes) maps `DispatchOutcome::Skip(v)` to `Ok(wrap_skip_marker(v))`
+    /// — a successful return whose Value carries the sentinel across the
+    /// flow-ir boundary. Pinning this mapping in a test guards the arm
+    /// order (a wildcard `Ok(other) =>` arm accidentally placed BEFORE the
+    /// Skip arm would route Skip to `EvalError::DispatcherError` and
+    /// abort the flow — the exact failure mode this tier prevents).
+    #[tokio::test]
+    async fn engine_dispatcher_maps_skip_outcome_to_ok_sentinel_value() {
+        let inner_verdict = json!({ "verdict": "SKIP", "reason": "not applicable" });
+        let inner_for_worker = inner_verdict.clone();
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("analyst", move |_inv| {
+            let value = wrap_skip_marker(inner_for_worker.clone());
+            async move { Ok(WorkerResult { value, ok: true }) }
+        });
+        let def = AgentDef {
+            name: "analyst".into(),
+            kind: AgentKind::RustFn,
+            spec: json!({ "fn_id": "analyst" }),
+            profile: None,
+            meta: None,
+            runner: None,
+            runner_ref: None,
+            verdict: None,
+        };
+        let spawner = factory.build(&def, None).expect("build");
+
+        let engine = Engine::new(EngineCfg::default());
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let dispatcher = EngineDispatcher::with_spawner(engine.clone(), op_token, spawner);
+
+        let out = dispatcher
+            .dispatch("analyst", json!("go"))
+            .await
+            .expect("dispatch returns Ok for Skip tier (not EvalError::DispatcherError)");
+
+        assert!(
+            is_skip_marker(&out),
+            "returned value must carry the skip-marker sentinel across the flow-ir boundary: got {out}"
+        );
+        assert_eq!(unwrap_skip_marker(&out), Some(inner_verdict));
+    }
+
+    /// `EngineDispatcher::dispatch`'s `RunContext` step-entry log records
+    /// `status = "skipped"` for a Skip completion (distinct from
+    /// `"passed"` / `"blocked"`), so post-run inspection of
+    /// `RunRecord.step_entries` can distinguish flow-continuation-with-
+    /// binding-write from flow-continuation-without-binding-write.
+    #[tokio::test]
+    async fn engine_dispatcher_step_entry_status_is_skipped_for_skip_outcome() {
+        let inner_verdict = json!({ "verdict": "SKIP" });
+        let inner_for_worker = inner_verdict.clone();
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("analyst", move |_inv| {
+            let value = wrap_skip_marker(inner_for_worker.clone());
+            async move { Ok(WorkerResult { value, ok: true }) }
+        });
+        let def = AgentDef {
+            name: "analyst".into(),
+            kind: AgentKind::RustFn,
+            spec: json!({ "fn_id": "analyst" }),
+            profile: None,
+            meta: None,
+            runner: None,
+            runner_ref: None,
+            verdict: None,
+        };
+        let spawner = factory.build(&def, None).expect("build");
+
+        let engine = Engine::new(EngineCfg::default());
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+
+        // Seed a RunContext with an InMemoryRunStore so the dispatcher
+        // appends a step_entry we can then read back.
+        let run_id = RunId::new();
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: None,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("create run record");
+        let run_ctx = RunContext::new(run_id.clone(), run_store.clone());
+
+        let dispatcher =
+            EngineDispatcher::with_spawner(engine.clone(), op_token, spawner).with_run(run_ctx);
+
+        let out = dispatcher
+            .dispatch("analyst", json!("go"))
+            .await
+            .expect("dispatch ok");
+        assert!(is_skip_marker(&out));
+
+        let record = run_store.get(&run_id).await.expect("run record present");
+        let step = record
+            .step_entries
+            .first()
+            .expect("at least one step_entry appended for the dispatched step");
+        assert_eq!(
+            step.status.as_deref(),
+            Some("skipped"),
+            "Skip outcome must record StepEntry.status = \"skipped\""
+        );
+        assert_eq!(step.step_ref.as_deref(), Some("analyst"));
     }
 }

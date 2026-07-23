@@ -45,6 +45,7 @@ use mlua_swarm::application::{
 use mlua_swarm::blueprint::{BindRequest, BindingAttestation, BoundAgent};
 use mlua_swarm::core::config::CheckPolicy;
 use mlua_swarm::service::merge_init_ctx_3layer;
+use mlua_swarm::service::TaskLaunchError;
 use mlua_swarm::store::replay::ReplayCursor;
 use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStoreError, SnapshotOrigin};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStoreError};
@@ -52,7 +53,7 @@ use mlua_swarm::{
     validate_bound_agent_snapshots, OperatorKind, Role, RunId, TaskId, TaskInputSpec,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -185,6 +186,59 @@ pub(crate) async fn finalize_run(
             }
         }
         Err(e) => {
+            // GH #76 error surface: persist a structured failure envelope into
+            // `RunRecord.result_ref` so the async poll path (`GET
+            // /v1/runs/:id`) can surface `failed_step` / `verdict_value` /
+            // `partial_ctx` symmetric to the sync path's `ApiError`
+            // `details` field. Envelope shape (documented for consumer
+            // disambiguation from the Ok arm's raw `final_ctx`):
+            //
+            // ```json
+            // {
+            //   "error": {
+            //     "message": <string>,
+            //     "failed_step": <string|null>,
+            //     "verdict_value": <value|null>
+            //   },
+            //   "partial_ctx": <value|null>
+            // }
+            // ```
+            //
+            // Consumers detect failure via the top-level `"error"` key
+            // (present iff this arm fired; the Ok arm stores the raw
+            // `final_ctx` verbatim, which is either a scalar or an object
+            // with the user's own keys — never a top-level `"error"`
+            // sibling of `"partial_ctx"`). Non-`FlowEval` errors (e.g.
+            // `TaskApplicationError::Store` / `NoStore` — dispatch never
+            // reached the flow eval boundary) still get an envelope, but
+            // with the structural fields `null` (the underlying error
+            // simply carries no `failed_step` semantic).
+            let envelope = match e {
+                TaskApplicationError::Launch(TaskLaunchError::FlowEval {
+                    message,
+                    failed_step,
+                    verdict_value,
+                    partial_ctx,
+                }) => json!({
+                    "error": {
+                        "message": message,
+                        "failed_step": failed_step,
+                        "verdict_value": verdict_value,
+                    },
+                    "partial_ctx": partial_ctx,
+                }),
+                other => json!({
+                    "error": {
+                        "message": other.to_string(),
+                        "failed_step": Value::Null,
+                        "verdict_value": Value::Null,
+                    },
+                    "partial_ctx": Value::Null,
+                }),
+            };
+            if let Err(store_err) = state.run_store.set_result(run_id, envelope).await {
+                tracing::warn!(%run_id, error = %store_err, "finalize_run: set_result (failure envelope) failed");
+            }
             if let Err(store_err) = state
                 .run_store
                 .update_status(run_id, RunStatus::Failed)
@@ -2615,5 +2669,174 @@ mod tests {
             Ok(_) => panic!("expected 404 for an unknown task"),
             Err(e) => assert_eq!(e.status, StatusCode::NOT_FOUND),
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #76 error surface: finalize_run Err arm populates result_ref with the
+    // structured failure envelope; run_get surfaces it.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Seed a Task + Run row so `finalize_run` can update them.
+    async fn seed_task_and_run(state: &AppState) -> (TaskId, RunId) {
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        state
+            .task_store
+            .create(TaskRecord {
+                id: task_id.clone(),
+                goal: "finalize-run-err-envelope".to_string(),
+                blueprint_ref: json!("inline"),
+                input_ctx: Value::Null,
+                task_input_spec: None,
+                status: TaskRecordStatus::Running,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed TaskRecord");
+        state
+            .run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: task_id.clone(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: Some("{}".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed RunRecord");
+        (task_id, run_id)
+    }
+
+    #[tokio::test]
+    async fn finalize_run_err_arm_populates_result_ref_with_structured_envelope() {
+        let state = test_state();
+        let (task_id, run_id) = seed_task_and_run(&state).await;
+
+        let err: Result<TaskApplicationOutput, TaskApplicationError> =
+            Err(TaskApplicationError::Launch(TaskLaunchError::FlowEval {
+                message: "blocked: {\"verdict\":\"BLOCKED\"}".to_string(),
+                failed_step: Some("gate".to_string()),
+                verdict_value: Some(json!({"verdict": "BLOCKED", "reason": "not-applicable"})),
+                partial_ctx: Some(
+                    json!({"steps": {"ST-abc": {"step_ref": "gate", "status": "blocked"}}}),
+                ),
+            }));
+
+        let _ = finalize_run(&state, &task_id, &run_id, err).await;
+
+        let run = state.run_store.get(&run_id).await.expect("run present");
+        assert_eq!(run.status, RunStatus::Failed);
+        let envelope = run
+            .result_ref
+            .as_ref()
+            .expect("result_ref must be Some on Err arm");
+        assert_eq!(
+            envelope["error"]["message"],
+            "blocked: {\"verdict\":\"BLOCKED\"}"
+        );
+        assert_eq!(envelope["error"]["failed_step"], "gate");
+        assert_eq!(envelope["error"]["verdict_value"]["verdict"], "BLOCKED");
+        assert_eq!(
+            envelope["partial_ctx"]["steps"]["ST-abc"]["status"],
+            "blocked"
+        );
+
+        // Owning Task status also flipped.
+        let task = state.task_store.get(&task_id).await.expect("task present");
+        assert_eq!(task.status, TaskRecordStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn finalize_run_err_arm_non_flow_eval_populates_envelope_with_null_structural_fields() {
+        let state = test_state();
+        let (task_id, run_id) = seed_task_and_run(&state).await;
+
+        // A non-FlowEval error (e.g. NoStore) still lands the envelope
+        // shape with `error.message` populated; the structural fields go
+        // to JSON `null` (no breadcrumb source available).
+        let err: Result<TaskApplicationOutput, TaskApplicationError> =
+            Err(TaskApplicationError::NoStore);
+
+        let _ = finalize_run(&state, &task_id, &run_id, err).await;
+        let run = state.run_store.get(&run_id).await.expect("run present");
+        let envelope = run
+            .result_ref
+            .as_ref()
+            .expect("result_ref must be Some on Err arm");
+        assert!(envelope["error"]["message"]
+            .as_str()
+            .expect("message string")
+            .contains("store"));
+        assert_eq!(envelope["error"]["failed_step"], Value::Null);
+        assert_eq!(envelope["error"]["verdict_value"], Value::Null);
+        assert_eq!(envelope["partial_ctx"], Value::Null);
+    }
+
+    /// Regression: the Ok arm still stores the raw `final_ctx` verbatim
+    /// (NOT an envelope) — consumers that never saw a failure keep their
+    /// pre-#76 shape. The disambiguation is the top-level `"error"` key:
+    /// present iff the Err arm fired.
+    #[tokio::test]
+    async fn finalize_run_ok_arm_still_stores_raw_final_ctx_verbatim() {
+        let state = test_state();
+        let (task_id, run_id) = seed_task_and_run(&state).await;
+
+        let ok: Result<TaskApplicationOutput, TaskApplicationError> = Ok(TaskApplicationOutput {
+            token: mlua_swarm::CapToken {
+                agent_id: "ut".to_string(),
+                role: mlua_swarm::Role::Operator,
+                scopes: vec!["*".to_string()],
+                issued_at: 0,
+                expire_at: u64::MAX,
+                max_uses: None,
+                nonce: "ut-nonce".to_string(),
+                sig_hex: String::new(),
+            },
+            final_ctx: json!({"out": {"echoed": "hi"}}),
+            bound_version: None,
+        });
+
+        let _ = finalize_run(&state, &task_id, &run_id, ok).await;
+        let run = state.run_store.get(&run_id).await.expect("run present");
+        assert_eq!(run.status, RunStatus::Done);
+        let stored = run.result_ref.as_ref().expect("result_ref Some");
+        // Raw final_ctx verbatim — NOT an envelope; no top-level "error" key.
+        assert_eq!(stored, &json!({"out": {"echoed": "hi"}}));
+        assert!(
+            stored.get("error").is_none(),
+            "Ok arm must never write an `error` key at the top of result_ref (envelope disambiguation)"
+        );
+    }
+
+    /// `GET /v1/runs/:id` returns the `RunRecord` verbatim, so after a
+    /// finalize_run Err arm the structured envelope surfaces through the
+    /// existing handler — no new response type needed. Failure detection
+    /// via the top-level `"error"` key inside `result_ref`.
+    #[tokio::test]
+    async fn run_get_surfaces_structured_failure_envelope_from_result_ref() {
+        let state = test_state();
+        let (_task_id, run_id) = seed_task_and_run(&state).await;
+        let err: Result<TaskApplicationOutput, TaskApplicationError> =
+            Err(TaskApplicationError::Launch(TaskLaunchError::FlowEval {
+                message: "blocked: bad verdict".to_string(),
+                failed_step: Some("scout".to_string()),
+                verdict_value: Some(json!("BLOCKED")),
+                partial_ctx: Some(json!({"steps": {}})),
+            }));
+        let _ = finalize_run(&state, &_task_id, &run_id, err).await;
+
+        let Json(run) = run_get(State(state), Path(run_id.to_string()))
+            .await
+            .expect("run_get");
+        assert_eq!(run.status, RunStatus::Failed);
+        let envelope = run.result_ref.expect("result_ref Some");
+        assert_eq!(envelope["error"]["failed_step"], "scout");
+        assert_eq!(envelope["error"]["verdict_value"], "BLOCKED");
     }
 }

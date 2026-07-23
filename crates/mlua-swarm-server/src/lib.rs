@@ -119,10 +119,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mlua_swarm::application::{BlueprintRef, TaskApplication};
+use mlua_swarm::application::{BlueprintRef, TaskApplication, TaskApplicationError};
 use mlua_swarm::blueprint::store::BlueprintStore;
 use mlua_swarm::core::config::CheckPolicy;
-use mlua_swarm::service::TaskLaunchService;
+use mlua_swarm::service::{TaskLaunchError, TaskLaunchService};
 use mlua_swarm::store::replay::{InMemoryReplayStore, ReplayStore};
 use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStore};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
@@ -1260,7 +1260,7 @@ async fn run_flow_form(
 
     let out = tasks::finalize_run(state, &task_id, &run_id, outcome)
         .await
-        .map_err(|e| ApiError::bad_request(format!("run: {e}")))?;
+        .map_err(flow_eval_error_to_api_error)?;
 
     Ok(TaskLaunchReply(
         TaskLaunchResponse {
@@ -1368,12 +1368,48 @@ fn parse_role(s: &str) -> Result<Role, ApiError> {
 
 // ─── error type ──────────────────────────────────────────────────────────
 
+/// GH #76 error surface: adapter that lifts a [`TaskApplicationError`] into an
+/// [`ApiError`], surfacing the structured
+/// [`TaskLaunchError::FlowEval`] fields
+/// (`failed_step` / `verdict_value` / `partial_ctx`) into the response
+/// body's `details` object when the abort originated from a Blueprint
+/// step. Every other error variant collapses to the pre-#76
+/// `bad_request(format!("run: {e}"))` shape byte-for-byte, so callers
+/// that only match on the `{"error": message}` message keep working.
+fn flow_eval_error_to_api_error(e: TaskApplicationError) -> ApiError {
+    if let TaskApplicationError::Launch(TaskLaunchError::FlowEval {
+        message,
+        failed_step,
+        verdict_value,
+        partial_ctx,
+    }) = &e
+    {
+        let details = json!({
+            "failed_step": failed_step,
+            "verdict_value": verdict_value,
+            "partial_ctx": partial_ctx,
+        });
+        return ApiError::bad_request(format!("run: flow eval: {message}")).with_details(details);
+    }
+    ApiError::bad_request(format!("run: {e}"))
+}
+
 /// Uniform error response type for the handlers in this module. Converts to
 /// a JSON `{"error": message}` body with the given status via [`IntoResponse`].
+///
+/// GH #76 error surface: an optional `details` field carries the structured
+/// [`mlua_swarm::service::TaskLaunchError::FlowEval`] envelope
+/// (`failed_step` / `verdict_value` / `partial_ctx`) when the abort
+/// originated from a Blueprint step. When present, the JSON body becomes
+/// `{"error": message, "details": {...}}` — a pure ADDITIVE schema change
+/// for consumers that already ignore unknown keys. Absent (the default)
+/// preserves the pre-#76 `{"error": message}` shape byte-for-byte for
+/// every other error site.
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    details: Option<Value>,
 }
 
 impl ApiError {
@@ -1382,6 +1418,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("engine: {e}"),
+            details: None,
         }
     }
     /// Builds a `404 Not Found` with the given message.
@@ -1389,6 +1426,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: m,
+            details: None,
         }
     }
     /// Builds a `400 Bad Request` with the given message.
@@ -1396,6 +1434,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: m,
+            details: None,
         }
     }
     /// Builds a `409 Conflict` with the given message (`POST
@@ -1405,6 +1444,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: m,
+            details: None,
         }
     }
     /// Builds a `503 Service Unavailable` with the given message (GH #33
@@ -1413,6 +1453,7 @@ impl ApiError {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: m,
+            details: None,
         }
     }
     /// Builds a `504 Gateway Timeout` with the given message (GH #33
@@ -1421,6 +1462,7 @@ impl ApiError {
         Self {
             status: StatusCode::GATEWAY_TIMEOUT,
             message: m,
+            details: None,
         }
     }
     /// Builds a `410 Gone` with the given message (GH #37 — worker
@@ -1431,6 +1473,7 @@ impl ApiError {
         Self {
             status: StatusCode::GONE,
             message: m,
+            details: None,
         }
     }
     /// Builds a `413 Payload Too Large` with the given message (GH #42 —
@@ -1440,6 +1483,7 @@ impl ApiError {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: m,
+            details: None,
         }
     }
     /// Builds a `422 Unprocessable Entity` with the given message (GH #50
@@ -1451,13 +1495,29 @@ impl ApiError {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             message: m.into(),
+            details: None,
         }
+    }
+    /// GH #76 error surface: attach a structured details payload alongside the
+    /// string message. Consumed by [`IntoResponse`] to emit
+    /// `{"error": message, "details": {...}}`. The current sole caller
+    /// is `run_flow_form`'s `TaskApplicationError::Launch(FlowEval)` arm,
+    /// which lifts `failed_step` / `verdict_value` / `partial_ctx` out of
+    /// the structured [`mlua_swarm::service::TaskLaunchError::FlowEval`]
+    /// variant into this field.
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({"error": self.message}))).into_response()
+        let body = match self.details {
+            Some(details) => json!({"error": self.message, "details": details}),
+            None => json!({"error": self.message}),
+        };
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -1758,5 +1818,106 @@ mod tests {
         let Json(resp) = status_get(State(state)).await;
         assert_eq!(resp.running_runs, 1);
         assert_eq!(resp.attached_operators, 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // GH #76 error surface: ApiError.details + flow_eval_error_to_api_error mapper
+    // ──────────────────────────────────────────────────────────────────
+
+    /// `ApiError::with_details` populates the optional `details` field, and
+    /// [`IntoResponse`] renders it into the JSON body as a sibling of
+    /// `error`. Pre-#76 shape (no details) stays byte-for-byte
+    /// `{"error": message}`.
+    #[tokio::test]
+    async fn api_error_details_render_into_response_body() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        // Baseline: no details → pre-#76 shape.
+        let bare = ApiError::bad_request("something".to_string()).into_response();
+        let (parts, body) = bare.into_parts();
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(body, 1024).await.expect("bare body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse bare");
+        assert_eq!(parsed, json!({"error": "something"}));
+
+        // With details → additive `details` key.
+        let with_details = ApiError::bad_request("run: flow eval: blocked".to_string())
+            .with_details(json!({
+                "failed_step": "gate",
+                "verdict_value": {"verdict": "BLOCKED"},
+                "partial_ctx": {"steps": {}},
+            }));
+        let resp = with_details.into_response();
+        let (parts, body) = resp.into_parts();
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(body, 4096).await.expect("details body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse details");
+        assert_eq!(parsed["error"], "run: flow eval: blocked");
+        assert_eq!(parsed["details"]["failed_step"], "gate");
+        assert_eq!(parsed["details"]["verdict_value"]["verdict"], "BLOCKED");
+        assert!(parsed["details"]["partial_ctx"].is_object());
+    }
+
+    /// The mapper lifts the structured `TaskLaunchError::FlowEval` fields
+    /// into `ApiError.details` while preserving the pre-#76 message prefix
+    /// (`"run: flow eval: <msg>"`). Regression: every other
+    /// `TaskApplicationError` variant collapses to the pre-#76 shape (no
+    /// `details`).
+    #[test]
+    fn flow_eval_error_to_api_error_lifts_structural_fields_into_details() {
+        let err = TaskApplicationError::Launch(TaskLaunchError::FlowEval {
+            message: "blocked: {\"verdict\":\"BLOCKED\"}".to_string(),
+            failed_step: Some("gate".to_string()),
+            verdict_value: Some(json!({"verdict": "BLOCKED"})),
+            partial_ctx: Some(json!({"steps": {}})),
+        });
+        let api_err = flow_eval_error_to_api_error(err);
+        assert_eq!(api_err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            api_err.message.starts_with("run: flow eval: "),
+            "message must preserve pre-#76 `run: flow eval: <msg>` prefix, got: {}",
+            api_err.message
+        );
+        let details = api_err.details.expect("details must be Some for FlowEval");
+        assert_eq!(details["failed_step"], "gate");
+        assert_eq!(details["verdict_value"]["verdict"], "BLOCKED");
+        assert!(details["partial_ctx"].is_object());
+    }
+
+    /// Regression: a non-`FlowEval` error must still map to a `bad_request`
+    /// without a `details` field — the pre-#76 shape for e.g.
+    /// `TaskApplicationError::NoStore`.
+    #[test]
+    fn flow_eval_error_to_api_error_non_flow_eval_falls_back_to_message_only() {
+        let api_err = flow_eval_error_to_api_error(TaskApplicationError::NoStore);
+        assert_eq!(api_err.status, StatusCode::BAD_REQUEST);
+        assert!(api_err.message.starts_with("run: "));
+        assert!(
+            api_err.details.is_none(),
+            "non-FlowEval errors must not carry a details field (pre-#76 shape)"
+        );
+    }
+
+    /// A `FlowEval` with every optional field `None` (upstream flow-ir
+    /// error path — no dispatcher breadcrumb, no run_ctx snapshot) still
+    /// lifts into `details` — the shape is `null` per key, which serialize
+    /// as JSON `null`. Consumers must treat missing / `null` as "not
+    /// available", both are legitimate.
+    #[test]
+    fn flow_eval_error_to_api_error_with_all_none_still_populates_details_with_nulls() {
+        let err = TaskApplicationError::Launch(TaskLaunchError::FlowEval {
+            message: "unresolved extern".to_string(),
+            failed_step: None,
+            verdict_value: None,
+            partial_ctx: None,
+        });
+        let api_err = flow_eval_error_to_api_error(err);
+        let details = api_err
+            .details
+            .expect("details Some even when fields are None");
+        assert_eq!(details["failed_step"], Value::Null);
+        assert_eq!(details["verdict_value"], Value::Null);
+        assert_eq!(details["partial_ctx"], Value::Null);
     }
 }

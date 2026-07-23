@@ -182,6 +182,187 @@ mod tests {
         assert_eq!(out["other"], serde_json::json!([]));
     }
 
+    /// GH #76 DSL sugar: `skip_on = { "SKIP", ... }` on a stage record wraps
+    /// the stage's own body (step + optional retry loop) in a Branch
+    /// whose `cond` is `in(<input>.parts["verdict"], <skip_on_list>)`.
+    /// When the skip check hits, the stage body is elided (`then` =
+    /// empty `Seq`); the gate/rest chain continues unchanged.
+    #[test]
+    fn bp_dsl_skip_on_compiles_to_branch_in_verdict_skip_on_list() {
+        let out = build_bp_from_script(
+            r#"
+            local F = require("flow_dsl")
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "gate" { agent = "mock-gate" },
+              B.stage "worker" {
+                agent = "mock-worker",
+                input = B.from "gate",
+                skip_on = { "SKIP", "NOT_APPLICABLE" },
+              },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        )
+        .expect("skip_on pipeline must build");
+
+        // Top-level seq: [gate_step, rest].
+        assert_eq!(out["kind"], serde_json::json!("seq"));
+        let top_children = out["children"].as_array().expect("top seq children");
+        assert_eq!(top_children.len(), 2);
+        assert_eq!(top_children[0]["kind"], serde_json::json!("step"));
+        assert_eq!(top_children[0]["ref"], serde_json::json!("mock-gate"));
+
+        // `rest` = worker stage's compiled form. With skip_on, the
+        // stage's body is wrapped in a branch whose cond is `in(...)`.
+        let rest = &top_children[1];
+        assert_eq!(rest["kind"], serde_json::json!("seq"));
+        let rest_children = rest["children"].as_array().expect("rest seq children");
+        // No gate/rest chain past worker (last stage, no halt_on / retry).
+        let worker_guarded = &rest_children[0];
+        assert_eq!(worker_guarded["kind"], serde_json::json!("branch"));
+
+        // cond: in(needle=path("$.gate.parts[\"verdict\"]"),
+        //         haystack=lit(["SKIP", "NOT_APPLICABLE"])).
+        let cond = &worker_guarded["cond"];
+        assert_eq!(cond["op"], serde_json::json!("in"));
+        assert_eq!(
+            cond["needle"],
+            serde_json::json!({"op": "path", "at": "$.gate.parts[\"verdict\"]"})
+        );
+        assert_eq!(cond["haystack"]["op"], serde_json::json!("lit"));
+        assert_eq!(
+            cond["haystack"]["value"],
+            serde_json::json!(["SKIP", "NOT_APPLICABLE"])
+        );
+
+        // then = empty seq (skip elides body).
+        assert_eq!(
+            worker_guarded["then"],
+            serde_json::json!({"kind": "seq", "children": []})
+        );
+
+        // else = the original stage body (just the worker step here —
+        // no retry, no gate).
+        let body = &worker_guarded["else"];
+        assert_eq!(body["kind"], serde_json::json!("seq"));
+        assert_eq!(body["children"][0]["ref"], serde_json::json!("mock-worker"));
+    }
+
+    /// GH #76 DSL sugar: `skip_on` may coexist with `halt_on` on the same
+    /// stage — the skip guard wraps the stage's OWN body (step +
+    /// optional retry loop) and sits INSIDE the enclosing gate/rest
+    /// chain, so a skipped stage still lets `halt_on`'s gate cond be
+    /// evaluated against the (absent) `<out>` and thread through to
+    /// `rest`.
+    #[test]
+    fn bp_dsl_skip_on_coexists_with_halt_on() {
+        let out = build_bp_from_script(
+            r#"
+            local F = require("flow_dsl")
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "planner" { agent = "mock-planner" },
+              B.stage "worker" {
+                agent = "mock-worker",
+                input = B.from "planner",
+                skip_on = { "SKIP" },
+                halt_on = { "BLOCKED" },
+              },
+              B.stage "publisher" { agent = "mock-publisher" },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        )
+        .expect("skip_on + halt_on pipeline must build");
+
+        // Walk to the worker stage. Structure: top seq -> [planner,
+        // rest]; rest = seq -> [worker_body, gate]; worker_body =
+        // branch (skip guard).
+        let rest = &out["children"][1];
+        let worker_seq = rest;
+        assert_eq!(worker_seq["kind"], serde_json::json!("seq"));
+        let worker_children = worker_seq["children"]
+            .as_array()
+            .expect("worker seq children");
+        assert_eq!(
+            worker_children.len(),
+            2,
+            "skip guard + halt_on gate (with publisher threaded into gate else)"
+        );
+
+        // Child 0 = skip guard branch (skip_on).
+        let skip_branch = &worker_children[0];
+        assert_eq!(skip_branch["kind"], serde_json::json!("branch"));
+        assert_eq!(skip_branch["cond"]["op"], serde_json::json!("in"));
+
+        // Child 1 = halt_on gate (`branch`) whose cond is `eq` against
+        // the current stage's own out.parts["verdict"].
+        let halt_gate = &worker_children[1];
+        assert_eq!(halt_gate["kind"], serde_json::json!("branch"));
+        assert_eq!(halt_gate["cond"]["op"], serde_json::json!("eq"));
+        assert_eq!(
+            halt_gate["cond"]["lhs"],
+            serde_json::json!({"op": "path", "at": "$.worker.parts[\"verdict\"]"})
+        );
+        // gate's else is publisher's compiled form (the pipeline tail).
+        let gate_else = &halt_gate["else"];
+        assert_eq!(gate_else["kind"], serde_json::json!("seq"));
+        // publisher's step should be somewhere in that seq's children.
+        let contains_publisher = gate_else["children"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .any(|c| c["ref"] == serde_json::json!("mock-publisher"))
+            })
+            .unwrap_or(false);
+        assert!(
+            contains_publisher,
+            "halt_on gate else must thread the publisher stage through: {gate_else}"
+        );
+    }
+
+    /// GH #76 DSL sugar: `skip_on = {}` is a no-op (equivalent to omitting
+    /// the option). No branch is emitted, the stage compiles exactly
+    /// as if `skip_on` were absent.
+    #[test]
+    fn bp_dsl_skip_on_empty_list_is_noop() {
+        let with_empty = build_bp_from_script(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "worker" { agent = "mock-worker", skip_on = {} },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        )
+        .expect("skip_on={} pipeline must build");
+
+        // Without any gate, retry, or a firing skip_on, the pipeline
+        // compiles to [step, <final_else>] (no branch wrapping).
+        let children = with_empty["children"].as_array().expect("seq children");
+        assert_eq!(
+            children.len(),
+            2,
+            "no skip guard emitted for empty skip_on: {with_empty}"
+        );
+        assert_eq!(children[0]["kind"], serde_json::json!("step"));
+        assert_eq!(children[0]["ref"], serde_json::json!("mock-worker"));
+
+        // Byte-identical to the same script without skip_on.
+        let baseline = build_bp_from_script(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "worker" { agent = "mock-worker" },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        )
+        .expect("baseline pipeline must build");
+        assert_eq!(with_empty, baseline, "skip_on = {{}} must be a no-op");
+    }
+
     #[test]
     fn empty_object_marker_replacement_does_not_misfire_on_ordinary_data() {
         // A field that legitimately reuses the marker key name for
