@@ -600,6 +600,19 @@ binding digest remain visible after execution. The route reads only
 reads platform wrapper files. A pre-snapshot Run returns `422`, preserving the
 distinction between “not recorded” and “currently resolvable.”
 
+**Resuming a Run created before binding snapshots existed.** Such a Run has no
+`bound_agents` to restore, so resume (and rerun-from) backfills the snapshot
+from the *current* Blueprint at resume time. The explain response marks this
+with `snapshot_origin`: `"launch"` when the bindings were pinned at the Run's
+initial launch, `"resume_backfill"` when they were re-derived on resume (a
+snapshot that carries `bound_agents` but no origin marker also reports
+`"resume_backfill"` — the safe side). A backfilled Run's binding identity is
+therefore *not* a launch-time pin, and its resume also records a
+`binding` / `resume_backfill` degradation. To keep the pre-upgrade replay log
+usable, a `resume_backfill` Run deliberately does **not** mix binding digests
+into its replay keys (an initial `launch` Run does), so its previously logged
+steps still replay verbatim instead of re-executing.
+
 Legacy `profile.worker_binding` conversion is controlled at server startup by
 `legacy_worker_binding_policy = "allow" | "reject"` (or CLI
 `--legacy-worker-binding-policy`). `allow` is the compatibility default and

@@ -192,7 +192,7 @@ async fn load_or_resolve_bound_agents(
     run_ctx: Option<&RunContext>,
     binding_provider: Option<&dyn AgentBindingProvider>,
     legacy_worker_binding_policy: LegacyWorkerBindingPolicy,
-) -> Result<Vec<BoundAgent>, TaskLaunchError> {
+) -> Result<(Vec<BoundAgent>, SnapshotOrigin), TaskLaunchError> {
     // Strict binding is a BP-level opt-in only (server config / launch
     // request cascade is intentionally out of scope for this change).
     let strict = blueprint.strategy.strict_binding;
@@ -203,9 +203,11 @@ async fn load_or_resolve_bound_agents(
         }
     };
     let Some(run_ctx) = run_ctx else {
+        // No Run context (embed use): nothing to persist, and no snapshot
+        // to backfill — this is an initial launch by definition.
         let mut bound_agents = resolve_fresh().map_err(CompileError::from)?;
         attest_or_gate_fresh(&mut bound_agents, binding_provider, strict, None).await?;
-        return Ok(bound_agents);
+        return Ok((bound_agents, SnapshotOrigin::Launch));
     };
 
     let record = run_ctx
@@ -225,7 +227,15 @@ async fn load_or_resolve_bound_agents(
             validate_bound_agent_snapshots(&bound_agents).map_err(|error| {
                 TaskLaunchError::PreDispatch(format!("validate Run BoundAgent snapshot: {error}"))
             })?;
-            return Ok(bound_agents);
+            // [Crux D2-b] The fast path reads the PERSISTED origin marker
+            // rather than re-deriving it from `run_ctx.resume`, so a
+            // backfilled Run stays `resume_backfill` (and keeps its legacy
+            // replay keys) across every subsequent resume — the outcome is a
+            // function of the pinned snapshot, not of how many times the Run
+            // was resumed. An absent marker maps to `resume_backfill` (the
+            // safe side — see `SnapshotOrigin::from_snapshot`).
+            let origin = SnapshotOrigin::from_snapshot(&snapshot);
+            return Ok((bound_agents, origin));
         }
     }
 
@@ -283,7 +293,7 @@ async fn load_or_resolve_bound_agents(
     if origin == SnapshotOrigin::ResumeBackfill {
         record_backfill_degradation(run_ctx, blueprint.id.as_str()).await;
     }
-    Ok(bound_agents)
+    Ok((bound_agents, origin))
 }
 
 /// Record one binding backfill: a pre-binding-snapshot Run was resumed (or
@@ -801,7 +811,7 @@ impl TaskLaunchService {
         // `LayerRegistry` resolution + `SpawnerStack` wrapping) is
         // concentrated inside `service::linker::link` — Service
         // scatter is intentionally prevented.
-        let bound_agents = load_or_resolve_bound_agents(
+        let (bound_agents, snapshot_origin) = load_or_resolve_bound_agents(
             &input.blueprint,
             input.run_ctx.as_ref(),
             self.binding_provider.as_deref(),
@@ -813,7 +823,20 @@ impl TaskLaunchService {
             .map(|bound| (bound.agent.name.clone(), bound.binding_digest.clone()))
             .collect();
         if let Some(run_ctx) = input.run_ctx.take() {
-            input.run_ctx = Some(run_ctx.with_binding_digests(binding_digests.clone()));
+            // [Crux D2-a] A `launch`-origin Run attaches the binding digests to
+            // the RunContext so replay keys distinguish the same step/input run
+            // under different bindings (the property the strict-binding series
+            // introduced). A `resume_backfill`-origin Run does NOT: its
+            // pre-upgrade replay log was hashed WITHOUT binding digests, so
+            // leaving `RunContext.binding_digests` empty makes the engine's
+            // `input_hash` fall back to the legacy form (`binding_digests.get`
+            // → None, see `Engine::dispatch_attempt_with_run_ctx`) and the old
+            // log hits verbatim. This is per-Run, keyed on the snapshot's
+            // origin — it does NOT disable digest keying for launch Runs.
+            input.run_ctx = Some(match snapshot_origin {
+                SnapshotOrigin::Launch => run_ctx.with_binding_digests(binding_digests.clone()),
+                SnapshotOrigin::ResumeBackfill => run_ctx,
+            });
         }
         input.blueprint = materialize_bound_blueprint(&input.blueprint, &bound_agents);
         let compiled = self
@@ -1970,7 +1993,7 @@ mod tests {
             vec![original_agent],
         );
 
-        let original = load_or_resolve_bound_agents(
+        let (original, _) = load_or_resolve_bound_agents(
             &blueprint,
             Some(&run_ctx),
             None,
@@ -1979,7 +2002,7 @@ mod tests {
         .await
         .unwrap();
         blueprint.agents[0].profile.as_mut().unwrap().system_prompt = "mutated role".to_string();
-        let restored = load_or_resolve_bound_agents(
+        let (restored, _) = load_or_resolve_bound_agents(
             &blueprint,
             Some(&run_ctx),
             None,
@@ -2079,7 +2102,7 @@ mod tests {
         });
         let provider = CountingProvider(AtomicUsize::new(0));
 
-        let first = load_or_resolve_bound_agents(
+        let (first, _) = load_or_resolve_bound_agents(
             &blueprint,
             Some(&run_ctx),
             Some(&provider),
@@ -2087,7 +2110,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let restored = load_or_resolve_bound_agents(
+        let (restored, _) = load_or_resolve_bound_agents(
             &blueprint,
             Some(&run_ctx),
             Some(&provider),
@@ -2292,7 +2315,7 @@ mod tests {
             .unwrap();
         let run_ctx = RunContext::new(run_id.clone(), run_store.clone());
 
-        let bound = load_or_resolve_bound_agents(
+        let (bound, _) = load_or_resolve_bound_agents(
             &runner_blueprint(false),
             Some(&run_ctx),
             Some(&AlwaysUnboundProvider),
@@ -2375,7 +2398,7 @@ mod tests {
                 capability_snapshot_digest: None,
             }],
         });
-        let bound = load_or_resolve_bound_agents(
+        let (bound, _) = load_or_resolve_bound_agents(
             &runner_blueprint(true),
             None,
             Some(&provider),
@@ -2962,5 +2985,192 @@ mod tests {
             .expect("ws_operator must feed the canonical spawn binding path");
         assert_eq!(binding.variant, "mse-reviewer");
         assert_eq!(binding.tools, ["Read", "Grep"]);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // D2: replay compat for backfilled Runs (origin drives digest keying)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Build a single-step `echo` RustFn Blueprint plus a call counter its
+    /// worker bumps on every real dispatch. A replay HIT never reaches the
+    /// worker, so the counter is the "was this step actually executed?"
+    /// probe.
+    fn counting_echo_service() -> (TaskLaunchService, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let factory = RustFnInProcessSpawnerFactory::new().register_fn("echo", move |inv| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(WorkerResult {
+                    value: json!({ "echoed": inv.prompt }),
+                    ok: true,
+                })
+            }
+        });
+        (build_service(factory), calls)
+    }
+
+    async fn seed_legacy_run(run_store: &Arc<dyn crate::store::run::RunStore>) -> crate::RunId {
+        use crate::store::run::{RunRecord, RunStatus};
+        use crate::types::TaskId;
+        let run_id = crate::RunId::new();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                // No `bound_agents` — a pre-binding-snapshot ("pre-upgrade")
+                // Run whose resume must backfill.
+                input_json: Some("{}".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed legacy RunRecord");
+        run_id
+    }
+
+    /// [Crux D2 items 4 + 6] A pre-upgrade Run whose replay log was hashed
+    /// WITHOUT binding digests replays cleanly through the full launch path
+    /// on resume, and stays consistent across a second resume (the fast path
+    /// reads the persisted `resume_backfill` origin, so no digests are ever
+    /// mixed into the replay key).
+    #[tokio::test]
+    async fn backfilled_run_replays_legacy_keys_stably_across_two_resumes() {
+        use crate::store::replay::{InMemoryReplayStore, ReplayCursor, ReplayStore};
+        use crate::store::run::{InMemoryRunStore, RunContext, RunStore};
+        use std::sync::atomic::Ordering;
+        use std::sync::Mutex;
+
+        let (svc, echo_calls) = counting_echo_service();
+        let blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let replay_store: Arc<dyn ReplayStore> = Arc::new(InMemoryReplayStore::new());
+        let run_id = seed_legacy_run(&run_store).await;
+
+        // Phase 1 — first resume backfills the snapshot AND, because the
+        // origin is `resume_backfill`, dispatches with legacy replay keys.
+        // This is the step that generates the pre-upgrade-shaped replay row.
+        let rc1 = RunContext::new(run_id.clone(), run_store.clone())
+            .with_replay_store(replay_store.clone())
+            .with_resume();
+        let mut input1 = launch_input(blueprint.clone(), json!({ "input": "hi" }));
+        input1.run_ctx = Some(rc1);
+        let out1 = svc.launch(input1).await.expect("phase-1 resume launch ok");
+        assert_eq!(out1.final_ctx["out"]["echoed"], "hi");
+        assert_eq!(
+            echo_calls.load(Ordering::SeqCst),
+            1,
+            "phase 1 dispatches the worker once (nothing to replay yet)"
+        );
+        let entries = replay_store
+            .list_by_run(&run_id)
+            .await
+            .expect("list replay rows");
+        assert_eq!(
+            entries.len(),
+            1,
+            "phase 1 must log exactly one legacy-hashed replay row"
+        );
+        let run = run_store.get(&run_id).await.expect("run present");
+        let snap: Value = serde_json::from_str(run.input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            SnapshotOrigin::from_snapshot(&snap),
+            SnapshotOrigin::ResumeBackfill,
+            "phase 1 must pin the snapshot as resume_backfill"
+        );
+
+        // Phase 2 — second resume. The snapshot now carries bound_agents, so
+        // load_or_resolve takes the fast path and reads the persisted
+        // `resume_backfill` origin — digests are again withheld, the legacy
+        // key matches, and the worker is NOT run a second time.
+        let cursor = ReplayCursor::from_entries(entries);
+        let rc2 = RunContext::new(run_id.clone(), run_store.clone())
+            .with_replay_store(replay_store.clone())
+            .with_replay_cursor(Arc::new(Mutex::new(cursor)))
+            .with_resume();
+        let mut input2 = launch_input(blueprint.clone(), json!({ "input": "hi" }));
+        input2.run_ctx = Some(rc2);
+        let out2 = svc.launch(input2).await.expect("phase-2 resume launch ok");
+        assert_eq!(out2.final_ctx["out"]["echoed"], "hi");
+        assert_eq!(
+            echo_calls.load(Ordering::SeqCst),
+            1,
+            "phase 2 must REPLAY the legacy-hashed row — the worker must not run again"
+        );
+        let run2 = run_store.get(&run_id).await.expect("run present");
+        let snap2: Value = serde_json::from_str(run2.input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            SnapshotOrigin::from_snapshot(&snap2),
+            SnapshotOrigin::ResumeBackfill,
+            "origin must stay resume_backfill across resumes (replay key stability)"
+        );
+    }
+
+    /// [Crux D2 item 5 / D2-a] A `launch`-origin Run mixes binding digests
+    /// into its replay key, so a legacy-hashed (digest-free) replay row does
+    /// NOT hit — the worker runs. Proves the fix is per-Run and does not
+    /// disable digest keying for initial launches.
+    #[tokio::test]
+    async fn launch_origin_run_uses_digest_keys_and_misses_legacy_replay_row() {
+        use crate::store::replay::{InMemoryReplayStore, ReplayCursor, ReplayStore};
+        use crate::store::run::{InMemoryRunStore, RunContext, RunStore};
+        use std::sync::atomic::Ordering;
+        use std::sync::Mutex;
+
+        let (svc, echo_calls) = counting_echo_service();
+        let blueprint = bp(
+            step("echo", path("$.input"), path("$.out")),
+            vec![agent("echo", "echo")],
+        );
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let replay_store: Arc<dyn ReplayStore> = Arc::new(InMemoryReplayStore::new());
+
+        // Produce a legacy-hashed replay row via a backfill (resume) Run.
+        let backfill_run = seed_legacy_run(&run_store).await;
+        let rc_bf = RunContext::new(backfill_run.clone(), run_store.clone())
+            .with_replay_store(replay_store.clone())
+            .with_resume();
+        let mut input_bf = launch_input(blueprint.clone(), json!({ "input": "hi" }));
+        input_bf.run_ctx = Some(rc_bf);
+        svc.launch(input_bf).await.expect("backfill launch ok");
+        assert_eq!(echo_calls.load(Ordering::SeqCst), 1);
+        let legacy_entries = replay_store
+            .list_by_run(&backfill_run)
+            .await
+            .expect("list legacy rows");
+        assert_eq!(legacy_entries.len(), 1);
+
+        // A fresh, `launch`-origin Run (no `with_resume`) fed a cursor built
+        // from those legacy rows. Its replay key mixes in the binding digest,
+        // so the legacy (digest-free) key MISSES and the worker runs again.
+        let launch_run = seed_legacy_run(&run_store).await;
+        let cursor = ReplayCursor::from_entries(legacy_entries);
+        let rc_launch = RunContext::new(launch_run.clone(), run_store.clone())
+            .with_replay_store(replay_store.clone())
+            .with_replay_cursor(Arc::new(Mutex::new(cursor)));
+        let mut input_launch = launch_input(blueprint.clone(), json!({ "input": "hi" }));
+        input_launch.run_ctx = Some(rc_launch);
+        svc.launch(input_launch)
+            .await
+            .expect("launch-origin launch ok");
+        assert_eq!(
+            echo_calls.load(Ordering::SeqCst),
+            2,
+            "a launch-origin Run keys replay by binding digest, so the \
+             legacy-hashed row must MISS and the worker must run"
+        );
+        let run = run_store.get(&launch_run).await.expect("run present");
+        let snap: Value = serde_json::from_str(run.input_json.as_deref().unwrap()).unwrap();
+        assert_eq!(SnapshotOrigin::from_snapshot(&snap), SnapshotOrigin::Launch);
     }
 }
