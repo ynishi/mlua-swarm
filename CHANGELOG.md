@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/ynishi/mlua-swarm/compare/v0.14.1...v0.15.0) - 2026-07-23
+
+### Added
+
+- keep legacy replay keys for backfilled run snapshots
+- mark run snapshot origin for backfilled bindings
+- carry binding request identity into spawn frames
+- make binding attestation optional behind strict gate
+- validate run snapshots and gate legacy bindings
+- add cross-platform operator provider
+- explain run-scoped agent bindings
+- attest operator capabilities at join
+- add execution binding provider interface
+- bind immutable agent snapshots at launch
+- expose blueprint binding requirements endpoint
+- add binding_lint family to bp_doctor
+
+### Other
+
+- ignore .codex dotdir and AGENTS.md
+- neutralize internal convention tokens in public surfaces
+- document optional manifests and strict binding mode
+- align bp build fixtures with runner-form migration
+
 ## [0.14.1](https://github.com/ynishi/mlua-swarm/compare/v0.14.0...v0.14.1) - 2026-07-20
 
 ### Fixed
