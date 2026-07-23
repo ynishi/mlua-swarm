@@ -130,7 +130,9 @@ return {
         // patch line.
         .stderr(contains("fix hint (worker-binding-missing)"))
         .stderr(contains("operator agent 'greeter'"))
-        .stderr(contains("worker_binding = \"claude\""));
+        .stderr(contains(
+            "runner = { backend = \"ws_operator\", variant = \"claude\", tools = {} }",
+        ));
 }
 
 /// GH #61 regression guard: the bundled `07-dsl-pipeline.bp.lua` sample
