@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/ynishi/mlua-swarm/compare/v0.15.0...v0.16.0) - 2026-07-23
+
+### Added
+
+- add DispatchOutcome::Skip tier + BP DSL skip_on sugar + structural FlowEval error (GH #76)
+
 ## [0.15.0](https://github.com/ynishi/mlua-swarm/compare/v0.14.1...v0.15.0) - 2026-07-23
 
 ### Added
