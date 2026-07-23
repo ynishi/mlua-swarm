@@ -93,7 +93,9 @@ pub mod projection;
 pub mod tasks;
 /// `/v1/worker/*` endpoints (SubAgent self-fetch path).
 pub mod worker;
-pub use blueprints::{build_blueprints_router, build_blueprints_router_with_refs};
+pub use blueprints::{
+    build_blueprints_router, build_blueprints_router_with_refs, BindingRequirementsResponse,
+};
 pub use enhance_log::build_enhance_log_router;
 pub use enhance_settings::build_enhance_settings_router;
 pub use issues::{build_issues_router, GetIssueResponse, PostIssueRequest, PostIssueResponse};

@@ -503,6 +503,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             cfg.blueprint_ref_includes.clone(),
             default_agent_kind,
             cfg.blueprint_strict_embed,
+            cfg.legacy_worker_binding_policy,
         ))
         .merge(build_enhance_log_router(log_store.clone()))
         .merge(build_enhance_settings_router(

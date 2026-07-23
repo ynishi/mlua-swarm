@@ -1,6 +1,8 @@
 //! HTTP surface for inspecting Blueprint state (= for debug / animation verification).
 //! `/v1/blueprints/:id/head` returns the head Blueprint JSON;
-//! `/v1/blueprints/:id/history` returns the commit-version list.
+//! `/v1/blueprints/:id/history` returns the commit-version list;
+//! `/v1/blueprints/:id/binding-requirements` returns the declaration-side
+//! `BindRequest` list an operator's capability manifest must cover.
 //! Callers pass a shared `Store` via `Arc` and mount the router.
 
 use axum::{
@@ -17,11 +19,13 @@ use mlua_swarm::blueprint::{default_global_agent_kind, AgentKind, Blueprint};
 use mlua_swarm::core::explain::{explain_agent_ctx, CtxTier};
 use mlua_swarm::core::step_naming::StepNaming;
 use mlua_swarm::operator::render::template_variables;
+use mlua_swarm::{binding_requests, LegacyWorkerBindingPolicy};
 use mlua_swarm_compile::{
     env_blueprint_includes, expand_file_refs_with_config, pre_read_in_bp_includes, ResolveConfig,
 };
 use mlua_swarm_schema::{
-    resolve_bound_agents, resolve_runner, BindingDigest, Runner, RunnerResolutionSource,
+    resolve_bound_agents, resolve_bound_agents_strict, resolve_runner, BindRequest, BindingDigest,
+    Runner, RunnerResolutionSource,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -58,6 +62,13 @@ pub struct BlueprintsState {
     /// the CLI `--blueprint-strict-embed` flag or the config-file
     /// `blueprint_strict_embed` key.
     pub strict_embed: bool,
+    /// Migration gate for the deprecated `AgentProfile.worker_binding`
+    /// Runner fallback, wired from the same server config the launch path
+    /// uses ([`crate::config::ResolvedConfig::legacy_worker_binding_policy`]).
+    /// `GET /v1/blueprints/:id/binding-requirements` applies this policy so
+    /// its declared requirements match what launch will actually resolve.
+    /// Defaults to `Allow` (compat) in [`build_blueprints_router`].
+    pub legacy_worker_binding_policy: LegacyWorkerBindingPolicy,
 }
 
 /// Minimal entry: no `ref_base` (ref expansion skipped), no CLI default
@@ -65,7 +76,14 @@ pub struct BlueprintsState {
 /// server accepts raw refs and runs the linker itself when `ref_base` is
 /// set).
 pub fn build_blueprints_router(store: Arc<dyn BlueprintStore>) -> Router {
-    build_blueprints_router_with_refs(store, None, Vec::new(), None, false)
+    build_blueprints_router_with_refs(
+        store,
+        None,
+        Vec::new(),
+        None,
+        false,
+        LegacyWorkerBindingPolicy::Allow,
+    )
 }
 
 /// When `ref_base` is set, `seed_blueprint` resolves `{"$file": ...}` /
@@ -77,12 +95,17 @@ pub fn build_blueprints_router(store: Arc<dyn BlueprintStore>) -> Router {
 /// (= layer (2) of the 4-tier cascade). Falls back when the BP JSON top-level
 /// `default_agent_kind` (= (3)) is absent; if that too is absent, uses the
 /// Schema `impl Default` = `Operator` (= (1)).
+///
+/// `legacy_worker_binding_policy` is the migration gate the launch path
+/// applies; `GET /v1/blueprints/:id/binding-requirements` reuses it so its
+/// declared requirements match what launch resolves.
 pub fn build_blueprints_router_with_refs(
     store: Arc<dyn BlueprintStore>,
     ref_base: Option<PathBuf>,
     ref_includes: Vec<PathBuf>,
     cli_default_agent_kind: Option<AgentKind>,
     strict_embed: bool,
+    legacy_worker_binding_policy: LegacyWorkerBindingPolicy,
 ) -> Router {
     let state = BlueprintsState {
         store,
@@ -90,10 +113,15 @@ pub fn build_blueprints_router_with_refs(
         ref_includes,
         cli_default_agent_kind,
         strict_embed,
+        legacy_worker_binding_policy,
     };
     Router::new()
         .route("/v1/blueprints/:id/head", get(get_head))
         .route("/v1/blueprints/:id/history", get(get_history))
+        .route(
+            "/v1/blueprints/:id/binding-requirements",
+            get(binding_requirements),
+        )
         .route(
             "/v1/blueprints/:id/agents/:agent/explain",
             get(explain_agent),
@@ -450,6 +478,79 @@ async fn get_history(
     }
     let count = entries.len();
     Ok(Json(HistoryResponse { count, entries }))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// GET /v1/blueprints/:id/binding-requirements
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Response body for `GET /v1/blueprints/:id/binding-requirements`.
+///
+/// The declaration-side reverse lookup an operator uses to machine-generate
+/// its capability manifest: one [`BindRequest`] per Runner-backed agent,
+/// byte-identical to what `binding_requests` reconstructs on the launch
+/// path. Read-only and provider-free — nothing here mutates the registry or
+/// calls a binding provider (requirements are pure declarations; attestation
+/// happens only when a Run is dispatched).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct BindingRequirementsResponse {
+    /// Blueprint id (echoed back from the path param).
+    pub blueprint_id: String,
+    /// `CompilerStrategy.strict_binding` for this Blueprint — whether launch
+    /// fails closed when a requirement is left unattested.
+    pub strict_binding: bool,
+    /// One request per Runner-backed agent, in Blueprint declaration order;
+    /// `[]` when no agent resolves to a Runner.
+    pub requirements: Vec<BindRequest>,
+}
+
+/// `GET /v1/blueprints/:id/binding-requirements` — the reverse lookup an
+/// operator uses to machine-generate its capability manifest: what bindings
+/// does this registered Blueprint require? Resolves the head Blueprint's
+/// Runner-backed agents under the SAME [`LegacyWorkerBindingPolicy`] the
+/// launch path applies (so the returned requirements match what launch will
+/// actually request), then reconstructs the platform-neutral `BindRequest`
+/// list via `binding_requests`.
+///
+/// Read-only, provider-free, and the same unauthenticated diagnostic trust
+/// tier as [`get_head`]: it never mutates the registry and never calls a
+/// binding provider.
+///
+/// - Unknown Blueprint id → 404 (same error mapping as [`get_head`]).
+/// - Resolution failure (a legacy `profile.worker_binding` rejected under
+///   `LegacyWorkerBindingPolicy::Reject`, or an unresolvable `runner_ref` /
+///   `default_runner`) → 422 carrying the resolve error message.
+async fn binding_requirements(
+    State(state): State<BlueprintsState>,
+    Path(id): Path<String>,
+) -> Result<Json<BindingRequirementsResponse>, (StatusCode, String)> {
+    let store = state.store;
+    let bp_id = BlueprintId::new(id.clone());
+    let traced = store
+        .read_head(&bp_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("read_head: {e}")))?;
+    let bp = traced.value;
+
+    // Apply the SAME legacy-worker-binding policy the launch path uses
+    // (`TaskLaunchService::load_or_resolve_bound_agents`) so the declared
+    // requirements match what launch will actually resolve.
+    let bound = match state.legacy_worker_binding_policy {
+        LegacyWorkerBindingPolicy::Allow => resolve_bound_agents(&bp),
+        LegacyWorkerBindingPolicy::Reject => resolve_bound_agents_strict(&bp),
+    }
+    .map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("resolve bound agents: {e}"),
+        )
+    })?;
+
+    Ok(Json(BindingRequirementsResponse {
+        blueprint_id: id,
+        strict_binding: bp.strategy.strict_binding,
+        requirements: binding_requests(&bound),
+    }))
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1033,6 +1134,7 @@ mod explain_agent_tests {
             ref_includes: Vec::new(),
             cli_default_agent_kind: None,
             strict_embed: false,
+            legacy_worker_binding_policy: LegacyWorkerBindingPolicy::Allow,
         }
     }
 
@@ -1458,6 +1560,211 @@ mod explain_agent_tests {
 
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
+
+    // ─── C3: GET /v1/blueprints/:id/binding-requirements ───────────────
+
+    fn state_with_policy(
+        store: InMemoryBlueprintStore,
+        legacy_worker_binding_policy: LegacyWorkerBindingPolicy,
+    ) -> BlueprintsState {
+        BlueprintsState {
+            store: Arc::new(store),
+            ref_base: None,
+            ref_includes: Vec::new(),
+            cli_default_agent_kind: None,
+            strict_embed: false,
+            legacy_worker_binding_policy,
+        }
+    }
+
+    /// A Runner-backed agent: a legacy `profile.worker_binding` resolves to a
+    /// `WsClaudeCode` Runner (see `runner_resolves_from_legacy_worker_binding`),
+    /// so `binding_requests` reconstructs a request carrying its
+    /// variant / tools / model.
+    fn runner_agent(name: &str, variant: &str, tools: &[&str], model: &str) -> AgentDef {
+        let profile = AgentProfile {
+            worker_binding: Some(variant.to_string()),
+            tools: tools.iter().map(|t| t.to_string()).collect(),
+            model: Some(model.to_string()),
+            ..Default::default()
+        };
+        agent_def(name, Some(profile), None)
+    }
+
+    fn bp_with_agents(bp_id: &str, agents: Vec<AgentDef>, strict_binding: bool) -> Blueprint {
+        let first = agents
+            .first()
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| "unused".to_string());
+        Blueprint {
+            schema_version: current_schema_version(),
+            id: bp_id.into(),
+            flow: serde_json::from_value(json!({
+                "kind": "step",
+                "ref": first,
+                "in": {"op": "path", "at": "$.input"},
+                "out": {"op": "path", "at": "$.out"},
+            }))
+            .expect("flow parse"),
+            agents,
+            operators: vec![],
+            metas: vec![],
+            hints: CompilerHints::default(),
+            strategy: CompilerStrategy {
+                strict_binding,
+                ..Default::default()
+            },
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+            projection_placement: None,
+            audits: vec![],
+            degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
+            check_policy: None,
+            blueprint_ref_includes: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn binding_requirements_lists_one_request_per_runner_backed_agent() {
+        let bp = bp_with_agents(
+            "binding-reqs-two-runners-bp",
+            vec![
+                runner_agent(
+                    "worker",
+                    "mse-worker-knowledge",
+                    &["Read", "Grep"],
+                    "sonnet",
+                ),
+                runner_agent("reader", "mse-worker-reader", &["Read"], "haiku"),
+            ],
+            true,
+        );
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let resp = binding_requirements(
+            State(state_with(store)),
+            Path("binding-reqs-two-runners-bp".to_string()),
+        )
+        .await
+        .expect("binding_requirements")
+        .0;
+
+        assert_eq!(resp.blueprint_id, "binding-reqs-two-runners-bp");
+        // `strict_binding` is echoed verbatim from the Blueprint strategy.
+        assert!(resp.strict_binding);
+        assert_eq!(resp.requirements.len(), 2);
+
+        let worker = resp
+            .requirements
+            .iter()
+            .find(|r| r.agent == "worker")
+            .expect("worker requirement");
+        assert_eq!(
+            worker.backend,
+            mlua_swarm_schema::BindingBackend::WsClaudeCode
+        );
+        assert_eq!(
+            worker.launch_variant.as_deref(),
+            Some("mse-worker-knowledge")
+        );
+        assert_eq!(worker.requested_tools, vec!["Grep", "Read"]);
+        assert_eq!(worker.requested_model.as_deref(), Some("sonnet"));
+
+        let reader = resp
+            .requirements
+            .iter()
+            .find(|r| r.agent == "reader")
+            .expect("reader requirement");
+        assert_eq!(
+            reader.backend,
+            mlua_swarm_schema::BindingBackend::WsClaudeCode
+        );
+        assert_eq!(reader.launch_variant.as_deref(), Some("mse-worker-reader"));
+        assert_eq!(reader.requested_tools, vec!["Read"]);
+        assert_eq!(reader.requested_model.as_deref(), Some("haiku"));
+    }
+
+    #[tokio::test]
+    async fn binding_requirements_empty_when_no_runner_backed_agents() {
+        // A profile without `worker_binding` (and no runner / runner_ref)
+        // resolves to no Runner, so `binding_requests` yields nothing.
+        let profile = AgentProfile {
+            tools: vec!["Read".to_string()],
+            ..Default::default()
+        };
+        let bp = single_step_bp(
+            "binding-reqs-no-runners-bp",
+            "scout",
+            Some(profile),
+            None,
+            None,
+        );
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let resp = binding_requirements(
+            State(state_with(store)),
+            Path("binding-reqs-no-runners-bp".to_string()),
+        )
+        .await
+        .expect("binding_requirements")
+        .0;
+
+        assert!(!resp.strict_binding);
+        assert!(resp.requirements.is_empty());
+    }
+
+    #[tokio::test]
+    async fn binding_requirements_unknown_blueprint_id_returns_404() {
+        let store = InMemoryBlueprintStore::new();
+
+        let err = binding_requirements(State(state_with(store)), Path("no-such-bp".to_string()))
+            .await
+            .expect_err("expected 404");
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn binding_requirements_422_when_legacy_binding_rejected_by_policy() {
+        // A legacy `profile.worker_binding` is the only Runner source; under
+        // `Reject` policy the strict resolver refuses it, so the handler maps
+        // the resolve error to 422 (not 500).
+        let bp = bp_with_agents(
+            "binding-reqs-legacy-reject-bp",
+            vec![runner_agent(
+                "worker",
+                "mse-worker-knowledge",
+                &["Read"],
+                "sonnet",
+            )],
+            false,
+        );
+        let store = InMemoryBlueprintStore::new();
+        seed(&store, &bp).await;
+
+        let err = binding_requirements(
+            State(state_with_policy(store, LegacyWorkerBindingPolicy::Reject)),
+            Path("binding-reqs-legacy-reject-bp".to_string()),
+        )
+        .await
+        .expect_err("expected 422");
+
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            err.1.contains("resolve bound agents"),
+            "422 body must carry the resolve error: {}",
+            err.1
+        );
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1530,6 +1837,7 @@ You write.\n";
             ref_includes: Vec::new(),
             cli_default_agent_kind: None,
             strict_embed,
+            legacy_worker_binding_policy: LegacyWorkerBindingPolicy::Allow,
         }
     }
 
