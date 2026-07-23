@@ -12,7 +12,7 @@ instead of round-tripping through dispatch-time failures.
 
 ## Why templates
 
-Sibling fixes (`halted_at` default = GH #60, `worker_binding` compile-lint
+Sibling fixes (`halted_at` default = GH #60, explicit Runner compile-lint
 = GH #61) tightened the DSL's mandatory-field contract. Templates
 front-load those fields into a legal shape so an author never has to
 learn each one by hitting the failure. Every rendered `.bp.lua`
@@ -37,7 +37,7 @@ Flags:
 |---|---|---|
 | `--stages` | Comma-separated stage names — one agent emitted per stage. | `stage1,stage2` |
 | `--operator` | Operator role name every agent points at. | `main-ai` |
-| `--binding` | Every operator agent's `profile.worker_binding`. | `claude` |
+| `--binding` | Every operator agent's `ws_operator` Runner variant. | `claude` |
 | `-o` / `--out` | Write to this path instead of stdout. | stdout |
 
 ### `single` — one-agent one-step
@@ -56,7 +56,7 @@ Flags:
 |---|---|---|
 | `--agent` | Sole agent's name (also the step's `id` and `out` key). | `solo` |
 | `--operator` | Operator role name. | `main-ai` |
-| `--binding` | The agent's `profile.worker_binding`. | `claude` |
+| `--binding` | The agent's `ws_operator` Runner variant. | `claude` |
 | `-o` / `--out` | Write to this path instead of stdout. | stdout |
 
 ### `verdict` — 3-stage verdict-gated with retry-through-fixer
@@ -79,7 +79,7 @@ Flags:
 |---|---|---|
 | `--stages` | 3-slot positional override — analyze / review / publish role names. Fewer than 3 → remaining slots use defaults; more than 3 → tail ignored. | `analyze,review,publish` |
 | `--operator` | Operator role name. | `main-ai` |
-| `--binding` | Every operator agent's `profile.worker_binding`. | `claude` |
+| `--binding` | Every operator agent's `ws_operator` Runner variant. | `claude` |
 | `-o` / `--out` | Write to this path instead of stdout. | stdout |
 
 The `verdict` template's 3-stage count is deliberate: stage identity ties
@@ -93,10 +93,10 @@ verdict gating.
 Every template's output:
 
 - Passes `mse bp build` compile-lint on first run (including the GH #61
-  `worker_binding` gate and the GH #60 `halted_at` default).
+  explicit Runner gate and the GH #60 `halted_at` default).
 - Uses `require("bp_dsl")` (`pipeline` / `verdict`) or `require("flow_dsl")`
   (`single`) — no other DSL crates.
-- Sets every operator agent's `profile.worker_binding` to `--binding`.
+- Sets every operator agent's platform-neutral `ws_operator` Runner variant to `--binding`.
 - Sets `strategy = { strict_refs = true, strict_kind = true }`.
 - Ships `TODO:` markers in every `system_prompt` and `metadata.description` —
   intentional: the author fills these in, and a stray `TODO:` in a

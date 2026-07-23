@@ -64,7 +64,7 @@ enum BpCmd {
     /// `--strict` exits non-zero on any WARN/ERROR (CI use).
     Lint(LintArgs),
     /// Scaffold a minimal `.bp.lua` from a bundled template with all
-    /// currently-mandatory fields pre-filled (`halted_at`, `worker_binding`,
+    /// currently-mandatory fields pre-filled (`halted_at`, `runner`,
     /// `strict_refs`/`strict_kind`). GH #62 Axis A. See
     /// `mse://guides/bp-dsl-templates` for template inventory.
     New(NewArgs),
@@ -139,7 +139,8 @@ struct NewArgs {
     /// Operator role name every agent points at. Defaults to `main-ai`.
     #[arg(long)]
     operator: Option<String>,
-    /// `profile.worker_binding` value for every emitted operator agent.
+    /// `runner.variant` value for every emitted operator agent. The historical
+    /// flag name remains for CLI compatibility.
     /// Defaults to `claude` (the Claude Code catch-all SubAgent variant).
     #[arg(long)]
     binding: Option<String>,
@@ -306,7 +307,7 @@ fn run_lint(args: LintArgs) -> Result<()> {
     }
 }
 
-/// GH #62 Axis A default `worker_binding` — the Claude Code catch-all
+/// GH #62 Axis A default Runner variant — the Claude Code catch-all
 /// SubAgent variant. Overridable per invocation via `--binding`.
 const DEFAULT_BINDING: &str = "claude";
 /// GH #62 Axis A default operator role name — the same `main-ai`
@@ -443,8 +444,8 @@ fn render_pipeline_template(
     let mut out = String::new();
     out.push_str("-- Scaffolded by `mse bp new pipeline` (GH #62 Axis A).\n");
     out.push_str("-- Every mandatory field is pre-filled: `halted_at` (compile-lint\n");
-    out.push_str("-- default), each operator agent's `profile.worker_binding` (WS\n");
-    out.push_str("-- thin-path requirement, GH #61), the operator's `kind` (main_ai,\n");
+    out.push_str("-- default), each operator agent's explicit `ws_operator` Runner,\n");
+    out.push_str("-- the operator's `kind` (main_ai,\n");
     out.push_str("-- so a caller can omit `operator_kind` at swarm_run time and the\n");
     out.push_str("-- BP Agent-level tier of the OperatorKind cascade routes spawns to\n");
     out.push_str("-- a joined main-ai session instead of silently falling through to\n");
@@ -490,8 +491,8 @@ fn render_pipeline_template(
         out.push_str(&format!(
             "    {{ name = \"{stage}\", kind = \"operator\",\n      \
              spec = {{ operator_ref = \"{operator}\" }},\n      \
-             profile = {{ system_prompt = \"TODO: describe {stage}\", \
-             tools = {{}}, worker_binding = \"{binding}\" }} }},\n"
+             profile = {{ system_prompt = \"TODO: describe {stage}\", tools = {{}} }},\n      \
+             runner = {{ backend = \"ws_operator\", variant = \"{binding}\", tools = {{}} }} }},\n"
         ));
     }
     out.push_str("  },\n");
@@ -510,7 +511,7 @@ fn render_single_template(name: &str, agent: &str, operator: &str, binding: &str
     let mut out = String::new();
     out.push_str("-- Scaffolded by `mse bp new single` (GH #62 Axis A).\n");
     out.push_str("-- Minimal 1-step 1-agent shape — `flow_dsl` directly, no pipeline\n");
-    out.push_str("-- sugar. All mandatory fields (`worker_binding`, `strict_refs`,\n");
+    out.push_str("-- sugar. All mandatory fields (`runner`, `strict_refs`,\n");
     out.push_str("-- `strict_kind`) are pre-filled. The operator's `kind` is also\n");
     out.push_str("-- pre-filled as `main_ai` (GH #66) so `swarm_run` can omit\n");
     out.push_str("-- `operator_kind` at launch and spawns route to a joined\n");
@@ -535,8 +536,8 @@ fn render_single_template(name: &str, agent: &str, operator: &str, binding: &str
     out.push_str(&format!(
         "    {{ name = \"{agent}\", kind = \"operator\",\n      \
          spec = {{ operator_ref = \"{operator}\" }},\n      \
-         profile = {{ system_prompt = \"TODO: describe {agent}\", \
-         tools = {{}}, worker_binding = \"{binding}\" }} }},\n"
+         profile = {{ system_prompt = \"TODO: describe {agent}\", tools = {{}} }},\n      \
+         runner = {{ backend = \"ws_operator\", variant = \"{binding}\", tools = {{}} }} }},\n"
     ));
     out.push_str("  },\n");
     out.push_str(&format!(
@@ -619,8 +620,8 @@ fn render_verdict_template(
         out.push_str(&format!(
             "    {{ name = \"{stage}\", kind = \"operator\",\n      \
              spec = {{ operator_ref = \"{operator}\" }},\n      \
-             profile = {{ system_prompt = \"TODO: describe {stage}\", \
-             tools = {{}}, worker_binding = \"{binding}\" }} }},\n"
+             profile = {{ system_prompt = \"TODO: describe {stage}\", tools = {{}} }},\n      \
+             runner = {{ backend = \"ws_operator\", variant = \"{binding}\", tools = {{}} }} }},\n"
         ));
     }
     // review: verdict-gated (PASS / BLOCKED).
@@ -629,7 +630,8 @@ fn render_verdict_template(
          spec = {{ operator_ref = \"{operator}\" }},\n      \
          profile = {{ system_prompt = \"TODO: stage a `verdict` part = \
          `PASS` or `BLOCKED`, then finish with report body\", \
-         tools = {{}}, worker_binding = \"{binding}\" }},\n      \
+         tools = {{}} }},\n      \
+         runner = {{ backend = \"ws_operator\", variant = \"{binding}\", tools = {{}} }},\n      \
          verdict = {{ channel = \"part\", values = {{ \"PASS\", \"BLOCKED\" }} }} }},\n"
     ));
     // fixer: plain operator, referenced by retry.fix.
@@ -638,7 +640,8 @@ fn render_verdict_template(
          spec = {{ operator_ref = \"{operator}\" }},\n      \
          profile = {{ system_prompt = \"TODO: given the reviewer's report, \
          emit a fix and reply so the review can retry\", \
-         tools = {{}}, worker_binding = \"{binding}\" }} }},\n"
+         tools = {{}} }},\n      \
+         runner = {{ backend = \"ws_operator\", variant = \"{binding}\", tools = {{}} }} }},\n"
     ));
     out.push_str("  },\n");
     out.push_str(&format!(
@@ -698,17 +701,17 @@ pub(crate) fn fix_hint_from_compile_error(err_msg: &str) -> Option<FixHint> {
         let agent = extract_between(err_msg, "agent '", "'");
         let reason = match agent {
             Some(name) => format!(
-                "operator agent '{name}' has no `profile.worker_binding` — required for the WS thin-path backend (GH #61)"
+                "operator agent '{name}' has no explicit Runner or legacy `profile.worker_binding`"
             ),
-            None => "an operator agent has no `profile.worker_binding` — required for the WS thin-path backend (GH #61)"
-                .into(),
+            None => {
+                "an operator agent has no explicit Runner or legacy `profile.worker_binding`".into()
+            }
         };
         return Some(FixHint {
             kind: "worker-binding-missing",
             reason,
             patch_suggestion:
-                "profile = { system_prompt = \"...\", tools = {}, worker_binding = \"claude\" }"
-                    .into(),
+                "runner = { backend = \"ws_operator\", variant = \"claude\", tools = {} }".into(),
             docs_ref: Some("mse://guides/bp-dsl-templates".into()),
         });
     }
@@ -968,7 +971,7 @@ mod tests {
                 .expect("render must succeed with defaults");
         // Sanity: the two mandatory fields GH #61 / GH #60 tightened must
         // both appear in the rendered text.
-        assert!(rendered.contains("worker_binding = \"claude\""));
+        assert!(rendered.contains("backend = \"ws_operator\", variant = \"claude\""));
         assert!(rendered.contains("halted_at = \"$.halted_at\""));
         // GH #66: operator entry must pre-declare `kind = "main_ai"` so the
         // BP Agent-level tier of the OperatorKind cascade resolves without
@@ -1050,7 +1053,7 @@ mod tests {
             Some("claude-lite"),
         )
         .expect("render must succeed with custom flags");
-        assert!(rendered.contains("worker_binding = \"claude-lite\""));
+        assert!(rendered.contains("backend = \"ws_operator\", variant = \"claude-lite\""));
         assert!(rendered.contains("operator_ref = \"primary\""));
         // 3 stages requested → 3 agents rendered.
         assert_eq!(rendered.matches("kind = \"operator\"").count(), 3);
@@ -1069,7 +1072,7 @@ mod tests {
         let rendered =
             render_template_by_kind("single", "roundtrip-single", None, None, None, None)
                 .expect("render must succeed with defaults");
-        assert!(rendered.contains(&format!("worker_binding = \"{DEFAULT_BINDING}\"")));
+        assert!(rendered.contains(&format!("variant = \"{DEFAULT_BINDING}\"")));
         assert!(rendered.contains(&format!("operator_ref = \"{DEFAULT_OPERATOR}\"")));
         assert!(rendered.contains(&format!("agent = \"{DEFAULT_SINGLE_AGENT}\"")));
         let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
@@ -1165,9 +1168,7 @@ mod tests {
         let hint = fix_hint_from_compile_error(msg).expect("worker_binding hint must fire");
         assert_eq!(hint.kind, "worker-binding-missing");
         assert!(hint.reason.contains("greeter"));
-        assert!(hint
-            .patch_suggestion
-            .contains("worker_binding = \"claude\""));
+        assert!(hint.patch_suggestion.contains("backend = \"ws_operator\""));
         assert_eq!(
             hint.docs_ref.as_deref(),
             Some("mse://guides/bp-dsl-templates")
@@ -1182,7 +1183,7 @@ mod tests {
         // Fallback reason (no agent name parsed) still names the kind
         // and remedy.
         assert!(hint.reason.contains("operator agent"));
-        assert!(hint.reason.contains("`profile.worker_binding`"));
+        assert!(hint.reason.contains("explicit Runner"));
     }
 
     #[test]

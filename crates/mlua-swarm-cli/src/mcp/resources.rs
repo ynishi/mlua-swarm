@@ -190,7 +190,7 @@ pub const RESOURCES: &[ResourceEntry] = &[
     ResourceEntry {
         uri: "mse://guides/bp-dsl-templates",
         title: "mse — bp_dsl authoring templates (mse bp new)",
-        description: "GH #62 Axis A: `mse bp new` / `bp_new` MCP scaffolding — three templates (pipeline / single / verdict) that emit a compile-lint-legal `.bp.lua` with every currently-mandatory field pre-filled (halted_at, worker_binding, strict_refs/strict_kind). Prevention layer for the trap surface that GH #60 / GH #61 sibling fixes tightened.",
+        description: "GH #62 Axis A: `mse bp new` / `bp_new` MCP scaffolding — three templates (pipeline / single / verdict) that emit a compile-lint-legal `.bp.lua` with every currently-mandatory field pre-filled (halted_at, explicit ws_operator Runner, strict_refs/strict_kind). Prevention layer for the trap surface that GH #60 / GH #61 sibling fixes tightened.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(BP_DSL_TEMPLATES_BODY),
     },
@@ -586,6 +586,9 @@ mod tests {
                 !bp.id.as_str().is_empty(),
                 "{uri}: sample Blueprint must carry a non-empty id"
             );
+            mlua_swarm::blueprint::resolve_bound_agents_strict(&bp).unwrap_or_else(|error| {
+                panic!("{uri}: bundled sample must not require legacy binding fallback: {error}")
+            });
         }
     }
 

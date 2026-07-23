@@ -26,6 +26,8 @@ pub struct DoctorInfo {
     pub blueprint_ref_base: Option<String>,
     /// `--enable-enhance-flow` on/off.
     pub enhance_flow_enabled: bool,
+    /// Fresh-launch migration policy for deprecated `profile.worker_binding`.
+    pub legacy_worker_binding_policy: mlua_swarm::LegacyWorkerBindingPolicy,
     /// Seed blueprint id (= combined mode default).
     pub seed_blueprint_id: String,
     /// Server-wide [`mlua_swarm::core::config::CheckPolicy`] resolved

@@ -49,7 +49,8 @@ return {
       name = "analyzer",
       kind = "operator",
       spec = { operator_ref = "main-ai" },
-      profile = { system_prompt = "Always reply `ANALYZED`", tools = {}, worker_binding = "claude" },
+      profile = { system_prompt = "Always reply `ANALYZED`", tools = {} },
+      runner = { backend = "ws_operator", variant = "claude", tools = {} },
     },
     {
       name = "reviewer",
@@ -58,21 +59,23 @@ return {
       profile = {
         system_prompt = "Stage a named `verdict` part (`PASS` or `BLOCKED`), then finish with a report body",
         tools = {},
-        worker_binding = "claude",
       },
+      runner = { backend = "ws_operator", variant = "claude", tools = {} },
       verdict = { channel = "part", values = { "PASS", "BLOCKED" } },
     },
     {
       name = "fixer",
       kind = "operator",
       spec = { operator_ref = "main-ai" },
-      profile = { system_prompt = "Always reply `FIXED`", tools = {}, worker_binding = "claude" },
+      profile = { system_prompt = "Always reply `FIXED`", tools = {} },
+      runner = { backend = "ws_operator", variant = "claude", tools = {} },
     },
     {
       name = "publisher",
       kind = "operator",
       spec = { operator_ref = "main-ai" },
-      profile = { system_prompt = "Always reply `PUBLISHED`", tools = {}, worker_binding = "claude" },
+      profile = { system_prompt = "Always reply `PUBLISHED`", tools = {} },
+      runner = { backend = "ws_operator", variant = "claude", tools = {} },
     },
   },
   operators = {

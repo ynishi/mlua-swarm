@@ -527,8 +527,8 @@ registry shape as `Blueprint.metas` — and resolved per-agent through a
 2. `AgentDef.runner_ref` — a name looked up in `Blueprint.runners`.
 3. Legacy fallback: `profile.worker_binding` synthesizes a
    `ws_claude_code` Runner from `{ variant: worker_binding, tools:
-   profile.tools }` — **deprecated, kept for one release cycle** while
-   Blueprints migrate onto `runner` / `runner_ref`.
+   profile.tools }` — **deprecated** while Blueprints migrate onto
+   `runner` / `runner_ref`.
 4. `Blueprint.default_runner` — a BP-wide registry name, used only when
    no tier above (1–3) applies to this agent.
 5. No Runner declared through any tier — the agent has none.
@@ -561,6 +561,10 @@ step input under a different binding is not treated as the same execution.
 
 The legacy `profile.worker_binding` tier is projected only at the Claude Code
 compatibility boundary. New Blueprints should use `runner` or `runner_ref`.
+Servers default to `legacy_worker_binding_policy = "allow"`; setting it to
+`"reject"` (or passing `--legacy-worker-binding-policy reject`) turns this
+fallback into a launch-time error. The policy affects fresh resolution only;
+persisted Run snapshots retain their pinned Runner.
 The Runner's `tools` remain requested/declarative for `ws_operator` and
 `ws_claude_code` until
 an injected `AgentBindingProvider` attests the execution environment's
@@ -574,7 +578,7 @@ resolves the submitted `capability_manifest`; it never reads wrapper files
 from the Server filesystem. Core validates one receipt
 per requested agent, requires every requested tool and the exact launch
 variant, then pins the accepted model, tools, provider revision, and optional
-evidence digest as `BindingAttestation`. That attestation is included in the
+capability snapshot digest as `BindingAttestation`. That attestation is included in the
 final `binding_digest` and persisted in the Run snapshot. Resume and replay
 reuse it without asking the provider to resolve mutable environment state
 again. MSE does not misreport declaration data as an enforced capability.

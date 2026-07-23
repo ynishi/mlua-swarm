@@ -22,7 +22,7 @@ directive, so wire frames and outputs correlate back to one Run. Server
 drill-down: `GET /v1/tasks` → `GET /v1/tasks/:id` (runs included) →
 `GET /v1/runs/:id` (step trace). `GET /v1/runs/:id/bindings` explains the
 immutable Runner request and Core-validated provider result, including
-provider revision, evidence digest, and a mechanical requested/effective
+provider revision, capability snapshot digest, and a mechanical requested/effective
 difference. It reads only the Run launch snapshot and returns `422` for older
 Runs instead of consulting a changed Blueprint. `POST /v1/tasks/:id/runs` re-kicks an
 existing Task with a fresh `RunId`, while `POST /v1/runs/:id/resume`

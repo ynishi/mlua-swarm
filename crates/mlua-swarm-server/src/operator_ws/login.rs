@@ -70,7 +70,8 @@ pub struct OperatorSessionEntry {
     pub roles: Vec<String>,
     /// Provider-owned effective capability manifest submitted at join.
     pub capability_manifest: Option<AgentProviderManifest>,
-    /// The live 3-trait session object once a WS has connected; `None` before first connect.
+    /// The reusable 3-trait session object once a WS has connected at least
+    /// once; `None` before first connect. Its sender tracks current connectivity.
     pub ws_session: Mutex<Option<Arc<WSOperatorSession>>>,
 }
 
@@ -345,10 +346,9 @@ async fn handle_operator_socket(
     }
     .await;
 
-    // Disconnect: tx → None (the session itself stays in operator_sessions
-    // and the three registries, waiting for a reconnect; teardown happens
-    // only through DELETE).
-    session.clear_tx().await;
+    // Clear only this socket's sender. A reconnect may already have installed
+    // a replacement while this older socket was unwinding.
+    session.clear_tx_if(&tx).await;
     write_task.abort();
     let _ = read_result;
 }
@@ -433,8 +433,8 @@ pub struct OperatorsInfoResp {
 }
 
 /// `GET /v1/operators/:sid`. Bearer mandatory. `404` on unknown sid, `401` on
-/// token mismatch. `connected` reflects whether `ws_session` is currently
-/// `Some` (= a WS is live, not merely that the session was ever connected).
+/// token mismatch. `connected` reflects whether the reusable session currently
+/// owns a live sender, not merely whether it connected at least once.
 pub async fn operators_info(
     State(state): State<AppState>,
     Path(sid): Path<String>,
@@ -460,7 +460,11 @@ pub async fn operators_info(
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
-    let connected = entry.ws_session.lock().await.is_some();
+    let session = entry.ws_session.lock().await.clone();
+    let connected = match session {
+        Some(session) => session.is_connected().await,
+        None => false,
+    };
     (
         StatusCode::OK,
         Json(OperatorsInfoResp {

@@ -104,7 +104,7 @@ impl AgentBindingProvider for OperatorSessionBindingProvider {
                     resolved_model: request.requested_model.clone(),
                     effective_tools: request.requested_tools.clone(),
                     launch_variant: None,
-                    evidence_digest: None,
+                    capability_snapshot_digest: None,
                 },
             };
             receipts.push(receipt);
@@ -153,7 +153,7 @@ mod tests {
                 launch_variant: Some("mse-coder".to_string()),
                 resolved_model: Some("claude-sonnet-4".to_string()),
                 effective_tools: vec!["Read".to_string(), "Write".to_string()],
-                evidence_digest: Some(BindingDigest::sha256("manifest")),
+                capability_snapshot_digest: Some(BindingDigest::sha256("manifest")),
             }],
         };
         let receipts = provider(Some(manifest))

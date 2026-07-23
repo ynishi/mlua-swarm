@@ -48,7 +48,9 @@ use mlua_swarm::service::merge_init_ctx_3layer;
 use mlua_swarm::store::replay::ReplayCursor;
 use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStoreError};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStoreError};
-use mlua_swarm::{OperatorKind, Role, RunId, TaskId, TaskInputSpec};
+use mlua_swarm::{
+    validate_bound_agent_snapshots, OperatorKind, Role, RunId, TaskId, TaskInputSpec,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -686,8 +688,14 @@ pub async fn run_resume(
              predates resume support, or was created by a path that does not persist one)"
         )));
     };
-    let snapshot: RunLaunchSnapshot = serde_json::from_str(&input_json).map_err(|e| {
-        ApiError::bad_request(format!(
+    let snapshot_value: Value = serde_json::from_str(&input_json).map_err(|e| {
+        ApiError::unprocessable(format!(
+            "run {run_id}: stored launch input failed to decode: {e}"
+        ))
+    })?;
+    validated_bound_agents_from_snapshot(&run_id, &snapshot_value)?;
+    let snapshot: RunLaunchSnapshot = serde_json::from_value(snapshot_value).map_err(|e| {
+        ApiError::unprocessable(format!(
             "run {run_id}: stored launch input failed to decode: {e}"
         ))
     })?;
@@ -940,8 +948,14 @@ pub async fn run_rerun_from(
              persist one)"
         )));
     };
-    let snapshot: RunLaunchSnapshot = serde_json::from_str(&input_json).map_err(|e| {
-        ApiError::bad_request(format!(
+    let snapshot_value: Value = serde_json::from_str(&input_json).map_err(|e| {
+        ApiError::unprocessable(format!(
+            "run {run_id}: stored launch input failed to decode: {e}"
+        ))
+    })?;
+    validated_bound_agents_from_snapshot(&run_id, &snapshot_value)?;
+    let snapshot: RunLaunchSnapshot = serde_json::from_value(snapshot_value).map_err(|e| {
+        ApiError::unprocessable(format!(
             "run {run_id}: stored launch input failed to decode: {e}"
         ))
     })?;
@@ -1203,6 +1217,27 @@ fn binding_difference(
     }
 }
 
+fn validated_bound_agents_from_snapshot(
+    run_id: &RunId,
+    snapshot: &Value,
+) -> Result<Option<Vec<BoundAgent>>, ApiError> {
+    let Some(bound_value) = snapshot.get("bound_agents") else {
+        return Ok(None);
+    };
+    let bound_agents: Vec<BoundAgent> =
+        serde_json::from_value(bound_value.clone()).map_err(|e| {
+            ApiError::unprocessable(format!(
+                "run {run_id} contains an invalid binding snapshot: {e}"
+            ))
+        })?;
+    validate_bound_agent_snapshots(&bound_agents).map_err(|error| {
+        ApiError::unprocessable(format!(
+            "run {run_id} contains an inconsistent binding snapshot: {error}"
+        ))
+    })?;
+    Ok(Some(bound_agents))
+}
+
 /// `GET /v1/runs/:id/bindings`. Explains the exact immutable agent bindings
 /// used by this Run. The handler never reads or resolves the current Blueprint;
 /// old Runs without a binding snapshot return `422` instead of guessed state.
@@ -1227,17 +1262,11 @@ pub async fn run_bindings_explain(
             "run {run_id} launch snapshot is invalid JSON; binding explain is unavailable: {e}"
         ))
     })?;
-    let bound_value = snapshot.get("bound_agents").ok_or_else(|| {
+    let bound_agents = validated_bound_agents_from_snapshot(&run_id, &snapshot)?.ok_or_else(|| {
         ApiError::unprocessable(format!(
             "run {run_id} predates immutable binding snapshots; current Blueprint state was not consulted"
         ))
     })?;
-    let bound_agents: Vec<BoundAgent> =
-        serde_json::from_value(bound_value.clone()).map_err(|e| {
-            ApiError::unprocessable(format!(
-                "run {run_id} contains an invalid binding snapshot: {e}"
-            ))
-        })?;
 
     let bindings = bound_agents
         .into_iter()
@@ -2414,7 +2443,9 @@ mod tests {
                 resolved_model: Some("claude-sonnet-4".to_string()),
                 effective_tools: vec!["Bash".to_string(), "Read".to_string()],
                 launch_variant: Some("coder".to_string()),
-                evidence_digest: Some(mlua_swarm::blueprint::BindingDigest::sha256(b"manifest-v1")),
+                capability_snapshot_digest: Some(mlua_swarm::blueprint::BindingDigest::sha256(
+                    b"manifest-v1",
+                )),
             })
             .unwrap();
         snapshot["bound_agents"] = serde_json::to_value(&bound_agents).unwrap();
@@ -2483,6 +2514,32 @@ mod tests {
         assert!(error
             .message
             .contains("current Blueprint state was not consulted"));
+    }
+
+    #[tokio::test]
+    async fn run_bindings_explain_rejects_a_tampered_snapshot() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req("tampered binding explain")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+        let run = state.run_store.get(&posted.run_id).await.unwrap();
+        let mut snapshot: Value = serde_json::from_str(run.input_json.as_deref().unwrap()).unwrap();
+        snapshot["bound_agents"][0]["agent"]["name"] = Value::String("tampered".into());
+        state
+            .run_store
+            .set_input_json(&posted.run_id, serde_json::to_string(&snapshot).unwrap())
+            .await
+            .unwrap();
+
+        let error = run_bindings_explain(State(state), Path(posted.run_id.to_string()))
+            .await
+            .expect_err("digest drift must fail closed");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.message.contains("inconsistent binding snapshot"));
     }
 
     #[tokio::test]

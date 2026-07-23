@@ -132,9 +132,9 @@
       },
       "profile": {
         "system_prompt": "Always reply `BLOCKED` (= FN signal)",
-        "tools": [],
-        "worker_binding": "claude"
-      }
+        "tools": []
+      },
+      "runner": { "backend": "ws_operator", "variant": "claude", "tools": [] }
     },
     {
       "name": "mock-approver",
@@ -144,9 +144,9 @@
       },
       "profile": {
         "system_prompt": "Always reply `ALLOW` (= override)",
-        "tools": [],
-        "worker_binding": "claude"
-      }
+        "tools": []
+      },
+      "runner": { "backend": "ws_operator", "variant": "claude", "tools": [] }
     },
     {
       "name": "mock-commit",
@@ -156,9 +156,9 @@
       },
       "profile": {
         "system_prompt": "Always reply `COMMITTED`",
-        "tools": [],
-        "worker_binding": "claude"
-      }
+        "tools": []
+      },
+      "runner": { "backend": "ws_operator", "variant": "claude", "tools": [] }
     }
   ],
   "operators": [

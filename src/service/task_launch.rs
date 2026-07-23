@@ -19,7 +19,10 @@
 //! one-Step flow, and we do not want two interfaces for the same
 //! shape.
 
-use crate::binding::{attest_bound_agents, AgentBindingProvider};
+use crate::binding::{
+    attest_bound_agents, validate_bound_agent_snapshots, AgentBindingProvider,
+    LegacyWorkerBindingPolicy,
+};
 use crate::blueprint::compiler::{materialize_bound_blueprint, CompileError, Compiler};
 use crate::blueprint::{
     resolve_bound_agents, AuditDef, Blueprint, BoundAgent, EngineDispatcher, Runner,
@@ -104,9 +107,16 @@ async fn load_or_resolve_bound_agents(
     blueprint: &Blueprint,
     run_ctx: Option<&RunContext>,
     binding_provider: Option<&dyn AgentBindingProvider>,
+    legacy_worker_binding_policy: LegacyWorkerBindingPolicy,
 ) -> Result<Vec<BoundAgent>, TaskLaunchError> {
+    let resolve_fresh = || match legacy_worker_binding_policy {
+        LegacyWorkerBindingPolicy::Allow => resolve_bound_agents(blueprint),
+        LegacyWorkerBindingPolicy::Reject => {
+            crate::blueprint::resolve_bound_agents_strict(blueprint)
+        }
+    };
     let Some(run_ctx) = run_ctx else {
-        let mut bound_agents = resolve_bound_agents(blueprint).map_err(CompileError::from)?;
+        let mut bound_agents = resolve_fresh().map_err(CompileError::from)?;
         if let Some(provider) = binding_provider {
             attest_bound_agents(provider, &mut bound_agents)
                 .await
@@ -125,13 +135,18 @@ async fn load_or_resolve_bound_agents(
             TaskLaunchError::PreDispatch(format!("decode Run launch snapshot: {e}"))
         })?;
         if let Some(value) = snapshot.get("bound_agents") {
-            return serde_json::from_value(value.clone()).map_err(|e| {
-                TaskLaunchError::PreDispatch(format!("decode Run BoundAgent snapshot: {e}"))
-            });
+            let bound_agents: Vec<BoundAgent> =
+                serde_json::from_value(value.clone()).map_err(|e| {
+                    TaskLaunchError::PreDispatch(format!("decode Run BoundAgent snapshot: {e}"))
+                })?;
+            validate_bound_agent_snapshots(&bound_agents).map_err(|error| {
+                TaskLaunchError::PreDispatch(format!("validate Run BoundAgent snapshot: {error}"))
+            })?;
+            return Ok(bound_agents);
         }
     }
 
-    let mut bound_agents = resolve_bound_agents(blueprint).map_err(CompileError::from)?;
+    let mut bound_agents = resolve_fresh().map_err(CompileError::from)?;
     if let Some(provider) = binding_provider {
         attest_bound_agents(provider, &mut bound_agents)
             .await
@@ -571,6 +586,9 @@ pub struct TaskLaunchService {
     /// Optional execution-environment binding implementation. When present,
     /// fresh Run snapshots require a complete, Core-validated receipt set.
     binding_provider: Option<Arc<dyn AgentBindingProvider>>,
+    /// Whether fresh Blueprint declarations may use the deprecated
+    /// `profile.worker_binding` Runner fallback.
+    legacy_worker_binding_policy: LegacyWorkerBindingPolicy,
 }
 
 impl TaskLaunchService {
@@ -581,6 +599,7 @@ impl TaskLaunchService {
             compiler,
             externs: Arc::new(NoExterns),
             binding_provider: None,
+            legacy_worker_binding_policy: LegacyWorkerBindingPolicy::default(),
         }
     }
 
@@ -597,6 +616,12 @@ impl TaskLaunchService {
     /// retains receipt validation and digest ownership.
     pub fn with_binding_provider(mut self, provider: Arc<dyn AgentBindingProvider>) -> Self {
         self.binding_provider = Some(provider);
+        self
+    }
+
+    /// Configure the migration gate for deprecated `profile.worker_binding`.
+    pub fn with_legacy_worker_binding_policy(mut self, policy: LegacyWorkerBindingPolicy) -> Self {
+        self.legacy_worker_binding_policy = policy;
         self
     }
 
@@ -637,6 +662,7 @@ impl TaskLaunchService {
             &input.blueprint,
             input.run_ctx.as_ref(),
             self.binding_provider.as_deref(),
+            self.legacy_worker_binding_policy,
         )
         .await?;
         let binding_digests: HashMap<String, crate::blueprint::BindingDigest> = bound_agents
@@ -1801,19 +1827,50 @@ mod tests {
             vec![original_agent],
         );
 
-        let original = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx), None)
-            .await
-            .unwrap();
+        let original = load_or_resolve_bound_agents(
+            &blueprint,
+            Some(&run_ctx),
+            None,
+            LegacyWorkerBindingPolicy::Allow,
+        )
+        .await
+        .unwrap();
         blueprint.agents[0].profile.as_mut().unwrap().system_prompt = "mutated role".to_string();
-        let restored = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx), None)
-            .await
-            .unwrap();
+        let restored = load_or_resolve_bound_agents(
+            &blueprint,
+            Some(&run_ctx),
+            None,
+            LegacyWorkerBindingPolicy::Allow,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(restored[0].binding_digest, original[0].binding_digest);
         assert_eq!(
             restored[0].agent.profile.as_ref().unwrap().system_prompt,
             "original role"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_migration_policy_rejects_fresh_legacy_worker_binding() {
+        let mut legacy_agent = agent("worker", "worker");
+        legacy_agent.profile = Some(AgentProfile {
+            worker_binding: Some("legacy-worker".to_string()),
+            ..Default::default()
+        });
+        let blueprint = bp(
+            step("worker", path("$.input"), path("$.out")),
+            vec![legacy_agent],
+        );
+
+        let error =
+            load_or_resolve_bound_agents(&blueprint, None, None, LegacyWorkerBindingPolicy::Reject)
+                .await
+                .expect_err("strict migration policy must reject fallback");
+        assert!(error
+            .to_string()
+            .contains("deprecated profile.worker_binding"));
     }
 
     #[tokio::test]
@@ -1843,7 +1900,7 @@ mod tests {
                         resolved_model: request.requested_model.clone(),
                         effective_tools: request.requested_tools.clone(),
                         launch_variant: request.launch_variant.clone(),
-                        evidence_digest: None,
+                        capability_snapshot_digest: None,
                     })
                     .collect())
             }
@@ -1877,12 +1934,22 @@ mod tests {
         });
         let provider = CountingProvider(AtomicUsize::new(0));
 
-        let first = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx), Some(&provider))
-            .await
-            .unwrap();
-        let restored = load_or_resolve_bound_agents(&blueprint, Some(&run_ctx), Some(&provider))
-            .await
-            .unwrap();
+        let first = load_or_resolve_bound_agents(
+            &blueprint,
+            Some(&run_ctx),
+            Some(&provider),
+            LegacyWorkerBindingPolicy::Allow,
+        )
+        .await
+        .unwrap();
+        let restored = load_or_resolve_bound_agents(
+            &blueprint,
+            Some(&run_ctx),
+            Some(&provider),
+            LegacyWorkerBindingPolicy::Allow,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(provider.0.load(Ordering::SeqCst), 1);
         assert!(first[0].attestation.is_some());

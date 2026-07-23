@@ -38,8 +38,7 @@ use mlua_swarm::{
 };
 use mlua_swarm_server::{
     build_blueprints_router_with_refs, build_enhance_log_router, build_enhance_settings_router,
-    build_issues_router, build_router_full, default_layer_registry,
-    default_registry_with_enhance_flow,
+    build_issues_router, default_layer_registry, default_registry_with_enhance_flow,
     doctor::{build_doctor_router, DoctorInfo},
 };
 use serde_json::json;
@@ -121,6 +120,10 @@ pub struct Args {
     /// `false`); passing it always forces `true`.
     #[arg(long)]
     enable_enhance_flow: bool,
+    /// Migration policy for deprecated `profile.worker_binding` Runner
+    /// fallback: `allow` (default, compatibility) or `reject` (strict).
+    #[arg(long, value_name = "allow|reject")]
+    legacy_worker_binding_policy: Option<String>,
     /// Base dir for expanding `{"$file": ...}` / `{"$agent_md": ...}` refs found
     /// in `POST /v1/blueprints/:id` seed bodies. When omitted (and absent from the
     /// config file), ref expansion is disabled (= parses raw JSON). Used by the
@@ -193,6 +196,13 @@ fn parse_check_policy_cli(s: &str) -> Result<mlua_swarm::core::config::CheckPoli
         .map_err(|e| format!("invalid --check-policy {s:?}: {e}"))
 }
 
+fn parse_legacy_worker_binding_policy_cli(
+    s: &str,
+) -> Result<mlua_swarm::LegacyWorkerBindingPolicy, String> {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .map_err(|e| format!("invalid --legacy-worker-binding-policy {s:?}: {e}"))
+}
+
 pub async fn run(args: Args) -> anyhow::Result<()> {
     let config_path = args
         .config
@@ -207,6 +217,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         } else {
             None
         },
+        legacy_worker_binding_policy: args.legacy_worker_binding_policy.as_ref().map(|s| {
+            parse_legacy_worker_binding_policy_cli(s).unwrap_or_else(|e| panic!("mse serve: {e}"))
+        }),
         blueprint_ref_base: args.blueprint_ref_base.clone(),
         blueprint_ref_includes: args.blueprint_ref_includes.clone(),
         blueprint_strict_embed: if args.blueprint_strict_embed {
@@ -432,7 +445,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let base_url: std::sync::Arc<str> = format!("http://{}", cfg.bind).into();
 
     // Router assembly (fixed combined mode): merges task, ws_operator_factory, and every enhance route.
-    let mut app = build_router_full(
+    let mut app = mlua_swarm_server::build_router_full_with_legacy_worker_binding_policy(
         engine.clone(),
         make_registry(),
         Some(store.clone()),
@@ -443,10 +456,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(run_store),
         Some(replay_store),
         cfg.sync_timeout_secs,
+        cfg.legacy_worker_binding_policy,
     );
 
     let compiler = Compiler::new(make_registry());
-    let launch_enhance = Arc::new(TaskLaunchService::new(engine.clone(), compiler));
+    let launch_enhance = Arc::new(
+        TaskLaunchService::new(engine.clone(), compiler)
+            .with_legacy_worker_binding_policy(cfg.legacy_worker_binding_policy),
+    );
 
     let enhance_app = Arc::new(EnhanceApplication::new(
         EnhanceApplicationConfig {
@@ -473,6 +490,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             .as_ref()
             .map(|p| p.display().to_string()),
         enhance_flow_enabled: cfg.enable_enhance_flow,
+        legacy_worker_binding_policy: cfg.legacy_worker_binding_policy,
         seed_blueprint_id: cfg.seed_blueprint_id.clone(),
         check_policy: cfg.check_policy,
     };

@@ -10,8 +10,23 @@ use crate::blueprint::{
     BoundAgent, Runner,
 };
 use async_trait::async_trait;
+use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use thiserror::Error;
+
+/// Migration policy for the deprecated `AgentProfile.worker_binding` Runner
+/// fallback. It applies only to fresh declaration resolution; persisted
+/// snapshots keep their pinned Runner and remain readable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyWorkerBindingPolicy {
+    /// Preserve pre-Runner Blueprint compatibility and mark the snapshot with
+    /// `runner_source = legacy_worker_binding`.
+    #[default]
+    Allow,
+    /// Reject the fallback and require an explicit `runner` or `runner_ref`.
+    Reject,
+}
 
 /// Execution-environment provider for effective agent capabilities.
 #[async_trait]
@@ -78,7 +93,7 @@ impl ManifestBindingProvider {
             resolved_model: capability.resolved_model.clone(),
             effective_tools: capability.effective_tools.clone(),
             launch_variant: capability.launch_variant.clone(),
-            evidence_digest: capability.evidence_digest.clone(),
+            capability_snapshot_digest: capability.capability_snapshot_digest.clone(),
         })
     }
 }
@@ -232,6 +247,124 @@ pub fn binding_request_for_snapshot(bound: &BoundAgent) -> Option<BindRequest> {
     })
 }
 
+#[derive(Serialize)]
+struct LegacyEvidenceAttestation<'a> {
+    request_digest: &'a crate::blueprint::BindingDigest,
+    provider_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_revision: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_model: &'a Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    effective_tools: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch_variant: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_digest: &'a Option<crate::blueprint::BindingDigest>,
+}
+
+#[derive(Serialize)]
+struct LegacyEvidenceBoundAgentDigestInput<'a> {
+    agent: &'a crate::blueprint::AgentDef,
+    runner: &'a Option<Runner>,
+    context_policy: &'a Option<crate::core::agent_context::ContextPolicy>,
+    runner_source: crate::blueprint::RunnerResolutionSource,
+    attestation: Option<LegacyEvidenceAttestation<'a>>,
+}
+
+fn legacy_evidence_binding_digest(
+    bound: &BoundAgent,
+) -> Result<crate::blueprint::BindingDigest, BindingProviderError> {
+    let attestation = bound
+        .attestation
+        .as_ref()
+        .map(|attestation| LegacyEvidenceAttestation {
+            request_digest: &attestation.request_digest,
+            provider_id: &attestation.provider_id,
+            provider_revision: &attestation.provider_revision,
+            resolved_model: &attestation.resolved_model,
+            effective_tools: &attestation.effective_tools,
+            launch_variant: &attestation.launch_variant,
+            evidence_digest: &attestation.capability_snapshot_digest,
+        });
+    let bytes = serde_json::to_vec(&LegacyEvidenceBoundAgentDigestInput {
+        agent: &bound.agent,
+        runner: &bound.runner,
+        context_policy: &bound.context_policy,
+        runner_source: bound.runner_source,
+        attestation,
+    })
+    .map_err(|error| BindingProviderError::Digest(error.to_string()))?;
+    Ok(crate::blueprint::BindingDigest::sha256(bytes))
+}
+
+/// Validate one persisted [`BoundAgent`] before it is reused or explained.
+///
+/// The digest is recomputed from the snapshot body, then an attested snapshot
+/// is checked again against its declaration-only request. This detects store
+/// corruption and schema-inconsistent mutations without consulting a Provider,
+/// the current Blueprint, or any mutable execution-environment registry.
+pub fn validate_bound_agent_snapshot(bound: &BoundAgent) -> Result<(), BindingProviderError> {
+    let mut expected = bound.clone();
+    expected
+        .recompute_binding_digest()
+        .map_err(|error| BindingProviderError::Digest(error.to_string()))?;
+    let legacy_digest = legacy_evidence_binding_digest(bound)?;
+    if expected.binding_digest != bound.binding_digest && legacy_digest != bound.binding_digest {
+        return Err(BindingProviderError::Digest(format!(
+            "stored BoundAgent '{}' has binding digest '{}', recomputed '{}'",
+            bound.agent.name, bound.binding_digest, expected.binding_digest
+        )));
+    }
+
+    let Some(attestation) = bound.attestation.as_ref() else {
+        return Ok(());
+    };
+
+    let mut declaration = bound.clone();
+    declaration.attestation = None;
+    declaration
+        .recompute_binding_digest()
+        .map_err(|error| BindingProviderError::Digest(error.to_string()))?;
+    let request = binding_request_for_snapshot(&declaration).ok_or_else(|| {
+        BindingProviderError::Provider(format!(
+            "stored BoundAgent '{}' has an attestation but no Runner declaration",
+            bound.agent.name
+        ))
+    })?;
+    let validated = validate_receipt(
+        &request,
+        BindReceipt {
+            agent: bound.agent.name.clone(),
+            request_digest: attestation.request_digest.clone(),
+            provider_id: attestation.provider_id.clone(),
+            provider_revision: attestation.provider_revision.clone(),
+            resolved_model: attestation.resolved_model.clone(),
+            effective_tools: attestation.effective_tools.clone(),
+            launch_variant: attestation.launch_variant.clone(),
+            capability_snapshot_digest: attestation.capability_snapshot_digest.clone(),
+        },
+    )?;
+    if &validated != attestation {
+        return Err(BindingProviderError::Provider(format!(
+            "stored BoundAgent '{}' contains a non-canonical attestation",
+            bound.agent.name
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a complete persisted binding snapshot without partially accepting
+/// any entry.
+pub fn validate_bound_agent_snapshots(
+    bound_agents: &[BoundAgent],
+) -> Result<(), BindingProviderError> {
+    for bound in bound_agents {
+        validate_bound_agent_snapshot(bound)?;
+    }
+    Ok(())
+}
+
 /// Ask `provider` to bind all Runner-backed agents, validate every receipt,
 /// and pin accepted attestations into the snapshots.
 pub async fn attest_bound_agents(
@@ -341,7 +474,7 @@ fn validate_receipt(
         resolved_model: receipt.resolved_model,
         effective_tools,
         launch_variant: receipt.launch_variant,
-        evidence_digest: receipt.evidence_digest,
+        capability_snapshot_digest: receipt.capability_snapshot_digest,
     })
 }
 
@@ -430,7 +563,7 @@ mod tests {
             resolved_model: Some("claude-sonnet-4".to_string()),
             effective_tools: vec!["Write".to_string(), "Read".to_string()],
             launch_variant: Some("mse-coder".to_string()),
-            evidence_digest: None,
+            capability_snapshot_digest: None,
         }
     }
 
@@ -455,10 +588,55 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(bound[0].binding_digest, declaration_digest);
+        validate_bound_agent_snapshot(&bound[0]).unwrap();
         assert_eq!(
             bound[0].attestation.as_ref().unwrap().effective_tools,
             ["Read", "Write"]
         );
+    }
+
+    #[test]
+    fn persisted_snapshot_rejects_binding_digest_drift() {
+        let mut bound = bound().remove(0);
+        bound.agent.profile.as_mut().unwrap().system_prompt = "mutated after persistence".into();
+
+        let error = validate_bound_agent_snapshot(&bound).unwrap_err();
+        assert!(matches!(error, BindingProviderError::Digest(_)));
+    }
+
+    #[tokio::test]
+    async fn persisted_snapshot_rejects_attestation_for_a_different_declaration() {
+        let mut bound = bound();
+        attest_bound_agents(&ReceiptProvider(vec![receipt()]), &mut bound)
+            .await
+            .unwrap();
+        bound[0].attestation.as_mut().unwrap().request_digest =
+            crate::blueprint::BindingDigest::sha256("other-declaration");
+        bound[0].recompute_binding_digest().unwrap();
+
+        let error = validate_bound_agent_snapshot(&bound[0]).unwrap_err();
+        assert!(matches!(
+            error,
+            BindingProviderError::RequestDigestMismatch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn persisted_snapshot_accepts_the_legacy_evidence_digest_identity() {
+        let mut receipt = receipt();
+        receipt.capability_snapshot_digest = Some(crate::blueprint::BindingDigest::sha256(
+            "legacy-capabilities",
+        ));
+        let mut bound = bound();
+        attest_bound_agents(&ReceiptProvider(vec![receipt]), &mut bound)
+            .await
+            .unwrap();
+        let new_digest = bound[0].binding_digest.clone();
+        let legacy_digest = legacy_evidence_binding_digest(&bound[0]).unwrap();
+        assert_ne!(legacy_digest, new_digest);
+
+        bound[0].binding_digest = legacy_digest;
+        validate_bound_agent_snapshot(&bound[0]).unwrap();
     }
 
     #[tokio::test]

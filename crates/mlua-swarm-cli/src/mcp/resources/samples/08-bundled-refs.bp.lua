@@ -46,10 +46,12 @@ return {
     {
       ["$agent_md"] = "agents/researcher.md",
       spec = { operator_ref = "main-ai" },
+      runner = { backend = "ws_operator", variant = "claude", tools = {} },
     },
     {
       ["$agent_md"] = "agents/reviewer.md",
       spec = { operator_ref = "main-ai" },
+      runner = { backend = "ws_operator", variant = "claude", tools = {} },
       verdict = { channel = "part", values = { "PASS", "BLOCKED" } },
     },
   },

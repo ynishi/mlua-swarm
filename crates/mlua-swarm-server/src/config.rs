@@ -11,6 +11,7 @@
 //! so changing settings = editing the file + restarting, not editing the plist.
 
 use mlua_swarm::core::config::CheckPolicy;
+use mlua_swarm::LegacyWorkerBindingPolicy;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -83,6 +84,8 @@ pub struct FileConfig {
     pub bind: Option<String>,
     /// Whether the enhance flow (Lua + AgentBlock factories) is baked into the registry.
     pub enable_enhance_flow: Option<bool>,
+    /// Migration gate for deprecated `profile.worker_binding` Runner fallback.
+    pub legacy_worker_binding_policy: Option<LegacyWorkerBindingPolicy>,
     /// Base dir for `$file` / `$agent_md` ref expansion in seeded Blueprints.
     pub blueprint_ref_base: Option<PathBuf>,
     /// Additional dirs (tier 5 of the include cascade — see
@@ -169,6 +172,8 @@ pub struct CliOverrides {
     pub bind: Option<String>,
     /// `--enable-enhance-flow` flag.
     pub enable_enhance_flow: Option<bool>,
+    /// `--legacy-worker-binding-policy` value.
+    pub legacy_worker_binding_policy: Option<LegacyWorkerBindingPolicy>,
     /// `--blueprint-ref-base` value.
     pub blueprint_ref_base: Option<PathBuf>,
     /// `--include` values (repeatable). Merged with the file config's
@@ -216,6 +221,8 @@ pub struct ResolvedConfig {
     pub bind: SocketAddr,
     /// Whether the enhance flow (Lua + AgentBlock factories) is baked into the registry.
     pub enable_enhance_flow: bool,
+    /// Migration gate for fresh Blueprint declarations.
+    pub legacy_worker_binding_policy: LegacyWorkerBindingPolicy,
     /// Base dir for `$file` / `$agent_md` ref expansion in seeded Blueprints.
     pub blueprint_ref_base: Option<PathBuf>,
     /// Merged include list (CLI `--include` first, then file
@@ -280,6 +287,7 @@ impl Default for ResolvedConfig {
         Self {
             bind: default_bind(),
             enable_enhance_flow: false,
+            legacy_worker_binding_policy: LegacyWorkerBindingPolicy::Allow,
             blueprint_ref_base: None,
             blueprint_ref_includes: Vec::new(),
             blueprint_strict_embed: false,
@@ -351,6 +359,10 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .enable_enhance_flow
             .or(file.enable_enhance_flow)
             .unwrap_or(default.enable_enhance_flow),
+        legacy_worker_binding_policy: cli
+            .legacy_worker_binding_policy
+            .or(file.legacy_worker_binding_policy)
+            .unwrap_or(default.legacy_worker_binding_policy),
         blueprint_ref_base: cli.blueprint_ref_base.or(file.blueprint_ref_base),
         blueprint_ref_includes: {
             let mut merged = cli.blueprint_ref_includes;
@@ -444,6 +456,35 @@ mod tests {
         let resolved = resolve(cli, file).expect("resolve");
         assert_eq!(resolved.seed_blueprint_id, "from-file");
         assert!(resolved.enable_enhance_flow);
+    }
+
+    #[test]
+    fn resolve_legacy_worker_binding_policy_uses_cli_file_default_precedence() {
+        let resolved = resolve(CliOverrides::default(), FileConfig::default()).unwrap();
+        assert_eq!(
+            resolved.legacy_worker_binding_policy,
+            LegacyWorkerBindingPolicy::Allow
+        );
+
+        let file = FileConfig {
+            legacy_worker_binding_policy: Some(LegacyWorkerBindingPolicy::Reject),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file.clone()).unwrap();
+        assert_eq!(
+            resolved.legacy_worker_binding_policy,
+            LegacyWorkerBindingPolicy::Reject
+        );
+
+        let cli = CliOverrides {
+            legacy_worker_binding_policy: Some(LegacyWorkerBindingPolicy::Allow),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).unwrap();
+        assert_eq!(
+            resolved.legacy_worker_binding_policy,
+            LegacyWorkerBindingPolicy::Allow
+        );
     }
 
     #[test]

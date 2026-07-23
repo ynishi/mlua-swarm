@@ -259,3 +259,52 @@ async fn resume_interrupted_run_completes_under_same_run_id() {
         "finalize_run must persist the resumed run's final_ctx"
     );
 }
+
+#[tokio::test]
+async fn resume_rejects_tampered_bound_agents_before_status_transition() {
+    let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+    let replay_store: Arc<dyn ReplayStore> = Arc::new(InMemoryReplayStore::new());
+    let base = spawn_server(run_store.clone(), replay_store).await;
+    let client = reqwest::Client::new();
+
+    let launch = client
+        .post(format!("{base}/v1/tasks"))
+        .json(&json!({
+            "blueprint": { "kind": "inline", "value": identity_blueprint() },
+            "init_ctx": { "in": "hello" },
+            "goal": "tampered snapshot",
+        }))
+        .send()
+        .await
+        .expect("launch request");
+    assert_eq!(launch.status(), reqwest::StatusCode::OK);
+    let launched: serde_json::Value = launch.json().await.expect("launch json");
+    let run_id =
+        RunId::parse(launched["run_id"].as_str().expect("run_id string")).expect("run_id parse");
+
+    let run = run_store.get(&run_id).await.expect("stored run");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(run.input_json.as_deref().expect("launch snapshot"))
+            .expect("snapshot json");
+    snapshot["bound_agents"][0]["agent"]["name"] = json!("tampered");
+    run_store
+        .set_input_json(&run_id, serde_json::to_string(&snapshot).unwrap())
+        .await
+        .expect("store tampered snapshot");
+    run_store
+        .update_status(&run_id, RunStatus::Interrupted)
+        .await
+        .expect("force interrupted");
+
+    let resume = client
+        .post(format!("{base}/v1/runs/{run_id}/resume"))
+        .send()
+        .await
+        .expect("resume request");
+    assert_eq!(resume.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        run_store.get(&run_id).await.unwrap().status,
+        RunStatus::Interrupted,
+        "integrity failure must happen before Interrupted -> Running"
+    );
+}

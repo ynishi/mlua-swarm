@@ -71,6 +71,25 @@ impl WSOperatorSession {
         *self.tx.lock().await = Some(new_tx);
     }
 
+    /// Whether this session currently has a live WebSocket sender.
+    pub(super) async fn is_connected(&self) -> bool {
+        self.tx.lock().await.is_some()
+    }
+
+    /// Clear the sender only when it still belongs to the connection that is
+    /// shutting down. A stale socket can finish after a reconnect installed a
+    /// replacement sender; that stale cleanup must not disconnect the new
+    /// socket.
+    pub(super) async fn clear_tx_if(&self, expected: &mpsc::UnboundedSender<ServerMsg>) {
+        let mut current = self.tx.lock().await;
+        if current
+            .as_ref()
+            .is_some_and(|sender| sender.same_channel(expected))
+        {
+            *current = None;
+        }
+    }
+
     /// Clears tx to `None` on disconnect. Expected to be called only from the handler side.
     pub(crate) async fn clear_tx(&self) {
         *self.tx.lock().await = None;
@@ -660,6 +679,36 @@ mod tests {
             work_dir: work_dir.map(String::from),
             ..AgentContextView::default()
         }
+    }
+
+    #[tokio::test]
+    async fn connection_state_tracks_the_current_sender() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-connection-state").unwrap(),
+            tx.clone(),
+            None,
+        );
+        assert!(session.is_connected().await);
+
+        session.clear_tx_if(&tx).await;
+        assert!(!session.is_connected().await);
+    }
+
+    #[tokio::test]
+    async fn stale_disconnect_does_not_clear_a_reconnected_sender() {
+        let (old_tx, _old_rx) = mpsc::unbounded_channel();
+        let (new_tx, _new_rx) = mpsc::unbounded_channel();
+        let session = WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-reconnect-state").unwrap(),
+            old_tx.clone(),
+            None,
+        );
+
+        session.replace_tx(new_tx).await;
+        session.clear_tx_if(&old_tx).await;
+
+        assert!(session.is_connected().await);
     }
 
     #[test]

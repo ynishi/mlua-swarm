@@ -395,23 +395,39 @@ impl OperatorClientState {
             })
             .unwrap_or_default();
 
-        let ws_url = format!(
-            "{}/v1/operators/{}/ws",
-            http_to_ws_base(&self.http_base),
-            sid
-        );
-        let mut req = ws_url
-            .into_client_request()
-            .map_err(|e| ClientError::Ws(e.to_string()))?;
-        req.headers_mut().insert(
-            "authorization",
-            HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|e| ClientError::Ws(e.to_string()))?,
-        );
-        let (ws_stream, _) = tokio_tungstenite::connect_async(req)
-            .await
-            .map_err(|e| ClientError::Ws(e.to_string()))?;
-        let (writer, reader) = ws_stream.split();
+        let connect_result: Result<_, ClientError> = async {
+            let ws_url = format!(
+                "{}/v1/operators/{}/ws",
+                http_to_ws_base(&self.http_base),
+                sid
+            );
+            let mut req = ws_url
+                .into_client_request()
+                .map_err(|e| ClientError::Ws(e.to_string()))?;
+            req.headers_mut().insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|e| ClientError::Ws(e.to_string()))?,
+            );
+            let (ws_stream, _) = tokio_tungstenite::connect_async(req)
+                .await
+                .map_err(|e| ClientError::Ws(e.to_string()))?;
+            Ok(ws_stream.split())
+        }
+        .await;
+        let (writer, reader) = match connect_result {
+            Ok(parts) => parts,
+            Err(connect_error) => {
+                if let Err(rollback_error) =
+                    rollback_minted_session(&client, &self.http_base, &sid, &token).await
+                {
+                    return Err(ClientError::Ws(format!(
+                        "{connect_error}; rollback DELETE /v1/operators/{sid} failed: {rollback_error}"
+                    )));
+                }
+                return Err(connect_error);
+            }
+        };
 
         let pending = Arc::new(PendingQueue::new());
         let reader_task = spawn_reader(reader, pending.clone());
@@ -527,6 +543,31 @@ impl OperatorClientState {
             )));
         }
         Ok(())
+    }
+}
+
+/// Best-effort rollback for the two-step join protocol. Once POST minted a
+/// role-owning session, any failure before the WebSocket becomes usable must
+/// release that session with the same bearer token or it becomes an orphan
+/// that blocks later joins for the same role.
+async fn rollback_minted_session(
+    client: &reqwest::Client,
+    http_base: &str,
+    sid: &str,
+    token: &str,
+) -> Result<(), String> {
+    let response = client
+        .delete(format!("{http_base}/v1/operators/{sid}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(format!("{status} {body}"))
     }
 }
 
@@ -842,6 +883,64 @@ mod tests {
         let state = OperatorClientState::with_http_base("http://127.0.0.1:1");
         let err = state.join(vec![], None).await.unwrap_err();
         assert!(matches!(err, ClientError::Http(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn join_rolls_back_the_minted_session_when_ws_connect_fails() {
+        use axum::extract::State;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::{delete, post};
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let deleted = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/v1/operators",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "sid": "S-rollback",
+                        "token": "rollback-token",
+                        "roles": ["main-ai"]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/operators/:sid",
+                delete(
+                    |State(deleted): State<Arc<AtomicBool>>, headers: HeaderMap| async move {
+                        let authorized = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            == Some("Bearer rollback-token");
+                        if authorized {
+                            deleted.store(true, Ordering::SeqCst);
+                            StatusCode::NO_CONTENT
+                        } else {
+                            StatusCode::UNAUTHORIZED
+                        }
+                    },
+                ),
+            )
+            .with_state(deleted.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rollback test server");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let state = OperatorClientState::with_http_base(base);
+        let error = state
+            .join(vec!["main-ai".to_string()], None)
+            .await
+            .expect_err("missing WS route must fail the upgrade");
+
+        assert!(matches!(error, ClientError::Ws(_)), "got: {error:?}");
+        assert!(
+            deleted.load(Ordering::SeqCst),
+            "failed WS join must delete the minted role-owning session"
+        );
+        server.abort();
     }
 
     // ─── http_to_ws_base ───────────────────────────────────────────────────

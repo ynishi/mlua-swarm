@@ -325,6 +325,38 @@ pub fn build_router_full(
     replay_store: Option<Arc<dyn ReplayStore>>,
     sync_timeout_secs: u64,
 ) -> Router {
+    build_router_full_with_legacy_worker_binding_policy(
+        engine,
+        registry,
+        store,
+        ws_operator_factory,
+        output_store,
+        base_url,
+        task_store,
+        run_store,
+        replay_store,
+        sync_timeout_secs,
+        mlua_swarm::LegacyWorkerBindingPolicy::Allow,
+    )
+}
+
+/// Full router builder with an explicit migration gate for deprecated
+/// `AgentProfile.worker_binding` Runner fallback. The existing
+/// [`build_router_full`] remains compatibility-defaulted to `Allow`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_router_full_with_legacy_worker_binding_policy(
+    engine: Engine,
+    registry: SpawnerRegistry,
+    store: Option<Arc<dyn BlueprintStore>>,
+    ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+    output_store: Option<Arc<dyn mlua_swarm::store::output::OutputStore>>,
+    base_url: Option<Arc<str>>,
+    task_store: Option<Arc<dyn TaskStore>>,
+    run_store: Option<Arc<dyn RunStore>>,
+    replay_store: Option<Arc<dyn ReplayStore>>,
+    sync_timeout_secs: u64,
+    legacy_worker_binding_policy: mlua_swarm::LegacyWorkerBindingPolicy,
+) -> Router {
     let operator_sessions = Arc::new(Mutex::new(HashMap::new()));
     let roles_to_sid = Arc::new(Mutex::new(HashMap::new()));
     let compiler = Compiler::new(registry);
@@ -333,7 +365,9 @@ pub fn build_router_full(
         roles_to_sid.clone(),
     ));
     let launch = Arc::new(
-        TaskLaunchService::new(engine.clone(), compiler).with_binding_provider(binding_provider),
+        TaskLaunchService::new(engine.clone(), compiler)
+            .with_binding_provider(binding_provider)
+            .with_legacy_worker_binding_policy(legacy_worker_binding_policy),
     );
     let task_app = Arc::new(match store {
         Some(s) => TaskApplication::new(launch, s),

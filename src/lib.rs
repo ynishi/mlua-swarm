@@ -114,8 +114,9 @@ pub use application::{
     TaskApplicationInput, TaskApplicationOutput, TickOutcome, VersionSelector,
 };
 pub use binding::{
-    attest_bound_agents, binding_request_for_snapshot, binding_requests, AgentBindingProvider,
-    BindingProviderError, ManifestBindingProvider,
+    attest_bound_agents, binding_request_for_snapshot, binding_requests,
+    validate_bound_agent_snapshot, validate_bound_agent_snapshots, AgentBindingProvider,
+    BindingProviderError, LegacyWorkerBindingPolicy, ManifestBindingProvider,
 };
 pub use blueprint::compiler::{
     CompileError, CompiledAgentTable, CompiledBlueprint, Compiler, HostBridge,

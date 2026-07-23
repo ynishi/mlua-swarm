@@ -594,11 +594,18 @@ Runner capability resolution has a separate Run-scoped explain surface:
 `GET /v1/runs/:id/bindings`. Each entry returns the pinned declaration as
 `requested`, the Core-validated provider attestation as `effective`, and a
 mechanical `difference` (model, tools, and launch variant). Provider id,
-provider revision, evidence digest, declaration request digest, and final
+provider revision, capability snapshot digest, declaration request digest, and final
 binding digest remain visible after execution. The route reads only
 `RunRecord.input_json.bound_agents`; it never re-resolves the Blueprint or
 reads platform wrapper files. A pre-snapshot Run returns `422`, preserving the
 distinction between “not recorded” and “currently resolvable.”
+
+Legacy `profile.worker_binding` conversion is controlled at server startup by
+`legacy_worker_binding_policy = "allow" | "reject"` (or CLI
+`--legacy-worker-binding-policy`). `allow` is the compatibility default and
+records `runner_source=legacy_worker_binding`; `reject` requires an explicit
+`runner` or `runner_ref`. This switch affects fresh resolution only—persisted
+Run snapshots are never rewritten or re-resolved.
 
 **The contract**: a worker SHOULD report every tool failure it works
 around through this channel rather than silently substituting it away.

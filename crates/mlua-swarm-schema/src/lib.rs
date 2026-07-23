@@ -1204,10 +1204,14 @@ pub struct BindReceipt {
     /// Effective platform launch variant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_variant: Option<String>,
-    /// Optional digest of provider-owned evidence such as a capability
-    /// manifest. The evidence body itself need not enter the Run snapshot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_digest: Option<BindingDigest>,
+    /// Optional digest of the provider-observed capability snapshot. This is
+    /// a drift/lint correlation key, not independent security evidence.
+    #[serde(
+        default,
+        alias = "evidence_digest",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub capability_snapshot_digest: Option<BindingDigest>,
 }
 
 /// Core-validated capability statement pinned into a [`BoundAgent`].
@@ -1233,9 +1237,13 @@ pub struct BindingAttestation {
     /// Effective platform launch variant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_variant: Option<String>,
-    /// Optional digest of provider-owned capability evidence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_digest: Option<BindingDigest>,
+    /// Optional digest of the provider-observed capability snapshot.
+    #[serde(
+        default,
+        alias = "evidence_digest",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub capability_snapshot_digest: Option<BindingDigest>,
 }
 
 /// One effective capability advertised by an execution-environment
@@ -1254,9 +1262,13 @@ pub struct AgentProviderCapability {
     /// Effective tool grant enforced by the provider.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effective_tools: Vec<String>,
-    /// Optional digest of provider-owned capability evidence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_digest: Option<BindingDigest>,
+    /// Optional digest of the provider-observed capability snapshot.
+    #[serde(
+        default,
+        alias = "evidence_digest",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub capability_snapshot_digest: Option<BindingDigest>,
 }
 
 /// Capability manifest supplied by an Operator/MainAI or an official
@@ -2876,6 +2888,22 @@ mod tests {
                 "accepted {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn capability_snapshot_digest_accepts_the_legacy_wire_name() {
+        let digest = BindingDigest::sha256("capabilities");
+        let capability: AgentProviderCapability = serde_json::from_value(serde_json::json!({
+            "launch_variant": "coder",
+            "effective_tools": ["Read"],
+            "evidence_digest": digest,
+        }))
+        .expect("legacy manifest remains readable");
+        assert_eq!(capability.capability_snapshot_digest, Some(digest.clone()));
+
+        let serialized = serde_json::to_value(capability).expect("serialize new wire shape");
+        assert_eq!(serialized["capability_snapshot_digest"], digest.to_string());
+        assert!(serialized.get("evidence_digest").is_none());
     }
 
     // ──────────────────────────────────────────────────────────────

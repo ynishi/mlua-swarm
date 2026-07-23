@@ -51,7 +51,9 @@ fn provider(
                 .iter()
                 .map(|tool| tool.to_string())
                 .collect(),
-            evidence_digest: Some(BindingDigest::sha256(format!("{provider_id}:{revision}"))),
+            capability_snapshot_digest: Some(BindingDigest::sha256(format!(
+                "{provider_id}:{revision}"
+            ))),
         }],
     })
 }
