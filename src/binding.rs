@@ -6,8 +6,8 @@
 //! official platform adapter is one implementation of this same interface.
 
 use crate::blueprint::{
-    AgentProviderManifest, BindReceipt, BindRequest, BindingAttestation, BindingBackend,
-    BoundAgent, Runner,
+    AgentProviderManifest, BindOutcome, BindReceipt, BindRequest, BindingAttestation,
+    BindingBackend, BoundAgent, Runner,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -32,11 +32,17 @@ pub enum LegacyWorkerBindingPolicy {
 #[async_trait]
 pub trait AgentBindingProvider: Send + Sync {
     /// Resolve all requested bindings as one launch-time transaction.
-    /// Returning fewer, extra, or duplicate receipts is rejected by Core.
+    ///
+    /// The provider returns exactly one [`BindOutcome`] per requested agent
+    /// — `Bound` with an (untrusted) receipt Core still validates, or
+    /// `Unbound` when the execution environment currently offers no matching
+    /// capability. Returning fewer, extra, or duplicate outcomes is rejected
+    /// by Core in [`attest_bound_agents`]. Whether an `Unbound` outcome fails
+    /// the launch is the caller's `strict` decision, not the provider's.
     async fn bind(
         &self,
         requests: &[BindRequest],
-    ) -> Result<Vec<BindReceipt>, BindingProviderError>;
+    ) -> Result<Vec<BindOutcome>, BindingProviderError>;
 }
 
 /// Reference provider backed by an execution-environment capability manifest.
@@ -61,7 +67,7 @@ impl ManifestBindingProvider {
         &self.manifest
     }
 
-    fn receipt_for(&self, request: &BindRequest) -> Result<BindReceipt, BindingProviderError> {
+    fn outcome_for(&self, request: &BindRequest) -> Result<BindOutcome, BindingProviderError> {
         if request.backend == BindingBackend::AgentBlockInProcess {
             return Err(BindingProviderError::Provider(format!(
                 "manifest provider '{}' cannot bind in-process agent '{}'",
@@ -73,27 +79,39 @@ impl ManifestBindingProvider {
             .capabilities
             .iter()
             .filter(|capability| capability.launch_variant == request.launch_variant);
-        let capability = matches.next().ok_or_else(|| {
-            BindingProviderError::Provider(format!(
-                "manifest provider '{}' has no capability for launch variant {:?} requested by agent '{}'",
-                self.manifest.provider_id, request.launch_variant, request.agent
-            ))
-        })?;
+        let Some(capability) = matches.next() else {
+            // No capability for the requested variant is an attestation gap,
+            // not a provider fault: report `Unbound` and let the caller's
+            // `strict` decision (in `attest_bound_agents`) choose whether the
+            // launch fails.
+            return Ok(BindOutcome::Unbound {
+                agent: request.agent.clone(),
+                reason: format!(
+                    "manifest provider '{}' has no capability for launch variant {:?}",
+                    self.manifest.provider_id, request.launch_variant
+                ),
+            });
+        };
         if matches.next().is_some() {
+            // A manifest that declares the same variant twice is ambiguous:
+            // this is a provider configuration bug, so it stays fail-closed
+            // in every mode.
             return Err(BindingProviderError::Provider(format!(
                 "manifest provider '{}' declares duplicate capabilities for launch variant {:?}",
                 self.manifest.provider_id, request.launch_variant
             )));
         }
-        Ok(BindReceipt {
-            agent: request.agent.clone(),
-            request_digest: request.request_digest.clone(),
-            provider_id: self.manifest.provider_id.clone(),
-            provider_revision: self.manifest.provider_revision.clone(),
-            resolved_model: capability.resolved_model.clone(),
-            effective_tools: capability.effective_tools.clone(),
-            launch_variant: capability.launch_variant.clone(),
-            capability_snapshot_digest: capability.capability_snapshot_digest.clone(),
+        Ok(BindOutcome::Bound {
+            receipt: BindReceipt {
+                agent: request.agent.clone(),
+                request_digest: request.request_digest.clone(),
+                provider_id: self.manifest.provider_id.clone(),
+                provider_revision: self.manifest.provider_revision.clone(),
+                resolved_model: capability.resolved_model.clone(),
+                effective_tools: capability.effective_tools.clone(),
+                launch_variant: capability.launch_variant.clone(),
+                capability_snapshot_digest: capability.capability_snapshot_digest.clone(),
+            },
         })
     }
 }
@@ -103,10 +121,10 @@ impl AgentBindingProvider for ManifestBindingProvider {
     async fn bind(
         &self,
         requests: &[BindRequest],
-    ) -> Result<Vec<BindReceipt>, BindingProviderError> {
+    ) -> Result<Vec<BindOutcome>, BindingProviderError> {
         requests
             .iter()
-            .map(|request| self.receipt_for(request))
+            .map(|request| self.outcome_for(request))
             .collect()
     }
 }
@@ -188,6 +206,40 @@ pub enum BindingProviderError {
     /// identity.
     #[error("binding digest recompute failed: {0}")]
     Digest(String),
+    /// `strict_binding` is set but the provider left a Runner-backed agent
+    /// `Unbound`. The message lists what an execution environment would have
+    /// to attest (launch variant, requested tools, requested model) so an
+    /// Operator can generate a satisfying capability manifest.
+    #[error(
+        "strict_binding requires an attestation for agent '{agent}' \
+         (requested launch variant {variant:?}, tools {tools:?}, model {model:?}) \
+         but the provider returned Unbound: {reason}"
+    )]
+    AttestationRequired {
+        /// Logical agent name.
+        agent: String,
+        /// Provider-reported reason the agent could not be bound.
+        reason: String,
+        /// Requested launch variant from the resolved `Runner`.
+        variant: Option<String>,
+        /// Requested minimum tool grant from the resolved `Runner`.
+        tools: Vec<String>,
+        /// Requested model alias or tier from `AgentProfile.model`.
+        model: Option<String>,
+    },
+}
+
+/// One Runner-backed agent the provider could not attest, returned by
+/// [`attest_bound_agents`] in non-strict mode. Purely observational: the
+/// `reason` never enters the [`BoundAgent`] snapshot or its digest lineage —
+/// the agent stays `DeclarationOnly` and callers record the gap out of band
+/// (tracing warn + `RunRecord.degradations`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnboundAgent {
+    /// Logical agent name that was left unattested.
+    pub agent: String,
+    /// Provider-reported reason the agent could not be bound.
+    pub reason: String,
 }
 
 /// Build platform-neutral requests for every Runner-bound agent.
@@ -365,41 +417,79 @@ pub fn validate_bound_agent_snapshots(
     Ok(())
 }
 
-/// Ask `provider` to bind all Runner-backed agents, validate every receipt,
-/// and pin accepted attestations into the snapshots.
+/// Ask `provider` to bind all Runner-backed agents, validate every returned
+/// receipt, and pin accepted attestations into the snapshots.
+///
+/// `strict` decides how an `Unbound` outcome is treated (never how a `Bound`
+/// one is validated — "attestation is optional, but never wrong"):
+///
+/// - A `Bound` outcome is always validated through [`validate_receipt`]; a
+///   receipt that is present but contradicts the request (missing tools,
+///   variant mismatch, stale digest, empty resolved model) is an error in
+///   BOTH modes.
+/// - An `Unbound` outcome fails the call with
+///   [`BindingProviderError::AttestationRequired`] when `strict`, or is
+///   collected into the returned [`UnboundAgent`] list when not — the agent
+///   stays `DeclarationOnly`.
+///
+/// Per-agent outcome completeness (exactly one outcome per requested agent,
+/// no missing / duplicate / unexpected entries) stays fail-closed in both
+/// modes.
 pub async fn attest_bound_agents(
     provider: &dyn AgentBindingProvider,
     bound_agents: &mut [BoundAgent],
-) -> Result<(), BindingProviderError> {
+    strict: bool,
+) -> Result<Vec<UnboundAgent>, BindingProviderError> {
     let requests = binding_requests(bound_agents);
     if requests.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
-    let receipts = provider.bind(&requests).await?;
+    let outcomes = provider.bind(&requests).await?;
     let requested_names: HashSet<&str> = requests.iter().map(|r| r.agent.as_str()).collect();
-    let mut by_agent = HashMap::with_capacity(receipts.len());
-    for receipt in receipts {
-        if !requested_names.contains(receipt.agent.as_str()) {
-            return Err(BindingProviderError::UnexpectedReceipt {
-                agent: receipt.agent,
-            });
+    let mut by_agent = HashMap::with_capacity(outcomes.len());
+    for outcome in outcomes {
+        let agent = match &outcome {
+            BindOutcome::Bound { receipt } => receipt.agent.clone(),
+            BindOutcome::Unbound { agent, .. } => agent.clone(),
+        };
+        if !requested_names.contains(agent.as_str()) {
+            return Err(BindingProviderError::UnexpectedReceipt { agent });
         }
-        let agent = receipt.agent.clone();
-        if by_agent.insert(agent.clone(), receipt).is_some() {
+        if by_agent.insert(agent.clone(), outcome).is_some() {
             return Err(BindingProviderError::DuplicateReceipt { agent });
         }
     }
 
     let mut accepted = Vec::with_capacity(requests.len());
+    let mut unbound = Vec::new();
     for request in requests {
-        let receipt = by_agent.remove(&request.agent).ok_or_else(|| {
+        let outcome = by_agent.remove(&request.agent).ok_or_else(|| {
             BindingProviderError::MissingReceipt {
                 agent: request.agent.clone(),
             }
         })?;
-        let attestation = validate_receipt(&request, receipt)?;
-        accepted.push((request.agent, attestation));
+        match outcome {
+            BindOutcome::Bound { receipt } => {
+                let attestation = validate_receipt(&request, receipt)?;
+                accepted.push((request.agent, attestation));
+            }
+            BindOutcome::Unbound { reason, .. } => {
+                if strict {
+                    return Err(BindingProviderError::AttestationRequired {
+                        agent: request.agent,
+                        reason,
+                        variant: request.launch_variant,
+                        tools: request.requested_tools,
+                        model: request.requested_model,
+                    });
+                }
+                unbound.push(UnboundAgent {
+                    agent: request.agent,
+                    reason,
+                });
+            }
+        }
     }
 
     for (agent, attestation) in accepted {
@@ -411,7 +501,7 @@ pub async fn attest_bound_agents(
             .set_attestation(attestation)
             .map_err(|error| BindingProviderError::Digest(error.to_string()))?;
     }
-    Ok(())
+    Ok(unbound)
 }
 
 fn validate_receipt(
@@ -505,8 +595,33 @@ mod tests {
         async fn bind(
             &self,
             _requests: &[BindRequest],
-        ) -> Result<Vec<BindReceipt>, BindingProviderError> {
-            Ok(self.0.clone())
+        ) -> Result<Vec<BindOutcome>, BindingProviderError> {
+            Ok(self
+                .0
+                .iter()
+                .cloned()
+                .map(|receipt| BindOutcome::Bound { receipt })
+                .collect())
+        }
+    }
+
+    /// Provider that reports every request as `Unbound` with a fixed reason —
+    /// exercises the `strict` gate in [`attest_bound_agents`].
+    struct UnboundProvider(&'static str);
+
+    #[async_trait]
+    impl AgentBindingProvider for UnboundProvider {
+        async fn bind(
+            &self,
+            requests: &[BindRequest],
+        ) -> Result<Vec<BindOutcome>, BindingProviderError> {
+            Ok(requests
+                .iter()
+                .map(|request| BindOutcome::Unbound {
+                    agent: request.agent.clone(),
+                    reason: self.0.to_string(),
+                })
+                .collect())
         }
     }
 
@@ -584,9 +699,10 @@ mod tests {
     async fn accepted_receipt_is_attested_and_changes_digest() {
         let mut bound = bound();
         let declaration_digest = bound[0].binding_digest.clone();
-        attest_bound_agents(&ReceiptProvider(vec![receipt()]), &mut bound)
+        let unbound = attest_bound_agents(&ReceiptProvider(vec![receipt()]), &mut bound, false)
             .await
             .unwrap();
+        assert!(unbound.is_empty());
         assert_ne!(bound[0].binding_digest, declaration_digest);
         validate_bound_agent_snapshot(&bound[0]).unwrap();
         assert_eq!(
@@ -607,7 +723,7 @@ mod tests {
     #[tokio::test]
     async fn persisted_snapshot_rejects_attestation_for_a_different_declaration() {
         let mut bound = bound();
-        attest_bound_agents(&ReceiptProvider(vec![receipt()]), &mut bound)
+        attest_bound_agents(&ReceiptProvider(vec![receipt()]), &mut bound, false)
             .await
             .unwrap();
         bound[0].attestation.as_mut().unwrap().request_digest =
@@ -628,7 +744,7 @@ mod tests {
             "legacy-capabilities",
         ));
         let mut bound = bound();
-        attest_bound_agents(&ReceiptProvider(vec![receipt]), &mut bound)
+        attest_bound_agents(&ReceiptProvider(vec![receipt]), &mut bound, false)
             .await
             .unwrap();
         let new_digest = bound[0].binding_digest.clone();
@@ -644,7 +760,9 @@ mod tests {
         let mut bound = bound();
         let mut receipt = receipt();
         receipt.effective_tools = vec!["Read".to_string()];
-        let error = attest_bound_agents(&ReceiptProvider(vec![receipt]), &mut bound)
+        // A receipt that IS present but contradicts the request fails in
+        // non-strict mode too — "attestation is optional, but never wrong".
+        let error = attest_bound_agents(&ReceiptProvider(vec![receipt]), &mut bound, false)
             .await
             .unwrap_err();
         assert_eq!(
@@ -659,7 +777,7 @@ mod tests {
     #[tokio::test]
     async fn missing_receipt_fails_closed() {
         let mut bound = bound();
-        let error = attest_bound_agents(&ReceiptProvider(vec![]), &mut bound)
+        let error = attest_bound_agents(&ReceiptProvider(vec![]), &mut bound, false)
             .await
             .unwrap_err();
         assert_eq!(
@@ -676,7 +794,7 @@ mod tests {
         let mut bound = bound();
         let mut receipt = receipt();
         receipt.request_digest = crate::blueprint::BindingDigest::sha256("stale");
-        let error = attest_bound_agents(&ReceiptProvider(vec![receipt]), &mut bound)
+        let error = attest_bound_agents(&ReceiptProvider(vec![receipt]), &mut bound, false)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -691,12 +809,61 @@ mod tests {
         let mut bound = bound();
         let mut receipt = receipt();
         receipt.launch_variant = Some("other".to_string());
-        let error = attest_bound_agents(&ReceiptProvider(vec![receipt]), &mut bound)
+        let error = attest_bound_agents(&ReceiptProvider(vec![receipt]), &mut bound, false)
             .await
             .unwrap_err();
         assert!(matches!(
             error,
             BindingProviderError::VariantMismatch { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn unbound_outcome_is_collected_in_non_strict_mode() {
+        let mut bound = bound();
+        let unbound = attest_bound_agents(
+            &UnboundProvider("no capability for launch variant"),
+            &mut bound,
+            false,
+        )
+        .await
+        .expect("non-strict must not fail on Unbound");
+        assert_eq!(unbound.len(), 1);
+        assert_eq!(unbound[0].agent, "coder");
+        assert_eq!(unbound[0].reason, "no capability for launch variant");
+        // The agent stays DeclarationOnly — no attestation is pinned.
+        assert!(bound[0].attestation.is_none());
+    }
+
+    #[tokio::test]
+    async fn unbound_outcome_fails_closed_in_strict_mode_with_requirements() {
+        let mut bound = bound();
+        let error = attest_bound_agents(
+            &UnboundProvider("role main-ai has not joined"),
+            &mut bound,
+            true,
+        )
+        .await
+        .unwrap_err();
+        match &error {
+            BindingProviderError::AttestationRequired {
+                agent,
+                variant,
+                tools,
+                ..
+            } => {
+                assert_eq!(agent, "coder");
+                assert_eq!(variant.as_deref(), Some("mse-coder"));
+                assert_eq!(tools, &["Read".to_string(), "Write".to_string()]);
+            }
+            other => panic!("expected AttestationRequired, got {other:?}"),
+        }
+        // The message must name the agent and the requested variant/tools so
+        // an Operator can generate a satisfying manifest.
+        let message = error.to_string();
+        assert!(message.contains("coder"), "message: {message}");
+        assert!(message.contains("mse-coder"), "message: {message}");
+        assert!(message.contains("Read"), "message: {message}");
+        assert!(bound[0].attestation.is_none());
     }
 }

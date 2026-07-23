@@ -52,11 +52,12 @@ pub use mlua_swarm_schema::OperatorKind as SchemaOperatorKind;
 pub use mlua_swarm_schema::{
     current_schema_version, default_global_agent_kind, resolve_bound_agents,
     resolve_bound_agents_strict, resolve_runner, AgentDef, AgentKind, AgentMeta, AgentProfile,
-    AgentProviderCapability, AgentProviderManifest, AuditDef, AuditMode, BindReceipt, BindRequest,
-    BindingAttestation, BindingBackend, BindingDigest, BindingDigestParseError, Blueprint,
-    BlueprintMetadata, BlueprintOrigin, BoundAgent, BoundAgentResolveError, CompilerHints,
-    CompilerStrategy, MetaDef, OperatorDef, ProjectionPlacementSpec, Runner, RunnerDef,
-    RunnerResolutionSource, RunnerResolveError, SpawnerHints, WorkerModel, CURRENT_SCHEMA_VERSION,
+    AgentProviderCapability, AgentProviderManifest, AuditDef, AuditMode, BindOutcome, BindReceipt,
+    BindRequest, BindingAttestation, BindingBackend, BindingDigest, BindingDigestParseError,
+    Blueprint, BlueprintMetadata, BlueprintOrigin, BoundAgent, BoundAgentResolveError,
+    CompilerHints, CompilerStrategy, MetaDef, OperatorDef, ProjectionPlacementSpec, Runner,
+    RunnerDef, RunnerResolutionSource, RunnerResolveError, SpawnerHints, WorkerModel,
+    CURRENT_SCHEMA_VERSION,
 };
 
 /// Bridges `mlua_flow_ir::AsyncDispatcher` to the engine's

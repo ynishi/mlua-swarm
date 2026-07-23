@@ -68,7 +68,7 @@ async fn claude_code_and_codex_bind_the_same_agent_contract_through_one_if() {
     let codex_request = binding_requests(&codex_bound);
     assert_eq!(claude_request, codex_request);
 
-    attest_bound_agents(
+    let claude_unbound = attest_bound_agents(
         &provider(
             "mse-provider-claude-code",
             "claude-plugin-1",
@@ -76,10 +76,12 @@ async fn claude_code_and_codex_bind_the_same_agent_contract_through_one_if() {
             &["Grep", "Read", "Write"],
         ),
         &mut claude_bound,
+        false,
     )
     .await
     .expect("Claude Code provider must satisfy the shared request");
-    attest_bound_agents(
+    assert!(claude_unbound.is_empty());
+    let codex_unbound = attest_bound_agents(
         &provider(
             "mse-provider-codex",
             "codex-plugin-1",
@@ -87,9 +89,11 @@ async fn claude_code_and_codex_bind_the_same_agent_contract_through_one_if() {
             &["Grep", "Read", "Shell"],
         ),
         &mut codex_bound,
+        false,
     )
     .await
     .expect("Codex provider must satisfy the shared request");
+    assert!(codex_unbound.is_empty());
 
     let claude = &claude_bound[0];
     let codex = &codex_bound[0];
@@ -114,6 +118,9 @@ async fn claude_code_and_codex_bind_the_same_agent_contract_through_one_if() {
 async fn either_platform_still_fails_closed_when_a_shared_tool_is_missing() {
     let blueprint = shared_blueprint();
     let mut bound = resolve_bound_agents(&blueprint).expect("resolve shared snapshot");
+    // A receipt that IS present but contradicts the request (missing Grep)
+    // fails even in non-strict mode — "attestation is optional, but never
+    // wrong".
     let error = attest_bound_agents(
         &provider(
             "mse-provider-codex",
@@ -122,6 +129,7 @@ async fn either_platform_still_fails_closed_when_a_shared_tool_is_missing() {
             &["Read"],
         ),
         &mut bound,
+        false,
     )
     .await
     .expect_err("missing Grep must be rejected by common Core validation");

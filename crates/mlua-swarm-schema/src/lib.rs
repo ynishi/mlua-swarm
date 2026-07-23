@@ -1214,6 +1214,35 @@ pub struct BindReceipt {
     pub capability_snapshot_digest: Option<BindingDigest>,
 }
 
+/// One provider outcome for a single [`BindRequest`].
+///
+/// A provider reports exactly one outcome per requested agent. `Bound`
+/// carries an (untrusted) [`BindReceipt`] Core still validates; `Unbound`
+/// records that the execution environment currently offers no capability for
+/// the request (e.g. the role has not joined, or the manifest declares no
+/// matching launch variant). Whether an `Unbound` outcome fails the launch
+/// or is merely observed is decided by
+/// [`CompilerStrategy::strict_binding`] — not by the provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BindOutcome {
+    /// The provider resolved a receipt for the agent. Still untrusted until
+    /// Core validates it against the originating [`BindRequest`].
+    Bound {
+        /// Provider-reported binding, validated by Core before acceptance.
+        receipt: BindReceipt,
+    },
+    /// The provider offers no capability for the request right now. The
+    /// `reason` is human-facing diagnostic text only; it never enters the
+    /// [`BoundAgent`] snapshot or its digest lineage.
+    Unbound {
+        /// Logical agent name copied from the request.
+        agent: String,
+        /// Why the provider could not bind the agent.
+        reason: String,
+    },
+}
+
 /// Core-validated capability statement pinned into a [`BoundAgent`].
 ///
 /// It deliberately omits the logical agent name because the containing
@@ -1649,6 +1678,22 @@ pub struct CompilerStrategy {
     /// `false`, it is skipped.
     #[serde(default = "default_true")]
     pub strict_kind: bool,
+    /// If `true`, every Runner-backed agent must obtain a Core-validated
+    /// attestation at launch (a binding provider is required, and any agent
+    /// the provider leaves `Unbound` fails the launch). If `false` (default),
+    /// an unattested agent runs `DeclarationOnly` and the gap is only
+    /// observed (tracing warn + a `RunRecord.degradations` entry).
+    ///
+    /// This default is deliberately the opposite of `strict_refs` /
+    /// `strict_kind` (both default `true`): those two guard *structural
+    /// integrity* of the Blueprint itself (an unresolved ref or unknown kind
+    /// is always a Blueprint bug), whereas binding attestation is an
+    /// *execution-assurance opt-in* — it depends on an execution environment
+    /// being present to attest against, which is not available for embed-only
+    /// or manifest-less launches. Requiring it by default would break every
+    /// launch that has no provider, so it is opt-in per Blueprint.
+    #[serde(default)]
+    pub strict_binding: bool,
 }
 
 fn default_true() -> bool {
@@ -1660,6 +1705,7 @@ impl Default for CompilerStrategy {
         Self {
             strict_refs: true,
             strict_kind: true,
+            strict_binding: false,
         }
     }
 }
@@ -2646,6 +2692,70 @@ mod tests {
         let json = serde_json::to_value(&def).expect("serializes");
         let back: RunnerDef = serde_json::from_value(json).expect("deserializes");
         assert_eq!(back, def);
+    }
+
+    #[test]
+    fn bind_outcome_bound_roundtrips_through_json_and_tags_outcome() {
+        let outcome = BindOutcome::Bound {
+            receipt: BindReceipt {
+                agent: "coder".to_string(),
+                request_digest: BindingDigest::sha256("req"),
+                provider_id: "mse-provider".to_string(),
+                provider_revision: Some("1".to_string()),
+                resolved_model: Some("claude-sonnet-4".to_string()),
+                effective_tools: vec!["Read".to_string(), "Write".to_string()],
+                launch_variant: Some("mse-coder".to_string()),
+                capability_snapshot_digest: None,
+            },
+        };
+        let json = serde_json::to_value(&outcome).expect("serializes");
+        assert_eq!(json["outcome"], "bound");
+        assert_eq!(json["receipt"]["agent"], "coder");
+        let back: BindOutcome = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, outcome);
+    }
+
+    #[test]
+    fn bind_outcome_unbound_roundtrips_through_json_and_tags_outcome() {
+        let outcome = BindOutcome::Unbound {
+            agent: "coder".to_string(),
+            reason: "no capability for launch variant".to_string(),
+        };
+        let json = serde_json::to_value(&outcome).expect("serializes");
+        assert_eq!(json["outcome"], "unbound");
+        assert_eq!(json["agent"], "coder");
+        assert_eq!(json["reason"], "no capability for launch variant");
+        let back: BindOutcome = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, outcome);
+    }
+
+    #[test]
+    fn bind_outcome_rejects_unknown_field() {
+        let json = serde_json::json!({
+            "outcome": "unbound",
+            "agent": "coder",
+            "reason": "gone",
+            "not_a_real_field": true,
+        });
+        let err = serde_json::from_value::<BindOutcome>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("not_a_real_field")
+                || err.to_string().contains("unknown field"),
+            "expected an unknown-field rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn compiler_strategy_strict_binding_defaults_false_and_omitted() {
+        let strategy = CompilerStrategy::default();
+        assert!(!strategy.strict_binding);
+        // Absent in JSON deserializes back to false.
+        let back: CompilerStrategy = serde_json::from_value(serde_json::json!({
+            "strict_refs": true,
+            "strict_kind": true,
+        }))
+        .expect("deserializes without strict_binding");
+        assert!(!back.strict_binding);
     }
 
     #[test]

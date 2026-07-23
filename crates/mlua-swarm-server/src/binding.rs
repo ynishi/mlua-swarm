@@ -7,8 +7,8 @@
 use crate::operator_ws::login::OperatorSessionEntry;
 use async_trait::async_trait;
 use mlua_swarm::{
-    AgentBindingProvider, BindReceipt, BindRequest, BindingBackend, BindingProviderError,
-    ManifestBindingProvider, SessionId,
+    AgentBindingProvider, BindOutcome, BindReceipt, BindRequest, BindingBackend,
+    BindingProviderError, ManifestBindingProvider, SessionId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,48 +36,55 @@ impl OperatorSessionBindingProvider {
     async fn bind_operator(
         &self,
         request: &BindRequest,
-    ) -> Result<BindReceipt, BindingProviderError> {
+    ) -> Result<BindOutcome, BindingProviderError> {
+        // A WS-backed agent with no logical binding target is a Blueprint
+        // declaration error, not a transient capability gap — keep it
+        // fail-closed rather than reporting `Unbound`.
         let target = request.binding_target.as_deref().ok_or_else(|| {
             BindingProviderError::Provider(format!(
                 "agent '{}' uses {:?} but declares no logical binding target",
                 request.agent, request.backend
             ))
         })?;
-        let sid = self
-            .roles_to_sid
-            .lock()
-            .await
-            .get(target)
-            .cloned()
-            .ok_or_else(|| {
-                BindingProviderError::Provider(format!(
-                    "no Operator session owns binding target '{target}' for agent '{}'",
-                    request.agent
-                ))
-            })?;
-        let entry = self
-            .operator_sessions
-            .lock()
-            .await
-            .get(&sid)
-            .cloned()
-            .ok_or_else(|| {
-                BindingProviderError::Provider(format!(
+        // (a) role not joined, (b) session gone, (c) no capability_manifest:
+        // the execution environment simply has nothing to attest yet. These
+        // are `Unbound` (observed, not fatal) — the non-strict launch runs
+        // DeclarationOnly and `strict_binding` decides whether they fail.
+        // (a)/(b) would fail again at real spawn-time routing anyway, so the
+        // binding stage does not pre-gate them.
+        let Some(sid) = self.roles_to_sid.lock().await.get(target).cloned() else {
+            return Ok(BindOutcome::Unbound {
+                agent: request.agent.clone(),
+                reason: format!("no Operator session owns binding target '{target}'"),
+            });
+        };
+        let Some(entry) = self.operator_sessions.lock().await.get(&sid).cloned() else {
+            return Ok(BindOutcome::Unbound {
+                agent: request.agent.clone(),
+                reason: format!(
                     "Operator session '{sid}' for binding target '{target}' disappeared"
-                ))
-            })?;
-        let manifest = entry.capability_manifest.as_ref().ok_or_else(|| {
-            BindingProviderError::Provider(format!(
-                "Operator session '{sid}' for binding target '{target}' supplied no capability_manifest"
-            ))
-        })?;
+                ),
+            });
+        };
+        let Some(manifest) = entry.capability_manifest.as_ref() else {
+            return Ok(BindOutcome::Unbound {
+                agent: request.agent.clone(),
+                reason: format!(
+                    "Operator session '{sid}' for binding target '{target}' supplied no capability_manifest"
+                ),
+            });
+        };
+        // (d) manifest lacks the requested variant surfaces as `Unbound` from
+        // the delegated `ManifestBindingProvider`; a duplicate variant stays
+        // an error there. Either way the single outcome is passed straight
+        // through.
         ManifestBindingProvider::new(manifest.clone())
             .bind(std::slice::from_ref(request))
             .await?
             .pop()
             .ok_or_else(|| {
                 BindingProviderError::Provider(format!(
-                    "Operator provider '{}' returned no receipt for agent '{}'",
+                    "Operator provider '{}' returned no outcome for agent '{}'",
                     manifest.provider_id, request.agent
                 ))
             })
@@ -89,27 +96,32 @@ impl AgentBindingProvider for OperatorSessionBindingProvider {
     async fn bind(
         &self,
         requests: &[BindRequest],
-    ) -> Result<Vec<BindReceipt>, BindingProviderError> {
-        let mut receipts = Vec::with_capacity(requests.len());
+    ) -> Result<Vec<BindOutcome>, BindingProviderError> {
+        let mut outcomes = Vec::with_capacity(requests.len());
         for request in requests {
-            let receipt = match request.backend {
+            let outcome = match request.backend {
                 BindingBackend::WsOperator | BindingBackend::WsClaudeCode => {
                     self.bind_operator(request).await?
                 }
-                BindingBackend::AgentBlockInProcess => BindReceipt {
-                    agent: request.agent.clone(),
-                    request_digest: request.request_digest.clone(),
-                    provider_id: "mse-agent-block-in-process".to_string(),
-                    provider_revision: Some(env!("CARGO_PKG_VERSION").to_string()),
-                    resolved_model: request.requested_model.clone(),
-                    effective_tools: request.requested_tools.clone(),
-                    launch_variant: None,
-                    capability_snapshot_digest: None,
+                // In-process AgentBlock still echoes a receipt (Core
+                // validates it); the registry-backed real attest is a future
+                // follow-up.
+                BindingBackend::AgentBlockInProcess => BindOutcome::Bound {
+                    receipt: BindReceipt {
+                        agent: request.agent.clone(),
+                        request_digest: request.request_digest.clone(),
+                        provider_id: "mse-agent-block-in-process".to_string(),
+                        provider_revision: Some(env!("CARGO_PKG_VERSION").to_string()),
+                        resolved_model: request.requested_model.clone(),
+                        effective_tools: request.requested_tools.clone(),
+                        launch_variant: None,
+                        capability_snapshot_digest: None,
+                    },
                 },
             };
-            receipts.push(receipt);
+            outcomes.push(outcome);
         }
-        Ok(receipts)
+        Ok(outcomes)
     }
 }
 
@@ -144,6 +156,15 @@ mod tests {
         OperatorSessionBindingProvider::new(sessions, roles)
     }
 
+    fn expect_bound(outcome: &BindOutcome) -> &mlua_swarm::BindReceipt {
+        match outcome {
+            BindOutcome::Bound { receipt } => receipt,
+            BindOutcome::Unbound { agent, reason } => {
+                panic!("expected Bound, got Unbound({agent}): {reason}")
+            }
+        }
+    }
+
     #[tokio::test]
     async fn operator_manifest_resolves_to_untrusted_receipt() {
         let manifest = AgentProviderManifest {
@@ -156,23 +177,52 @@ mod tests {
                 capability_snapshot_digest: Some(BindingDigest::sha256("manifest")),
             }],
         };
-        let receipts = provider(Some(manifest))
+        let outcomes = provider(Some(manifest))
             .await
             .bind(&[request()])
             .await
             .unwrap();
-        assert_eq!(receipts.len(), 1);
-        assert_eq!(receipts[0].provider_id, "main-ai-self-report");
-        assert_eq!(receipts[0].request_digest, request().request_digest);
-        assert_eq!(receipts[0].effective_tools, ["Read", "Write"]);
+        assert_eq!(outcomes.len(), 1);
+        let receipt = expect_bound(&outcomes[0]);
+        assert_eq!(receipt.provider_id, "main-ai-self-report");
+        assert_eq!(receipt.request_digest, request().request_digest);
+        assert_eq!(receipt.effective_tools, ["Read", "Write"]);
     }
 
     #[tokio::test]
-    async fn missing_manifest_fails_closed() {
-        let error = provider(None).await.bind(&[request()]).await.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("supplied no capability_manifest"));
+    async fn missing_manifest_reports_unbound() {
+        let outcomes = provider(None).await.bind(&[request()]).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            BindOutcome::Unbound { agent, reason } => {
+                assert_eq!(agent, "coder");
+                assert!(
+                    reason.contains("supplied no capability_manifest"),
+                    "reason: {reason}"
+                );
+            }
+            BindOutcome::Bound { .. } => panic!("expected Unbound when no manifest was submitted"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_role_reports_unbound() {
+        // A provider whose role maps are empty: the requested binding target
+        // has not joined, so the agent is Unbound (not a hard error).
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let roles = Arc::new(Mutex::new(HashMap::new()));
+        let provider = OperatorSessionBindingProvider::new(sessions, roles);
+        let outcomes = provider.bind(&[request()]).await.unwrap();
+        match &outcomes[0] {
+            BindOutcome::Unbound { agent, reason } => {
+                assert_eq!(agent, "coder");
+                assert!(
+                    reason.contains("no Operator session owns"),
+                    "reason: {reason}"
+                );
+            }
+            BindOutcome::Bound { .. } => panic!("expected Unbound when the role has not joined"),
+        }
     }
 
     #[tokio::test]
@@ -181,8 +231,9 @@ mod tests {
         request.backend = BindingBackend::AgentBlockInProcess;
         request.binding_target = None;
         request.launch_variant = None;
-        let receipts = provider(None).await.bind(&[request.clone()]).await.unwrap();
-        assert_eq!(receipts[0].provider_id, "mse-agent-block-in-process");
-        assert_eq!(receipts[0].effective_tools, request.requested_tools);
+        let outcomes = provider(None).await.bind(&[request.clone()]).await.unwrap();
+        let receipt = expect_bound(&outcomes[0]);
+        assert_eq!(receipt.provider_id, "mse-agent-block-in-process");
+        assert_eq!(receipt.effective_tools, request.requested_tools);
     }
 }

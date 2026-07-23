@@ -20,8 +20,8 @@
 //! shape.
 
 use crate::binding::{
-    attest_bound_agents, validate_bound_agent_snapshots, AgentBindingProvider,
-    LegacyWorkerBindingPolicy,
+    attest_bound_agents, binding_requests, validate_bound_agent_snapshots, AgentBindingProvider,
+    LegacyWorkerBindingPolicy, UnboundAgent,
 };
 use crate::blueprint::compiler::{materialize_bound_blueprint, CompileError, Compiler};
 use crate::blueprint::{
@@ -103,12 +103,97 @@ fn worker_bindings_from_bound_agents(
         .collect()
 }
 
+/// Attest a freshly resolved snapshot (or enforce the strict-without-provider
+/// gate) exactly once, applied identically on both first-resolution paths in
+/// [`load_or_resolve_bound_agents`].
+///
+/// `strict` = [`crate::blueprint::CompilerStrategy::strict_binding`]:
+///
+/// - With a provider: every `Bound` outcome is validated and pinned; any
+///   `Unbound` agent fails the launch when `strict`, or (non-strict) is
+///   reported through a `tracing::warn!` and, if a `RunContext` is present, a
+///   `RunRecord.degradations` entry (the existing append-only channel). The
+///   agent stays `DeclarationOnly` either way.
+/// - Without a provider: a `strict` Blueprint that declares any Runner-backed
+///   agent fails fast (`PreDispatch`) because nothing can attest it; a
+///   non-strict Blueprint runs `DeclarationOnly` (the embed use case).
+async fn attest_or_gate_fresh(
+    bound_agents: &mut [BoundAgent],
+    binding_provider: Option<&dyn AgentBindingProvider>,
+    strict: bool,
+    run_ctx: Option<&RunContext>,
+) -> Result<(), TaskLaunchError> {
+    match binding_provider {
+        Some(provider) => {
+            let unbound = attest_bound_agents(provider, bound_agents, strict)
+                .await
+                .map_err(|error| TaskLaunchError::PreDispatch(error.to_string()))?;
+            for agent in &unbound {
+                record_unbound_degradation(agent, run_ctx).await;
+            }
+            Ok(())
+        }
+        None => {
+            if strict && !binding_requests(bound_agents).is_empty() {
+                return Err(TaskLaunchError::PreDispatch(format!(
+                    "strict_binding requires a binding provider but none is injected; \
+                     {} Runner-backed agent(s) cannot be attested",
+                    binding_requests(bound_agents).len()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Record one non-strict unattested agent: a `tracing::warn!` always, plus a
+/// `RunRecord.degradations` append when a `RunContext` carries a run store.
+/// Observational only — a failed append is itself logged and never fails the
+/// launch (degradation recording must not gate a launch the strict decision
+/// already let through).
+async fn record_unbound_degradation(agent: &UnboundAgent, run_ctx: Option<&RunContext>) {
+    tracing::warn!(
+        agent = %agent.agent,
+        reason = %agent.reason,
+        "binding_unattested: agent runs DeclarationOnly (strict_binding is off)"
+    );
+    let Some(run_ctx) = run_ctx else {
+        return;
+    };
+    let entry = crate::store::run::DegradationEntry {
+        tool: "binding".to_string(),
+        error: agent.reason.clone(),
+        fallback: "DeclarationOnly".to_string(),
+        note: Some(format!(
+            "agent '{}' launched without a binding attestation (strict_binding off)",
+            agent.agent
+        )),
+        step_ref: None,
+        attempt: None,
+        at: crate::types::now_unix(),
+    };
+    if let Err(error) = run_ctx
+        .run_store
+        .append_degradation(&run_ctx.run_id, entry)
+        .await
+    {
+        tracing::warn!(
+            agent = %agent.agent,
+            %error,
+            "binding_unattested: failed to record degradation entry"
+        );
+    }
+}
+
 async fn load_or_resolve_bound_agents(
     blueprint: &Blueprint,
     run_ctx: Option<&RunContext>,
     binding_provider: Option<&dyn AgentBindingProvider>,
     legacy_worker_binding_policy: LegacyWorkerBindingPolicy,
 ) -> Result<Vec<BoundAgent>, TaskLaunchError> {
+    // Strict binding is a BP-level opt-in only (server config / launch
+    // request cascade is intentionally out of scope for this change).
+    let strict = blueprint.strategy.strict_binding;
     let resolve_fresh = || match legacy_worker_binding_policy {
         LegacyWorkerBindingPolicy::Allow => resolve_bound_agents(blueprint),
         LegacyWorkerBindingPolicy::Reject => {
@@ -117,11 +202,7 @@ async fn load_or_resolve_bound_agents(
     };
     let Some(run_ctx) = run_ctx else {
         let mut bound_agents = resolve_fresh().map_err(CompileError::from)?;
-        if let Some(provider) = binding_provider {
-            attest_bound_agents(provider, &mut bound_agents)
-                .await
-                .map_err(|error| TaskLaunchError::PreDispatch(error.to_string()))?;
-        }
+        attest_or_gate_fresh(&mut bound_agents, binding_provider, strict, None).await?;
         return Ok(bound_agents);
     };
 
@@ -147,11 +228,7 @@ async fn load_or_resolve_bound_agents(
     }
 
     let mut bound_agents = resolve_fresh().map_err(CompileError::from)?;
-    if let Some(provider) = binding_provider {
-        attest_bound_agents(provider, &mut bound_agents)
-            .await
-            .map_err(|error| TaskLaunchError::PreDispatch(error.to_string()))?;
-    }
+    attest_or_gate_fresh(&mut bound_agents, binding_provider, strict, Some(run_ctx)).await?;
     if let Some(input_json) = record.input_json {
         let mut snapshot: Value = serde_json::from_str(&input_json).map_err(|e| {
             TaskLaunchError::PreDispatch(format!("decode Run launch snapshot: {e}"))
@@ -1876,7 +1953,7 @@ mod tests {
     #[tokio::test]
     async fn run_snapshot_calls_binding_provider_only_on_first_resolution() {
         use crate::binding::{AgentBindingProvider, BindingProviderError};
-        use crate::blueprint::{BindReceipt, BindRequest};
+        use crate::blueprint::{BindOutcome, BindReceipt, BindRequest};
         use crate::store::run::{InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore};
         use crate::types::{RunId, TaskId};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1888,19 +1965,21 @@ mod tests {
             async fn bind(
                 &self,
                 requests: &[BindRequest],
-            ) -> Result<Vec<BindReceipt>, BindingProviderError> {
+            ) -> Result<Vec<BindOutcome>, BindingProviderError> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(requests
                     .iter()
-                    .map(|request| BindReceipt {
-                        agent: request.agent.clone(),
-                        request_digest: request.request_digest.clone(),
-                        provider_id: "operator-main-ai".to_string(),
-                        provider_revision: Some("test".to_string()),
-                        resolved_model: request.requested_model.clone(),
-                        effective_tools: request.requested_tools.clone(),
-                        launch_variant: request.launch_variant.clone(),
-                        capability_snapshot_digest: None,
+                    .map(|request| BindOutcome::Bound {
+                        receipt: BindReceipt {
+                            agent: request.agent.clone(),
+                            request_digest: request.request_digest.clone(),
+                            provider_id: "operator-main-ai".to_string(),
+                            provider_revision: Some("test".to_string()),
+                            resolved_model: request.requested_model.clone(),
+                            effective_tools: request.requested_tools.clone(),
+                            launch_variant: request.launch_variant.clone(),
+                            capability_snapshot_digest: None,
+                        },
                     })
                     .collect())
             }
@@ -1954,6 +2033,170 @@ mod tests {
         assert_eq!(provider.0.load(Ordering::SeqCst), 1);
         assert!(first[0].attestation.is_some());
         assert_eq!(restored, first);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // C1: `strict_binding` gate + optional attestation
+    // ──────────────────────────────────────────────────────────────────
+
+    /// A Runner-backed Blueprint whose single `worker` agent binds through a
+    /// WS Operator variant `mse-worker` requiring tool `Read`.
+    fn runner_blueprint(strict_binding: bool) -> Blueprint {
+        let mut blueprint = bp(
+            step("worker", path("$.input"), path("$.out")),
+            vec![agent("worker", "worker")],
+        );
+        blueprint.strategy.strict_binding = strict_binding;
+        blueprint.agents[0].runner = Some(Runner::WsClaudeCode {
+            variant: "mse-worker".to_string(),
+            tools: vec!["Read".to_string()],
+        });
+        blueprint
+    }
+
+    /// Provider that leaves every request `Unbound` — models a missing /
+    /// manifest-less execution environment.
+    struct AlwaysUnboundProvider;
+
+    #[async_trait::async_trait]
+    impl AgentBindingProvider for AlwaysUnboundProvider {
+        async fn bind(
+            &self,
+            requests: &[crate::blueprint::BindRequest],
+        ) -> Result<Vec<crate::blueprint::BindOutcome>, crate::binding::BindingProviderError>
+        {
+            Ok(requests
+                .iter()
+                .map(|request| crate::blueprint::BindOutcome::Unbound {
+                    agent: request.agent.clone(),
+                    reason: "no capability manifest submitted".to_string(),
+                })
+                .collect())
+        }
+    }
+
+    /// Non-strict + a provider that cannot attest → launch resolution
+    /// succeeds, the agent stays `DeclarationOnly`, and the gap is recorded
+    /// as a `RunRecord.degradations` entry.
+    #[tokio::test]
+    async fn non_strict_unbound_agent_runs_declaration_only_with_degradation() {
+        use crate::store::run::{InMemoryRunStore, RunContext, RunRecord, RunStatus, RunStore};
+        use crate::types::{RunId, TaskId};
+
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = RunId::new();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: Some("{}".to_string()),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .unwrap();
+        let run_ctx = RunContext::new(run_id.clone(), run_store.clone());
+
+        let bound = load_or_resolve_bound_agents(
+            &runner_blueprint(false),
+            Some(&run_ctx),
+            Some(&AlwaysUnboundProvider),
+            LegacyWorkerBindingPolicy::Allow,
+        )
+        .await
+        .expect("non-strict launch must succeed even without an attestation");
+        assert!(
+            bound[0].attestation.is_none(),
+            "an unattested agent must stay DeclarationOnly"
+        );
+
+        let run = run_store.get(&run_id).await.expect("run present");
+        assert_eq!(run.degradations.len(), 1, "expected one degradation entry");
+        assert_eq!(run.degradations[0].tool, "binding");
+        assert_eq!(run.degradations[0].fallback, "DeclarationOnly");
+        assert!(run.degradations[0].error.contains("no capability manifest"));
+    }
+
+    /// Strict + a provider that cannot attest → launch fails, and the error
+    /// message names the agent and its requested launch variant / tools so an
+    /// Operator can generate a satisfying manifest.
+    #[tokio::test]
+    async fn strict_unbound_agent_fails_with_requirements_in_message() {
+        let error = load_or_resolve_bound_agents(
+            &runner_blueprint(true),
+            None,
+            Some(&AlwaysUnboundProvider),
+            LegacyWorkerBindingPolicy::Allow,
+        )
+        .await
+        .expect_err("strict + Unbound must reject the launch");
+        match error {
+            TaskLaunchError::PreDispatch(message) => {
+                assert!(message.contains("worker"), "message: {message}");
+                assert!(message.contains("mse-worker"), "message: {message}");
+                assert!(message.contains("Read"), "message: {message}");
+            }
+            other => panic!("expected PreDispatch, got {other:?}"),
+        }
+    }
+
+    /// Strict + no provider at all → launch fails fast: nothing can attest the
+    /// Runner-backed agent.
+    #[tokio::test]
+    async fn strict_without_provider_rejects_runner_backed_launch() {
+        let error = load_or_resolve_bound_agents(
+            &runner_blueprint(true),
+            None,
+            None,
+            LegacyWorkerBindingPolicy::Allow,
+        )
+        .await
+        .expect_err("strict + no provider must reject a Runner-backed launch");
+        match error {
+            TaskLaunchError::PreDispatch(message) => {
+                assert!(
+                    message.contains("strict_binding requires a binding provider"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected PreDispatch, got {other:?}"),
+        }
+    }
+
+    /// Strict + a correct manifest → the agent is Attested (the pre-C1 pass
+    /// path still holds under the strict gate).
+    #[tokio::test]
+    async fn strict_with_correct_manifest_attests_the_agent() {
+        use crate::binding::ManifestBindingProvider;
+        use crate::blueprint::{AgentProviderCapability, AgentProviderManifest};
+
+        let provider = ManifestBindingProvider::new(AgentProviderManifest {
+            provider_id: "operator-main-ai".to_string(),
+            provider_revision: Some("1".to_string()),
+            capabilities: vec![AgentProviderCapability {
+                launch_variant: Some("mse-worker".to_string()),
+                resolved_model: None,
+                effective_tools: vec!["Read".to_string()],
+                capability_snapshot_digest: None,
+            }],
+        });
+        let bound = load_or_resolve_bound_agents(
+            &runner_blueprint(true),
+            None,
+            Some(&provider),
+            LegacyWorkerBindingPolicy::Allow,
+        )
+        .await
+        .expect("strict launch with a correct manifest must attest");
+        assert!(
+            bound[0].attestation.is_some(),
+            "a correctly attested agent must carry its attestation"
+        );
     }
 
     #[tokio::test]
