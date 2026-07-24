@@ -1927,6 +1927,7 @@ mod tests {
                 task_input_override: None,
                 timeout_secs: None,
                 detach: false,
+                operator_sid: None,
             })),
         )
         .await

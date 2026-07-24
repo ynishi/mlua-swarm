@@ -366,6 +366,19 @@ pub struct RunKickRequest {
     /// exclusive with `timeout_secs` (`400` when combined).
     #[serde(default)]
     pub detach: bool,
+    /// Per-Run pin to a live Operator session (rekick parity with
+    /// `POST /v1/tasks`' `operator_sid` — see
+    /// `crate::TaskLaunchRequest::operator_sid` for the full
+    /// disconnected-vs-unknown / last-write-wins contract). Resolved
+    /// before any Task/Run store write: an unknown sid fails fast with a
+    /// `400`, never silently falling back to the BP-level alias lookup.
+    /// `Some(sid)` becomes this kick's `operator_backend_id` (this handler
+    /// carries no other Operator-override field) and is persisted verbatim
+    /// into `RunRecord.operator_sid`; `None` (absent field, or no body at
+    /// all) preserves the pre-existing Operator-default rekick path
+    /// byte-for-byte.
+    #[serde(default)]
+    pub operator_sid: Option<String>,
 }
 
 /// Response body for `POST /v1/tasks/:id/runs`.
@@ -392,9 +405,10 @@ pub struct RunKickResponse {
 /// optional per-Run override}` via [`merge_init_ctx_3layer`], resolves the
 /// Task-level canonical fields (`RunKickRequest.task_input_override`,
 /// falling back to `TaskRecord.task_input_spec`), mints a fresh `RunId`,
-/// dispatches through `TaskApplication::handle_with_run` (the unadorned
-/// Operator-default path — no per-request Operator override support here,
-/// unlike `POST /v1/tasks`; the stored Task carries no such preferences)
+/// dispatches through `TaskApplication::handle_with_run` (Operator-default
+/// unless the caller pins a live session via `RunKickRequest.operator_sid`
+/// — the rekick parity for `POST /v1/tasks`' own `operator_sid`; the
+/// stored Task carries no persisted Operator preference of its own)
 /// plus a freshly-built `RunContext` (issue #13 run_id propagation, so
 /// this kick's steps get their own `step_entries` trace), and persists the
 /// outcome via [`finalize_run`].
@@ -443,6 +457,29 @@ pub async fn task_rekick(
 
     let req = body.map(|Json(r)| r).unwrap_or_default();
 
+    // S2 parity with `run_flow_form` (`lib.rs:1035-1048`): an explicit
+    // `operator_sid` pins this rekick to a live Operator session,
+    // resolved *before* any Task/Run store write so an unknown sid fails
+    // fast with a `400` rather than minting records for a kick that
+    // references a session nothing can serve. Unlike `run_flow_form` this
+    // handler has no other Operator-override field, so the resolved sid
+    // flows straight into `TaskApplicationInput.operator_backend_id`
+    // (below) and is persisted verbatim into `RunRecord.operator_sid`. See
+    // `crate::TaskLaunchRequest::operator_sid` for the disconnected-vs-
+    // unknown distinction.
+    let operator_backend_id = match &req.operator_sid {
+        Some(sid) => {
+            let known_ids = state.engine.list_operator_ids().await;
+            if !known_ids.iter().any(|id| id == sid) {
+                return Err(ApiError::bad_request(format!(
+                    "operator_sid: no such registered operator session '{sid}'"
+                )));
+            }
+            Some(sid.clone())
+        }
+        None => None,
+    };
+
     // GH #33 Guard 2 ceiling resolution (issue #35 ST3 — mirrors
     // `run_flow_form`'s `lib.rs:813-826` cascade): request field > server
     // config > built-in default. Validated up front, before Guard 1 and
@@ -471,17 +508,18 @@ pub async fn task_rekick(
         (_, None) => state.sync_timeout_secs,
     };
 
-    // GH #33 Guard 1 (issue #35 ST3 — adapted signal): `RunKickRequest`
-    // carries no per-request Operator override field (unlike
-    // `run_flow_form`'s `op_req.operator_backend_id`, sourced from
-    // `TaskLaunchRequest.operator` — this module's doc, above, confirms
-    // that's by design). The adapted "operator backend referenced" signal
-    // is the Blueprint's own `spawner_hints.layers` instead: when the
-    // resolved Blueprint declares the `operator_delegate` layer and zero
-    // operators are attached at all, fail fast rather than dispatching
-    // into a session nothing can serve. Same ordering invariant
-    // `run_flow_form` observes: this check runs before any Task/Run row
-    // is touched (no side effects on the 503 path).
+    // GH #33 Guard 1 (issue #35 — adapted signal): the
+    // per-request `operator_sid` above already fail-fasts an *unknown*
+    // sid, but a rekick with no `operator_sid` still has no per-request
+    // "operator backend referenced" signal of its own (unlike
+    // `run_flow_form`, whose `op_req.operator_backend_id` is sourced from
+    // `TaskLaunchRequest.operator`). The adapted signal is the Blueprint's
+    // own `spawner_hints.layers`: when the resolved Blueprint declares the
+    // `operator_delegate` layer and zero operators are attached at all,
+    // fail fast rather than dispatching into a session nothing can serve.
+    // Same ordering invariant `run_flow_form` observes: this check runs
+    // before any Task/Run row is touched (no side effects on the 503
+    // path).
     if resolved_bp
         .spawner_hints
         .layers
@@ -534,7 +572,7 @@ pub async fn task_rekick(
         operator_kind: None,
         bridge_id: None,
         hook_id: None,
-        operator_backend_id: None,
+        operator_backend_id,
         operator_kind_overrides: HashMap::new(),
         task_input: task_input_spec,
         // This legacy `POST /v1/tasks/:id/runs`-style path does not carry a
@@ -561,7 +599,7 @@ pub async fn task_rekick(
             status: RunStatus::Running,
             step_entries: Vec::new(),
             degradations: Vec::new(),
-            operator_sid: None,
+            operator_sid: req.operator_sid.clone(),
             result_ref: None,
             input_json,
             created_at: now,
@@ -2153,6 +2191,7 @@ mod tests {
                 task_input_override: None,
                 timeout_secs: None,
                 detach: true,
+                operator_sid: None,
             })),
         )
         .await
@@ -2191,6 +2230,7 @@ mod tests {
                 task_input_override: None,
                 timeout_secs: Some(60),
                 detach: true,
+                operator_sid: None,
             })),
         )
         .await
@@ -2427,6 +2467,7 @@ mod tests {
                 task_input_override: None,
                 timeout_secs: None,
                 detach: false,
+                operator_sid: None,
             })),
         )
         .await
@@ -2522,6 +2563,7 @@ mod tests {
                 }),
                 timeout_secs: None,
                 detach: false,
+                operator_sid: None,
             })),
         )
         .await
@@ -2652,6 +2694,7 @@ mod tests {
                     task_input_override: None,
                     timeout_secs: Some(1),
                     detach: false,
+                    operator_sid: None,
                 })),
             ),
         )
@@ -2673,12 +2716,12 @@ mod tests {
                 );
             }
             Ok(_) => {
-                // `task_rekick` hardcodes `operator_backend_id: None` for
-                // every kick (module doc, above — "no per-request Operator
-                // override support here"), so a registered-but-unattached
-                // `StallingOperator` is never actually engaged by a
-                // rekick's dispatch; the flow resolves through the plain
-                // baseline path instead. Guard 2's `tokio::time::timeout`
+                // This rekick passes no `operator_sid`, so its
+                // `operator_backend_id` stays `None` and the
+                // registered-but-unattached `StallingOperator` is never
+                // actually engaged by the dispatch; the flow resolves
+                // through the plain baseline path instead. Guard 2's
+                // `tokio::time::timeout`
                 // wrap is exercised (and does not falsely fire) rather
                 // than tripped — assert the fast-success shape so a
                 // regression that makes rekick dispatch slow (or that
@@ -2721,6 +2764,7 @@ mod tests {
                 task_input_override: None,
                 timeout_secs: Some(0),
                 detach: false,
+                operator_sid: None,
             })),
         )
         .await;
@@ -2768,6 +2812,116 @@ mod tests {
                 e.message
             );
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // B-1: rekick operator_sid pin (parity with POST /v1/tasks)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// A rekick pinning an unknown `operator_sid` fails fast with a `400`
+    /// before any Task/Run store write — no new Run is minted (S2 parity
+    /// with `run_flow_form`'s `operator_sid` fail-fast).
+    #[tokio::test]
+    async fn rekick_unknown_operator_sid_rejected_before_side_effects() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req("unknown operator_sid rekick goal")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        let before = task_get(State(state.clone()), Path(posted.task_id.to_string()))
+            .await
+            .expect("task_get")
+            .0;
+        let runs_before = before.runs.len();
+
+        let result = task_rekick(
+            State(state.clone()),
+            Path(posted.task_id.to_string()),
+            Some(Json(RunKickRequest {
+                init_ctx_override: None,
+                task_input_override: None,
+                timeout_secs: None,
+                detach: false,
+                operator_sid: Some("S-not-registered".to_string()),
+            })),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("an unknown operator_sid must be rejected, not dispatched"),
+        };
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("operator_sid"),
+            "error message must reference operator_sid: {}",
+            err.message
+        );
+
+        let after = task_get(State(state), Path(posted.task_id.to_string()))
+            .await
+            .expect("task_get")
+            .0;
+        assert_eq!(
+            after.runs.len(),
+            runs_before,
+            "a rejected unknown-operator_sid rekick must not create a new Run"
+        );
+    }
+
+    /// A rekick pinning a *registered* `operator_sid` dispatches
+    /// successfully and persists the sid verbatim onto the new
+    /// `RunRecord.operator_sid`. The Task's stored Blueprint is the plain
+    /// baseline (no `operator_delegate` layer), so the registered Operator
+    /// is never actually engaged — the kick resolves through the baseline
+    /// path and the assertion is purely on the persisted correlation
+    /// field.
+    #[tokio::test]
+    async fn rekick_with_registered_operator_sid_persists_it_on_the_run() {
+        let state = test_state();
+        // Register an Operator whose sid the rekick can pin. It is never
+        // engaged (plain Blueprint does not delegate), so a `StallingOperator`
+        // is a fine stand-in for "a live, registered session".
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req("registered operator_sid rekick goal")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        let (status, rekicked) = task_rekick(
+            State(state.clone()),
+            Path(posted.task_id.to_string()),
+            Some(Json(RunKickRequest {
+                init_ctx_override: None,
+                task_input_override: None,
+                timeout_secs: None,
+                detach: false,
+                operator_sid: Some("S-live-op".to_string()),
+            })),
+        )
+        .await
+        .expect("task_rekick with a registered operator_sid");
+        assert_eq!(status, StatusCode::CREATED);
+
+        let run = state
+            .run_store
+            .get(&rekicked.0.run_id)
+            .await
+            .expect("run get");
+        assert_eq!(
+            run.operator_sid,
+            Some("S-live-op".to_string()),
+            "the pinned operator_sid must be persisted verbatim on the RunRecord"
+        );
     }
 
     #[tokio::test]

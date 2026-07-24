@@ -95,6 +95,38 @@ impl WSOperatorSession {
         *self.tx.lock().await = None;
     }
 
+    /// Drains every in-flight `pending` entry, dropping its oneshot
+    /// `Sender`. Dropping the sender closes the reply channel, so the
+    /// matching `send_and_await` unparks from `orx.await` with an `Err`
+    /// immediately — an in-flight `ask` / `hook_before` / `spawn` fails
+    /// loud right away (for `Operator::execute`, a `WorkerError::Failed`)
+    /// instead of orphaning in `orx.await` until the run's sync timeout
+    /// (up to 300s) fires. `reason` is recorded for the log only — a
+    /// dropped `oneshot::Sender` can carry no payload, so the receiver
+    /// observes the generic "reply path closed" error.
+    ///
+    /// Called on **session teardown** (`DELETE /v1/operators/:sid` and
+    /// `/by-role`), where the session is being removed from
+    /// `operator_sessions` and can never be reconnected — so the
+    /// disconnect-survives-in-`pending` reconnect/resend contract (see the
+    /// module doc) does not apply. It is deliberately NOT called on a plain
+    /// WS disconnect, which keeps `pending` alive for a reconnecting client
+    /// to resend against.
+    pub(crate) async fn fail_pending(&self, reason: &str) {
+        let drained: Vec<(String, oneshot::Sender<PendingReply>)> =
+            self.pending.lock().await.drain().collect();
+        if !drained.is_empty() {
+            tracing::warn!(
+                sid = %self.sid,
+                count = drained.len(),
+                reason,
+                "ws operator session: failing in-flight pending replies"
+            );
+        }
+        // `drained` drops here: each `oneshot::Sender` closes its channel,
+        // unparking the corresponding `send_and_await` with an `Err`.
+    }
+
     /// Resolves the pending oneshot when a `ClientMsg` arrives on the handler's
     /// read task. If `req_id` is not registered, no-op (= silently drops unknown acks).
     pub(super) async fn resolve_pending(&self, req_id: &str, reply: PendingReply) {
@@ -1260,6 +1292,53 @@ mod tests {
 
         let err = handle.await.expect("join").expect_err("must be error");
         assert!(matches!(err, WorkerError::Failed(msg) if msg.contains("real crash")));
+    }
+
+    /// B-2: a spawn parked in `execute` (awaiting a `SpawnAck` that never
+    /// arrives) must unblock with a `WorkerError::Failed` as soon as
+    /// `fail_pending` drains the pending map — the teardown path's
+    /// immediate-fail guarantee, so a torn-down session does not leave a
+    /// spawn orphaned until the run's sync timeout fires.
+    #[tokio::test]
+    async fn fail_pending_unblocks_a_parked_spawn_with_worker_error() {
+        use mlua_swarm::{Operator, WorkerError};
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-teardown").unwrap(),
+            tx,
+            None,
+        ));
+
+        let session_bg = session.clone();
+        let handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &test_ctx("ST-teardown"),
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        // Wait until the Spawn is actually parked (its pending entry is
+        // registered) before tearing down, so the drain has something to
+        // fail rather than racing the insert.
+        let _sent = rx.recv().await.expect("Spawn sent");
+
+        session.fail_pending("operator session torn down").await;
+
+        let err = handle
+            .await
+            .expect("join")
+            .expect_err("a parked spawn must fail once pending is drained");
+        assert!(
+            matches!(err, WorkerError::Failed(_)),
+            "fail_pending must surface a WorkerError::Failed, got: {err:?}"
+        );
     }
 
     // ─── Issue #17: end-to-end `execute()` splice (ctx.meta.runtime → Spawn.directive) ───

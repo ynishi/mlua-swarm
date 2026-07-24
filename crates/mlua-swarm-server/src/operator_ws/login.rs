@@ -414,6 +414,13 @@ async fn teardown_operator_session(
     }
 
     if let Some(session) = entry.ws_session.lock().await.take() {
+        // B-2: fail every parked spawn/ask/hook_before on this session
+        // right away. Teardown removes the session from `operator_sessions`
+        // below (no reconnect can find it again), so unlike a plain WS
+        // disconnect there is no reconnect/resend contract to preserve —
+        // an in-flight spawn parked in `send_and_await` would otherwise
+        // orphan until the run's sync timeout (up to 300s) fires.
+        session.fail_pending("operator session torn down").await;
         session.clear_tx().await;
     }
 

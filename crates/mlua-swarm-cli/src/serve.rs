@@ -488,6 +488,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         None
     };
 
+    // B-4 graceful shutdown drain: keep handles to the Task/Run stores
+    // before they are moved into the router below, so the post-serve drain
+    // can mark any still-`Running` Run `Interrupted` (they are `Arc`s, so
+    // this is a refcount bump, not a second store).
+    let shutdown_task_store = task_store.clone();
+    let shutdown_run_store = run_store.clone();
+
     // Router assembly (fixed combined mode): merges task, ws_operator_factory, and every enhance route.
     let mut app = mlua_swarm_server::build_router_full_with_legacy_worker_binding_policy(
         engine.clone(),
@@ -564,13 +571,28 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         cfg.bind
     );
     let listener = tokio::net::TcpListener::bind(cfg.bind).await.expect("bind");
-    let serve = axum::serve(listener, app);
-    tokio::select! {
-        r = serve => { r.expect("serve"); }
-        _ = tokio::signal::ctrl_c() => { eprintln!("mse serve: ctrl-c, shutting down"); }
-        _ = wait_sigterm() => { eprintln!("mse serve: SIGTERM, shutting down"); }
-    }
+    // B-4: graceful shutdown. `with_graceful_shutdown` stops accepting new
+    // connections when the signal fires but lets in-flight requests finish
+    // draining, instead of the old `tokio::select!` shape that dropped the
+    // `serve` future outright (which reset in-flight HTTP to an empty reply
+    // — curl exit 52). The shutdown future selects the same two signals as
+    // before; `wait_sigterm` keeps its existing `#[cfg(unix)]` gate so the
+    // Windows build stays clean (no unconditional `tokio::signal::unix`).
+    let shutdown_signal = async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => { eprintln!("mse serve: ctrl-c, shutting down"); }
+            _ = wait_sigterm() => { eprintln!("mse serve: SIGTERM, shutting down"); }
+        }
+    };
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .expect("serve");
     enhance_loop.abort();
+    // B-4: mark any Run still `Running` after the drain `Interrupted`, so a
+    // restart does not leave it stranded `Running` forever. Runs BEFORE the
+    // isle drivers are drained below — it writes through the SQLite stores.
+    interrupt_running_on_shutdown(&shutdown_task_store, &shutdown_run_store).await;
     // Drain SQLite isle drivers (drops queued jobs, joins the SQLite thread).
     // Errors are logged but do not fail shutdown — the process is exiting.
     for driver in isle_drivers {
@@ -590,12 +612,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 /// sweep).
 ///
 /// After each Interrupted mark the replay log for the run is consulted
-/// via `ReplayStore::list_by_run`. When at least one entry exists, the
-/// run is emitted at `tracing::info!` level as a **resumable candidate**
-/// — the attached operator can then kick `POST /v1/runs/<id>/resume`
-/// under the same `run_id` (state-driven resume endpoint). Runs with no
-/// replay entries are logged at `debug!` level (not resumable — nothing
-/// to replay against). This function itself never auto-respawns: an
+/// via `ReplayStore::list_by_run`. A run counts as a **resumable
+/// candidate** when it has at least one replay entry OR a persisted
+/// launch-input snapshot (`RunRecord.input_json` — `run_resume` can
+/// re-dispatch from scratch off the snapshot even at 0 replayed steps);
+/// such runs are emitted at `tracing::info!` level so the attached
+/// operator can kick `POST /v1/runs/<id>/resume` under the same `run_id`
+/// (state-driven resume endpoint). A run with neither is not resumable,
+/// but is still logged at `info!` (not `debug!`) so the orphan stays
+/// visible at the default log level. This function itself never
+/// auto-respawns: an
 /// operator that has not attached would burn its TTL for nothing, so the
 /// actual resume kick is left to the operator (per User direction —
 /// boot-time auto-respawn is deferred to a separate issue).
@@ -616,45 +642,24 @@ async fn recover_interrupted_runs(
         }
     };
     for run in running {
-        let reason = serde_json::json!({"error": "server restart"});
-        if let Err(e) = run_store.set_result(&run.id, reason).await {
-            eprintln!(
-                "mse serve: boot sweep: run {} set_result failed: {e}",
-                run.id
-            );
-        }
-        if let Err(e) = run_store
-            .update_status(&run.id, mlua_swarm::store::run::RunStatus::Interrupted)
-            .await
-        {
-            eprintln!(
-                "mse serve: boot sweep: run {} update_status failed: {e}",
-                run.id
-            );
-        }
-        if let Err(e) = task_store
-            .update_status(
-                &run.task_id,
-                mlua_swarm::store::task::TaskRecordStatus::Interrupted,
-            )
-            .await
-        {
-            eprintln!(
-                "mse serve: boot sweep: task {} update_status failed: {e}",
-                run.task_id
-            );
-        }
+        mark_run_interrupted(task_store, run_store, &run, "server restart", "boot sweep").await;
 
-        // Classify each Interrupted run as resumable / non-resumable by
-        // consulting the replay log entry count. Emit at info! when
-        // resumable (operator can kick `POST /v1/runs/<id>/resume`) and
-        // debug! when not (nothing to replay against). Failures are
-        // logged as warn! and skipped so a single lookup error cannot
-        // stall the whole sweep.
+        // Classify each Interrupted run as resumable / non-resumable. A run
+        // is resumable via either axis: at least one replay entry (an
+        // in-place replay resume) OR a persisted launch-input snapshot
+        // (`RunRecord.input_json` — `run_resume` rebuilds the input and
+        // re-dispatches from scratch even at 0 replayed steps). Both are
+        // surfaced at info! so the operator can see every orphan that
+        // `POST /v1/runs/<id>/resume` can still recover; only a run with
+        // neither is truly non-resumable — and even that is emitted at
+        // info! (not debug!) so the orphan stays visible at the default
+        // log level rather than disappearing. Failures are logged as
+        // warn! and skipped so a single lookup error cannot stall the
+        // whole sweep.
         match replay_store.list_by_run(&run.id).await {
             Ok(entries) => {
                 let replayed_steps = entries.len();
-                if replayed_steps > 0 {
+                if replayed_steps > 0 || run.input_json.is_some() {
                     tracing::info!(
                         run_id = %run.id,
                         task_id = %run.task_id,
@@ -663,10 +668,10 @@ async fn recover_interrupted_runs(
                         "boot sweep: resumable Interrupted run"
                     );
                 } else {
-                    tracing::debug!(
+                    tracing::info!(
                         run_id = %run.id,
                         task_id = %run.task_id,
-                        "boot sweep: not resumable, no replay entries"
+                        "boot sweep: not resumable (no replay entries, no input snapshot)"
                     );
                 }
             }
@@ -679,6 +684,76 @@ async fn recover_interrupted_runs(
                 );
             }
         }
+    }
+}
+
+/// Mark a single `Running` run (and its owning Task) `Interrupted` with a
+/// structured `{"error": <reason>}` result envelope. Shared by the
+/// boot-time recovery sweep ([`recover_interrupted_runs`], `reason =
+/// "server restart"`) and the graceful-shutdown drain
+/// ([`interrupt_running_on_shutdown`], `reason = "server shutdown"`) so
+/// both stamp the identical terminal shape. Best-effort: every store error
+/// is logged (prefixed with `context`) and swallowed — neither lifecycle
+/// path can fail on a persistence hiccup while the process is starting or
+/// exiting.
+async fn mark_run_interrupted(
+    task_store: &std::sync::Arc<dyn mlua_swarm::store::task::TaskStore>,
+    run_store: &std::sync::Arc<dyn mlua_swarm::store::run::RunStore>,
+    run: &mlua_swarm::store::run::RunRecord,
+    reason: &str,
+    context: &str,
+) {
+    let envelope = serde_json::json!({ "error": reason });
+    if let Err(e) = run_store.set_result(&run.id, envelope).await {
+        eprintln!("mse serve: {context}: run {} set_result failed: {e}", run.id);
+    }
+    if let Err(e) = run_store
+        .update_status(&run.id, mlua_swarm::store::run::RunStatus::Interrupted)
+        .await
+    {
+        eprintln!(
+            "mse serve: {context}: run {} update_status failed: {e}",
+            run.id
+        );
+    }
+    if let Err(e) = task_store
+        .update_status(
+            &run.task_id,
+            mlua_swarm::store::task::TaskRecordStatus::Interrupted,
+        )
+        .await
+    {
+        eprintln!(
+            "mse serve: {context}: task {} update_status failed: {e}",
+            run.task_id
+        );
+    }
+}
+
+/// Graceful-shutdown drain (B-4): after `axum::serve`'s
+/// `with_graceful_shutdown` future has resolved (all in-flight HTTP
+/// drained), any Run still `Running` belonged to a synchronous dispatch
+/// whose handler future the drain let finish — or a detached driver the
+/// process is about to drop. Mark each `Interrupted` (same terminal shape
+/// as the boot sweep) so it does not linger `Running` forever across the
+/// restart, leaving a resumable orphan the next boot sweep / operator can
+/// pick up via `POST /v1/runs/<id>/resume`. Only meaningful with a
+/// persistent store; a fresh `InMemoryRunStore` has nothing that survives
+/// the process. Must run BEFORE the isle SQLite drivers are drained (it
+/// writes through them).
+async fn interrupt_running_on_shutdown(
+    task_store: &std::sync::Arc<dyn mlua_swarm::store::task::TaskStore>,
+    run_store: &std::sync::Arc<dyn mlua_swarm::store::run::RunStore>,
+) {
+    let running = match run_store.list_running().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("mse serve: shutdown drain: list_running failed: {e}");
+            return;
+        }
+    };
+    for run in running {
+        mark_run_interrupted(task_store, run_store, &run, "server shutdown", "shutdown drain").await;
     }
 }
 
@@ -939,5 +1014,88 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let empty = replay_store.list_by_run(&run_without_replay).await.unwrap();
         assert!(empty.is_empty());
+    }
+
+    /// B-4: the graceful-shutdown drain marks any still-`Running` Run (and
+    /// its owning Task) `Interrupted` with a `{"error": "server shutdown"}`
+    /// envelope, while leaving already-terminal runs untouched — the same
+    /// terminal shape the boot sweep stamps, only with a shutdown-specific
+    /// reason.
+    #[tokio::test]
+    async fn interrupt_running_on_shutdown_marks_running_as_interrupted() {
+        let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+
+        let running_task_id = TaskId::parse("T-shutdown-running").unwrap();
+        let done_task_id = TaskId::parse("T-shutdown-done").unwrap();
+        let running_run_id = RunId::parse("R-shutdown-running").unwrap();
+        let done_run_id = RunId::parse("R-shutdown-done").unwrap();
+
+        for (tid, status) in [
+            (&running_task_id, TaskRecordStatus::Running),
+            (&done_task_id, TaskRecordStatus::Done),
+        ] {
+            task_store
+                .create(TaskRecord {
+                    id: tid.clone(),
+                    goal: "shutdown drain fixture".into(),
+                    blueprint_ref: json!({}),
+                    input_ctx: json!({}),
+                    task_input_spec: None,
+                    status,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .await
+                .unwrap();
+        }
+        run_store
+            .create(RunRecord {
+                id: running_run_id.clone(),
+                task_id: running_task_id.clone(),
+                status: RunStatus::Running,
+                step_entries: vec![],
+                degradations: vec![],
+                operator_sid: None,
+                result_ref: None,
+                input_json: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        run_store
+            .create(RunRecord {
+                id: done_run_id.clone(),
+                task_id: done_task_id.clone(),
+                status: RunStatus::Done,
+                step_entries: vec![],
+                degradations: vec![],
+                operator_sid: None,
+                result_ref: None,
+                input_json: None,
+                created_at: 2,
+                updated_at: 2,
+            })
+            .await
+            .unwrap();
+
+        interrupt_running_on_shutdown(&task_store, &run_store).await;
+
+        let running_run = run_store.get(&running_run_id).await.unwrap();
+        assert_eq!(running_run.status, RunStatus::Interrupted);
+        assert_eq!(
+            running_run.result_ref,
+            Some(json!({"error": "server shutdown"}))
+        );
+        let running_task = task_store.get(&running_task_id).await.unwrap();
+        assert_eq!(running_task.status, TaskRecordStatus::Interrupted);
+
+        // Control: the already-Done run/task pair is untouched.
+        let done_run = run_store.get(&done_run_id).await.unwrap();
+        assert_eq!(done_run.status, RunStatus::Done);
+        assert_eq!(done_run.result_ref, None);
+        let done_task = task_store.get(&done_task_id).await.unwrap();
+        assert_eq!(done_task.status, TaskRecordStatus::Done);
     }
 }
