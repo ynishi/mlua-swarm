@@ -1,12 +1,13 @@
-//! Parity test: every one of the 6 flow_dsl Node builders (`F.step` /
-//! `F.seq` / `F.branch` / `F.loop_` / `F.assign` / `F.try_`) is reachable
-//! through `flow_dsl`, and every table it emits deserializes into
-//! `mlua_flow_ir::Node` — proving flow_dsl's Node tables are
-//! wire-shape-compatible without touching the flow-ir / schema crates.
-//! Mirrors `tests/dsl_parity.rs` (the Expr op version, same technique)
-//! one layer up: Node builders instead of Expr ops. `fanout` has no
-//! flow_dsl builder yet (flow.ir's 7th Node kind, hand-writable only via
-//! `F.raw()`), so it is out of scope for this parity test.
+//! Parity test: every one of the 7 flow_dsl Node builders (`F.step` /
+//! `F.seq` / `F.branch` / `F.loop_` / `F.fanout` / `F.assign` /
+//! `F.try_`) is reachable through `flow_dsl`, and every table it emits
+//! deserializes into `mlua_flow_ir::Node` — proving flow_dsl's Node
+//! tables are wire-shape-compatible without touching the flow-ir /
+//! schema crates. Mirrors `tests/dsl_parity.rs` (the Expr op version,
+//! same technique) one layer up: Node builders instead of Expr ops.
+//! GH #82 closes the previous 6-only gap by adding `F.fanout` — the
+//! 7th (and final) Node kind — so the closed-set assertion below tracks
+//! flow.ir's complete Node grammar.
 
 use mlua_swarm_cli::dsl;
 
@@ -63,12 +64,17 @@ fn every_node_builder_round_trips_through_flow_dsl() {
             "try",
             r#"F.try_({ body = F.seq({}), catch = F.seq({}), err_at = F.p("$.err") })"#,
         ),
+        (
+            "fanout",
+            // GH #82: F.fanout — the 7th Node builder.
+            r#"F.fanout({ items = F.lit({1, 2}), bind = F.p("$.item"), body = F.seq({}), join = "all", out = F.p("$.results") })"#,
+        ),
     ];
 
     assert_eq!(
         cases.len(),
-        6,
-        "the guide documents exactly 6 Node builders (fanout has no flow_dsl builder yet)"
+        7,
+        "the guide documents exactly 7 Node builders (GH #82 added F.fanout — flow.ir's full Node grammar is now reachable via flow_dsl)"
     );
     for (kind, node_lua) in cases {
         assert_node_parity(kind, node_lua);
@@ -89,6 +95,33 @@ fn step_node_emits_the_documented_field_names() {
             "out": {"op": "path", "at": "$.out"},
         })
     );
+}
+
+#[test]
+fn fanout_node_emits_the_documented_field_names_across_join_modes() {
+    // GH #82: assert the wire shape verbatim + parity across all four
+    // join modes. The blueprint-authoring guide's Node kind table lists
+    // exactly these four; if flow-ir grows a fifth, this test must be
+    // updated in lockstep.
+    for join in ["all", "any", "race", "all_settled"] {
+        let value = build_node(&format!(
+            r#"F.fanout({{ items = F.lit({{1, 2}}), bind = F.p("$.item"), body = F.seq({{}}), join = "{join}", out = F.p("$.results") }})"#
+        ));
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "fanout",
+                "items": {"op": "lit", "value": [1, 2]},
+                "bind": {"op": "path", "at": "$.item"},
+                "body": {"kind": "seq", "children": []},
+                "join": join,
+                "out": {"op": "path", "at": "$.results"},
+            }),
+            "join mode `{join}` did not round-trip through the wire shape"
+        );
+        serde_json::from_value::<mlua_flow_ir::Node>(value)
+            .unwrap_or_else(|e| panic!("fanout join=`{join}` failed Node deserialize: {e}"));
+    }
 }
 
 #[test]

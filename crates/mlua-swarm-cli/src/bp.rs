@@ -325,6 +325,13 @@ const DEFAULT_PIPELINE_STAGES: &[&str] = &["stage1", "stage2"];
 const DEFAULT_VERDICT_STAGES: [&str; 3] = ["analyze", "review", "publish"];
 /// GH #62 Axis A `single` template default sole-agent name.
 const DEFAULT_SINGLE_AGENT: &str = "solo";
+/// GH #82 `fanout` template default parallel-branch stage names.
+/// (The aggregate stage is a fixed positional slot appended by the
+/// renderer; only the parallel branches are `--stages`-configurable.)
+const DEFAULT_FANOUT_STAGES: &[&str] = &["checker1", "checker2"];
+/// GH #82 `fanout` template fixed name for the join/aggregate stage
+/// that consumes the fanout's `out` array.
+const FANOUT_AGGREGATE_STAGE: &str = "aggregate";
 
 fn run_new(args: NewArgs) -> Result<()> {
     let out = render_template(&args)?;
@@ -384,8 +391,17 @@ pub(crate) fn render_template_by_kind(
             operator,
             binding,
         )),
+        // GH #82: `fanout` template — N parallel checker stages + one
+        // aggregate stage. `stages` names only the parallel branches;
+        // the aggregate stage's id is fixed (`FANOUT_AGGREGATE_STAGE`).
+        "fanout" => Ok(render_fanout_template(
+            name,
+            &parse_stages(stages, DEFAULT_FANOUT_STAGES),
+            operator,
+            binding,
+        )),
         other => Err(anyhow!(
-            "unknown template '{other}': accepted = pipeline / single / verdict"
+            "unknown template '{other}': accepted = pipeline / single / verdict / fanout"
         )),
     }
 }
@@ -645,6 +661,134 @@ fn render_verdict_template(
          tools = {{}} }},\n      \
          runner = {{ backend = \"ws_operator\", variant = \"{binding}\", tools = {{}} }} }},\n"
     ));
+    out.push_str("  },\n");
+    out.push_str(&format!(
+        "  operators = {{ {{ name = \"{operator}\", kind = \"main_ai\" }} }},\n"
+    ));
+    out.push_str("  strategy = { strict_refs = true, strict_kind = true },\n");
+    out.push_str(&format!(
+        "  metadata = {{ description = \"TODO: describe {name}\" }},\n"
+    ));
+    out.push_str("}\n");
+    out
+}
+
+/// GH #82: `mse bp new fanout` — parallel branch dispatch + aggregate.
+/// Emits a `flow_dsl` shape that used to require `F.raw()`:
+/// `F.seq{ assign(items), fanout(items -> N checkers -> results), aggregate step }`.
+/// The parallel branches are named by `stages` (2+ entries); the aggregate
+/// stage's id is fixed as `FANOUT_AGGREGATE_STAGE` and reads the
+/// fanout's `$.results` array. Every declared agent — the N checkers
+/// and the aggregate — is a plain operator with the standard
+/// `ws_operator` Runner shape the other templates use, so the emitted
+/// script round-trips through the same compile-lint path.
+///
+/// The `bind` expression the fanout uses (`$.d.<checker>`) is the same
+/// `$.d.<stage>` convention `pipeline` / `verdict` follow, so the
+/// launch prerequisite is symmetric: seed each parallel branch's own
+/// input under `d` at `swarm_run` time.
+fn render_fanout_template(
+    name: &str,
+    checkers: &[String],
+    operator: &str,
+    binding: &str,
+) -> String {
+    let checkers: &[String] = if checkers.is_empty() {
+        // parse_stages returns empty only when `--stages ""` is passed
+        // literally; fall back to the same default the None arm uses.
+        return render_fanout_template(
+            name,
+            &DEFAULT_FANOUT_STAGES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+            operator,
+            binding,
+        );
+    } else {
+        checkers
+    };
+    let aggregate = FANOUT_AGGREGATE_STAGE;
+    let checker_list_lua = checkers
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let init_ctx_sample = checkers
+        .iter()
+        .map(|c| format!("{c} = \"...\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = String::new();
+    out.push_str("-- Scaffolded by `mse bp new fanout` (GH #82).\n");
+    out.push_str("-- Parallel branch dispatch + aggregate — the shape `bp_dsl` used to\n");
+    out.push_str("-- require `F.raw()` for. Every mandatory field is pre-filled\n");
+    out.push_str("-- (`halted_at` is unused here since no halt-on rule is declared;\n");
+    out.push_str("-- each operator agent's explicit `ws_operator` Runner; the\n");
+    out.push_str("-- operator's `kind = main_ai`; `strict_refs` + `strict_kind`).\n");
+    out.push_str("--\n");
+    out.push_str(
+        "-- Launch prerequisite (mirrors `pipeline` / `verdict` — GH #64): each\n",
+    );
+    out.push_str("-- checker reads its input from `$.d.<checker>`. Seed every\n");
+    out.push_str("-- checker under `d` when starting a run:\n");
+    out.push_str("--\n");
+    out.push_str(&format!(
+        "--   swarm_run(blueprint = ..., init_ctx = {{ d = {{ {init_ctx_sample} }} }})\n"
+    ));
+    out.push_str("--\n");
+    out.push_str(
+        "-- The fanout `join = \"all\"` gathers every branch's final ctx into an\n",
+    );
+    out.push_str("-- ordered array at `$.results`; the aggregate stage reads that\n");
+    out.push_str("-- array and produces the final decision.\n");
+    out.push_str("--\n");
+    out.push_str("-- See `mse://guides/blueprint-authoring` § \"Flow node kinds\" for\n");
+    out.push_str("-- the four `join` modes (`all` / `any` / `race` / `all_settled`)\n");
+    out.push_str("-- and `mse://guides/bp-dsl-templates` for this template's shape.\n\n");
+    out.push_str("local F = require(\"flow_dsl\")\n\n");
+    // Flow: pre-seed items array with the checker names, run the fanout
+    // per element (each branch runs its own step keyed on `$.d.<bind>`),
+    // then dispatch the aggregate step reading `$.results`.
+    out.push_str("local flow = F.seq({\n");
+    out.push_str(&format!(
+        "  F.assign({{ at = F.p(\"$.checkers\"), value = F.lit({{ {checker_list_lua} }}) }}),\n"
+    ));
+    // The fanout's `body` dispatches ONE step per element; the element
+    // (a checker's name) binds under `$.item`, and each branch reads
+    // its own input from `$.d.<checker_name>` — resolved statically at
+    // scaffold time so every branch dispatches its own operator agent.
+    out.push_str("  F.fanout({\n");
+    out.push_str("    items = F.p(\"$.checkers\"),\n");
+    out.push_str("    bind  = F.p(\"$.item\"),\n");
+    out.push_str("    join  = \"all\",\n");
+    out.push_str("    out   = F.p(\"$.results\"),\n");
+    // Bodies dispatched in parallel: one step per checker, each reading
+    // its own `$.d.<checker>` slot. seq-of-1 keeps the body a Node
+    // rather than a bare Step, matching the branch shape flow.ir
+    // expects.
+    out.push_str("    body  = F.seq({\n");
+    for checker in checkers {
+        out.push_str(&format!(
+            "      F.step({{ agent = \"{checker}\", input = F.p(\"$.d.{checker}\"), out = F.p(\"$.branch_out\") }}),\n"
+        ));
+    }
+    out.push_str("    }),\n");
+    out.push_str("  }),\n");
+    out.push_str(&format!(
+        "  F.step({{ agent = \"{aggregate}\", input = F.p(\"$.results\"), out = F.p(\"$.{aggregate}\") }}),\n"
+    ));
+    out.push_str("})\n\n");
+    out.push_str(&format!("return {{\n  id = \"{name}\",\n  flow = flow,\n"));
+    out.push_str("  agents = {\n");
+    for stage in checkers.iter().map(String::as_str).chain([aggregate]) {
+        out.push_str(&format!(
+            "    {{ name = \"{stage}\", kind = \"operator\",\n      \
+             spec = {{ operator_ref = \"{operator}\" }},\n      \
+             profile = {{ system_prompt = \"TODO: describe {stage}\", tools = {{}} }},\n      \
+             runner = {{ backend = \"ws_operator\", variant = \"{binding}\", tools = {{}} }} }},\n"
+        ));
+    }
     out.push_str("  },\n");
     out.push_str(&format!(
         "  operators = {{ {{ name = \"{operator}\", kind = \"main_ai\" }} }},\n"
@@ -1251,10 +1395,113 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("unknown template 'bogus'"));
         // Accepted list appears in the error so an author who typos sees
-        // the closed set.
+        // the closed set. GH #82 grew this set to include `fanout`.
         assert!(msg.contains("pipeline"));
         assert!(msg.contains("single"));
         assert!(msg.contains("verdict"));
+        assert!(msg.contains("fanout"));
+    }
+
+    // ─── GH #82: fanout template ─────────────────────────────────────
+
+    #[test]
+    fn fanout_template_round_trips_with_defaults() {
+        let rendered =
+            render_template_by_kind("fanout", "roundtrip-fanout", None, None, None, None)
+                .expect("render must succeed with defaults");
+        // Default: 2 parallel checkers + 1 aggregate = 3 operator agents,
+        // all pointing at the single main-ai operator.
+        assert_eq!(rendered.matches("kind = \"operator\"").count(), 3);
+        assert!(rendered.contains("F.fanout({"));
+        assert!(rendered.contains("join  = \"all\","));
+        for checker in DEFAULT_FANOUT_STAGES {
+            assert!(
+                rendered.contains(&format!("agent = \"{checker}\"")),
+                "default checker '{checker}' missing"
+            );
+        }
+        assert!(rendered.contains(&format!("agent = \"{FANOUT_AGGREGATE_STAGE}\"")));
+        let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
+        assert!(matches!(
+            report,
+            LintReport::Ok {
+                agents: 3,
+                operators: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn fanout_template_honours_stages_flag() {
+        let rendered = render_template_by_kind(
+            "fanout",
+            "custom-fanout",
+            Some("lint,test,build"),
+            None,
+            None,
+            None,
+        )
+        .expect("render must succeed with 3 stages");
+        // 3 checkers + aggregate = 4 operator agents.
+        assert_eq!(rendered.matches("kind = \"operator\"").count(), 4);
+        for checker in ["lint", "test", "build"] {
+            assert!(
+                rendered.contains(&format!("agent = \"{checker}\"")),
+                "custom checker '{checker}' missing"
+            );
+        }
+        assert!(rendered.contains(&format!("agent = \"{FANOUT_AGGREGATE_STAGE}\"")));
+        let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
+        assert!(matches!(
+            report,
+            LintReport::Ok {
+                agents: 4,
+                operators: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn fanout_template_documents_init_ctx_seeding() {
+        // GH #82 mirrors GH #64: fanout shares the `$.d.<stage>` seeding
+        // convention every other operator-agent template uses.
+        let rendered = render_template_by_kind(
+            "fanout",
+            "seed-doc-fanout",
+            Some("lint,test"),
+            None,
+            None,
+            None,
+        )
+        .expect("render must succeed");
+        assert!(
+            rendered.contains("$.d.lint"),
+            "each checker must read its input from $.d.<checker>"
+        );
+        assert!(
+            rendered.contains("init_ctx = { d = { lint = \"...\", test = \"...\" } }"),
+            "fanout header must ship a concrete init_ctx sample tied to the checker names"
+        );
+        assert!(
+            rendered.contains("mse://guides/bp-dsl-templates"),
+            "fanout header must link to the guide covering the convention"
+        );
+    }
+
+    #[test]
+    fn fanout_template_with_empty_stages_flag_falls_back_to_defaults() {
+        // parse_stages returns empty for `--stages ""`; render_fanout_template
+        // recovers by recursing with DEFAULT_FANOUT_STAGES rather than
+        // emitting an empty fanout body (which would fail compile-lint).
+        let rendered = render_template_by_kind("fanout", "recov", Some(""), None, None, None)
+            .expect("render must succeed with empty stages");
+        for checker in DEFAULT_FANOUT_STAGES {
+            assert!(
+                rendered.contains(&format!("agent = \"{checker}\"")),
+                "empty-stages fallback must include default checker '{checker}'"
+            );
+        }
+        build_and_compile_lint(&rendered).expect("empty-stages fallback must compile-lint");
     }
 
     // ─── GH #62 Axis B.1: fix_hint pattern matching ─────────────────

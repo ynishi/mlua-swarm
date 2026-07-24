@@ -56,6 +56,7 @@
 //! | `mse://blueprints/samples/07-dsl-pipeline`   | Sample `.bp.lua` — bp_dsl verdict-gated pipeline.   |
 //! | `mse://blueprints/samples/08-bundled-refs`   | Sample `.bp.lua` — `$agent_md` refs into the bundled `samples/agents/` dir (include cascade). |
 //! | `mse://blueprints/samples/09-skip-on-example`| Sample `.bp.lua` — GH #76 DSL sugar `skip_on` DSL sugar (Skip tier). |
+//! | `mse://blueprints/samples/10-fanout`         | Sample `.bp.lua` — GH #82 `F.fanout` (parallel branch dispatch + aggregate) — the shape `bp_dsl` used to require `F.raw()`. |
 //! | `mse://guides/skip-tier-and-skip-on`         | Skip tier semantics + `skip_on = { ... }` DSL surface + `bp_doctor` `skip_on_lint` family + error surface (GH #76). |
 //! | `mse://api/blueprint-schema`                 | Live Blueprint JSON Schema (generated per read).    |
 //! | `mse://api/http-endpoints`                   | Live HTTP wire-body JSON Schemas, keyed by endpoint (issue #19). |
@@ -134,6 +135,7 @@ const SAMPLE_08_BUNDLED_REFS_BODY: &str =
     include_str!("./resources/samples/08-bundled-refs.bp.lua");
 const SAMPLE_09_SKIP_ON_EXAMPLE_BODY: &str =
     include_str!("./resources/samples/bp/skip-on-example.bp.lua");
+const SAMPLE_10_FANOUT_BODY: &str = include_str!("./resources/samples/09-fanout.bp.lua");
 
 /// Static resource catalogue. Order is the order `list_resources` reports.
 pub const RESOURCES: &[ResourceEntry] = &[
@@ -304,6 +306,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "Three-stage analyst chain (triage -> analyze -> summarize) whose middle stage uses `skip_on = { \"NOT_APPLICABLE\" }` to pre-emptively elide its body when triage's staged verdict part reads NOT_APPLICABLE, letting the pipeline continue to summarize. Runnable via `mse bp build` (embed the agents inline). Full semantics: mse://guides/skip-tier-and-skip-on.",
         mime_type: "text/x-lua",
         body: ResourceBody::Static(SAMPLE_09_SKIP_ON_EXAMPLE_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://blueprints/samples/10-fanout",
+        title: "Sample .bp.lua — parallel branch dispatch + aggregate (F.fanout, GH #82)",
+        description: "GH #82: three independent checkers (lint / test / build) dispatched in parallel via `F.fanout` (join = \"all\"); an aggregate stage consumes the collected `$.results` array. Demonstrates the `F.fanout` builder — flow.ir's 7th Node kind, previously reachable only via `F.raw()`. Full semantics: `mse://guides/blueprint-authoring` § \"Flow node kinds\"; scaffold recipe: `mse://guides/bp-dsl-templates`.",
+        mime_type: "text/x-lua",
+        body: ResourceBody::Static(SAMPLE_10_FANOUT_BODY),
     },
     ResourceEntry {
         uri: "mse://guides/skip-tier-and-skip-on",
@@ -691,6 +700,7 @@ mod tests {
             "mse://blueprints/samples/07-dsl-pipeline",
             "mse://blueprints/samples/08-bundled-refs",
             "mse://blueprints/samples/09-skip-on-example",
+            "mse://blueprints/samples/10-fanout",
         ] {
             let entry = find_by_uri(uri).unwrap_or_else(|| panic!("sample must exist: {uri}"));
             let body = body_for(entry).expect("sample body must generate");

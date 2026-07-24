@@ -22,11 +22,12 @@
 ---
 --- ## Node builders
 ---
---- `F.step` / `F.seq` / `F.branch` / `F.loop_` / `F.assign` / `F.try_`
---- return plain Lua tables (no metatable) shaped like flow.ir `Node`s.
---- `loop` / `try` / `in` are Lua reserved words, hence the `loop_` / `try_`
---- suffixes on the Node builders and the `input` rename on `F.step`;
---- `then` / `else` (Branch) are reserved too, hence `on_true` / `on_false`.
+--- `F.step` / `F.seq` / `F.branch` / `F.loop_` / `F.fanout` / `F.assign` /
+--- `F.try_` return plain Lua tables (no metatable) shaped like flow.ir
+--- `Node`s. `loop` / `try` / `in` are Lua reserved words, hence the
+--- `loop_` / `try_` suffixes on the Node builders and the `input` rename
+--- on `F.step`; `then` / `else` (Branch) are reserved too, hence
+--- `on_true` / `on_false`.
 
 local M = {}
 
@@ -234,6 +235,28 @@ function M.loop_(t)
     cond = M.unwrap(t.cond),
     body = t.body,
     max = t.max,
+  }
+end
+
+--- `F.fanout{items=, bind=, body=, join=, out=}` — a `fanout` Node
+--- (parallel branch dispatch + aggregate; GH #82). `items` evaluates
+--- to an array; `body` runs once per element, bound to the write
+--- target `bind` inside a branch-local ctx; results aggregate into
+--- `out` per the `join` mode (`"all"` — every branch runs, array of
+--- final ctx; `"any"` — first success wins; `"race"` — first to settle
+--- wins; `"all_settled"` — never raises, per-item `{status,
+--- value|reason}` record). `items` / `bind` / `out` accept an Expr
+--- wrapper or a raw value (auto-`lit`), same convention as the sibling
+--- builders. `join` is a plain string. See `mse://guides/blueprint-authoring`
+--- § "Flow node kinds" for the wire schema and semantics.
+function M.fanout(t)
+  return {
+    kind = "fanout",
+    items = M.unwrap(t.items),
+    bind = M.unwrap(t.bind),
+    body = t.body,
+    join = t.join,
+    out = M.unwrap(t.out),
   }
 end
 

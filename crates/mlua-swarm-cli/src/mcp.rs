@@ -441,17 +441,20 @@ struct BpDoctorReq {
 #[derive(Deserialize, JsonSchema)]
 struct BpNewReq {
     /// Template kind: `pipeline` (N-stage main-ai) / `single` (one-agent
-    /// one-step) / `verdict` (3-stage verdict-gated with retry-through-fixer).
-    /// Any other value returns `status: "error"`, `stage: "render"` with the
-    /// accepted list — the DSL parser stays strict; the "fuzzy" scope
-    /// (`GH #62 Axis B`) is separate.
+    /// one-step) / `verdict` (3-stage verdict-gated with retry-through-fixer) /
+    /// `fanout` (N parallel checkers + aggregate stage, GH #82). Any other
+    /// value returns `status: "error"`, `stage: "render"` with the accepted
+    /// list — the DSL parser stays strict; the "fuzzy" scope (`GH #62 Axis
+    /// B`) is separate.
     template: String,
     /// Blueprint id (also the emitted `id` field in the rendered script).
     name: String,
-    /// Stage names, comma-separated. `pipeline` / `verdict` only.
+    /// Stage names, comma-separated. `pipeline` / `verdict` / `fanout`.
     /// `pipeline` default: `stage1,stage2`. `verdict` default:
     /// `analyze,review,publish` (fixed 3-stage — extras ignored, missing
-    /// slots fall back to defaults per position).
+    /// slots fall back to defaults per position). `fanout` default:
+    /// `checker1,checker2` for the parallel branches, followed by an
+    /// implicit `aggregate` stage.
     #[serde(default)]
     stages: Option<String>,
     /// Agent name for the `single` template. Default `solo`.
@@ -2993,7 +2996,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Scaffold a minimal `.bp.lua` from a bundled template with every currently-mandatory field pre-filled (`halted_at` compile-lint default, each operator agent's explicit platform-neutral `ws_operator` Runner, `strict_refs`/`strict_kind`) — the MCP twin of the `mse bp new` CLI (GH #62 Axis A). Templates: `pipeline` (N-stage main-ai with `--stages`), `single` (one-agent one-step), `verdict` (3-stage verdict-gated with retry-through-fixer, fixed shape mirroring `mse://blueprints/samples/07-dsl-pipeline`). When `out` is set, writes the rendered text to that path (relative resolves against the mse-mcp process CWD) and reports the byte count; when omitted, includes the rendered `.bp.lua` inline as `script`. Failures return `status: \"error\"` with `stage` (`render` for unknown template / rendering, `write_out` for I/O). Guide: `mse://guides/bp-dsl-templates` lists every template + flag surface. Non-goal: fuzzy parsing — the DSL parser stays strict; the fuzzy scope (GH #62 Axis B, lint→patch mapping) is a separate follow-up."
+        description = "Scaffold a minimal `.bp.lua` from a bundled template with every currently-mandatory field pre-filled (`halted_at` compile-lint default, each operator agent's explicit platform-neutral `ws_operator` Runner, `strict_refs`/`strict_kind`) — the MCP twin of the `mse bp new` CLI (GH #62 Axis A). Templates: `pipeline` (N-stage main-ai with `--stages`), `single` (one-agent one-step), `verdict` (3-stage verdict-gated with retry-through-fixer, fixed shape mirroring `mse://blueprints/samples/07-dsl-pipeline`), `fanout` (N parallel checkers + aggregate stage using `F.fanout` — GH #82; the shape `bp_dsl` previously could not express without `F.raw()`, mirroring `mse://blueprints/samples/09-fanout`). When `out` is set, writes the rendered text to that path (relative resolves against the mse-mcp process CWD) and reports the byte count; when omitted, includes the rendered `.bp.lua` inline as `script`. Failures return `status: \"error\"` with `stage` (`render` for unknown template / rendering, `write_out` for I/O). Guide: `mse://guides/bp-dsl-templates` lists every template + flag surface. Non-goal: fuzzy parsing — the DSL parser stays strict; the fuzzy scope (GH #62 Axis B, lint→patch mapping) is a separate follow-up."
     )]
     async fn bp_new(
         &self,

@@ -88,6 +88,47 @@ consumes on PASS). Variable stage counts would change the flow shape,
 not just role names — use `pipeline` if you need N stages without
 verdict gating.
 
+### `fanout` — N parallel checkers + aggregate (GH #82)
+
+`F.fanout` shape: N independent checker agents dispatch in parallel,
+their branch results collect into `$.results` (`join = "all"`), and a
+fixed `aggregate` stage consumes that array. This is the shape
+`bp_dsl` used to require `F.raw()` for; GH #82 added the 7th (and
+final) Node builder to `flow_dsl` so the whole flow.ir Node grammar
+is now reachable from the DSL.
+
+```
+mse bp new fanout ci-gate
+mse bp new fanout ci-gate --stages lint,test,build
+mse bp new fanout ci-gate -o ci-gate.bp.lua
+```
+
+Flags:
+
+| flag | meaning | default |
+|---|---|---|
+| `--stages` | Comma-separated names for the parallel checkers — one agent emitted per checker (the aggregate stage's id is fixed at `aggregate`). | `checker1,checker2` |
+| `--operator` | Operator role name every agent points at. | `main-ai` |
+| `--binding` | Every operator agent's `ws_operator` Runner variant. | `claude` |
+| `-o` / `--out` | Write to this path instead of stdout. | stdout |
+
+Each checker reads its own `$.d.<checker>` slot at launch time (the
+`$.d.<stage>` seeding convention `pipeline` and `verdict` use), so
+seed every checker under `d` when starting a run:
+
+```
+swarm_run(blueprint = ..., init_ctx = { d = { lint = "...", test = "...", build = "..." } })
+```
+
+The rendered flow uses `F.fanout{items, bind, body, join, out}` with
+`join = "all"` (every branch runs, results collect in order). To
+short-circuit on the first success, first settlement, or gather
+per-item status without raising, switch `join` to `"any"` /
+`"race"` / `"all_settled"` respectively — the runtime already
+supports all four modes; see `mse://guides/blueprint-authoring`
+§ "Flow node kinds" for the semantics of each. Live sample:
+`mse://blueprints/samples/10-fanout`.
+
 ## Rendered shape guarantees
 
 Every template's output:
@@ -95,7 +136,7 @@ Every template's output:
 - Passes `mse bp build` compile-lint on first run (including the GH #61
   explicit Runner gate and the GH #60 `halted_at` default).
 - Uses `require("bp_dsl")` (`pipeline` / `verdict`) or `require("flow_dsl")`
-  (`single`) — no other DSL crates.
+  (`single` / `fanout`) — no other DSL crates.
 - Sets every operator agent's platform-neutral `ws_operator` Runner variant to `--binding`.
 - Sets `strategy = { strict_refs = true, strict_kind = true }`.
 - Ships `TODO:` markers in every `system_prompt` and `metadata.description` —

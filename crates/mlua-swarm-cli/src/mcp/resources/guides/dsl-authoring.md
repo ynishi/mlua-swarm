@@ -58,9 +58,12 @@ comparison Expr — there is no `E1 < E2` shorthand.
 
 ## Node builders
 
-`flow_dsl` exposes exactly **6** Node builders, matching 6 of the 7
-`flow.ir` Node kinds (`step` / `seq` / `branch` / `loop` / `assign` / `try`).
+`flow_dsl` exposes exactly **7** Node builders, one per `flow.ir` Node
+kind (`step` / `seq` / `branch` / `loop` / `fanout` / `assign` / `try`).
 Each returns a plain Lua table (no metatable) shaped like a `flow.ir` `Node`.
+GH #82 closed the previous 6-only gap by adding `F.fanout`; the full
+`flow.ir` Node grammar is now reachable through the DSL without
+resorting to `F.raw()`.
 
 | kind     | flow_dsl builder                                   | field mapping                                                                                     |
 |----------|-------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
@@ -68,20 +71,9 @@ Each returns a plain Lua table (no metatable) shaped like a `flow.ir` `Node`.
 | `seq`    | `F.seq{node1, node2, ...}`                             | The list -> wire `children`, evaluated in order.                                                    |
 | `branch` | `F.branch{cond=, on_true=, on_false=}`                 | `cond` -> wire `cond`; `on_true` -> wire `then`; `on_false` -> wire `else` (`then`/`else` are Lua reserved words). |
 | `loop_`  | `F.loop_{counter=, cond=, max=, body=}`                | `counter` -> wire `counter`; `cond` -> wire `cond`; `max` -> wire `max`; `body` -> wire `body` (`loop` is a Lua reserved word, hence the trailing underscore). |
+| `fanout` | `F.fanout{items=, bind=, body=, join=, out=}`          | `items` -> wire `items`; `bind` -> wire `bind`; `body` -> wire `body`; `join` -> wire `join` (`"all"` / `"any"` / `"race"` / `"all_settled"` — see `mse://guides/blueprint-authoring` § Flow node kinds); `out` -> wire `out`. Parallel branch dispatch + aggregate — the shape `bp_dsl` previously required `F.raw()` for (GH #82). Live sample: `mse://blueprints/samples/10-fanout`; scaffold: `mse bp new fanout`. |
 | `assign` | `F.assign{at=, value=}`                                | `at` -> wire `at`; `value` -> wire `value`. Pure ctx transform, no agent dispatch.                   |
 | `try_`   | `F.try_{body=, catch=, err_at=}`                       | `body` -> wire `body`; `catch` -> wire `catch`; `err_at` -> wire `err_at` (optional — omitted entirely from the emitted table when not given, matching the wire schema's default). `try` is a Lua reserved word, hence the trailing underscore. |
-
-**`fanout` has no `flow_dsl` builder.** `flow.ir`'s `Node` schema has a
-7th kind, `fanout` (`items` / `bind` / `body` / `join` / `out`, evaluated
-per-item over an array with `all` / `any` / `race` / `all_settled` join
-modes — see `mse://guides/blueprint-authoring` § Flow node kinds), but
-`flow_dsl` does not currently expose a dedicated builder for it. Author a
-`fanout` Node by hand with `F.raw(t)`, the general escape hatch that
-treats an arbitrary raw AST table as an Expr/Node wrapper passthrough (no
-validation — `t` is emitted verbatim). This is a current gap in `flow_dsl`'s
-surface, not an intentional omission from the `flow.ir` vocabulary; do not
-read the absence of a `fanout` row above as `fanout` itself being
-deprecated or unsupported by the engine.
 
 ## `bp_dsl` pipeline conventions
 
