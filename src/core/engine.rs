@@ -2106,6 +2106,42 @@ impl Engine {
         Ok(())
     }
 
+    /// GH #83: unconditionally materialize the baked system prompt for
+    /// `(task_id, attempt)` to a file and return its path — the value
+    /// source of the `{system_file}` placeholder in a `SubprocessDef`
+    /// template. Unlike [`Self::apply_system_ref_threshold`] (whose
+    /// `SystemRefMode::File` write only fires over
+    /// `SystemRefConfig.threshold_bytes`, a behavior this helper does NOT
+    /// touch), a template that names `{system_file}` needs a real path
+    /// regardless of size, so the write here is unconditional. Reuses the
+    /// same store dir and `{task_id}-{attempt}.md` naming as the File
+    /// mode, so both paths converge on one on-disk identity per attempt.
+    ///
+    /// `Ok(None)` = no system prompt was baked for this attempt (the
+    /// caller decides whether that is fail-loud — the Subprocess spawn
+    /// path treats a `{system_file}` reference without a baked system as
+    /// a `SpawnError`).
+    pub async fn materialize_system_file(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+    ) -> Result<Option<std::path::PathBuf>, EngineError> {
+        let key = (task_id.clone(), attempt);
+        let rendered = self
+            .with_state("materialize_system_file", move |s| {
+                s.systems.get(&key).cloned().unwrap_or(None)
+            })
+            .await?;
+        let Some(rendered) = rendered else {
+            return Ok(None);
+        };
+        let cfg = self.cfg().system_ref.clone();
+        tokio::fs::create_dir_all(&cfg.store_dir).await?;
+        let path = cfg.store_dir.join(format!("{task_id}-{attempt}.md"));
+        tokio::fs::write(&path, rendered.as_bytes()).await?;
+        Ok(Some(path))
+    }
+
     /// Returns the effective [`mlua_swarm_schema::ContextPolicy`]
     /// `AgentContextMiddleware` resolved and snapshotted for `(task_id,
     /// attempt)` at spawn time (the same policy already applied to that
@@ -3861,6 +3897,46 @@ mod system_ref_threshold_tests {
             "most-recently-observed size wins, not the largest"
         );
     }
+
+    /// GH #83: `materialize_system_file` writes the baked system prompt
+    /// unconditionally — a system well UNDER `threshold_bytes` still
+    /// lands on disk, because a `{system_file}` template reference needs
+    /// a real path regardless of size.
+    #[tokio::test]
+    async fn materialize_system_file_writes_under_threshold_system() {
+        let mut cfg = EngineCfg::default();
+        cfg.system_ref.store_dir =
+            std::env::temp_dir().join(format!("mse-system-file-test-{}", crate::types::now_unix()));
+        assert!(cfg.system_ref.threshold_bytes > 64, "fixture premise");
+        let (engine, _op_token, task_id) = seeded_engine_with_cfg(cfg).await;
+        let rendered = "a short system prompt".to_string();
+        engine
+            .bake_worker_system_prompt(&task_id, 1, Some(rendered.clone()))
+            .await
+            .expect("bake");
+        let path = engine
+            .materialize_system_file(&task_id, 1)
+            .await
+            .expect("materialize_system_file")
+            .expect("baked system must yield a path");
+        let written = tokio::fs::read_to_string(&path)
+            .await
+            .expect("materialized path must exist");
+        assert_eq!(written, rendered);
+    }
+
+    /// GH #83: no baked system → `Ok(None)` (the Subprocess spawn path
+    /// turns this into a fail-loud `SpawnError` when `{system_file}` is
+    /// actually referenced).
+    #[tokio::test]
+    async fn materialize_system_file_none_when_nothing_baked() {
+        let (engine, _op_token, task_id) = seeded_engine_with_cfg(EngineCfg::default()).await;
+        let path = engine
+            .materialize_system_file(&task_id, 1)
+            .await
+            .expect("materialize_system_file");
+        assert!(path.is_none());
+    }
 }
 
 /// subtask-4 / ST2 rework: `submit_output` / `submit_worker_result_trusted`'s
@@ -4099,6 +4175,7 @@ mod submit_time_projection_sink_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         };

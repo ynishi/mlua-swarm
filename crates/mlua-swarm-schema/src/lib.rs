@@ -72,6 +72,7 @@
 //!     degradation_policy: None,
 //!     runners: vec![],
 //!     default_runner: None,
+//!     subprocesses: vec![],
 //!     check_policy: None,
 //!     blueprint_ref_includes: vec![],
 //! };
@@ -114,6 +115,7 @@
 //!     degradation_policy: None,
 //!     runners: vec![],
 //!     default_runner: None,
+//!     subprocesses: vec![],
 //!     check_policy: None,
 //!     blueprint_ref_includes: vec![],
 //! };
@@ -414,6 +416,13 @@ pub struct Blueprint {
     /// declared — every pre-#46 Blueprint is unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_runner: Option<String>,
+    /// GH #83 — named registry of [`SubprocessDef`] CLI invocation
+    /// templates, referenced by `Runner::Subprocess { template }` by
+    /// name. Same registry shape as [`Self::metas`] / [`Self::runners`].
+    /// `[]` (the default) = no templates declared — every pre-#83
+    /// Blueprint is unaffected, byte-for-byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subprocesses: Vec<SubprocessDef>,
     /// "Blueprint" tier (tier 2) of the `check_policy`
     /// cascade: `launch request > blueprint > server config` (highest to
     /// lowest priority). The launch entry point resolves
@@ -914,6 +923,133 @@ pub enum Runner {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tools: Vec<String>,
     },
+    /// GH #83 — Subprocess EmbedAgent backend: the step runs headless
+    /// through the `ProcessSpawner` path, with the invocation described by
+    /// a [`SubprocessDef`] template looked up by name in
+    /// [`Blueprint::subprocesses`]. Name symmetry with
+    /// `AgentKind::Subprocess` is deliberate (1:1 — this variant is the
+    /// Runner-axis face of the same Worker IMPL kind).
+    ///
+    /// Per-agent overrides live HERE (not on `SubprocessDef`) so the
+    /// template struct stays flat and shareable across agents.
+    Subprocess {
+        /// [`SubprocessDef::name`] reference into
+        /// [`Blueprint::subprocesses`].
+        template: String,
+        /// Per-agent overrides applied on top of the referenced template
+        /// and the agent profile. Empty (all defaults) is omitted on the
+        /// wire.
+        #[serde(default, skip_serializing_if = "SubprocessOverrides::is_empty")]
+        overrides: SubprocessOverrides,
+    },
+}
+
+/// Per-agent overrides for [`Runner::Subprocess`] — values that take
+/// precedence over the agent's `profile.model` / `profile.tools` and the
+/// spawn-time `{work_dir}` placeholder source when rendering the
+/// [`SubprocessDef`] template. Lives on the Runner variant (not on
+/// `SubprocessDef`) so the template itself stays flat (no per-agent
+/// state, no variant axis).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubprocessOverrides {
+    /// Overrides the `{model}` placeholder value (wins over
+    /// `profile.model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Overrides the `{tools_csv}` placeholder value (wins over
+    /// `profile.tools`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// Overrides the child process working directory (wins over the
+    /// template's `cwd` and the spawn-time `{work_dir}` source).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+impl SubprocessOverrides {
+    /// `true` when every field is at its default — used by
+    /// `skip_serializing_if` so an empty overrides block stays off the
+    /// wire (pre-#83 byte-compatibility for the `Runner` enum).
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none() && self.tools.is_empty() && self.cwd.is_none()
+    }
+}
+
+/// GH #83 — one declarative CLI invocation template: how a materialized
+/// worker payload (system prompt + task + model/tools/cwd) is rendered
+/// into a child-process invocation, and how its stdout is normalized back
+/// into the worker-result shape.
+///
+/// Deliberately a **flat struct** — no internal variant/kind
+/// discriminator. Adding support for a new CLI backend means adding one
+/// more named entry to [`Blueprint::subprocesses`], never a new enum arm
+/// or spawner branch (the `AgentKind` closed enum already owns the kind
+/// axis; nesting a second "backend" hierarchy under it is the exact
+/// complexity this shape refuses).
+///
+/// `argv` / `stdin` / `env` values / `cwd` may contain `{placeholder}`
+/// tokens drawn from a closed, logic-free set (`{system}` /
+/// `{system_file}` / `{prompt}` / `{model}` / `{tools_csv}` /
+/// `{work_dir}` / `{task_id}` / `{attempt}`). Rendering is pure string
+/// substitution — no conditionals, no loops, no expression language; the
+/// engine-side consumer validates tokens against the closed set at
+/// compile time. This crate stores the templates as plain strings only
+/// (IN-immutability: no execution logic here).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubprocessDef {
+    /// Registry key, referenced by `Runner::Subprocess { template }`.
+    pub name: String,
+    /// Program + arguments. `argv[0]` is the binary; every element may
+    /// carry placeholder tokens.
+    pub argv: Vec<String>,
+    /// Rendered and piped to the child's stdin when `Some`; `None` = no
+    /// stdin write (EOF immediately).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
+    /// Extra environment variables (appended to the engine's `MSE_*`
+    /// token exports). Values may carry placeholder tokens. `BTreeMap`
+    /// for a deterministic wire order.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Child working directory (may carry placeholder tokens). `None` =
+    /// the spawn-time `{work_dir}` source decides (or the engine default
+    /// when no source exists).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// stdout normalization declaration. `None` = the engine's historical
+    /// JSON-or-raw behavior, byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<SubprocessOutput>,
+    /// Streaming wire protocol for stdout (`"ndjson_lines"` /
+    /// `"sse_events"` / `"length_prefixed"` — same vocabulary as the
+    /// spec-based Subprocess path). `None` = plain mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_mode: Option<String>,
+}
+
+/// GH #83 — declarative stdout → worker-result normalization for a
+/// [`SubprocessDef`] (plain mode only; streaming modes keep their event
+/// protocol untouched).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubprocessOutput {
+    /// Expected stdout format. `Some("json")` = stdout MUST parse as
+    /// JSON (an unparsable stdout is a failed step). `None` = the
+    /// historical lenient JSON-or-raw wrap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// JSON Pointer (RFC 6901) selecting the worker-result value out of
+    /// the parsed stdout (e.g. `"/result"`). `None` = the whole parsed
+    /// value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ptr: Option<String>,
+    /// Where the ok/failure signal comes from: `"exit_code"` (default
+    /// behavior) or a JSON Pointer into the parsed stdout whose value
+    /// must be boolean `true` for ok.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok_from: Option<String>,
 }
 
 /// One [`Blueprint::runners`] registry entry — a named [`Runner`]
@@ -1886,6 +2022,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         }
@@ -2692,6 +2829,169 @@ mod tests {
         let json = serde_json::to_value(&def).expect("serializes");
         let back: RunnerDef = serde_json::from_value(json).expect("deserializes");
         assert_eq!(back, def);
+    }
+
+    // ─── GH #83: SubprocessDef / Runner::Subprocess ────────────────
+
+    fn sample_subprocess_def(name: &str) -> SubprocessDef {
+        SubprocessDef {
+            name: name.to_string(),
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo '{\"result\": \"ok\"}'".to_string(),
+            ],
+            stdin: Some("{prompt}".to_string()),
+            env: std::collections::BTreeMap::from([("EXTRA".to_string(), "{task_id}".to_string())]),
+            cwd: Some("{work_dir}".to_string()),
+            output: Some(SubprocessOutput {
+                format: Some("json".to_string()),
+                result_ptr: Some("/result".to_string()),
+                ok_from: Some("exit_code".to_string()),
+            }),
+            stream_mode: None,
+        }
+    }
+
+    #[test]
+    fn subprocess_def_roundtrips_through_json() {
+        let def = sample_subprocess_def("echo-json");
+        let json = serde_json::to_value(&def).expect("serializes");
+        let back: SubprocessDef = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, def);
+    }
+
+    #[test]
+    fn subprocess_def_optional_fields_omitted_when_default() {
+        let def = SubprocessDef {
+            name: "min".to_string(),
+            argv: vec!["cat".to_string()],
+            stdin: None,
+            env: Default::default(),
+            cwd: None,
+            output: None,
+            stream_mode: None,
+        };
+        let json = serde_json::to_value(&def).expect("serializes");
+        let obj = json.as_object().unwrap();
+        for absent in ["stdin", "env", "cwd", "output", "stream_mode"] {
+            assert!(
+                !obj.contains_key(absent),
+                "{absent} key must be absent when default: {json}"
+            );
+        }
+        let back: SubprocessDef = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, def);
+    }
+
+    #[test]
+    fn subprocess_def_rejects_unknown_field() {
+        let json = serde_json::json!({
+            "name": "x",
+            "argv": ["cat"],
+            "not_a_real_field": true,
+        });
+        let err = serde_json::from_value::<SubprocessDef>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected an unknown-field rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn blueprint_subprocesses_defaults_to_empty_and_stays_off_the_wire() {
+        // Pre-#83 BP JSON (no `subprocesses` key) deserializes to an empty registry.
+        let bp = minimal_bp(None);
+        let json = serde_json::to_value(&bp).expect("serializes");
+        assert!(
+            json.as_object().unwrap().get("subprocesses").is_none(),
+            "subprocesses key must be absent when empty: {json}"
+        );
+        let back: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert!(back.subprocesses.is_empty());
+    }
+
+    #[test]
+    fn blueprint_subprocesses_roundtrips_when_declared() {
+        let mut bp = minimal_bp(None);
+        bp.subprocesses = vec![sample_subprocess_def("echo-json")];
+        let json = serde_json::to_value(&bp).expect("serializes");
+        assert_eq!(json["subprocesses"][0]["name"], "echo-json");
+        let back: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.subprocesses, bp.subprocesses);
+    }
+
+    #[test]
+    fn runner_subprocess_roundtrips_through_json_and_tags_backend() {
+        // 1:1 name symmetry with AgentKind::Subprocess — tag must be "subprocess".
+        let runner = Runner::Subprocess {
+            template: "echo-json".to_string(),
+            overrides: SubprocessOverrides {
+                model: Some("small".to_string()),
+                tools: vec!["Read".to_string()],
+                cwd: Some("/tmp/wd".to_string()),
+            },
+        };
+        let json = serde_json::to_value(&runner).expect("serializes");
+        assert_eq!(json["backend"], "subprocess");
+        assert_eq!(json["template"], "echo-json");
+        assert_eq!(json["overrides"]["model"], "small");
+        let back: Runner = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, runner);
+    }
+
+    #[test]
+    fn runner_subprocess_overrides_omitted_when_empty() {
+        let runner = Runner::Subprocess {
+            template: "echo-json".to_string(),
+            overrides: SubprocessOverrides::default(),
+        };
+        let json = serde_json::to_value(&runner).expect("serializes");
+        assert!(
+            json.as_object().unwrap().get("overrides").is_none(),
+            "overrides key must be absent when all-default: {json}"
+        );
+        let back: Runner = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, runner);
+    }
+
+    #[test]
+    fn resolve_runner_inline_subprocess_variant_resolves() {
+        let inline = Runner::Subprocess {
+            template: "echo-json".to_string(),
+            overrides: SubprocessOverrides::default(),
+        };
+        let agent = agent_with_runner("headless", None, Some(inline.clone()), None);
+        let mut bp = minimal_bp(None);
+        bp.agents = vec![agent.clone()];
+
+        let resolved = resolve_runner(&bp, &agent).expect("resolves");
+        assert_eq!(resolved, Some(inline));
+    }
+
+    #[test]
+    fn resolve_runner_registry_and_default_tiers_resolve_subprocess_variant() {
+        let registry_runner = Runner::Subprocess {
+            template: "echo-json".to_string(),
+            overrides: SubprocessOverrides::default(),
+        };
+        // Tier 2: runner_ref → registry.
+        let agent = agent_with_runner("headless", None, None, Some("proc-entry".to_string()));
+        let mut bp = minimal_bp(None);
+        bp.runners = vec![RunnerDef {
+            name: "proc-entry".to_string(),
+            runner: registry_runner.clone(),
+        }];
+        bp.agents = vec![agent.clone()];
+        let resolved = resolve_runner(&bp, &agent).expect("resolves");
+        assert_eq!(resolved, Some(registry_runner.clone()));
+
+        // Tier 4: default_runner alone.
+        let bare = agent_with_runner("headless", None, None, None);
+        bp.agents = vec![bare.clone()];
+        bp.default_runner = Some("proc-entry".to_string());
+        let resolved = resolve_runner(&bp, &bare).expect("resolves");
+        assert_eq!(resolved, Some(registry_runner));
     }
 
     #[test]

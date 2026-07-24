@@ -57,6 +57,8 @@
 //! | `mse://blueprints/samples/08-bundled-refs`   | Sample `.bp.lua` — `$agent_md` refs into the bundled `samples/agents/` dir (include cascade). |
 //! | `mse://blueprints/samples/09-skip-on-example`| Sample `.bp.lua` — GH #76 DSL sugar `skip_on` DSL sugar (Skip tier). |
 //! | `mse://blueprints/samples/10-fanout`         | Sample `.bp.lua` — GH #82 `F.fanout` (parallel branch dispatch + aggregate) — the shape `bp_dsl` used to require `F.raw()`. |
+//! | `mse://guides/subprocess-backends`           | GH #83 SubprocessDef CLI invocation templates (EmbedAgent): closed placeholder set, output normalization, Runner::Subprocess binding. |
+//! | `mse://blueprints/samples/11-subprocess-embed` | GH #83 sample — two headless workers on different SubprocessDef templates, neutral binaries only. |
 //! | `mse://guides/skip-tier-and-skip-on`         | Skip tier semantics + `skip_on = { ... }` DSL surface + `bp_doctor` `skip_on_lint` family + error surface (GH #76). |
 //! | `mse://api/blueprint-schema`                 | Live Blueprint JSON Schema (generated per read).    |
 //! | `mse://api/http-endpoints`                   | Live HTTP wire-body JSON Schemas, keyed by endpoint (issue #19). |
@@ -118,6 +120,7 @@ const BP_LIFECYCLE_BODY: &str = include_str!("./resources/guides/bp-lifecycle.md
 const LINT_DIAGNOSTIC_MODEL_BODY: &str =
     include_str!("./resources/guides/lint-diagnostic-model.md");
 const STRICT_EMBED_MODES_BODY: &str = include_str!("./resources/guides/strict-embed-modes.md");
+const SUBPROCESS_BACKENDS_BODY: &str = include_str!("./resources/guides/subprocess-backends.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -136,6 +139,8 @@ const SAMPLE_08_BUNDLED_REFS_BODY: &str =
 const SAMPLE_09_SKIP_ON_EXAMPLE_BODY: &str =
     include_str!("./resources/samples/bp/skip-on-example.bp.lua");
 const SAMPLE_10_FANOUT_BODY: &str = include_str!("./resources/samples/09-fanout.bp.lua");
+const SAMPLE_11_SUBPROCESS_EMBED_BODY: &str =
+    include_str!("./resources/samples/11-subprocess-embed.json");
 
 /// Static resource catalogue. Order is the order `list_resources` reports.
 pub const RESOURCES: &[ResourceEntry] = &[
@@ -313,6 +318,20 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "GH #82: three independent checkers (lint / test / build) dispatched in parallel via `F.fanout` (join = \"all\"); an aggregate stage consumes the collected `$.results` array. Demonstrates the `F.fanout` builder — flow.ir's 7th Node kind, previously reachable only via `F.raw()`. Full semantics: `mse://guides/blueprint-authoring` § \"Flow node kinds\"; scaffold recipe: `mse://guides/bp-dsl-templates`.",
         mime_type: "text/x-lua",
         body: ResourceBody::Static(SAMPLE_10_FANOUT_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/subprocess-backends",
+        title: "mse — Subprocess backends (SubprocessDef CLI invocation templates)",
+        description: "GH #83: declarative per-worker CLI backend descriptors for headless Subprocess workers (EmbedAgent). SubprocessDef fields (argv/stdin/env/cwd/output/stream_mode), the closed logic-free placeholder set ({system}/{system_file}/{prompt}/{model}/{tools_csv}/{work_dir}/{task_id}/{attempt}), output normalization (format/result_ptr/ok_from), Runner::Subprocess binding + overrides, failure semantics, and a runnable neutral-binary example. Adding a new CLI backend = one more Blueprint.subprocesses entry, no spawner code.",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(SUBPROCESS_BACKENDS_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://blueprints/samples/11-subprocess-embed",
+        title: "Sample Blueprint — Subprocess EmbedAgent templates (GH #83)",
+        description: "GH #83: two headless workers backed by different SubprocessDef templates in one Blueprint — one pipes {prompt} to stdin and reads {system_file} back via env, one is a bare echo; both extract their worker result via output.result_ptr. Neutral binaries only (sh) — runnable with no vendor CLI installed. Authoring guide: mse://guides/subprocess-backends.",
+        mime_type: "application/json",
+        body: ResourceBody::Static(SAMPLE_11_SUBPROCESS_EMBED_BODY),
     },
     ResourceEntry {
         uri: "mse://guides/skip-tier-and-skip-on",
@@ -497,6 +516,29 @@ mod tests {
         assert!(find_by_uri("mse://guides/nonexistent").is_none());
         assert!(find_by_uri("mse://other/getting-started").is_none());
         assert!(find_by_uri("https://example.com").is_none());
+    }
+
+    /// GH #83: the bundled subprocess-embed sample must stay a valid
+    /// Blueprint document — schema drift in `SubprocessDef` /
+    /// `Runner::Subprocess` breaks this test before it breaks a reader.
+    #[test]
+    fn bundled_sample_subprocess_embed_deserializes_as_blueprint() {
+        let bp: Blueprint = serde_json::from_str(SAMPLE_11_SUBPROCESS_EMBED_BODY)
+            .expect("bundled 11-subprocess-embed sample must deserialize as a Blueprint");
+        assert_eq!(bp.subprocesses.len(), 2, "two templates declared");
+        assert_eq!(bp.agents.len(), 2, "two workers declared");
+        for agent in &bp.agents {
+            let runner = mlua_swarm::blueprint::resolve_runner(&bp, agent)
+                .expect("resolve_runner")
+                .expect("every sample agent declares a Runner");
+            let mlua_swarm::blueprint::Runner::Subprocess { template, .. } = runner else {
+                panic!("sample agents must resolve to Runner::Subprocess");
+            };
+            assert!(
+                bp.subprocesses.iter().any(|d| d.name == template),
+                "template '{template}' must be declared in Blueprint.subprocesses"
+            );
+        }
     }
 
     #[test]

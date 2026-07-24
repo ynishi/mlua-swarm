@@ -275,6 +275,10 @@ pub fn binding_request_for_snapshot(bound: &BoundAgent) -> Option<BindRequest> {
             canonical_tools(tools),
             None,
         ),
+        // GH #83: a Subprocess-backed agent runs as a headless local child
+        // process — there is no execution-environment provider to bind, so
+        // no platform-neutral BindRequest is emitted for it.
+        Runner::Subprocess { .. } => return None,
     };
     Some(BindRequest {
         agent: bound.agent.name.clone(),
@@ -647,6 +651,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: vec![],
         };

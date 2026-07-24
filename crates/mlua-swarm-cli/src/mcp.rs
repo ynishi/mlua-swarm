@@ -4444,6 +4444,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         }
@@ -6691,6 +6692,7 @@ mod tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         };

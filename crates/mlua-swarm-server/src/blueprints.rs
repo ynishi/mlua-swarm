@@ -716,6 +716,12 @@ fn runner_kind_mismatch_warning(
             "agent '{agent_name}' resolves to Runner::WsClaudeCode but AgentDef.kind = AgentBlock"
         )),
         (Runner::WsClaudeCode { .. }, _) => None,
+        // GH #83: Runner::Subprocess pairs 1:1 with AgentKind::Subprocess.
+        (Runner::Subprocess { .. }, AgentKind::Subprocess) => None,
+        (Runner::Subprocess { .. }, other) => Some(format!(
+            "agent '{agent_name}' resolves to Runner::Subprocess but AgentDef.kind = {other:?} \
+             (expected Subprocess)"
+        )),
     }
 }
 
@@ -1118,6 +1124,7 @@ mod explain_agent_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         }
@@ -1447,6 +1454,7 @@ mod explain_agent_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         }
@@ -1538,6 +1546,7 @@ mod explain_agent_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         };
@@ -1631,6 +1640,7 @@ mod explain_agent_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         }
