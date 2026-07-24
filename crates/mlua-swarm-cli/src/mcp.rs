@@ -1098,6 +1098,269 @@ fn classify_skip_on_lint(bp: &Blueprint) -> serde_json::Value {
 const WRAPPER_ONLY_CONTRACT_TOOLS: &[&str] =
     &["mcp__mse__mse_worker_fetch", "mcp__mse__mse_worker_submit"];
 
+// ─── GH #79 Phase 3: classify_* → Diagnostic siblings ─────────────────────
+//
+// Each `classify_*` family gains a sibling that projects its JSON
+// verdict into the unified `mlua_swarm_diag::Diagnostic` shape. The
+// siblings consume the classifier *output* rather than re-running the
+// family logic — one logic source, one projection — and only emit a
+// Diagnostic for findings (an `OK` verdict projects to nothing). The
+// old family-specific response fields stay in place (additive, minor
+// bump); Phase 4 retires them.
+
+/// Map a `bp_doctor` severity string to the unified level. `OK` never
+/// reaches this fn (callers skip OK verdicts before projecting).
+fn diag_level_from_severity(severity: &str) -> mlua_swarm_diag::DiagLevel {
+    match severity {
+        "BLOCK" => mlua_swarm_diag::DiagLevel::Error,
+        "INFO" => mlua_swarm_diag::DiagLevel::Info,
+        _ => mlua_swarm_diag::DiagLevel::Warn,
+    }
+}
+
+/// Shorthand: an `agents[]` span for a named agent.
+fn diag_agent_span(agent: &str) -> mlua_swarm_diag::DiagSpan {
+    mlua_swarm_diag::DiagSpan {
+        element: mlua_swarm_diag::DiagElement::Agent {
+            name: agent.to_string(),
+        },
+        json_path: Some(format!("$.agents[?(@.name=='{agent}')]")),
+    }
+}
+
+/// Sibling of [`classify_agent_md_severity`]: project one agent's size
+/// verdict. `OK` → `None`.
+fn diag_from_agent_md(
+    agent: &str,
+    severity: &str,
+    bytes: usize,
+    lines: usize,
+) -> Option<mlua_swarm_diag::Diagnostic> {
+    use mlua_swarm_diag::{BpDoctorFamily, DiagStage, Diagnostic, DocsRef};
+    if severity == "OK" {
+        return None;
+    }
+    Some(
+        Diagnostic::new(
+            "agent-md-size",
+            DiagStage::BpDoctor {
+                family: BpDoctorFamily::AgentMdSize,
+            },
+            diag_level_from_severity(severity),
+            format!(
+                "agent '{agent}' system_prompt is {bytes} bytes / {lines} lines — over the \
+                 authoring-guide size target"
+            ),
+        )
+        .with_docs_ref(DocsRef {
+            uri: "mse://guides/agent-md-authoring",
+            anchor: None,
+        })
+        .with_span(diag_agent_span(agent)),
+    )
+}
+
+/// Sibling of [`classify_tool_lint`]: project one agent's phantom-tool
+/// verdict. `OK` → `None`.
+fn diag_from_tool_lint(
+    agent: &str,
+    verdict: &serde_json::Value,
+) -> Option<mlua_swarm_diag::Diagnostic> {
+    use mlua_swarm_diag::{BpDoctorFamily, DiagStage, Diagnostic, DocsRef};
+    let severity = verdict.get("severity")?.as_str()?;
+    if severity == "OK" {
+        return None;
+    }
+    let unknown: Vec<String> = verdict
+        .get("unknown_tools")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut d = Diagnostic::new(
+        "tool-unknown-mcp-ref",
+        DiagStage::BpDoctor {
+            family: BpDoctorFamily::ToolLint,
+        },
+        diag_level_from_severity(severity),
+        format!(
+            "agent '{agent}' profile.tools references {} mcp__mse__ tool(s) absent from the \
+             live registry",
+            unknown.len()
+        ),
+    )
+    .with_docs_ref(DocsRef {
+        uri: "mse://guides/mcp-tool-reference",
+        anchor: None,
+    })
+    .with_span(diag_agent_span(agent));
+    for tool in unknown {
+        d = d.with_note(format!("unknown tool: {tool}"));
+    }
+    Some(d)
+}
+
+/// Sibling of [`classify_output_contract_lint`]: project one agent's
+/// output-contract verdict. `OK` → `None`.
+fn diag_from_output_contract_lint(
+    agent: &str,
+    verdict: &serde_json::Value,
+) -> Option<mlua_swarm_diag::Diagnostic> {
+    use mlua_swarm_diag::{BpDoctorFamily, DiagStage, Diagnostic, DocsRef};
+    let severity = verdict.get("severity")?.as_str()?;
+    if severity == "OK" {
+        return None;
+    }
+    let reason = verdict
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("expected_output declaration missing or malformed");
+    Some(
+        Diagnostic::new(
+            "output-contract-missing",
+            DiagStage::BpDoctor {
+                family: BpDoctorFamily::OutputContractLint,
+            },
+            diag_level_from_severity(severity),
+            format!("agent '{agent}': {reason}"),
+        )
+        .with_docs_ref(DocsRef {
+            uri: "mse://guides/agent-md-authoring",
+            anchor: None,
+        })
+        .with_span(diag_agent_span(agent)),
+    )
+}
+
+/// Sibling of [`classify_worker_binding_lint`]: project one agent's
+/// worker-binding verdict. `OK` → `None`.
+///
+/// Same lint kind (`worker-binding-missing`) the compile stage emits as
+/// `Error` via `From<&CompileError>` — here at `Warn` (report-only),
+/// realizing the GH #79 dual-stage story: one `LintDecl`, one docs
+/// anchor, one downstream switch key.
+fn diag_from_worker_binding_lint(
+    agent: &str,
+    verdict: &serde_json::Value,
+) -> Option<mlua_swarm_diag::Diagnostic> {
+    use mlua_swarm_diag::{
+        Applicability, BpDoctorFamily, DiagStage, Diagnostic, DocsRef, Suggestion,
+    };
+    let severity = verdict.get("severity")?.as_str()?;
+    if severity == "OK" {
+        return None;
+    }
+    let mut d = Diagnostic::new(
+        "worker-binding-missing",
+        DiagStage::BpDoctor {
+            family: BpDoctorFamily::WorkerBindingLint,
+        },
+        diag_level_from_severity(severity),
+        format!("operator agent '{agent}' lacks worker_binding"),
+    )
+    .with_help(
+        "the WS thin-path operator backend requires a Runner (or legacy \
+         profile.worker_binding) at dispatch",
+    )
+    .with_suggestion(Suggestion {
+        msg: "add an explicit Runner (or legacy profile.worker_binding)".into(),
+        patch: "runner = { backend = \"ws_operator\", variant = \"claude\", tools = {} }".into(),
+        applicability: Applicability::HasPlaceholders,
+    })
+    .with_docs_ref(DocsRef {
+        uri: "mse://guides/bp-dsl-templates",
+        anchor: None,
+    })
+    .with_span(mlua_swarm_diag::DiagSpan {
+        element: mlua_swarm_diag::DiagElement::Agent {
+            name: agent.to_string(),
+        },
+        json_path: Some(format!(
+            "$.agents[?(@.name=='{agent}')].profile.worker_binding"
+        )),
+    });
+    if let Some(reason) = verdict.get("reason").and_then(|v| v.as_str()) {
+        d = d.with_note(reason.to_string());
+    }
+    Some(d)
+}
+
+/// Sibling of [`classify_binding_lint`] / [`classify_skip_on_lint`]:
+/// project a Blueprint-scoped `{"findings": [...]}` verdict. Shared
+/// walker — the two families' findings carry the same
+/// `check` / `severity` / `message` / optional `agent` shape; `check`
+/// keys map to the kebab-case registry kinds.
+fn diag_from_findings(
+    family: mlua_swarm_diag::BpDoctorFamily,
+    verdict: &serde_json::Value,
+) -> Vec<mlua_swarm_diag::Diagnostic> {
+    use mlua_swarm_diag::{DiagElement, DiagSpan, DiagStage, Diagnostic, DocsRef};
+    let docs_uri = match family {
+        mlua_swarm_diag::BpDoctorFamily::SkipOnLint => "mse://guides/skip-tier-and-skip-on",
+        _ => "mse://guides/operator-execution-model",
+    };
+    let Some(findings) = verdict.get("findings").and_then(|f| f.as_array()) else {
+        return Vec::new();
+    };
+    findings
+        .iter()
+        .filter_map(|finding| {
+            let check = finding.get("check")?.as_str()?;
+            let kind: &'static str = match check {
+                "binding_requirements_info" => "binding-requirements-info",
+                "strict_binding_without_runners" => "strict-binding-without-runners",
+                "legacy_worker_binding" => "legacy-worker-binding",
+                "binding_resolution_error" => "binding-resolution-error",
+                "skip_on_missing_for_skip_like_verdict_value" => {
+                    "skip-on-missing-for-skip-like-verdict-value"
+                }
+                "skip_on_declared_but_no_matching_verdict_value" => {
+                    "skip-on-declared-but-no-matching-verdict-value"
+                }
+                "skip_on_pattern_conflicts_with_halt_on" => {
+                    "skip-on-pattern-conflicts-with-halt-on"
+                }
+                // A future check without a registry kind is skipped
+                // rather than emitted with an undeclared kind — the
+                // old `findings` field still carries it verbatim.
+                _ => return None,
+            };
+            let severity = finding
+                .get("severity")
+                .and_then(|s| s.as_str())
+                .unwrap_or("WARN");
+            let message = finding
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or(check)
+                .to_string();
+            let span = match finding.get("agent").and_then(|a| a.as_str()) {
+                Some(agent) => diag_agent_span(agent),
+                None => DiagSpan {
+                    element: DiagElement::BlueprintRoot,
+                    json_path: None,
+                },
+            };
+            Some(
+                Diagnostic::new(
+                    kind,
+                    DiagStage::BpDoctor { family },
+                    diag_level_from_severity(severity),
+                    message,
+                )
+                .with_docs_ref(DocsRef {
+                    uri: docs_uri,
+                    anchor: None,
+                })
+                .with_span(span),
+            )
+        })
+        .collect()
+}
+
 /// Builds the [`WRAPPER_ONLY_CONTRACT_TOOLS`] allow-list as a `BTreeSet`,
 /// for [`classify_wrapper_only`]'s `contract` parameter.
 fn wrapper_only_contract_set() -> std::collections::BTreeSet<String> {
@@ -2707,21 +2970,36 @@ impl MseServer {
                 // GH #62 Axis B.1: attach a structured `fix_hint` when
                 // the Compiler error matches a known lint kind. `null`
                 // otherwise — never a wrong-but-confident hint.
+                // GH #79 Phase 2: also attach the unified `diagnostic`
+                // (typed `CompileError` → `Diagnostic` projection, no
+                // substring re-parse) — additive alongside `fix_hint`,
+                // which now derives from the same Diagnostic when the
+                // typed path recognizes the failure.
                 let msg = format!("{e:#}");
-                let fix_hint = crate::bp::fix_hint_from_compile_error(&msg).map(|h| {
-                    serde_json::json!({
-                        "kind": h.kind,
-                        "reason": h.reason,
-                        "patch_suggestion": h.patch_suggestion,
-                        "docs_ref": h.docs_ref,
-                    })
-                });
+                let diagnostic = crate::bp::diagnostic_for_error(&e);
+                let fix_hint = diagnostic
+                    .as_ref()
+                    .and_then(crate::bp::fix_hint_from_diagnostic)
+                    .or_else(|| crate::bp::fix_hint_from_compile_error(&msg))
+                    .map(|h| {
+                        serde_json::json!({
+                            "kind": h.kind,
+                            "reason": h.reason,
+                            "patch_suggestion": h.patch_suggestion,
+                            "docs_ref": h.docs_ref,
+                        })
+                    });
+                let diagnostic_json = diagnostic
+                    .as_ref()
+                    .map(|d| serde_json::to_value(d).unwrap_or(serde_json::Value::Null))
+                    .unwrap_or(serde_json::Value::Null);
                 return json_result(&serde_json::json!({
                     "status": "error",
                     "stage": "lint",
                     "script_path": req.script_path,
                     "error": msg,
                     "fix_hint": fix_hint,
+                    "diagnostic": diagnostic_json,
                     "blueprint": bp_value,
                 }));
             }
@@ -2813,7 +3091,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Per-Blueprint agent.md size check plus GH #45 contract lints and GH #61 worker_binding lint. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline. GH #45: each agent entry also carries `tool_lint` (phantom MCP tool refs — profile.tools entries with the `mcp__mse__` prefix are compared against the live `mse://api/mcp-tools` registry; unknown names surface as WARN with the unknown tool list) and `output_contract_lint` (absent or malformed `profile.extras.expected_output` under the GH #44 convention surfaces as WARN with a specific reason). GH #61: each operator-kind agent additionally carries `worker_binding_lint` (missing `profile.worker_binding` surfaces as WARN — same fail-loud condition `Compiler::compile` enforces at dispatch, retroactively surfaced on already-registered Blueprints); non-operator kinds are OK and carry `kind_requires_binding: false`. Any per-agent family can be disabled per call via `disable_tool_lint` / `disable_output_contract_lint` / `disable_worker_binding_lint`; the disabled family's field is omitted entirely from each entry (not `null`) so a caller cannot mistake a disabled family for a passed check. C4: a Blueprint-scoped `binding_lint` family (default enabled; disable via `disable_binding_lint`) is attached as a top-level `binding_lint.findings` array (omitted entirely when disabled) — advisory operator-binding checks: `binding_requirements_info` (INFO — one finding per Runner-backed agent listing the launch variant / tools / model a joining operator's capability_manifest must cover, identical to GET /v1/blueprints/:id/binding-requirements), `strict_binding_without_runners` (WARN — strategy.strict_binding is true but no agent resolves to a Runner, so strict is a no-op), and `legacy_worker_binding` (WARN — an agent's Runner came from the deprecated profile.worker_binding fallback; migrate to runner / runner_ref). The aggregate verdict folds size + tool + contract + worker_binding + binding_lint-WARN severities via the same OK/WARN/BLOCK precedence (binding_lint INFO findings never escalate the verdict)."
+        description = "Per-Blueprint agent.md size check plus GH #45 contract lints and GH #61 worker_binding lint. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline. GH #45: each agent entry also carries `tool_lint` (phantom MCP tool refs — profile.tools entries with the `mcp__mse__` prefix are compared against the live `mse://api/mcp-tools` registry; unknown names surface as WARN with the unknown tool list) and `output_contract_lint` (absent or malformed `profile.extras.expected_output` under the GH #44 convention surfaces as WARN with a specific reason). GH #61: each operator-kind agent additionally carries `worker_binding_lint` (missing `profile.worker_binding` surfaces as WARN — same fail-loud condition `Compiler::compile` enforces at dispatch, retroactively surfaced on already-registered Blueprints); non-operator kinds are OK and carry `kind_requires_binding: false`. Any per-agent family can be disabled per call via `disable_tool_lint` / `disable_output_contract_lint` / `disable_worker_binding_lint`; the disabled family's field is omitted entirely from each entry (not `null`) so a caller cannot mistake a disabled family for a passed check. C4: a Blueprint-scoped `binding_lint` family (default enabled; disable via `disable_binding_lint`) is attached as a top-level `binding_lint.findings` array (omitted entirely when disabled) — advisory operator-binding checks: `binding_requirements_info` (INFO — one finding per Runner-backed agent listing the launch variant / tools / model a joining operator's capability_manifest must cover, identical to GET /v1/blueprints/:id/binding-requirements), `strict_binding_without_runners` (WARN — strategy.strict_binding is true but no agent resolves to a Runner, so strict is a no-op), and `legacy_worker_binding` (WARN — an agent's Runner came from the deprecated profile.worker_binding fallback; migrate to runner / runner_ref). The aggregate verdict folds size + tool + contract + worker_binding + binding_lint-WARN severities via the same OK/WARN/BLOCK precedence (binding_lint INFO findings never escalate the verdict). GH #79 Phase 3: the response additionally carries a top-level `diagnostics: [...]` array — the unified Clippy-style projection of every finding across every family (`mlua-swarm-diag` `Diagnostic` wire shape: stable `kind`, `stage {type, family}`, `level`, `message`/`notes`/`help`, optional `suggestion {msg, patch, applicability}`, `docs_ref`, `span`). Additive alongside the family-specific fields above (which remain authoritative for current callers and are slated for removal in a future major bump); an OK verdict contributes no diagnostics entry, so an all-clear Blueprint reports `diagnostics: []`. Lint kinds and the add-a-lint recipe: `mse://guides/lint-diagnostic-model`."
     )]
     async fn bp_doctor(
         &self,
@@ -2873,6 +3151,10 @@ impl MseServer {
 
         let mut per_agent = Vec::with_capacity(bp.agents.len());
         let mut severities: Vec<&'static str> = Vec::with_capacity(bp.agents.len());
+        // GH #79 Phase 3: the unified `diagnostics` projection,
+        // accumulated alongside (not instead of) the family-specific
+        // fields below — additive; Phase 4 retires the old surface.
+        let mut diagnostics: Vec<mlua_swarm_diag::Diagnostic> = Vec::new();
         // GH #45 / #61: track lint-family severities separately so the
         // aggregate verdict can factor them in without disturbing the
         // size-check `severities` vec (which downstream callers already
@@ -2887,6 +3169,7 @@ impl MseServer {
             };
             let severity = classify_agent_md_severity(bytes, lines, &thresholds);
             severities.push(severity);
+            diagnostics.extend(diag_from_agent_md(&agent.name, severity, bytes, lines));
 
             // GH #31: live post-render size lookup, reusing the same
             // `bind`/`client` already constructed above.
@@ -2941,6 +3224,7 @@ impl MseServer {
                     .map(|p| p.tools.as_slice())
                     .unwrap_or(&[]);
                 let tool_lint = classify_tool_lint(tools_ref, &tool_registry);
+                diagnostics.extend(diag_from_tool_lint(&agent.name, &tool_lint));
                 if let Some(sev) = tool_lint.get("severity").and_then(|v| v.as_str()) {
                     tool_lint_severities.push(sev.to_string());
                 }
@@ -2956,6 +3240,7 @@ impl MseServer {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
                 let contract_lint = classify_output_contract_lint(&extras);
+                diagnostics.extend(diag_from_output_contract_lint(&agent.name, &contract_lint));
                 if let Some(sev) = contract_lint.get("severity").and_then(|v| v.as_str()) {
                     output_contract_lint_severities.push(sev.to_string());
                 }
@@ -2969,6 +3254,7 @@ impl MseServer {
                     .as_ref()
                     .and_then(|p| p.worker_binding.as_deref());
                 let wb_lint = classify_worker_binding_lint(&agent.kind, wb);
+                diagnostics.extend(diag_from_worker_binding_lint(&agent.name, &wb_lint));
                 if let Some(sev) = wb_lint.get("severity").and_then(|v| v.as_str()) {
                     worker_binding_lint_severities.push(sev.to_string());
                 }
@@ -2988,6 +3274,12 @@ impl MseServer {
         // WARN findings feed the aggregate verdict; INFO findings do not
         // (they are informational manifest requirements, not defects).
         let binding_lint = (!disable_binding_lint).then(|| classify_binding_lint(&bp));
+        if let Some(b) = &binding_lint {
+            diagnostics.extend(diag_from_findings(
+                mlua_swarm_diag::BpDoctorFamily::BindingLint,
+                b,
+            ));
+        }
         let binding_lint_severities: Vec<String> = binding_lint
             .as_ref()
             .and_then(|b| b.get("findings"))
@@ -3006,6 +3298,12 @@ impl MseServer {
         // conditional-presence convention as `binding_lint`: omitted
         // entirely when the family is disabled.
         let skip_on_lint = (!disable_skip_on_lint).then(|| classify_skip_on_lint(&bp));
+        if let Some(s) = &skip_on_lint {
+            diagnostics.extend(diag_from_findings(
+                mlua_swarm_diag::BpDoctorFamily::SkipOnLint,
+                s,
+            ));
+        }
         let skip_on_lint_severities: Vec<String> = skip_on_lint
             .as_ref()
             .and_then(|b| b.get("findings"))
@@ -3097,6 +3395,11 @@ impl MseServer {
                 "skip_on_lint_enabled": !disable_skip_on_lint,
             },
             "agents": per_agent,
+            // GH #79 Phase 3: the unified projection — one entry per
+            // finding across every family, in the mlua-swarm-diag
+            // `Diagnostic` wire shape. Additive alongside the
+            // family-specific fields; Phase 4 retires those.
+            "diagnostics": diagnostics,
             "guide_ref": "mse://guides/agent-md-authoring",
         });
         // C4: Blueprint-scoped operator-binding advisories. Inserted only
@@ -6375,5 +6678,145 @@ mod tests {
         assert_eq!(runs[0]["run_id"], "R-stub");
         assert_eq!(runs[0]["task_id"], "T-stub");
         assert_eq!(runs[0]["count"], 1);
+    }
+}
+
+// ─── GH #79 Phase 3: classify_* → Diagnostic sibling projections ──────────
+#[cfg(test)]
+mod diag_sibling_tests {
+    use super::*;
+    use mlua_swarm_diag::{BpDoctorFamily, DiagLevel, DiagStage};
+
+    #[test]
+    fn ok_verdicts_project_to_no_diagnostic() {
+        assert!(diag_from_agent_md("a", "OK", 10, 2).is_none());
+        let ok = serde_json::json!({"severity": "OK", "unknown_tools": []});
+        assert!(diag_from_tool_lint("a", &ok).is_none());
+        let ok = serde_json::json!({"severity": "OK", "present": true, "kind": "literal_enum"});
+        assert!(diag_from_output_contract_lint("a", &ok).is_none());
+        let ok = serde_json::json!({"severity": "OK", "kind_requires_binding": false});
+        assert!(diag_from_worker_binding_lint("a", &ok).is_none());
+    }
+
+    #[test]
+    fn agent_md_warn_projects_with_size_kind_and_agent_span() {
+        let d = diag_from_agent_md("planner", "WARN", 30_000, 250).expect("WARN must project");
+        assert_eq!(d.kind, "agent-md-size");
+        assert_eq!(d.level, DiagLevel::Warn);
+        assert!(matches!(
+            d.stage,
+            DiagStage::BpDoctor {
+                family: BpDoctorFamily::AgentMdSize
+            }
+        ));
+        assert!(d.message.contains("planner"));
+        // BLOCK maps to Error.
+        let d = diag_from_agent_md("planner", "BLOCK", 60_000, 600).expect("BLOCK must project");
+        assert_eq!(d.level, DiagLevel::Error);
+    }
+
+    #[test]
+    fn tool_lint_warn_carries_each_unknown_tool_as_a_note() {
+        let verdict = classify_tool_lint(
+            &["mcp__mse__no_such_tool".to_string(), "Read".to_string()],
+            &std::collections::BTreeSet::new(),
+        );
+        let d = diag_from_tool_lint("scout", &verdict).expect("WARN must project");
+        assert_eq!(d.kind, "tool-unknown-mcp-ref");
+        assert!(d
+            .notes
+            .iter()
+            .any(|n| n.contains("mcp__mse__no_such_tool")));
+    }
+
+    #[test]
+    fn worker_binding_warn_realizes_the_dual_stage_kind_with_suggestion() {
+        let verdict =
+            classify_worker_binding_lint(&mlua_swarm::blueprint::AgentKind::Operator, None);
+        let d = diag_from_worker_binding_lint("greeter", &verdict).expect("WARN must project");
+        // Same kind the compile stage emits as Error — the GH #79
+        // dual-stage story realized: one LintDecl, two stages.
+        assert_eq!(d.kind, "worker-binding-missing");
+        assert_eq!(d.level, DiagLevel::Warn);
+        assert!(matches!(
+            d.stage,
+            DiagStage::BpDoctor {
+                family: BpDoctorFamily::WorkerBindingLint
+            }
+        ));
+        let s = d.suggestion.expect("suggestion must carry the runner patch");
+        assert!(s.patch.contains("backend = \"ws_operator\""));
+        assert!(!d.notes.is_empty(), "the classifier reason must carry over");
+    }
+
+    #[test]
+    fn findings_walker_maps_checks_levels_and_spans() {
+        let verdict = serde_json::json!({
+            "findings": [
+                {"check": "binding_requirements_info", "severity": "INFO",
+                 "agent": "worker", "message": "agent 'worker' needs a manifest entry"},
+                {"check": "legacy_worker_binding", "severity": "WARN",
+                 "agent": "old", "message": "agent 'old' uses the deprecated fallback"},
+                {"check": "strict_binding_without_runners", "severity": "WARN",
+                 "message": "strict binding is a no-op"},
+                {"check": "some_future_check", "severity": "WARN",
+                 "message": "not in the registry yet"},
+            ]
+        });
+        let ds = diag_from_findings(BpDoctorFamily::BindingLint, &verdict);
+        // The unknown check is skipped (old `findings` field still
+        // carries it), the three known ones project.
+        assert_eq!(ds.len(), 3);
+        assert_eq!(ds[0].kind, "binding-requirements-info");
+        assert_eq!(ds[0].level, DiagLevel::Info);
+        assert_eq!(ds[1].kind, "legacy-worker-binding");
+        assert_eq!(ds[1].level, DiagLevel::Warn);
+        // Blueprint-scoped finding (no agent field) spans BlueprintRoot.
+        match &ds[2].span.as_ref().expect("span must be set").element {
+            mlua_swarm_diag::DiagElement::BlueprintRoot => {}
+            other => panic!("expected BlueprintRoot span, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skip_on_findings_project_with_the_skip_guide_docs_ref() {
+        let verdict = serde_json::json!({
+            "findings": [
+                {"check": "skip_on_pattern_conflicts_with_halt_on", "severity": "WARN",
+                 "value": "BLOCKED", "message": "value 'BLOCKED' appears in both guards"},
+            ]
+        });
+        let ds = diag_from_findings(BpDoctorFamily::SkipOnLint, &verdict);
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].kind, "skip-on-pattern-conflicts-with-halt-on");
+        assert_eq!(
+            ds[0].docs_ref.expect("docs_ref must be set").uri,
+            "mse://guides/skip-tier-and-skip-on"
+        );
+    }
+
+    /// Every kind a sibling projection can emit must be declared in the
+    /// `LINT_DECLS` registry.
+    #[test]
+    fn every_sibling_emitted_kind_is_a_declared_lint() {
+        let kinds = [
+            "agent-md-size",
+            "tool-unknown-mcp-ref",
+            "output-contract-missing",
+            "worker-binding-missing",
+            "binding-requirements-info",
+            "strict-binding-without-runners",
+            "legacy-worker-binding",
+            "binding-resolution-error",
+            "skip-on-missing-for-skip-like-verdict-value",
+            "skip-on-declared-but-no-matching-verdict-value",
+            "skip-on-pattern-conflicts-with-halt-on",
+        ];
+        for kind in kinds {
+            assert!(
+                mlua_swarm_diag::lint_decl(kind).is_some(),
+                "sibling-emitted kind '{kind}' has no LINT_DECLS entry"
+            );
+        }
     }
 }

@@ -1,0 +1,24 @@
+[package]
+name = "mlua-swarm-diag"
+version = "0.16.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/mlua-swarm-diag"
+readme = "README.md"
+description = "Unified Clippy-style diagnostic model (Diagnostic / Suggestion / Applicability / LintDecl registry) for the mlua-swarm authoring-time feedback surface."
+keywords = ["swarm", "lint", "diagnostics", "mcp", "flow-ir"]
+categories = ["development-tools"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

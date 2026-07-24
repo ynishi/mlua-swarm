@@ -155,7 +155,8 @@ runs both side by side. The full three-hop responsibility model is
 - Authoring surface: `mse://guides/dsl-authoring`,
   `mse://guides/bp-dsl-templates`, `mse://guides/blueprint-authoring`
 - Lint / diagnosis: `bp_build` / `bp_doctor` entries in
-  `mse://guides/mcp-tool-reference`
+  `mse://guides/mcp-tool-reference`; the unified diagnostic model and
+  the add-a-lint recipe: `mse://guides/lint-diagnostic-model`
 - Run / iterate: `swarm_run` / `swarm_status` entries in
   `mse://guides/mcp-tool-reference`; `mse://guides/replay-and-resume`
 - Operator model: `mse://guides/operator-execution-model`

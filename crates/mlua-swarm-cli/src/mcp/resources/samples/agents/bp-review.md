@@ -41,6 +41,13 @@ live in the guide, not in your training data.
    Blueprint-scoped operator-binding family: `binding_requirements_info`
    INFO, `strict_binding_without_runners` / `legacy_worker_binding`
    WARN) — advisory only, it never contributes a BLOCKED verdict.
+   Additionally record the top-level `diagnostics: [...]` array (GH #79
+   unified projection): one entry per finding across every family, each
+   with a stable `kind` key, `level` (`Info`/`Warn`/`Error`), and an
+   optional `suggestion` patch. When you cite a finding in the Findings
+   section below, prefer its `diagnostics[].kind` key as the label; keep
+   reading the per-family fields in parallel — they remain the
+   authoritative surface until they are retired in a future major bump.
    `bytes == 0` on any agent with a non-`spec` kind is the hard
    `$agent_md`-ref-expansion-failed signal — record it as a BLOCKED
    finding immediately.

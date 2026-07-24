@@ -213,6 +213,164 @@ pub enum CompileError {
     },
 }
 
+/// Stable prefix of the `InvalidSpec` message the operator factory emits
+/// when a WS-thin-path operator agent lacks its worker binding. Shared
+/// by the message construction site
+/// ([`OperatorSpawnerFactory::build`]) and the
+/// [`From<&CompileError>`] specialization below, so the two can never
+/// drift apart (GH #79 — the CLI used to re-detect this case by
+/// substring-matching the *formatted* error, which broke silently on
+/// any wording change).
+pub const WORKER_BINDING_REQUIRED_MSG_PREFIX: &str =
+    "profile.worker_binding is required for this operator backend";
+
+/// GH #79 Phase 2: project every [`CompileError`] variant into the
+/// unified [`Diagnostic`] shape (`mlua-swarm-diag`), preserving the
+/// variant's typed fields into `span` / `notes` / `help` directly — no
+/// substring re-parse of the `#[error(...)]` strings.
+///
+/// Every diagnostic is `stage: CompileLint` / `level: Error` (a
+/// `CompileError` always aborts the compile). The `kind` keys match
+/// [`mlua_swarm_diag::LINT_DECLS`] entries one-to-one — asserted by
+/// this module's `every_compile_error_variant_maps_to_a_declared_lint`
+/// test.
+///
+/// One specialization: an [`CompileError::InvalidSpec`] whose message
+/// carries [`WORKER_BINDING_REQUIRED_MSG_PREFIX`] maps to the
+/// dual-stage kind `worker-binding-missing` (the same lint `bp_doctor`
+/// reports as `Warn` post-register) instead of the generic
+/// `invalid-agent-spec` — one lint kind, one docs anchor, one
+/// downstream switch key across both stages.
+impl From<&CompileError> for mlua_swarm_diag::Diagnostic {
+    fn from(err: &CompileError) -> Self {
+        use mlua_swarm_diag::{
+            Applicability, DiagElement, DiagLevel, DiagSpan, DiagStage, Diagnostic, DocsRef,
+            Suggestion,
+        };
+        let base = |kind: &'static str| {
+            Diagnostic::new(kind, DiagStage::CompileLint, DiagLevel::Error, err.to_string())
+        };
+        let agent_span = |name: &str| DiagSpan {
+            element: DiagElement::Agent {
+                name: name.to_string(),
+            },
+            json_path: Some(format!("$.agents[?(@.name=='{name}')]")),
+        };
+        match err {
+            CompileError::BoundAgent(_) => base("bound-agent-resolution"),
+            CompileError::UnknownKind(_) => base("unknown-agent-kind").with_help(
+                "register a SpawnerFactory for this kind, or disable strategy.strict_kind",
+            ),
+            CompileError::InvalidSpec { name, msg }
+                if msg.starts_with(WORKER_BINDING_REQUIRED_MSG_PREFIX) =>
+            {
+                Diagnostic::new(
+                    "worker-binding-missing",
+                    DiagStage::CompileLint,
+                    DiagLevel::Error,
+                    format!(
+                        "operator agent '{name}' has no explicit Runner or legacy \
+                         `profile.worker_binding`"
+                    ),
+                )
+                .with_note(msg.clone())
+                .with_suggestion(Suggestion {
+                    msg: "add an explicit Runner (or legacy profile.worker_binding)".into(),
+                    patch: "runner = { backend = \"ws_operator\", variant = \"claude\", \
+                            tools = {} }"
+                        .into(),
+                    applicability: Applicability::HasPlaceholders,
+                })
+                .with_docs_ref(DocsRef {
+                    uri: "mse://guides/bp-dsl-templates",
+                    anchor: None,
+                })
+                .with_span(agent_span(name))
+            }
+            CompileError::InvalidSpec { name, .. } => {
+                base("invalid-agent-spec").with_span(agent_span(name))
+            }
+            CompileError::UnresolvedRef(ref_) => {
+                base("unresolved-agent-ref").with_span(DiagSpan {
+                    element: DiagElement::Step {
+                        ref_: ref_.clone(),
+                    },
+                    json_path: None,
+                })
+            }
+            CompileError::DuplicateAgent(name) => {
+                base("duplicate-agent-name").with_span(agent_span(name))
+            }
+            CompileError::UnresolvedOperatorRef {
+                agent, defined, ..
+            } => base("unresolved-operator-ref")
+                .with_note(format!("declared OperatorDef names: {defined:?}"))
+                .with_span(agent_span(agent)),
+            CompileError::UnresolvedMetaRef { defined, .. } => base("unresolved-meta-ref")
+                .with_note(format!("declared MetaDef names: {defined:?}")),
+            CompileError::StepNamingCollision(_) => base("step-naming-collision"),
+            CompileError::InvalidProjectionPlacement(_) => base("invalid-projection-placement")
+                .with_span(DiagSpan {
+                    element: DiagElement::BlueprintRoot,
+                    json_path: Some("$.projection_placement".into()),
+                }),
+            CompileError::UnresolvedAuditAgent { defined, .. } => {
+                base("unresolved-audit-agent")
+                    .with_note(format!("declared AgentDef names: {defined:?}"))
+                    .with_span(DiagSpan {
+                        element: DiagElement::BlueprintRoot,
+                        json_path: Some("$.audits".into()),
+                    })
+            }
+            CompileError::VerdictChannelMismatch { agent, .. } => {
+                base("verdict-channel-mismatch")
+                    .with_help(
+                        "see the \"Returning verdicts to drive BP flow\" guide's Pattern A \
+                         (channel: \"body\") / Pattern B (channel: \"part\")",
+                    )
+                    .with_docs_ref(DocsRef {
+                        uri: "mse://guides/blueprint-authoring",
+                        anchor: None,
+                    })
+                    .with_span(agent_span(agent))
+            }
+            CompileError::VerdictValueNotInContract { agent, .. } => {
+                base("verdict-value-not-in-contract")
+                    // The patch is deliberately the same prose recipe the
+                    // legacy FixHint carried (GH #62) — CLI stderr and the
+                    // bp_build response render it verbatim, and the
+                    // `bp_build_cli` smoke test asserts on the
+                    // `agents[N].verdict.values` pointer inside it.
+                    .with_suggestion(Suggestion {
+                        msg: "align the cond literal with the agent's declared verdict \
+                              contract"
+                            .into(),
+                        patch: "either add the cond's literal to `agents[N].verdict.values`, \
+                                or change the cond to a value that is already declared"
+                            .into(),
+                        applicability: Applicability::MaybeIncorrect,
+                    })
+                    .with_docs_ref(DocsRef {
+                        uri: "mse://guides/blueprint-authoring",
+                        anchor: None,
+                    })
+                    .with_span(agent_span(agent))
+            }
+            CompileError::VerdictValueUnhandled {
+                agent,
+                declared_values,
+                ..
+            } => base("verdict-value-unhandled")
+                .with_note(format!("declared verdict.values: {declared_values:?}"))
+                .with_help(
+                    "either handle the value in a downstream Branch/Loop cond, or drop it \
+                     from verdict.values",
+                )
+                .with_span(agent_span(agent)),
+        }
+    }
+}
+
 // ─── SpawnerFactory + Registry ───────────────────────────────────────────
 
 /// Factory trait that interprets an `AgentDef` and builds the concrete
@@ -1843,17 +2001,18 @@ impl SpawnerFactory for OperatorSpawnerFactory {
             // Issue #9: the two Blueprint authoring paths (direct JSON
             // and `$agent_md` file ref) both land here. Old message
             // pointed only at the `.md` frontmatter, which was
-            // confusing for authors on the JSON-direct path.
-            return Err(invalid(
-                "profile.worker_binding is required for this operator backend. \
+            // confusing for authors on the JSON-direct path. The prefix
+            // const keeps this message and the GH #79 Diagnostic
+            // specialization in lockstep.
+            return Err(invalid(format!(
+                "{WORKER_BINDING_REQUIRED_MSG_PREFIX}. \
                  Fix by either: \
                  (a) if authoring the Blueprint JSON directly, add \
                  `agents[N].profile.worker_binding: \"<subagent-type>\"` \
                  to the JSON literal; or \
                  (b) if using an $agent_md file ref, add \
                  `worker_binding: <subagent-type>` to the agent .md frontmatter."
-                    .into(),
-            ));
+            )));
         }
         Ok(Arc::new(OperatorSpawner::new(
             op,
@@ -1945,6 +2104,39 @@ mod operator_spawner_factory_worker_binding_tests {
             Err(other) => panic!("expected InvalidSpec, got: {other:?}"),
             Ok(_) => panic!("expected compile-time failure, got Ok"),
         }
+    }
+
+    /// GH #79 regression lock: the factory error the compile-time gate
+    /// emits must keep starting with the shared
+    /// `WORKER_BINDING_REQUIRED_MSG_PREFIX` — otherwise the
+    /// `From<&CompileError>` Diagnostic specialization (and `bp_doctor`'s
+    /// dual-stage `worker-binding-missing` story) silently degrades to
+    /// the generic `invalid-agent-spec` kind.
+    #[test]
+    fn factory_error_message_carries_the_shared_prefix_and_specializes_the_diagnostic() {
+        let factory = OperatorSpawnerFactory::new();
+        factory.register_operator(
+            "op1",
+            Arc::new(StubOperator {
+                requires_binding: true,
+            }) as Arc<dyn Operator>,
+        );
+        let def = agent_def_with(Some(AgentProfile::default()));
+        let err = match factory.build(&def, None) {
+            Err(err) => err,
+            Ok(_) => panic!("expected compile-time failure, got Ok"),
+        };
+        match &err {
+            CompileError::InvalidSpec { msg, .. } => {
+                assert!(
+                    msg.starts_with(WORKER_BINDING_REQUIRED_MSG_PREFIX),
+                    "factory message must start with the shared prefix, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSpec, got: {other:?}"),
+        }
+        let d = mlua_swarm_diag::Diagnostic::from(&err);
+        assert_eq!(d.kind, "worker-binding-missing");
     }
 
     #[test]
@@ -2961,4 +3153,96 @@ mod verdict_contract_lint_tests {
             "no agent declared a verdict contract"
         );
     }
+
+    // ─── GH #79 Phase 2: CompileError → Diagnostic projection ────────
+
+    /// Every `kind` key the `From<&CompileError>` impl can emit must be
+    /// declared in `mlua_swarm_diag::LINT_DECLS` (the exhaustiveness of
+    /// the variant mapping itself is enforced by the compiler — the
+    /// `match` in the impl has no wildcard arm).
+    #[test]
+    fn every_compile_error_diagnostic_kind_is_a_declared_lint() {
+        let kinds = [
+            "bound-agent-resolution",
+            "unknown-agent-kind",
+            "invalid-agent-spec",
+            "worker-binding-missing",
+            "unresolved-agent-ref",
+            "duplicate-agent-name",
+            "unresolved-operator-ref",
+            "unresolved-meta-ref",
+            "step-naming-collision",
+            "invalid-projection-placement",
+            "unresolved-audit-agent",
+            "verdict-channel-mismatch",
+            "verdict-value-not-in-contract",
+            "verdict-value-unhandled",
+        ];
+        for kind in kinds {
+            assert!(
+                mlua_swarm_diag::lint_decl(kind).is_some(),
+                "kind '{kind}' emitted by From<&CompileError> has no LINT_DECLS entry"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_spec_with_worker_binding_prefix_specializes_the_diagnostic_kind() {
+        // The factory's message construction and the From matcher share
+        // WORKER_BINDING_REQUIRED_MSG_PREFIX, so building the error the
+        // way the factory does must hit the specialized arm.
+        let err = CompileError::InvalidSpec {
+            name: "greeter".into(),
+            msg: format!("{WORKER_BINDING_REQUIRED_MSG_PREFIX}. Fix by either: (a) ..."),
+        };
+        let d = mlua_swarm_diag::Diagnostic::from(&err);
+        assert_eq!(d.kind, "worker-binding-missing");
+        assert_eq!(d.level, mlua_swarm_diag::DiagLevel::Error);
+        assert!(matches!(d.stage, mlua_swarm_diag::DiagStage::CompileLint));
+        assert!(d.message.contains("greeter"));
+        let suggestion = d.suggestion.expect("specialized arm must carry a suggestion");
+        assert!(suggestion.patch.contains("backend = \"ws_operator\""));
+        assert_eq!(
+            suggestion.applicability,
+            mlua_swarm_diag::Applicability::HasPlaceholders
+        );
+        assert_eq!(
+            d.docs_ref.expect("docs_ref must be set").uri,
+            "mse://guides/bp-dsl-templates"
+        );
+        match d.span.expect("span must be set").element {
+            mlua_swarm_diag::DiagElement::Agent { name } => assert_eq!(name, "greeter"),
+            other => panic!("expected Agent span, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generic_invalid_spec_maps_to_the_generic_kind() {
+        let err = CompileError::InvalidSpec {
+            name: "solo".into(),
+            msg: "operator spec: 'operator_ref' (string) required".into(),
+        };
+        let d = mlua_swarm_diag::Diagnostic::from(&err);
+        assert_eq!(d.kind, "invalid-agent-spec");
+        assert!(d.suggestion.is_none(), "generic arm carries no canned patch");
+    }
+
+    #[test]
+    fn verdict_value_not_in_contract_diagnostic_carries_suggestion_and_span() {
+        let err = CompileError::VerdictValueNotInContract {
+            where_: "Branch cond".into(),
+            agent: "review".into(),
+            value: "NOT_DECLARED".into(),
+            values: vec!["PASS".into(), "BLOCKED".into()],
+        };
+        let d = mlua_swarm_diag::Diagnostic::from(&err);
+        assert_eq!(d.kind, "verdict-value-not-in-contract");
+        assert!(d.message.contains("NOT_DECLARED"));
+        assert!(d.suggestion.is_some());
+        match d.span.expect("span must be set").element {
+            mlua_swarm_diag::DiagElement::Agent { name } => assert_eq!(name, "review"),
+            other => panic!("expected Agent span, got {other:?}"),
+        }
+    }
+
 }

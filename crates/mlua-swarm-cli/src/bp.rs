@@ -204,8 +204,7 @@ async fn run_build(args: BuildArgs) -> Result<()> {
             // matches a known lint kind — Clippy-style diagnostic
             // affordance without changing what stderr's exit code
             // signals (still non-zero via the `?` on this arm below).
-            let msg = format!("{e:#}");
-            if let Some(hint) = fix_hint_from_compile_error(&msg) {
+            if let Some(hint) = fix_hint_for_error(&e) {
                 eprintln!();
                 eprintln!("fix hint ({}):", hint.kind);
                 eprintln!("  {}", hint.reason);
@@ -288,7 +287,7 @@ fn run_lint(args: LintArgs) -> Result<()> {
         Err(e) => {
             let msg = format!("{e:#}");
             eprintln!("bp lint: ERROR — {msg}");
-            if let Some(hint) = fix_hint_from_compile_error(&msg) {
+            if let Some(hint) = fix_hint_for_error(&e) {
                 eprintln!();
                 eprintln!("fix hint ({}):", hint.kind);
                 eprintln!("  {}", hint.reason);
@@ -741,6 +740,98 @@ pub(crate) fn fix_hint_from_compile_error(err_msg: &str) -> Option<FixHint> {
     None
 }
 
+/// GH #79 Phase 2: derive the unified [`mlua_swarm_diag::Diagnostic`]
+/// for a compile-lint failure. Two paths, tried in order:
+///
+/// 1. **Typed** — walk the anyhow chain for the
+///    [`mlua_swarm::CompileError`] that [`compile_lint`] preserved and
+///    project it via `Diagnostic::from(&err)` (no substring re-parse;
+///    the variant's typed fields carry over).
+/// 2. **String fallback** — the halted-at case is a serde shape error
+///    (`missing field \`at\``), not a `CompileError`, so it is still
+///    recognized from the formatted message and synthesized here.
+///
+/// `None` when neither path recognizes the failure — the caller then
+/// falls back to the raw error text alone.
+pub(crate) fn diagnostic_for_error(err: &anyhow::Error) -> Option<mlua_swarm_diag::Diagnostic> {
+    if let Some(ce) = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<mlua_swarm::CompileError>())
+    {
+        return Some(mlua_swarm_diag::Diagnostic::from(ce));
+    }
+    let msg = format!("{err:#}");
+    if msg.contains("missing field `at`") || msg.contains("halted_at") {
+        return Some(halted_at_missing_diagnostic());
+    }
+    None
+}
+
+/// The `halted-at-missing` [`mlua_swarm_diag::Diagnostic`] — synthesized
+/// on the CLI side because the underlying failure is a serde shape
+/// error (the Blueprint deserializer, not `Compiler::compile`) and thus
+/// never reaches the typed `From<&CompileError>` path.
+fn halted_at_missing_diagnostic() -> mlua_swarm_diag::Diagnostic {
+    use mlua_swarm_diag::{Applicability, DiagLevel, DiagStage, Diagnostic, DocsRef, Suggestion};
+    Diagnostic::new(
+        "halted-at-missing",
+        DiagStage::CompileLint,
+        DiagLevel::Error,
+        "the flow declares a halt-on rule but has no `halted_at` sink — where should the \
+         halted-stage id land in ctx?",
+    )
+    .with_suggestion(Suggestion {
+        msg: "add a `halted_at` sink to the pipeline block".into(),
+        patch: "halted_at = \"$.halted_at\",  -- add inside the B.pipeline { ... } block, \
+                before `done = ...`"
+            .into(),
+        applicability: Applicability::MaybeIncorrect,
+    })
+    .with_docs_ref(DocsRef {
+        uri: "mse://guides/bp-dsl-templates",
+        anchor: None,
+    })
+}
+
+/// GH #79 Phase 2: the backward-compatibility adapter — wrap a
+/// [`mlua_swarm_diag::Diagnostic`] in the existing [`FixHint`] shape.
+/// Only the three kinds with a canonical fix recipe produce a hint
+/// (same closed set the string matcher recognizes); everything else is
+/// `None`, preserving the "never a wrong-but-confident hint" contract
+/// (GH #62 Axis B).
+pub(crate) fn fix_hint_from_diagnostic(d: &mlua_swarm_diag::Diagnostic) -> Option<FixHint> {
+    const FIXABLE_KINDS: [&str; 3] = [
+        "worker-binding-missing",
+        "verdict-value-not-in-contract",
+        "halted-at-missing",
+    ];
+    if !FIXABLE_KINDS.contains(&d.kind) {
+        return None;
+    }
+    let suggestion = d.suggestion.as_ref()?;
+    Some(FixHint {
+        kind: d.kind,
+        reason: d.message.clone(),
+        patch_suggestion: suggestion.patch.clone(),
+        docs_ref: d.docs_ref.map(|r| r.uri.to_string()),
+    })
+}
+
+/// GH #79 Phase 2: preferred [`FixHint`] entry point for callers holding
+/// the full error — routes through the typed [`diagnostic_for_error`]
+/// path first, then falls back to the legacy string matcher
+/// ([`fix_hint_from_compile_error`]) so failures whose typed error was
+/// severed somewhere in the chain keep their hint.
+pub(crate) fn fix_hint_for_error(err: &anyhow::Error) -> Option<FixHint> {
+    if let Some(hint) = diagnostic_for_error(err)
+        .as_ref()
+        .and_then(fix_hint_from_diagnostic)
+    {
+        return Some(hint);
+    }
+    fix_hint_from_compile_error(&format!("{err:#}"))
+}
+
 /// Substring helper for [`fix_hint_from_compile_error`]. Returns the slice
 /// between the first occurrence of `prefix` and the next occurrence of
 /// `suffix` after it, or `None` if either isn't found. Non-greedy —
@@ -850,9 +941,14 @@ pub(crate) fn compile_lint(
     })?;
 
     let registry = lint_registry(&bp);
+    // GH #79 Phase 2: keep the typed `CompileError` in the anyhow chain
+    // (`Error::new` + `context`) instead of formatting it away — the
+    // downstream fix-hint / Diagnostic path downcasts it back out
+    // (`diagnostic_for_error`). `{e:#}` renders identically to the old
+    // `anyhow!("compile lint FAILED: {e}")` string.
     Compiler::new(registry)
         .compile(&bp)
-        .map_err(|e| anyhow!("compile lint FAILED: {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("compile lint FAILED"))?;
     Ok(LintReport::Ok {
         agents: bp.agents.len(),
         operators: bp.operators.len(),
@@ -1214,6 +1310,92 @@ mod tests {
             fix_hint_from_compile_error("some new lint the mapping doesn't know about").is_none()
         );
         assert!(fix_hint_from_compile_error("").is_none());
+    }
+
+    // ─── GH #79 Phase 2: typed Diagnostic path + FixHint adapter ─────
+
+    #[test]
+    fn typed_worker_binding_error_routes_through_diagnostic_to_fix_hint() {
+        let ce = mlua_swarm::CompileError::InvalidSpec {
+            name: "greeter".into(),
+            msg: format!(
+                "{}. Fix by either: (a) ...",
+                mlua_swarm::WORKER_BINDING_REQUIRED_MSG_PREFIX
+            ),
+        };
+        let err = anyhow::Error::new(ce).context("compile lint FAILED");
+        let d = diagnostic_for_error(&err).expect("typed path must recognize CompileError");
+        assert_eq!(d.kind, "worker-binding-missing");
+        let hint = fix_hint_for_error(&err).expect("hint must derive from the diagnostic");
+        assert_eq!(hint.kind, "worker-binding-missing");
+        assert!(hint.reason.contains("greeter"));
+        assert!(hint.patch_suggestion.contains("backend = \"ws_operator\""));
+        assert_eq!(
+            hint.docs_ref.as_deref(),
+            Some("mse://guides/bp-dsl-templates")
+        );
+    }
+
+    #[test]
+    fn typed_non_fixable_error_yields_diagnostic_but_no_hint() {
+        // A kind without a canonical fix recipe still produces the
+        // unified Diagnostic (for the additive `diagnostic` response
+        // field) but no FixHint — the GH #62 "never a wrong-but-confident
+        // hint" contract carries over to the typed path.
+        let ce = mlua_swarm::CompileError::DuplicateAgent("scout".into());
+        let err = anyhow::Error::new(ce).context("compile lint FAILED");
+        let d = diagnostic_for_error(&err).expect("typed path must recognize CompileError");
+        assert_eq!(d.kind, "duplicate-agent-name");
+        assert!(fix_hint_from_diagnostic(&d).is_none());
+        assert!(fix_hint_for_error(&err).is_none());
+    }
+
+    #[test]
+    fn halted_at_serde_error_synthesizes_the_diagnostic_on_the_string_path() {
+        // The halted-at case is a serde shape error, not a CompileError —
+        // the string fallback must still synthesize the Diagnostic and
+        // the derived hint.
+        let err = anyhow!("compile lint: blueprint shape invalid after $agent_md expansion: missing field `at`");
+        let d = diagnostic_for_error(&err).expect("string path must recognize the serde error");
+        assert_eq!(d.kind, "halted-at-missing");
+        let hint = fix_hint_for_error(&err).expect("halted-at hint must fire");
+        assert_eq!(hint.kind, "halted-at-missing");
+        assert!(hint.patch_suggestion.contains("halted_at = \"$.halted_at\""));
+    }
+
+    #[test]
+    fn compile_lint_preserves_the_typed_compile_error_in_the_chain() {
+        // End-to-end over compile_lint: a rendered template stripped of
+        // its runner must fail with a downcastable CompileError so the
+        // typed Diagnostic path works on real compile_lint output.
+        let rendered = render_single_template("solo-bp", "solo", "main-ai", "claude");
+        let runner_clause =
+            "runner = { backend = \"ws_operator\", variant = \"claude\", tools = {} } },";
+        assert!(
+            rendered.contains(runner_clause),
+            "template shape drifted; update the runner_clause literal"
+        );
+        // The clause's trailing `},` closes the agent table — keep it.
+        let stripped = rendered.replace(runner_clause, "},");
+        let bp_value = dsl::build_bp_from_script(&stripped).expect("script must build");
+        let err = compile_lint(&bp_value, Path::new("/tmp/nonexistent.bp.lua"), &[])
+            .err()
+            .expect("compile lint must fail without a runner");
+        assert!(
+            err.chain()
+                .any(|c| c.downcast_ref::<mlua_swarm::CompileError>().is_some()),
+            "typed CompileError must survive the compile_lint anyhow chain: {err:#}"
+        );
+        let d = diagnostic_for_error(&err)
+            .expect("typed CompileError must project into a Diagnostic");
+        assert!(
+            mlua_swarm_diag::lint_decl(d.kind).is_some(),
+            "projected kind '{}' must be a declared lint",
+            d.kind
+        );
+        // `{e:#}` still renders the legacy "compile lint FAILED: ..."
+        // prefix the string matcher (and existing callers) rely on.
+        assert!(format!("{err:#}").starts_with("compile lint FAILED: "));
     }
 
     #[test]

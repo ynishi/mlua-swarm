@@ -8,7 +8,7 @@ semver_check = true
 release_always = false       # publish only when the release PR is merged
 pr_labels = ["release"]
 
-# Keep all 4 crates in lockstep versioning.
+# Keep all 5 crates in lockstep versioning.
 # Only the root crate maintains the (root) CHANGELOG.md.
 [[package]]
 name = "mlua-swarm"
@@ -22,7 +22,11 @@ changelog_update = true
 # this, feat/fix commits scoped to a sibling crate disappear from
 # every CHANGELOG (see v0.4.0 — only the one commit that touched
 # `src/` made it in; the other four were dropped).
-changelog_include = ["mlua-swarm-schema", "mlua-swarm-server", "mlua-swarm-cli"]
+changelog_include = ["mlua-swarm-diag", "mlua-swarm-schema", "mlua-swarm-server", "mlua-swarm-cli"]
+
+[[package]]
+name = "mlua-swarm-diag"
+version_group = "mse"
 
 [[package]]
 name = "mlua-swarm-schema"

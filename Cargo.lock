@@ -1706,6 +1706,7 @@ dependencies = [
  "mlua-flow-ir",
  "mlua-isle 0.5.0",
  "mlua-swarm-compile",
+ "mlua-swarm-diag",
  "mlua-swarm-schema",
  "rusqlite",
  "rusqlite-isle",
@@ -1737,6 +1738,7 @@ dependencies = [
  "mlua-flow-ir",
  "mlua-swarm",
  "mlua-swarm-compile",
+ "mlua-swarm-diag",
  "mlua-swarm-dsl",
  "mlua-swarm-schema",
  "mlua-swarm-server",
@@ -1769,6 +1771,14 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "mlua-swarm-diag"
+version = "0.16.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

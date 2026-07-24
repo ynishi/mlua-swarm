@@ -45,6 +45,7 @@
 //! | `mse://guides/server-management`             | `mse server` subcommand reference, MCP-tool ↔ subcmd mapping, and recovery SOPs (GH #69). |
 //! | `mse://guides/blueprint-ref-paths`           | `$file` / `$agent_md` refs, the 6-tier include cascade, and the `--strict-embed` opt-in. |
 //! | `mse://guides/bp-lifecycle`                  | Workflow-oriented lifecycle map (develop → trial-run → operate): per-stage feature routing + the `MainAi` vs `Automate` operator contract (GH #80). |
+//! | `mse://guides/lint-diagnostic-model`         | Unified Clippy-style `Diagnostic` model + `LINT_DECLS` registry + the 4-step add-a-lint recipe (GH #79). |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
@@ -112,6 +113,8 @@ const BLUEPRINT_REF_PATHS_BODY: &str = include_str!("./resources/guides/blueprin
 const SKIP_TIER_AND_SKIP_ON_BODY: &str =
     include_str!("./resources/guides/skip-tier-and-skip-on.md");
 const BP_LIFECYCLE_BODY: &str = include_str!("./resources/guides/bp-lifecycle.md");
+const LINT_DIAGNOSTIC_MODEL_BODY: &str =
+    include_str!("./resources/guides/lint-diagnostic-model.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -222,6 +225,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "GH #80: workflow-oriented map of the Blueprint authoring loop. Stage 1 Develop (bp_new templates, `mse bp lint`, `bp_build register=false` fix hints, `bp_doctor` six lint families), Stage 2 Trial-run (`OperatorKind::Automate` is the default; `swarm_run` blocking / `detach: true` + `swarm_status`; rekick vs `resume` vs `rerun-from`), Stage 3 Operate (the `MainAi` contract: the attached operator owns the `mse_pending_wait` → dispatch → `mse_ack` loop by design). Routes each stage to the feature-level reference guides.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(BP_LIFECYCLE_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/lint-diagnostic-model",
+        title: "mse — Lint & Diagnostic model (Diagnostic / LINT_DECLS / Applicability)",
+        description: "GH #79: the unified Clippy-style diagnostic model every feedback stage produces (compile-lint / bp_doctor / launch pre-flight). Wire shape (stable kind, internally-tagged stage, per-stage level, suggestion with Applicability auto-apply gate, mse:// docs_ref, Blueprint-document span), the mlua-swarm-diag LINT_DECLS registry, where diagnostics surface today (bp_build `diagnostic`, bp_doctor `diagnostics`), and the 4-step add-a-lint recipe (declare → document → produce → test).",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(LINT_DIAGNOSTIC_MODEL_BODY),
     },
     ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",

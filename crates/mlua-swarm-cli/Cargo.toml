@@ -22,6 +22,7 @@ formula = "mse"
 
 [dependencies]
 mlua-swarm.workspace = true
+mlua-swarm-diag.workspace = true
 mlua-swarm-server.workspace = true
 mlua-swarm-schema.workspace = true
 mlua-swarm-dsl.workspace = true
