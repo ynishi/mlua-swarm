@@ -248,7 +248,12 @@ impl From<&CompileError> for mlua_swarm_diag::Diagnostic {
             Suggestion,
         };
         let base = |kind: &'static str| {
-            Diagnostic::new(kind, DiagStage::CompileLint, DiagLevel::Error, err.to_string())
+            Diagnostic::new(
+                kind,
+                DiagStage::CompileLint,
+                DiagLevel::Error,
+                err.to_string(),
+            )
         };
         let agent_span = |name: &str| DiagSpan {
             element: DiagElement::Agent {
@@ -290,22 +295,18 @@ impl From<&CompileError> for mlua_swarm_diag::Diagnostic {
             CompileError::InvalidSpec { name, .. } => {
                 base("invalid-agent-spec").with_span(agent_span(name))
             }
-            CompileError::UnresolvedRef(ref_) => {
-                base("unresolved-agent-ref").with_span(DiagSpan {
-                    element: DiagElement::Step {
-                        ref_: ref_.clone(),
-                    },
-                    json_path: None,
-                })
-            }
+            CompileError::UnresolvedRef(ref_) => base("unresolved-agent-ref").with_span(DiagSpan {
+                element: DiagElement::Step { ref_: ref_.clone() },
+                json_path: None,
+            }),
             CompileError::DuplicateAgent(name) => {
                 base("duplicate-agent-name").with_span(agent_span(name))
             }
-            CompileError::UnresolvedOperatorRef {
-                agent, defined, ..
-            } => base("unresolved-operator-ref")
-                .with_note(format!("declared OperatorDef names: {defined:?}"))
-                .with_span(agent_span(agent)),
+            CompileError::UnresolvedOperatorRef { agent, defined, .. } => {
+                base("unresolved-operator-ref")
+                    .with_note(format!("declared OperatorDef names: {defined:?}"))
+                    .with_span(agent_span(agent))
+            }
             CompileError::UnresolvedMetaRef { defined, .. } => base("unresolved-meta-ref")
                 .with_note(format!("declared MetaDef names: {defined:?}")),
             CompileError::StepNamingCollision(_) => base("step-naming-collision"),
@@ -314,26 +315,22 @@ impl From<&CompileError> for mlua_swarm_diag::Diagnostic {
                     element: DiagElement::BlueprintRoot,
                     json_path: Some("$.projection_placement".into()),
                 }),
-            CompileError::UnresolvedAuditAgent { defined, .. } => {
-                base("unresolved-audit-agent")
-                    .with_note(format!("declared AgentDef names: {defined:?}"))
-                    .with_span(DiagSpan {
-                        element: DiagElement::BlueprintRoot,
-                        json_path: Some("$.audits".into()),
-                    })
-            }
-            CompileError::VerdictChannelMismatch { agent, .. } => {
-                base("verdict-channel-mismatch")
-                    .with_help(
-                        "see the \"Returning verdicts to drive BP flow\" guide's Pattern A \
+            CompileError::UnresolvedAuditAgent { defined, .. } => base("unresolved-audit-agent")
+                .with_note(format!("declared AgentDef names: {defined:?}"))
+                .with_span(DiagSpan {
+                    element: DiagElement::BlueprintRoot,
+                    json_path: Some("$.audits".into()),
+                }),
+            CompileError::VerdictChannelMismatch { agent, .. } => base("verdict-channel-mismatch")
+                .with_help(
+                    "see the \"Returning verdicts to drive BP flow\" guide's Pattern A \
                          (channel: \"body\") / Pattern B (channel: \"part\")",
-                    )
-                    .with_docs_ref(DocsRef {
-                        uri: "mse://guides/blueprint-authoring",
-                        anchor: None,
-                    })
-                    .with_span(agent_span(agent))
-            }
+                )
+                .with_docs_ref(DocsRef {
+                    uri: "mse://guides/blueprint-authoring",
+                    anchor: None,
+                })
+                .with_span(agent_span(agent)),
             CompileError::VerdictValueNotInContract { agent, .. } => {
                 base("verdict-value-not-in-contract")
                     // The patch is deliberately the same prose recipe the
@@ -503,6 +500,11 @@ fn project_bound_agent_for_legacy_factories(bound: &BoundAgent) -> AgentDef {
             profile.worker_binding = None;
             profile.tools = tools.clone();
         }
+        // GH #83: the Subprocess EmbedAgent backend has no legacy profile
+        // projection — the resolved SubprocessDef template reaches
+        // `SubprocessProcessSpawnerFactory` through the build hint, and
+        // profile.model/tools are consumed by the factory directly.
+        Some(Runner::Subprocess { .. }) => {}
         None => {}
     }
     let meta = agent.meta.get_or_insert_with(Default::default);
@@ -680,7 +682,17 @@ impl Compiler {
                 }
             };
             let hint = bp.hints.per_agent.get(&ad.name);
-            let spawner = factory.build(ad, hint)?;
+            // GH #83: a Subprocess agent resolving to `Runner::Subprocess`
+            // gets a compile-synthesized hint carrying its resolved
+            // `SubprocessDef` template + overrides (EmbedAgent mode). Any
+            // other resolution keeps the historical spec-based hint — an
+            // existing Subprocess BP (program/args in spec) is untouched.
+            let subprocess_hint = if ad.kind == AgentKind::Subprocess {
+                resolve_subprocess_template_hint(bp, ad)?
+            } else {
+                None
+            };
+            let spawner = factory.build(ad, subprocess_hint.as_ref().or(hint))?;
             routes.insert(ad.name.clone(), spawner);
         }
 
@@ -1334,6 +1346,19 @@ impl SpawnerAdapter for CompiledAgentTable {
 ///   "stream_mode": "ndjson_lines" | "sse_events" | "length_prefixed" | null  // optional, default = null (plain)
 /// }
 /// ```
+///
+/// # GH #83 — EmbedAgent template mode
+///
+/// When the build `hint` carries a `subprocess_template` key (synthesized
+/// by `Compiler::compile` from a resolved `Runner::Subprocess` — see
+/// [`resolve_subprocess_template_hint`]), the factory switches to the
+/// EmbedAgent path instead: it bakes `agent_def.profile`
+/// (system_prompt / model / tools, same compile-time bake shape as
+/// `OperatorSpawnerFactory`), validates the template's placeholder tokens
+/// against the closed set, and returns a `ProcessSpawner` whose `embed`
+/// field drives the render → exec → normalize spawn. The spec-based
+/// shape above stays byte-for-byte untouched when no such hint is
+/// present.
 pub struct SubprocessProcessSpawnerFactory;
 
 impl SpawnerFactoryKind for SubprocessProcessSpawnerFactory {
@@ -1341,12 +1366,232 @@ impl SpawnerFactoryKind for SubprocessProcessSpawnerFactory {
     type Worker = crate::worker::process_spawner::ProcessWorker;
 }
 
+/// GH #83 — hint key carrying the resolved [`SubprocessDef`] template
+/// (synthesized at compile time, see [`resolve_subprocess_template_hint`]).
+pub const SUBPROCESS_TEMPLATE_HINT_KEY: &str = "subprocess_template";
+/// GH #83 — hint key carrying the `Runner::Subprocess` overrides.
+pub const SUBPROCESS_OVERRIDES_HINT_KEY: &str = "subprocess_overrides";
+
+/// GH #83 — reject any `{ident}` token outside the closed placeholder
+/// set. Only lowercase-identifier tokens (`[a-z_]+`) are placeholder
+/// candidates; other brace contents (e.g. JSON literals like
+/// `{"result": 1}` inside a `sh -c` one-liner) are legal template text.
+fn validate_embed_placeholders(s: &str, where_: &str) -> Result<(), String> {
+    let mut rest = s;
+    while let Some(start) = rest.find('{') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        let token = &after[..end];
+        let is_candidate =
+            !token.is_empty() && token.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+        if is_candidate {
+            if !crate::worker::process_spawner::EMBED_PLACEHOLDERS.contains(&token) {
+                return Err(format!(
+                    "unknown placeholder '{{{token}}}' in {where_}; closed set is \
+                     {{system, system_file, prompt, model, tools_csv, work_dir, task_id, attempt}}"
+                ));
+            }
+            rest = &after[end + 1..];
+        } else {
+            // Literal brace text — keep scanning right after the '{' so a
+            // placeholder nested inside (e.g. a JSON-wrapped stdin like
+            // `{"task": "{prompt}"}`) is still validated. Mirrors the
+            // spawn-time render scan in `EmbedVars::render`.
+            rest = after;
+        }
+    }
+    Ok(())
+}
+
+/// GH #83 — compile-time resolution of an agent's `Runner::Subprocess`
+/// declaration into the synthesized build hint the
+/// `SubprocessProcessSpawnerFactory` consumes. Returns `Ok(None)` when
+/// the agent resolves to no Runner or to a non-Subprocess backend — the
+/// caller then keeps the historical spec-based hint untouched.
+fn resolve_subprocess_template_hint(
+    bp: &Blueprint,
+    ad: &AgentDef,
+) -> Result<Option<Value>, CompileError> {
+    let invalid = |msg: String| CompileError::InvalidSpec {
+        name: ad.name.clone(),
+        msg,
+    };
+    let runner = mlua_swarm_schema::resolve_runner(bp, ad).map_err(|e| invalid(e.to_string()))?;
+    let Some(Runner::Subprocess {
+        template,
+        overrides,
+    }) = runner
+    else {
+        return Ok(None);
+    };
+    let def = bp
+        .subprocesses
+        .iter()
+        .find(|d| d.name == template)
+        .ok_or_else(|| {
+            let mut names: Vec<&str> = bp.subprocesses.iter().map(|d| d.name.as_str()).collect();
+            names.sort_unstable();
+            invalid(format!(
+                "Runner::Subprocess template '{template}' not found in \
+                 Blueprint.subprocesses (defined: [{}])",
+                names.join(", ")
+            ))
+        })?;
+    Ok(Some(serde_json::json!({
+        SUBPROCESS_TEMPLATE_HINT_KEY: def,
+        SUBPROCESS_OVERRIDES_HINT_KEY: overrides,
+    })))
+}
+
+impl SubprocessProcessSpawnerFactory {
+    /// GH #83 — the EmbedAgent template build path (see the struct doc).
+    /// Returns the concrete [`ProcessSpawner`] so unit tests can inspect
+    /// the baked [`EmbedTemplate`]; `SpawnerFactory::build` wraps it in
+    /// the trait `Arc`.
+    fn build_embed(
+        agent_def: &AgentDef,
+        template: &Value,
+        overrides: Option<&Value>,
+    ) -> Result<ProcessSpawner, CompileError> {
+        use crate::worker::process_spawner::EmbedTemplate;
+        use mlua_swarm_schema::{SubprocessDef, SubprocessOverrides};
+
+        let agent_name = &agent_def.name;
+        let invalid = |msg: String| CompileError::InvalidSpec {
+            name: agent_name.to_string(),
+            msg,
+        };
+        let def: SubprocessDef = serde_json::from_value(template.clone())
+            .map_err(|e| invalid(format!("subprocess_template hint: {e}")))?;
+        let overrides: SubprocessOverrides = match overrides {
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| invalid(format!("subprocess_overrides hint: {e}")))?,
+            None => SubprocessOverrides::default(),
+        };
+
+        if def.argv.is_empty() {
+            return Err(invalid(format!(
+                "SubprocessDef '{}': argv must not be empty",
+                def.name
+            )));
+        }
+        // Closed-set placeholder validation across every template string.
+        for (i, a) in def.argv.iter().enumerate() {
+            validate_embed_placeholders(a, &format!("argv[{i}]")).map_err(&invalid)?;
+        }
+        if let Some(stdin) = &def.stdin {
+            validate_embed_placeholders(stdin, "stdin").map_err(&invalid)?;
+        }
+        for (k, v) in &def.env {
+            validate_embed_placeholders(v, &format!("env['{k}']")).map_err(&invalid)?;
+        }
+        if let Some(cwd) = &def.cwd {
+            validate_embed_placeholders(cwd, "cwd").map_err(&invalid)?;
+        }
+        let stream_mode = match def.stream_mode.as_deref() {
+            Some("ndjson_lines") => Some(StreamMode::NdjsonLines),
+            Some("sse_events") => Some(StreamMode::SseEvents),
+            Some("length_prefixed") => Some(StreamMode::LengthPrefixed),
+            Some(other) => return Err(invalid(format!("unknown stream_mode: {other}"))),
+            None => None,
+        };
+        if let Some(output) = &def.output {
+            if stream_mode.is_some() {
+                return Err(invalid(format!(
+                    "SubprocessDef '{}': output normalization is a plain-mode \
+                     declaration; remove either `output` or `stream_mode`",
+                    def.name
+                )));
+            }
+            if let Some(format) = output.format.as_deref() {
+                if format != "json" {
+                    return Err(invalid(format!(
+                        "SubprocessDef '{}': unknown output.format '{format}' \
+                         (supported: \"json\")",
+                        def.name
+                    )));
+                }
+            }
+            if let Some(ptr) = output.result_ptr.as_deref() {
+                if !ptr.starts_with('/') {
+                    return Err(invalid(format!(
+                        "SubprocessDef '{}': output.result_ptr '{ptr}' is not a \
+                         JSON Pointer (RFC 6901 — must start with '/')",
+                        def.name
+                    )));
+                }
+            }
+            if let Some(ok_from) = output.ok_from.as_deref() {
+                if ok_from != "exit_code" && !ok_from.starts_with('/') {
+                    return Err(invalid(format!(
+                        "SubprocessDef '{}': output.ok_from '{ok_from}' must be \
+                         \"exit_code\" or a JSON Pointer (starting with '/')",
+                        def.name
+                    )));
+                }
+            }
+        }
+
+        // Compile-time profile bake — same shape as OperatorSpawnerFactory,
+        // with Runner::Subprocess overrides winning over the profile.
+        let profile = agent_def.profile.as_ref();
+        let system_prompt = profile
+            .map(|p| p.system_prompt.clone())
+            .filter(|s| !s.is_empty());
+        let model = overrides
+            .model
+            .clone()
+            .or_else(|| profile.and_then(|p| p.model.clone()));
+        let tools: Vec<String> = if overrides.tools.is_empty() {
+            profile.map(|p| p.tools.clone()).unwrap_or_default()
+        } else {
+            overrides.tools.clone()
+        };
+        // overrides.cwd wins over the template's own cwd.
+        let cwd = overrides.cwd.clone().or_else(|| def.cwd.clone());
+        if let Some(c) = &cwd {
+            validate_embed_placeholders(c, "overrides.cwd").map_err(&invalid)?;
+        }
+
+        let program = def.argv[0].clone();
+        let sp = ProcessSpawner {
+            program,
+            args: Vec::new(),
+            use_stdin: def.stdin.is_some(),
+            stream_mode,
+            embed: Some(EmbedTemplate {
+                argv: def.argv,
+                stdin: def.stdin,
+                env: def.env,
+                cwd,
+                output: def.output,
+                system_prompt,
+                model,
+                tools_csv: tools.join(","),
+            }),
+        };
+        Ok(sp)
+    }
+}
+
 impl SpawnerFactory for SubprocessProcessSpawnerFactory {
     fn build(
         &self,
         agent_def: &AgentDef,
-        _hint: Option<&Value>,
+        hint: Option<&Value>,
     ) -> Result<Arc<dyn SpawnerAdapter>, CompileError> {
+        // GH #83: EmbedAgent template mode when the compile-synthesized
+        // hint is present; the spec-based path below is byte-for-byte
+        // unchanged otherwise.
+        if let Some(template) = hint.and_then(|h| h.get(SUBPROCESS_TEMPLATE_HINT_KEY)) {
+            let overrides = hint.and_then(|h| h.get(SUBPROCESS_OVERRIDES_HINT_KEY));
+            return Self::build_embed(agent_def, template, overrides).map(|sp| {
+                let arc: Arc<dyn SpawnerAdapter> = Arc::new(sp);
+                arc
+            });
+        }
         let agent_name = &agent_def.name;
         let spec = &agent_def.spec;
         let invalid = |msg: String| CompileError::InvalidSpec {
@@ -1384,6 +1629,7 @@ impl SpawnerFactory for SubprocessProcessSpawnerFactory {
             args,
             use_stdin,
             stream_mode,
+            embed: None,
         };
         if let Some(mode) = sp.stream_mode.clone() {
             sp = sp.stream_mode(mode);
@@ -2354,6 +2600,7 @@ mod meta_ref_validation_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         }
@@ -2532,6 +2779,7 @@ mod audit_agent_validation_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         }
@@ -2638,6 +2886,7 @@ mod projection_placement_compile_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         }
@@ -2760,6 +3009,7 @@ mod verdict_contract_lint_tests {
             degradation_policy: None,
             runners: vec![],
             default_runner: None,
+            subprocesses: vec![],
             check_policy: None,
             blueprint_ref_includes: Vec::new(),
         }
@@ -3200,7 +3450,9 @@ mod verdict_contract_lint_tests {
         assert_eq!(d.level, mlua_swarm_diag::DiagLevel::Error);
         assert!(matches!(d.stage, mlua_swarm_diag::DiagStage::CompileLint));
         assert!(d.message.contains("greeter"));
-        let suggestion = d.suggestion.expect("specialized arm must carry a suggestion");
+        let suggestion = d
+            .suggestion
+            .expect("specialized arm must carry a suggestion");
         assert!(suggestion.patch.contains("backend = \"ws_operator\""));
         assert_eq!(
             suggestion.applicability,
@@ -3224,7 +3476,10 @@ mod verdict_contract_lint_tests {
         };
         let d = mlua_swarm_diag::Diagnostic::from(&err);
         assert_eq!(d.kind, "invalid-agent-spec");
-        assert!(d.suggestion.is_none(), "generic arm carries no canned patch");
+        assert!(
+            d.suggestion.is_none(),
+            "generic arm carries no canned patch"
+        );
     }
 
     #[test]
@@ -3244,5 +3499,228 @@ mod verdict_contract_lint_tests {
             other => panic!("expected Agent span, got {other:?}"),
         }
     }
+}
 
+// ─── GH #83: SubprocessDef template hint + placeholder validation ─────────
+#[cfg(test)]
+mod subprocess_embed_compile_tests {
+    use super::*;
+    use mlua_swarm_schema::{current_schema_version, SubprocessDef, SubprocessOverrides};
+
+    fn subprocess_agent(name: &str, runner: Option<Runner>) -> AgentDef {
+        AgentDef {
+            name: name.to_string(),
+            kind: AgentKind::Subprocess,
+            spec: serde_json::json!({}),
+            profile: Some(AgentProfile {
+                system_prompt: "you are a headless worker".to_string(),
+                model: Some("profile-model".to_string()),
+                tools: vec!["Read".to_string()],
+                ..Default::default()
+            }),
+            meta: None,
+            runner,
+            runner_ref: None,
+            verdict: None,
+        }
+    }
+
+    fn echo_def(name: &str) -> SubprocessDef {
+        SubprocessDef {
+            name: name.to_string(),
+            argv: vec!["sh".to_string(), "-c".to_string(), "cat".to_string()],
+            stdin: Some("{prompt}".to_string()),
+            env: Default::default(),
+            cwd: None,
+            output: None,
+            stream_mode: None,
+        }
+    }
+
+    fn bp_with(agents: Vec<AgentDef>, subprocesses: Vec<SubprocessDef>) -> Blueprint {
+        Blueprint {
+            schema_version: current_schema_version(),
+            id: "gh83-ut".into(),
+            flow: FlowNode::Seq { children: vec![] },
+            agents,
+            operators: vec![],
+            metas: vec![],
+            hints: Default::default(),
+            strategy: Default::default(),
+            metadata: BlueprintMetadata::default(),
+            spawner_hints: Default::default(),
+            default_agent_kind: AgentKind::Operator,
+            default_operator_kind: None,
+            default_init_ctx: None,
+            default_agent_ctx: None,
+            default_context_policy: None,
+            projection_placement: None,
+            audits: vec![],
+            degradation_policy: None,
+            runners: vec![],
+            default_runner: None,
+            subprocesses,
+            check_policy: None,
+            blueprint_ref_includes: vec![],
+        }
+    }
+
+    fn subprocess_runner(template: &str) -> Runner {
+        Runner::Subprocess {
+            template: template.to_string(),
+            overrides: SubprocessOverrides::default(),
+        }
+    }
+
+    #[test]
+    fn validate_placeholders_accepts_closed_set_and_json_braces() {
+        for ok in [
+            "{system} {system_file} {prompt} {model} {tools_csv} {work_dir} {task_id} {attempt}",
+            r#"echo '{"result": "ok", "nested": {"a": 1}}'"#,
+            "no placeholders at all",
+            "unmatched { brace",
+        ] {
+            validate_embed_placeholders(ok, "ut").expect("must be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_placeholders_rejects_unknown_token() {
+        let err = validate_embed_placeholders("--flag {evil}", "argv[1]").unwrap_err();
+        assert!(err.contains("'{evil}'"), "token named: {err}");
+        assert!(err.contains("closed set"), "closed set listed: {err}");
+    }
+
+    /// The scan descends into literal braces — a token nested inside a
+    /// JSON-wrapped template string is still validated (mirrors the
+    /// spawn-time render scan).
+    #[test]
+    fn validate_placeholders_descends_into_literal_braces() {
+        validate_embed_placeholders(r#"{"task": "{prompt}"}"#, "stdin")
+            .expect("nested closed-set token must be accepted");
+        let err = validate_embed_placeholders(r#"{"task": "{evil}"}"#, "stdin").unwrap_err();
+        assert!(
+            err.contains("'{evil}'"),
+            "nested unknown token caught: {err}"
+        );
+    }
+
+    #[test]
+    fn hint_resolution_finds_declared_template() {
+        let agent = subprocess_agent("headless", Some(subprocess_runner("echo")));
+        let bp = bp_with(vec![agent.clone()], vec![echo_def("echo")]);
+        let hint = resolve_subprocess_template_hint(&bp, &agent)
+            .expect("resolves")
+            .expect("Runner::Subprocess must synthesize a hint");
+        assert_eq!(hint[SUBPROCESS_TEMPLATE_HINT_KEY]["name"], "echo");
+        assert!(hint.get(SUBPROCESS_OVERRIDES_HINT_KEY).is_some());
+    }
+
+    #[test]
+    fn hint_resolution_unknown_template_is_invalid_spec() {
+        let agent = subprocess_agent("headless", Some(subprocess_runner("nope")));
+        let bp = bp_with(vec![agent.clone()], vec![echo_def("echo")]);
+        let err = resolve_subprocess_template_hint(&bp, &agent).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("'nope'"), "missing template named: {msg}");
+        assert!(msg.contains("echo"), "defined templates listed: {msg}");
+    }
+
+    #[test]
+    fn hint_resolution_none_without_subprocess_runner() {
+        let agent = subprocess_agent("headless", None);
+        let bp = bp_with(vec![agent.clone()], vec![echo_def("echo")]);
+        let hint = resolve_subprocess_template_hint(&bp, &agent).expect("resolves");
+        assert!(hint.is_none(), "spec-based agents keep the historical path");
+    }
+
+    #[test]
+    fn build_embed_rejects_unknown_placeholder() {
+        let agent = subprocess_agent("headless", None);
+        let mut def = echo_def("echo");
+        def.argv.push("--x={evil}".to_string());
+        let err = SubprocessProcessSpawnerFactory::build_embed(
+            &agent,
+            &serde_json::to_value(&def).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("'{evil}'"));
+    }
+
+    #[test]
+    fn build_embed_rejects_output_with_stream_mode() {
+        let agent = subprocess_agent("headless", None);
+        let mut def = echo_def("echo");
+        def.stream_mode = Some("ndjson_lines".to_string());
+        def.output = Some(mlua_swarm_schema::SubprocessOutput {
+            format: Some("json".to_string()),
+            result_ptr: None,
+            ok_from: None,
+        });
+        let err = SubprocessProcessSpawnerFactory::build_embed(
+            &agent,
+            &serde_json::to_value(&def).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("plain-mode"));
+    }
+
+    #[test]
+    fn build_embed_rejects_malformed_result_ptr_and_ok_from() {
+        let agent = subprocess_agent("headless", None);
+        let mut def = echo_def("echo");
+        def.output = Some(mlua_swarm_schema::SubprocessOutput {
+            format: None,
+            result_ptr: Some("result".to_string()),
+            ok_from: None,
+        });
+        let err = SubprocessProcessSpawnerFactory::build_embed(
+            &agent,
+            &serde_json::to_value(&def).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("JSON Pointer"));
+
+        let mut def = echo_def("echo");
+        def.output = Some(mlua_swarm_schema::SubprocessOutput {
+            format: None,
+            result_ptr: None,
+            ok_from: Some("status".to_string()),
+        });
+        let err = SubprocessProcessSpawnerFactory::build_embed(
+            &agent,
+            &serde_json::to_value(&def).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("exit_code"));
+    }
+
+    #[test]
+    fn build_embed_bakes_profile_with_override_precedence() {
+        let agent = subprocess_agent("headless", None);
+        let def = echo_def("echo");
+        let overrides = SubprocessOverrides {
+            model: Some("override-model".to_string()),
+            tools: vec!["Bash".to_string(), "Write".to_string()],
+            cwd: Some("/tmp/override-wd".to_string()),
+        };
+        let sp = SubprocessProcessSpawnerFactory::build_embed(
+            &agent,
+            &serde_json::to_value(&def).unwrap(),
+            Some(&serde_json::to_value(&overrides).unwrap()),
+        )
+        .expect("builds");
+        let embed = sp.embed.as_ref().expect("embed template baked");
+        assert_eq!(embed.model.as_deref(), Some("override-model"));
+        assert_eq!(embed.tools_csv, "Bash,Write");
+        assert_eq!(embed.cwd.as_deref(), Some("/tmp/override-wd"));
+        assert_eq!(
+            embed.system_prompt.as_deref(),
+            Some("you are a headless worker")
+        );
+    }
 }

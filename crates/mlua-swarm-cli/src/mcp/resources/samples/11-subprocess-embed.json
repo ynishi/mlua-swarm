@@ -1,0 +1,60 @@
+{
+  "schema_version": "0.1.0",
+  "id": "sample-subprocess-embed",
+  "flow": {
+    "kind": "seq",
+    "children": [
+      {
+        "kind": "step",
+        "ref": "probe_worker",
+        "in": { "op": "lit", "value": "summarize the change in one line" },
+        "out": { "op": "path", "at": "$.probe" }
+      },
+      {
+        "kind": "step",
+        "ref": "echo_worker",
+        "in": { "op": "lit", "value": "ignored" },
+        "out": { "op": "path", "at": "$.echo" }
+      }
+    ]
+  },
+  "agents": [
+    {
+      "name": "probe_worker",
+      "kind": "subprocess",
+      "spec": {},
+      "profile": {
+        "system_prompt": "You are a headless one-line summarizer."
+      },
+      "runner": { "backend": "subprocess", "template": "sh-probe" }
+    },
+    {
+      "name": "echo_worker",
+      "kind": "subprocess",
+      "spec": {},
+      "runner": { "backend": "subprocess", "template": "sh-echo" }
+    }
+  ],
+  "subprocesses": [
+    {
+      "name": "sh-probe",
+      "argv": [
+        "sh",
+        "-c",
+        "printf '{\"result\": {\"prompt_seen\": \"%s\", \"system_seen\": \"%s\"}, \"ok\": true}' \"$(cat)\" \"$(cat \"$SYS_FILE\")\""
+      ],
+      "stdin": "{prompt}",
+      "env": { "SYS_FILE": "{system_file}" },
+      "output": {
+        "format": "json",
+        "result_ptr": "/result",
+        "ok_from": "/ok"
+      }
+    },
+    {
+      "name": "sh-echo",
+      "argv": ["sh", "-c", "printf '{\"result\": \"echoed\"}'"],
+      "output": { "format": "json", "result_ptr": "/result" }
+    }
+  ]
+}

@@ -56,8 +56,8 @@ pub use mlua_swarm_schema::{
     BindRequest, BindingAttestation, BindingBackend, BindingDigest, BindingDigestParseError,
     Blueprint, BlueprintMetadata, BlueprintOrigin, BoundAgent, BoundAgentResolveError,
     CompilerHints, CompilerStrategy, MetaDef, OperatorDef, ProjectionPlacementSpec, Runner,
-    RunnerDef, RunnerResolutionSource, RunnerResolveError, SpawnerHints, WorkerModel,
-    CURRENT_SCHEMA_VERSION,
+    RunnerDef, RunnerResolutionSource, RunnerResolveError, SpawnerHints, SubprocessDef,
+    SubprocessOutput, SubprocessOverrides, WorkerModel, CURRENT_SCHEMA_VERSION,
 };
 
 /// Bridges `mlua_flow_ir::AsyncDispatcher` to the engine's
