@@ -244,6 +244,21 @@ impl SpawnerAdapter for OperatorSpawner {
                 r = op.execute(&ctx_clone, system, prompt, worker_binding, token_for_op) => r,
                 _ = cancel_inner.cancelled() => Err(WorkerError::Cancelled),
             };
+            // Per-step run stats: the WS operator ack may attach
+            // harness-reported SubAgent usage — forward it to the
+            // engine so the dispatcher's outcome fold lands it on the
+            // terminal StepEntry. Even without stats attached,
+            // `ensure_worker_kind` guarantees the `worker_kind:
+            // "operator"` label always rides (mirrors the sibling
+            // `OperatorDelegateMiddleware` fold site).
+            let result = result.map(|wr| wr.ensure_worker_kind("operator"));
+            if let Ok(wr) = &result {
+                if let Some(stats) = wr.stats.clone() {
+                    engine_clone
+                        .record_worker_stats(&task_id_clone, attempt, stats)
+                        .await;
+                }
+            }
             // Emit `WorkerResult` → `OutputEvent::Final` in
             // parallel. If the SubAgent already
             // pushed a `Final` via HTTP (`/v1/worker/result` or
