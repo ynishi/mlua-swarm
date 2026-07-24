@@ -676,6 +676,42 @@ Rules that fall out of this:
    `POST /v1/operators` returns `409 CONFLICT` only when the same alias
    string is already claimed by a live session (`login.rs` role check
    under `roles_to_sid`). Distinct alias strings never conflict.
+5. **The 409 conflict body names the holding session (GH #81 Layer 2 (a)).**
+   Alongside the pre-#81 `conflicts: [<role>]` array, the response now
+   carries `conflicts_detail: [{role, sid}]` so a recovery driver can
+   read the holder sid directly:
+   ```json
+   {
+     "error": "roles conflict",
+     "conflicts": ["main-ai"],
+     "conflicts_detail": [{"role": "main-ai", "sid": "S-..."}]
+   }
+   ```
+   Existing clients that only read `conflicts` are unaffected.
+
+### Recovery: enumerate and release stale sessions (GH #81 Layer 2)
+
+Two surfaces close the pre-#81 recovery gap where a driver that crashed
+after minting a session could only be recovered by a full `mse serve`
+restart (which also dropped every OTHER live session):
+
+- **`GET /v1/operators`** — read-only enumeration of every live session's
+  `{sid, roles, joined_at_secs, connected}`. Same trust tier as
+  `GET /v1/status` (no Bearer required — sids are identifiers, not
+  secrets; the token is the sole Bearer credential and never surfaces
+  here). Answers "which sid holds `main-ai`?" without probing every sid
+  individually.
+- **`DELETE /v1/operators/by-role/:role`** — release the session
+  currently holding `role` without knowing the sid or its Bearer token.
+  `404` when no session holds the role, `204` on successful teardown.
+  Same trust tier as `mlua_swarm_server_shutdown` (no Bearer — admin
+  observability + recovery for stale-session drift). MCP counterpart:
+  `mse_operator_leave_by_role(role)`.
+
+The pre-#81 `DELETE /v1/operators/:sid` (Bearer required) is unchanged
+and remains the correct path for a session's own driver to leave
+cleanly. `by-role` is the recovery escape hatch when the sid is
+unknown, not a replacement for the sid-scoped route.
 
 ### Capability manifest at join
 

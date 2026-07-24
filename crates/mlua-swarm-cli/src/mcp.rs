@@ -1728,6 +1728,15 @@ struct OperatorLeaveReq {
     sid: String,
 }
 
+/// GH #81 Layer 2 (c): request schema for the by-role recovery route —
+/// release a stale session holding `role` when the sid is unknown.
+#[derive(Deserialize, JsonSchema)]
+struct OperatorLeaveByRoleReq {
+    /// Role name held by the stale session (e.g. `"main-ai"`) — matches
+    /// the values passed as `mse_operator_join(roles=[...])`.
+    role: String,
+}
+
 // ---- worker HTTP tool param schemas ----
 // Pure-MCP replacements for the two Bash curl steps in the mse-worker
 // wrapper agents, so their tools list can drop `Bash` entirely (the curl
@@ -2049,7 +2058,7 @@ struct SwarmCancelReq {
 #[tool_router]
 impl MseServer {
     #[tool(
-        description = "Join as an Operator session: POST /v1/operators (mint sid+token and submit capability_manifest) then connect WS /v1/operators/:sid/ws with the returned Bearer token. The token stays process-local (never returned to the caller). Runner-backed launches resolve the manifest fail-closed by logical role, launch_variant, model, and tools. Returns {sid, roles}. Use `sid` with mse_pending_wait / mse_ack / mse_operator_leave."
+        description = "Join as an Operator session: POST /v1/operators (mint sid+token and submit capability_manifest) then connect WS /v1/operators/:sid/ws with the returned Bearer token. The token stays process-local (never returned to the caller). Runner-backed launches resolve the manifest fail-closed by logical role, launch_variant, model, and tools. Returns {sid, roles}. Use `sid` with mse_pending_wait / mse_ack / mse_operator_leave. On a `roles conflict` (409), the response body carries both the pre-#81 `conflicts: [<role>]` array and the GH #81 Layer 2 `conflicts_detail: [{role, sid}]` array identifying the holding session — pair with `mse_operator_leave_by_role(role)` to recover from a stale session whose original driver crashed."
     )]
     async fn mse_operator_join(
         &self,
@@ -2116,6 +2125,20 @@ impl MseServer {
             .await
             .map_err(client_error_to_mcp)?;
         json_result(&serde_json::json!({ "removed": true }))
+    }
+
+    #[tool(
+        description = "GH #81 Layer 2 (c): release the Operator session currently holding `role` without knowing the sid or its Bearer token. Recovery route for a stale session whose driver crashed after minting the sid — pre-#81 the only reliable recovery was a full server restart, which also dropped every OTHER live session. Proxies DELETE /v1/operators/by-role/:role (same trust tier as `mlua_swarm_server_shutdown` — no Bearer). Returns {removed: true} on 204, and surfaces the server's 404 (no session holds this role) as an invalid_params McpError. Sibling `GET /v1/operators` route (not yet exposed as an MCP tool — call the HTTP endpoint directly) enumerates every live session's {sid, roles, joined_at_secs, connected} to identify which role to release."
+    )]
+    async fn mse_operator_leave_by_role(
+        &self,
+        Parameters(req): Parameters<OperatorLeaveByRoleReq>,
+    ) -> Result<CallToolResult, McpError> {
+        self.op_client
+            .leave_by_role(&req.role)
+            .await
+            .map_err(client_error_to_mcp)?;
+        json_result(&serde_json::json!({ "removed": true, "role": req.role }))
     }
 
     #[tool(

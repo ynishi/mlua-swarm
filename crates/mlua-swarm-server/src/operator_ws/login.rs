@@ -70,6 +70,11 @@ pub struct OperatorSessionEntry {
     pub roles: Vec<String>,
     /// Provider-owned effective capability manifest submitted at join.
     pub capability_manifest: Option<AgentProviderManifest>,
+    /// GH #81 Layer 2: unix epoch seconds when `POST /v1/operators` minted
+    /// this entry. Surfaced by `GET /v1/operators` so a recovery driver
+    /// can pick the oldest stale session without probing each sid
+    /// individually.
+    pub joined_at_secs: u64,
     /// The reusable 3-trait session object once a WS has connected at least
     /// once; `None` before first connect. Its sender tracks current connectivity.
     pub ws_session: Mutex<Option<Arc<WSOperatorSession>>>,
@@ -132,9 +137,26 @@ pub async fn operators_create(
             .cloned()
             .collect();
         if !conflicts.is_empty() {
+            // GH #81 Layer 2 (a): identify the holding session per
+            // conflicted role so a recovery driver knows which sid to
+            // release without probing. The pre-#81 `conflicts: [role]`
+            // array stays byte-identical for callers that already
+            // ignore unknown keys; the new `conflicts_detail: [{role,
+            // sid}]` array is an additive companion.
+            let conflicts_detail: Vec<serde_json::Value> = conflicts
+                .iter()
+                .map(|r| {
+                    let holder = map.get(r.as_str()).map(|sid| sid.to_string());
+                    json!({ "role": r, "sid": holder })
+                })
+                .collect();
             return (
                 StatusCode::CONFLICT,
-                Json(json!({"error": "roles conflict", "conflicts": conflicts})),
+                Json(json!({
+                    "error": "roles conflict",
+                    "conflicts": conflicts,
+                    "conflicts_detail": conflicts_detail,
+                })),
             )
                 .into_response();
         }
@@ -143,11 +165,16 @@ pub async fn operators_create(
         }
     }
 
+    let joined_at_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let entry = Arc::new(OperatorSessionEntry {
         sid: sid.clone(),
         token: token.clone(),
         roles: roles.clone(),
         capability_manifest,
+        joined_at_secs,
         ws_session: Mutex::new(None),
     });
     state
@@ -355,6 +382,47 @@ async fn handle_operator_socket(
 
 // ─── DELETE /v1/operators/:sid (Bearer required) ────────────────────────────
 
+/// Shared teardown for `DELETE /v1/operators/:sid` (`operators_delete`) and
+/// `DELETE /v1/operators/by-role/:role` (`operators_delete_by_role` — GH #81
+/// Layer 2 (c)): drops the 3 engine registries + role aliases +
+/// `ws_operator_factory` bindings + `operator_sessions` entry, and releases
+/// the sid's ownership in `roles_to_sid`. Idempotent w.r.t. a concurrent
+/// delete — every `remove` / `unregister` is a no-op when the entry is
+/// already gone.
+async fn teardown_operator_session(
+    state: &AppState,
+    sid: &SessionId,
+    entry: &Arc<OperatorSessionEntry>,
+) {
+    state.engine.unregister_senior_bridge(sid.as_str()).await;
+    state.engine.unregister_spawn_hook(sid.as_str()).await;
+    state.engine.unregister_operator(sid.as_str()).await;
+    if let Some(factory) = &state.ws_operator_factory {
+        factory.unregister_operator(sid.as_str());
+    }
+    for role in &entry.roles {
+        state.engine.unregister_operator(role).await;
+        if let Some(factory) = &state.ws_operator_factory {
+            factory.unregister_operator(role);
+        }
+    }
+
+    if let Some(session) = entry.ws_session.lock().await.take() {
+        session.clear_tx().await;
+    }
+
+    state.operator_sessions.lock().await.remove(sid);
+
+    {
+        let mut map = state.roles_to_sid.lock().await;
+        for role in &entry.roles {
+            if map.get(role) == Some(sid) {
+                map.remove(role);
+            }
+        }
+    }
+}
+
 /// `DELETE /v1/operators/:sid`. Bearer mandatory. `404` on unknown sid, `401`
 /// on token mismatch. Drops the 3 engine registries + role aliases +
 /// `ws_operator_factory` bindings + `operator_sessions` entry, and releases
@@ -385,34 +453,123 @@ pub async fn operators_delete(
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
-    state.engine.unregister_senior_bridge(sid.as_str()).await;
-    state.engine.unregister_spawn_hook(sid.as_str()).await;
-    state.engine.unregister_operator(sid.as_str()).await;
-    if let Some(factory) = &state.ws_operator_factory {
-        factory.unregister_operator(sid.as_str());
-    }
-    for role in &entry.roles {
-        state.engine.unregister_operator(role).await;
-        if let Some(factory) = &state.ws_operator_factory {
-            factory.unregister_operator(role);
-        }
-    }
+    teardown_operator_session(&state, &sid, &entry).await;
 
-    if let Some(session) = entry.ws_session.lock().await.take() {
-        session.clear_tx().await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// ─── GH #81 Layer 2: GET /v1/operators + DELETE /v1/operators/by-role/:role
+
+/// GH #81 Layer 2 (b): one entry in the `GET /v1/operators` list response.
+/// Bare identity fields (no token, no capability manifest — those live
+/// behind Bearer on `GET /v1/operators/:sid`); this list surface is
+/// read-only observability, on the same trust tier as `GET /v1/status`.
+#[derive(Debug, Serialize)]
+pub struct OperatorsListEntry {
+    /// Session id (`S-<hex>`) — safe to expose; token is the sole bearer secret.
+    pub sid: SessionId,
+    /// Role aliases held by this session.
+    pub roles: Vec<String>,
+    /// Unix epoch seconds when the session minted (from
+    /// [`OperatorSessionEntry::joined_at_secs`]).
+    pub joined_at_secs: u64,
+    /// Whether a WS is currently attached to this session (matches the
+    /// `connected` field on `GET /v1/operators/:sid`).
+    pub connected: bool,
+}
+
+/// Response body for `GET /v1/operators` (GH #81 Layer 2 (b)).
+#[derive(Debug, Serialize)]
+pub struct OperatorsListResp {
+    /// One entry per live session, ordered by `sid` (deterministic —
+    /// callers can `.iter().find(...)` without probing the map order).
+    pub operators: Vec<OperatorsListEntry>,
+}
+
+/// `GET /v1/operators`. Read-only enumeration of every live session's
+/// `{sid, roles, joined_at_secs, connected}` (GH #81 Layer 2 (b)). Same
+/// trust tier as `GET /v1/status` — no Bearer required; sids are
+/// identifiers, not secrets. Answers "which sid holds `main-ai`?"
+/// without probing every sid individually via `GET /v1/operators/:sid`,
+/// which was the pre-#81 recovery gap.
+pub async fn operators_list(State(state): State<AppState>) -> Response {
+    let entries: Vec<(SessionId, Arc<OperatorSessionEntry>)> = {
+        let map = state.operator_sessions.lock().await;
+        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let mut operators = Vec::with_capacity(entries.len());
+    for (sid, entry) in entries {
+        let session = entry.ws_session.lock().await.clone();
+        let connected = match session {
+            Some(session) => session.is_connected().await,
+            None => false,
+        };
+        operators.push(OperatorsListEntry {
+            sid,
+            roles: entry.roles.clone(),
+            joined_at_secs: entry.joined_at_secs,
+            connected,
+        });
     }
+    operators.sort_by(|a, b| a.sid.as_str().cmp(b.sid.as_str()));
+    (StatusCode::OK, Json(OperatorsListResp { operators })).into_response()
+}
 
-    state.operator_sessions.lock().await.remove(&sid);
-
-    {
-        let mut map = state.roles_to_sid.lock().await;
-        for role in &entry.roles {
-            if map.get(role) == Some(&sid) {
-                map.remove(role);
+/// `DELETE /v1/operators/by-role/:role`. Releases the session currently
+/// holding `role` without requiring the caller to know the sid or its
+/// Bearer token (GH #81 Layer 2 (c)). Recovery route for a stale session
+/// whose driver crashed after minting the sid — pre-#81 the only reliable
+/// recovery was a full server restart, which also dropped every OTHER live
+/// session. Same trust tier as the server-shutdown surface
+/// (`mlua_swarm_server_shutdown`): admin observability, no Bearer.
+///
+/// `404` when no session holds the role, `204` on successful teardown. The
+/// response body on `204` is empty (`teardown_operator_session` performs
+/// the same cleanup as `operators_delete`).
+pub async fn operators_delete_by_role(
+    State(state): State<AppState>,
+    Path(role): Path<String>,
+) -> Response {
+    let sid = {
+        let map = state.roles_to_sid.lock().await;
+        match map.get(role.as_str()) {
+            Some(sid) => sid.clone(),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "no session holds this role", "role": role})),
+                )
+                    .into_response();
             }
         }
-    }
-
+    };
+    let entry = {
+        let map = state.operator_sessions.lock().await;
+        map.get(&sid).cloned()
+    };
+    let entry = match entry {
+        Some(e) => e,
+        None => {
+            // The role was mapped to a sid that has no matching
+            // `operator_sessions` entry — a torn state that a mint-time
+            // atomic guard prevents in normal operation. Release the
+            // stale role mapping so a future mint can reclaim the
+            // name, then report NOT_FOUND.
+            let mut map = state.roles_to_sid.lock().await;
+            if map.get(role.as_str()) == Some(&sid) {
+                map.remove(role.as_str());
+            }
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "torn role mapping cleared; role now open",
+                    "role": role,
+                })),
+            )
+                .into_response();
+        }
+    };
+    teardown_operator_session(&state, &sid, &entry).await;
     StatusCode::NO_CONTENT.into_response()
 }
 

@@ -424,7 +424,7 @@ pub async fn task_rekick(
         .task_app
         .resolve(&blueprint_ref)
         .await
-        .map_err(|e| ApiError::bad_request(format!("task {task_id}: bp resolve: {e}")))?;
+        .map_err(|e| ApiError::from_task_resolve(&e, &format!("task {task_id}: bp resolve")))?;
 
     let req = body.map(|Json(r)| r).unwrap_or_default();
 

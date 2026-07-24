@@ -149,6 +149,7 @@ mod tests {
             token: "token".to_string(),
             roles: vec!["main-ai".to_string()],
             capability_manifest: manifest,
+            joined_at_secs: 0,
             ws_session: Mutex::new(None),
         });
         let sessions = Arc::new(Mutex::new(HashMap::from([(sid.clone(), entry)])));

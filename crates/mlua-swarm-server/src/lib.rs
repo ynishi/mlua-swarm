@@ -100,8 +100,9 @@ pub use enhance_log::build_enhance_log_router;
 pub use enhance_settings::build_enhance_settings_router;
 pub use issues::{build_issues_router, GetIssueResponse, PostIssueRequest, PostIssueResponse};
 pub use operator_ws::{
-    operators_create, operators_delete, operators_info, operators_ws_connect, ClientMsg,
-    OperatorSessionEntry, ServerMsg, WSOperatorSession,
+    operators_create, operators_delete, operators_delete_by_role, operators_info, operators_list,
+    operators_ws_connect, ClientMsg, OperatorSessionEntry, OperatorsListEntry, OperatorsListResp,
+    ServerMsg, WSOperatorSession,
 };
 pub use projection::{McpQueryAdapter, ProjectionSource, StepList, StepPathQuery, StepSummary};
 pub use tasks::{
@@ -446,8 +447,24 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
         .route("/v1/runs/:id/rerun-from", post(tasks::run_rerun_from))
         // REST-like Operator login flow (Bearer-mandatory, roles exclusivity).
         // Sole WS Operator session route; see `operator_ws::login` module doc.
-        .route("/v1/operators", post(operators_create))
+        // GH #81 Layer 2: `GET /v1/operators` (list, read-only observability
+        // — no Bearer, same trust tier as `GET /v1/status`) and
+        // `DELETE /v1/operators/by-role/:role` (stale-session recovery
+        // without knowing the sid — same trust tier as
+        // `mlua_swarm_server_shutdown`) close the pre-#81 recovery gap
+        // where a stale session was only clearable via a full server
+        // restart. Order matters: the `by-role` route is declared BEFORE
+        // the `:sid` route so `axum` matches `by-role/:role` as its own
+        // path, not as a `:sid` extract of literal `by-role`.
+        .route(
+            "/v1/operators",
+            post(operators_create).get(operators_list),
+        )
         .route("/v1/operators/:sid/ws", get(operators_ws_connect))
+        .route(
+            "/v1/operators/by-role/:role",
+            axum::routing::delete(operators_delete_by_role),
+        )
         .route(
             "/v1/operators/:sid",
             get(operators_info).delete(operators_delete),
@@ -1079,7 +1096,7 @@ async fn run_flow_form(
                 .task_app
                 .resolve(&blueprint)
                 .await
-                .map_err(|e| ApiError::bad_request(format!("bp resolve: {e}")))?;
+                .map_err(|e| ApiError::from_task_resolve(&e, "bp resolve"))?;
             match resolved_bp.metadata.default_run_ttl_secs {
                 Some(v) => (v, TtlSource::BpMetadata),
                 None => (default_run_ttl(), TtlSource::ServerDefault),
@@ -1446,6 +1463,32 @@ impl ApiError {
             message: m,
             details: None,
         }
+    }
+    /// GH #81 Layer 1: map a `TaskApplication::resolve` failure into the
+    /// same recovery wording the register path already emits when the
+    /// underlying condition is that the Blueprint is archived. On the
+    /// archived branch the caller gets a `409 CONFLICT` with the exact
+    /// hint `blueprint {id} is archived; POST /v1/blueprints/{id}/unarchive
+    /// first` — byte-identical to `blueprints::seed_blueprint`'s message
+    /// so downstream tooling can grep either surface. Every other
+    /// `TaskApplicationError` falls through to the pre-#81 `400 bad
+    /// request` shape, preserving the launch / rekick error surface for
+    /// callers that don't distinguish store errors from other resolve
+    /// failures.
+    pub fn from_task_resolve(err: &mlua_swarm::TaskApplicationError, prefix: &str) -> Self {
+        use mlua_swarm::blueprint::store::BlueprintStoreError;
+        use mlua_swarm::TaskApplicationError as E;
+        if let E::Store(BlueprintStoreError::Archived(bp_id)) = err {
+            return Self {
+                status: StatusCode::CONFLICT,
+                message: format!(
+                    "{prefix}: blueprint {bp_id} is archived; \
+                     POST /v1/blueprints/{bp_id}/unarchive first"
+                ),
+                details: None,
+            };
+        }
+        Self::bad_request(format!("{prefix}: {err}"))
     }
     /// Builds a `503 Service Unavailable` with the given message (GH #33
     /// Guard 1 — operator readiness precheck).
@@ -1919,5 +1962,65 @@ mod tests {
         assert_eq!(details["failed_step"], Value::Null);
         assert_eq!(details["verdict_value"], Value::Null);
         assert_eq!(details["partial_ctx"], Value::Null);
+    }
+
+    // ─── GH #81 Layer 1: archived-BP guidance on run paths ──────────
+
+    #[test]
+    fn from_task_resolve_archived_maps_to_409_with_unarchive_hint() {
+        use mlua_swarm::blueprint::store::{BlueprintId, BlueprintStoreError};
+        use mlua_swarm::TaskApplicationError;
+        let bp_id = BlueprintId::new("greeter".to_string());
+        let err = TaskApplicationError::Store(BlueprintStoreError::Archived(bp_id));
+        let api = ApiError::from_task_resolve(&err, "bp resolve");
+        assert_eq!(api.status, StatusCode::CONFLICT);
+        // The wording is byte-identical to the register path
+        // (`blueprints::seed_blueprint`) so downstream tooling can grep
+        // either surface.
+        assert_eq!(
+            api.message,
+            "bp resolve: blueprint greeter is archived; \
+             POST /v1/blueprints/greeter/unarchive first"
+        );
+    }
+
+    #[test]
+    fn from_task_resolve_archived_honours_the_caller_supplied_prefix() {
+        use mlua_swarm::blueprint::store::{BlueprintId, BlueprintStoreError};
+        use mlua_swarm::TaskApplicationError;
+        // The rekick site prepends `task {task_id}: ` to distinguish
+        // rekick failures from launch failures in logs.
+        let bp_id = BlueprintId::new("scout".to_string());
+        let err = TaskApplicationError::Store(BlueprintStoreError::Archived(bp_id));
+        let api = ApiError::from_task_resolve(&err, "task T-abc: bp resolve");
+        assert_eq!(api.status, StatusCode::CONFLICT);
+        assert!(api.message.starts_with("task T-abc: bp resolve:"));
+        assert!(api.message.contains(
+            "blueprint scout is archived; POST /v1/blueprints/scout/unarchive first"
+        ));
+    }
+
+    #[test]
+    fn from_task_resolve_non_archived_store_error_stays_400() {
+        // A store IdNotFound → resolve() surfaces
+        // `TaskApplicationError::Store(BlueprintStoreError::IdNotFound(...))`
+        // which must remain the pre-#81 400 shape.
+        use mlua_swarm::blueprint::store::{BlueprintId, BlueprintStoreError};
+        use mlua_swarm::TaskApplicationError;
+        let bp_id = BlueprintId::new("no-such".to_string());
+        let err = TaskApplicationError::Store(BlueprintStoreError::IdNotFound(bp_id));
+        let api = ApiError::from_task_resolve(&err, "bp resolve");
+        assert_eq!(api.status, StatusCode::BAD_REQUEST);
+        assert!(api.message.starts_with("bp resolve:"));
+    }
+
+    #[test]
+    fn from_task_resolve_no_store_error_stays_400() {
+        // A non-Store variant (NoStore fires when `BlueprintRef::Id` is
+        // used against an inline-only TaskApplication) also stays 400.
+        use mlua_swarm::TaskApplicationError;
+        let err = TaskApplicationError::NoStore;
+        let api = ApiError::from_task_resolve(&err, "bp resolve");
+        assert_eq!(api.status, StatusCode::BAD_REQUEST);
     }
 }

@@ -513,6 +513,35 @@ impl OperatorClientState {
         result
     }
 
+    /// GH #81 Layer 2 (c): `DELETE /v1/operators/by-role/:role` — release a
+    /// stale role holder without knowing the sid or its Bearer token. The
+    /// route is unauthenticated by design (same trust tier as
+    /// `mlua_swarm_server_shutdown`); the calling driver is expected to
+    /// hold the same trust as the server's shutdown surface. `404` if no
+    /// session holds the role, `204` on successful teardown. No local sid
+    /// cleanup — the recovery scenario is a driver that crashed and lost
+    /// its own local session map, so there is nothing local to sweep.
+    /// Callers that DO have a live local session and want to leave should
+    /// use [`Self::leave`] with the known sid instead.
+    pub async fn leave_by_role(&self, role: &str) -> Result<(), ClientError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        let url = format!("{}/v1/operators/by-role/{role}", self.http_base);
+        let resp = client
+            .delete(&url)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Http(format!("DELETE {url} failed: {status} {body}")));
+        }
+        Ok(())
+    }
+
     /// `DELETE /v1/operators/:sid` (Bearer) + abort the reader task + drop
     /// the local entry. The local entry is removed and the reader task
     /// aborted before the HTTP call, so process-local state is always

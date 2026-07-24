@@ -147,6 +147,22 @@ runs both side by side. The full three-hop responsibility model is
   snapshot (incl. after-run audit findings and worker degradation
   counts); `bp_doctor` stays useful post-register whenever a Blueprint
   head changes.
+- **Recovery from blocked resources (GH #81)** — error bodies name the
+  fix, not just the blocking condition:
+  - **Archived Blueprint on launch/rekick.** Launching or rekicking a
+    task against an archived Blueprint now returns `409 CONFLICT` with
+    the same wording the register path already emits: `bp resolve:
+    blueprint {id} is archived; POST /v1/blueprints/{id}/unarchive
+    first`. Pre-#81 this fell through to a generic `400` with no
+    recovery hint. `bp_unarchive` is the corresponding MCP tool.
+  - **Stale operator session** (a driver crashed after
+    `mse_operator_join`). `GET /v1/operators` enumerates every live
+    session's `{sid, roles, joined_at_secs, connected}` without
+    Bearer; `DELETE /v1/operators/by-role/:role` (MCP:
+    `mse_operator_leave_by_role`) releases the holder without knowing
+    the sid or its Bearer, so recovery no longer needs a full server
+    restart. Full contract:
+    `mse://guides/operator-execution-model` § Recovery.
 
 ---
 
