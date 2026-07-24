@@ -419,6 +419,23 @@ struct BpDoctorReq {
     /// top-level `skip_on_lint` section entirely.
     #[serde(default)]
     disable_skip_on_lint: Option<bool>,
+    /// GH #78 context_policy_lint family (default enabled): when true,
+    /// skip the context_policy / projection-root cross-checks
+    /// (`context_policy_strips_projection_roots` /
+    /// `projection_root_seed_missing`) and omit the top-level
+    /// `context_policy_lint` section entirely. WARN is the maximum
+    /// severity ever emitted.
+    #[serde(default)]
+    disable_context_policy_lint: Option<bool>,
+    /// GH #78: optional simulated launch payload for the
+    /// `projection_root_seed_missing` check — an object whose
+    /// `"project_root"` / `"work_dir"` string fields mirror the canonical
+    /// seed the real `POST /v1/tasks` request would carry. When omitted,
+    /// the seed simulation is skipped (only the static
+    /// `context_policy_strips_projection_roots` check runs); pass `{}`
+    /// to simulate a launch that seeds neither root.
+    #[serde(default)]
+    simulated_launch: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -480,6 +497,9 @@ struct BpBuildReq {
     /// resolves refs itself at register time. `true` mirrors the CLI's
     /// `--strict-embed`: an unresolved ref returns `status: "error"`
     /// with `stage: "lint"` and no register attempt is made.
+    /// Independent from the server-side `mse serve
+    /// --blueprint-strict-embed` switch (register-time raw-ref
+    /// reject) — see `mse://guides/strict-embed-modes`.
     #[serde(default)]
     strict_embed: bool,
 }
@@ -1098,6 +1118,123 @@ fn classify_skip_on_lint(bp: &Blueprint) -> serde_json::Value {
 const WRAPPER_ONLY_CONTRACT_TOOLS: &[&str] =
     &["mcp__mse__mse_worker_fetch", "mcp__mse__mse_worker_submit"];
 
+/// GH #78 Layer 1 `context_policy_lint` family: Blueprint-scoped advisory
+/// checks that front-load the "silent `file_path: null`" failure — a
+/// Blueprint registers and launches with 200s, but
+/// `resolve_materialized_file`'s root resolution
+/// (`ProjectionPlacement::resolve_root`) silently returns `None` at read
+/// time because neither `work_dir` nor `project_root` survives into the
+/// step's `AgentContextView`. Report-only (WARN — never BLOCK), matching
+/// the sibling `binding_lint` / `skip_on_lint` posture.
+///
+/// Two checks:
+///
+/// - `context_policy_strips_projection_roots` (WARN, static): an agent's
+///   effective [`mlua_swarm_schema::ContextPolicy`]
+///   (`AgentMeta.context_policy`, else `Blueprint.default_context_policy`)
+///   filters out BOTH `"work_dir"` AND `"project_root"`. Root resolution
+///   is then guaranteed to fail whatever the launch seeds — every step
+///   artifact for that agent materializes `content_url`-only. A policy
+///   that strips only one root field is not flagged (the other still
+///   resolves via `RootPreference`'s fallback).
+/// - `projection_root_seed_missing` (WARN, simulation): evaluated only
+///   when the caller passes `simulated_launch` (an object whose
+///   `"project_root"` / `"work_dir"` string fields mirror the canonical
+///   launch-time seed). Flags every agent for which no seeded field
+///   survives its effective policy — the exact GH #78 P1a repro
+///   (`projection_placement.root = "project_root"` declared, launch omits
+///   `project_root`), evaluated before any real work is dispatched.
+///
+/// A Blueprint that declares no `context_policy` anywhere and is checked
+/// without `simulated_launch` produces no findings (OK) — the family
+/// stays silent for the pre-#20/#21 Blueprint population.
+///
+/// Pure over the resolved Blueprint (no I/O), unit-testable.
+fn classify_context_policy_lint(
+    bp: &Blueprint,
+    simulated_launch: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    const ROOT_FIELDS: [&str; 2] = ["work_dir", "project_root"];
+
+    // The declared placement preference, for the finding's hint field —
+    // resolution failure is both-absent regardless of preference, but
+    // naming the declared preference points the author at the field the
+    // BP most likely intended to seed.
+    let root_preference: &str = bp
+        .projection_placement
+        .as_ref()
+        .and_then(|spec| spec.root.as_deref())
+        .unwrap_or("work_dir");
+
+    let mut findings: Vec<serde_json::Value> = Vec::new();
+    for agent in &bp.agents {
+        let (policy, policy_source): (Option<&mlua_swarm_schema::ContextPolicy>, &str) = match agent
+            .meta
+            .as_ref()
+            .and_then(|m| m.context_policy.as_ref())
+        {
+            Some(p) => (Some(p), "agent"),
+            None => match bp.default_context_policy.as_ref() {
+                Some(p) => (Some(p), "bp-global"),
+                None => (None, "none"),
+            },
+        };
+
+        // Check 1 — static: the effective policy strips both root fields.
+        if let Some(p) = policy {
+            let survives_any = ROOT_FIELDS.iter().any(|f| p.allows(f));
+            if !survives_any {
+                findings.push(serde_json::json!({
+                    "check": "context_policy_strips_projection_roots",
+                    "severity": "WARN",
+                    "agent": agent.name,
+                    "policy_source": policy_source,
+                    "message": format!(
+                        "agent '{}' effective context_policy ({policy_source} tier) filters \
+                         out both 'work_dir' and 'project_root'; the projection placement \
+                         root can never resolve, so this agent's step artifacts will \
+                         materialize with file_path: null (content_url-only). Allow at \
+                         least one root field, or drop the projection expectation \
+                         downstream.",
+                        agent.name
+                    ),
+                }));
+            }
+        }
+
+        // Check 2 — simulation: no seeded field survives the policy.
+        if let Some(sim) = simulated_launch {
+            let seeded_and_surviving = ROOT_FIELDS
+                .iter()
+                .filter(|f| {
+                    sim.get(**f)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty())
+                })
+                .any(|f| policy.map_or(true, |p| p.allows(f)));
+            if !seeded_and_surviving {
+                findings.push(serde_json::json!({
+                    "check": "projection_root_seed_missing",
+                    "severity": "WARN",
+                    "agent": agent.name,
+                    "policy_source": policy_source,
+                    "root_preference": root_preference,
+                    "message": format!(
+                        "under the simulated launch payload, agent '{}' has no \
+                         policy-surviving root seed (declared preference: \
+                         '{root_preference}'); step artifacts will materialize with \
+                         file_path: null (content_url-only). Seed '{root_preference}' \
+                         (or 'work_dir'/'project_root') in the launch request's \
+                         canonical fields, or via Blueprint defaults.",
+                        agent.name
+                    ),
+                }));
+            }
+        }
+    }
+    serde_json::json!({ "findings": findings })
+}
+
 // ─── GH #79 Phase 3: classify_* → Diagnostic siblings ─────────────────────
 //
 // Each `classify_*` family gains a sibling that projects its JSON
@@ -1323,6 +1460,10 @@ fn diag_from_findings(
                 "skip_on_pattern_conflicts_with_halt_on" => {
                     "skip-on-pattern-conflicts-with-halt-on"
                 }
+                "context_policy_strips_projection_roots" => {
+                    "context-policy-strips-projection-roots"
+                }
+                "projection_root_seed_missing" => "projection-root-seed-missing",
                 // A future check without a registry kind is skipped
                 // rather than emitted with an undeclared kind — the
                 // old `findings` field still carries it verbatim.
@@ -3091,7 +3232,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Per-Blueprint agent.md size check plus GH #45 contract lints and GH #61 worker_binding lint. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline. GH #45: each agent entry also carries `tool_lint` (phantom MCP tool refs — profile.tools entries with the `mcp__mse__` prefix are compared against the live `mse://api/mcp-tools` registry; unknown names surface as WARN with the unknown tool list) and `output_contract_lint` (absent or malformed `profile.extras.expected_output` under the GH #44 convention surfaces as WARN with a specific reason). GH #61: each operator-kind agent additionally carries `worker_binding_lint` (missing `profile.worker_binding` surfaces as WARN — same fail-loud condition `Compiler::compile` enforces at dispatch, retroactively surfaced on already-registered Blueprints); non-operator kinds are OK and carry `kind_requires_binding: false`. Any per-agent family can be disabled per call via `disable_tool_lint` / `disable_output_contract_lint` / `disable_worker_binding_lint`; the disabled family's field is omitted entirely from each entry (not `null`) so a caller cannot mistake a disabled family for a passed check. C4: a Blueprint-scoped `binding_lint` family (default enabled; disable via `disable_binding_lint`) is attached as a top-level `binding_lint.findings` array (omitted entirely when disabled) — advisory operator-binding checks: `binding_requirements_info` (INFO — one finding per Runner-backed agent listing the launch variant / tools / model a joining operator's capability_manifest must cover, identical to GET /v1/blueprints/:id/binding-requirements), `strict_binding_without_runners` (WARN — strategy.strict_binding is true but no agent resolves to a Runner, so strict is a no-op), and `legacy_worker_binding` (WARN — an agent's Runner came from the deprecated profile.worker_binding fallback; migrate to runner / runner_ref). The aggregate verdict folds size + tool + contract + worker_binding + binding_lint-WARN severities via the same OK/WARN/BLOCK precedence (binding_lint INFO findings never escalate the verdict). GH #79 Phase 3: the response additionally carries a top-level `diagnostics: [...]` array — the unified Clippy-style projection of every finding across every family (`mlua-swarm-diag` `Diagnostic` wire shape: stable `kind`, `stage {type, family}`, `level`, `message`/`notes`/`help`, optional `suggestion {msg, patch, applicability}`, `docs_ref`, `span`). Additive alongside the family-specific fields above (which remain authoritative for current callers and are slated for removal in a future major bump); an OK verdict contributes no diagnostics entry, so an all-clear Blueprint reports `diagnostics: []`. Lint kinds and the add-a-lint recipe: `mse://guides/lint-diagnostic-model`."
+        description = "Per-Blueprint agent.md size check plus GH #45 contract lints and GH #61 worker_binding lint. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline. GH #45: each agent entry also carries `tool_lint` (phantom MCP tool refs — profile.tools entries with the `mcp__mse__` prefix are compared against the live `mse://api/mcp-tools` registry; unknown names surface as WARN with the unknown tool list) and `output_contract_lint` (absent or malformed `profile.extras.expected_output` under the GH #44 convention surfaces as WARN with a specific reason). GH #61: each operator-kind agent additionally carries `worker_binding_lint` (missing `profile.worker_binding` surfaces as WARN — same fail-loud condition `Compiler::compile` enforces at dispatch, retroactively surfaced on already-registered Blueprints); non-operator kinds are OK and carry `kind_requires_binding: false`. Any per-agent family can be disabled per call via `disable_tool_lint` / `disable_output_contract_lint` / `disable_worker_binding_lint`; the disabled family's field is omitted entirely from each entry (not `null`) so a caller cannot mistake a disabled family for a passed check. C4: a Blueprint-scoped `binding_lint` family (default enabled; disable via `disable_binding_lint`) is attached as a top-level `binding_lint.findings` array (omitted entirely when disabled) — advisory operator-binding checks: `binding_requirements_info` (INFO — one finding per Runner-backed agent listing the launch variant / tools / model a joining operator's capability_manifest must cover, identical to GET /v1/blueprints/:id/binding-requirements), `strict_binding_without_runners` (WARN — strategy.strict_binding is true but no agent resolves to a Runner, so strict is a no-op), and `legacy_worker_binding` (WARN — an agent's Runner came from the deprecated profile.worker_binding fallback; migrate to runner / runner_ref). The aggregate verdict folds size + tool + contract + worker_binding + binding_lint-WARN severities via the same OK/WARN/BLOCK precedence (binding_lint INFO findings never escalate the verdict). GH #79 Phase 3: the response additionally carries a top-level `diagnostics: [...]` array — the unified Clippy-style projection of every finding across every family (`mlua-swarm-diag` `Diagnostic` wire shape: stable `kind`, `stage {type, family}`, `level`, `message`/`notes`/`help`, optional `suggestion {msg, patch, applicability}`, `docs_ref`, `span`). Additive alongside the family-specific fields above (which remain authoritative for current callers and are slated for removal in a future major bump); an OK verdict contributes no diagnostics entry, so an all-clear Blueprint reports `diagnostics: []`. Lint kinds and the add-a-lint recipe: `mse://guides/lint-diagnostic-model`. GH #78: a Blueprint-scoped `context_policy_lint` family (default enabled; disable via `disable_context_policy_lint`) is attached as a top-level `context_policy_lint.findings` array — front-loads the silent `file_path: null` failure: `context_policy_strips_projection_roots` (WARN — an agent's effective context_policy filters out both `work_dir` and `project_root`, so the projection root can never resolve) and, only when the caller passes `simulated_launch` (an object whose `project_root` / `work_dir` string fields mirror the canonical launch seed; pass `{}` to simulate a seedless launch), `projection_root_seed_missing` (WARN — no seeded field survives the agent's policy, so materialized step reads will return `content_url`-only). WARN-only family; its findings fold into the aggregate verdict and the `diagnostics` array like every other family."
     )]
     async fn bp_doctor(
         &self,
@@ -3148,6 +3289,7 @@ impl MseServer {
         let disable_worker_binding_lint = req.disable_worker_binding_lint.unwrap_or(false);
         let disable_binding_lint = req.disable_binding_lint.unwrap_or(false);
         let disable_skip_on_lint = req.disable_skip_on_lint.unwrap_or(false);
+        let disable_context_policy_lint = req.disable_context_policy_lint.unwrap_or(false);
 
         let mut per_agent = Vec::with_capacity(bp.agents.len());
         let mut severities: Vec<&'static str> = Vec::with_capacity(bp.agents.len());
@@ -3297,6 +3439,30 @@ impl MseServer {
         // `classify_skip_on_lint` doc for the 3 checks). Same
         // conditional-presence convention as `binding_lint`: omitted
         // entirely when the family is disabled.
+        // GH #78 — Blueprint-scoped context_policy_lint (see
+        // `classify_context_policy_lint` doc for the 2 checks). Same
+        // conditional-presence convention as `binding_lint`.
+        let context_policy_lint = (!disable_context_policy_lint)
+            .then(|| classify_context_policy_lint(&bp, req.simulated_launch.as_ref()));
+        if let Some(c) = &context_policy_lint {
+            diagnostics.extend(diag_from_findings(
+                mlua_swarm_diag::BpDoctorFamily::ContextPolicyLint,
+                c,
+            ));
+        }
+        let context_policy_lint_severities: Vec<String> = context_policy_lint
+            .as_ref()
+            .and_then(|b| b.get("findings"))
+            .and_then(|f| f.as_array())
+            .map(|findings| {
+                findings
+                    .iter()
+                    .filter_map(|f| f.get("severity").and_then(|s| s.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let skip_on_lint = (!disable_skip_on_lint).then(|| classify_skip_on_lint(&bp));
         if let Some(s) = &skip_on_lint {
             diagnostics.extend(diag_from_findings(
@@ -3331,7 +3497,8 @@ impl MseServer {
                 + output_contract_lint_severities.len()
                 + worker_binding_lint_severities.len()
                 + binding_lint_severities.len()
-                + skip_on_lint_severities.len(),
+                + skip_on_lint_severities.len()
+                + context_policy_lint_severities.len(),
         );
         all_severities.extend(severities.iter().copied());
         all_severities.extend(tool_lint_severities.iter().map(|s| s.as_str()));
@@ -3339,6 +3506,7 @@ impl MseServer {
         all_severities.extend(worker_binding_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(binding_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(skip_on_lint_severities.iter().map(|s| s.as_str()));
+        all_severities.extend(context_policy_lint_severities.iter().map(|s| s.as_str()));
         let verdict = aggregate_agent_md_verdict(&all_severities);
         let over_threshold_count = severities.iter().filter(|s| **s != "OK").count();
         let tool_lint_warn_count = tool_lint_severities
@@ -3367,6 +3535,12 @@ impl MseServer {
             .iter()
             .filter(|s| s.as_str() == "WARN")
             .count();
+        // GH #78 — context_policy_lint findings are WARN-only (same
+        // BLOCK-disabled posture as skip_on_lint).
+        let context_policy_lint_warn_count = context_policy_lint_severities
+            .iter()
+            .filter(|s| s.as_str() == "WARN")
+            .count();
 
         let mut body = serde_json::json!({
             "bp_id": req.id,
@@ -3380,6 +3554,7 @@ impl MseServer {
             "worker_binding_lint_warn_count": worker_binding_lint_warn_count,
             "binding_lint_warn_count": binding_lint_warn_count,
             "skip_on_lint_warn_count": skip_on_lint_warn_count,
+            "context_policy_lint_warn_count": context_policy_lint_warn_count,
             "thresholds": {
                 "warn_bytes": thresholds.warn_bytes,
                 "warn_lines": thresholds.warn_lines,
@@ -3393,6 +3568,7 @@ impl MseServer {
                 "worker_binding_lint_enabled": !disable_worker_binding_lint,
                 "binding_lint_enabled": !disable_binding_lint,
                 "skip_on_lint_enabled": !disable_skip_on_lint,
+                "context_policy_lint_enabled": !disable_context_policy_lint,
             },
             "agents": per_agent,
             // GH #79 Phase 3: the unified projection — one entry per
@@ -3419,6 +3595,13 @@ impl MseServer {
         if let Some(skip_on_lint) = skip_on_lint {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("skip_on_lint".to_string(), skip_on_lint);
+            }
+        }
+        // GH #78 — attach `context_policy_lint` when the family is
+        // enabled, same conditional-presence convention.
+        if let Some(context_policy_lint) = context_policy_lint {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("context_policy_lint".to_string(), context_policy_lint);
             }
         }
         json_result(&body)
@@ -6811,12 +6994,215 @@ mod diag_sibling_tests {
             "skip-on-missing-for-skip-like-verdict-value",
             "skip-on-declared-but-no-matching-verdict-value",
             "skip-on-pattern-conflicts-with-halt-on",
+            "context-policy-strips-projection-roots",
+            "projection-root-seed-missing",
         ];
         for kind in kinds {
             assert!(
                 mlua_swarm_diag::lint_decl(kind).is_some(),
                 "sibling-emitted kind '{kind}' has no LINT_DECLS entry"
             );
+        }
+    }
+}
+
+// ─── GH #78 Layer 1: context_policy_lint family ───────────────────────────
+#[cfg(test)]
+mod context_policy_lint_tests {
+    use super::*;
+    use mlua_swarm::blueprint::{AgentDef, AgentMeta};
+    use mlua_swarm_schema::ContextPolicy;
+
+    /// Minimal Blueprint fixture via serde (the Blueprint type has no
+    /// `Default`; the wire format's serde defaults are the canonical
+    /// minimal shape).
+    fn bp_with(agents: Vec<AgentDef>) -> Blueprint {
+        let mut bp: Blueprint = serde_json::from_value(serde_json::json!({
+            "id": "cp-lint-fixture",
+            "flow": {"kind": "seq", "children": []},
+            "agents": [],
+        }))
+        .expect("minimal fixture blueprint must deserialize");
+        bp.agents = agents;
+        bp
+    }
+
+    fn agent(name: &str, meta: Option<AgentMeta>) -> AgentDef {
+        let mut def: AgentDef = serde_json::from_value(serde_json::json!({
+            "name": name,
+            "kind": "rust_fn",
+            "spec": {},
+        }))
+        .expect("minimal fixture agent must deserialize");
+        def.meta = meta;
+        def
+    }
+
+    fn meta_with_policy(policy: ContextPolicy) -> AgentMeta {
+        AgentMeta {
+            context_policy: Some(policy),
+            ..Default::default()
+        }
+    }
+
+    fn exclude_both_roots() -> ContextPolicy {
+        ContextPolicy {
+            exclude: vec!["work_dir".into(), "project_root".into()],
+            ..Default::default()
+        }
+    }
+
+    fn checks_of(verdict: &serde_json::Value) -> Vec<String> {
+        verdict["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .map(|f| f["check"].as_str().expect("check string").to_string())
+            .collect()
+    }
+
+    // AC case 3: neither context_policy declared, no simulation → OK.
+    #[test]
+    fn no_policy_and_no_simulation_produces_no_findings() {
+        let bp = bp_with(vec![agent("solo", None)]);
+        let verdict = classify_context_policy_lint(&bp, None);
+        assert!(checks_of(&verdict).is_empty(), "verdict: {verdict}");
+    }
+
+    // AC case 1: BP-global default_context_policy declared.
+    #[test]
+    fn bp_global_policy_stripping_both_roots_warns_per_agent() {
+        let mut bp = bp_with(vec![agent("a", None), agent("b", None)]);
+        bp.default_context_policy = Some(exclude_both_roots());
+        let verdict = classify_context_policy_lint(&bp, None);
+        let checks = checks_of(&verdict);
+        assert_eq!(
+            checks,
+            vec![
+                "context_policy_strips_projection_roots",
+                "context_policy_strips_projection_roots"
+            ],
+            "verdict: {verdict}"
+        );
+        assert_eq!(verdict["findings"][0]["policy_source"], "bp-global");
+        assert_eq!(verdict["findings"][0]["severity"], "WARN");
+    }
+
+    // AC case 2: per-agent AgentMeta.context_policy declared (outranks
+    // the BP-global tier).
+    #[test]
+    fn per_agent_policy_stripping_both_roots_warns_only_that_agent() {
+        let bp = bp_with(vec![
+            agent("clean", None),
+            agent("filtered", Some(meta_with_policy(exclude_both_roots()))),
+        ]);
+        let verdict = classify_context_policy_lint(&bp, None);
+        let findings = verdict["findings"].as_array().expect("findings");
+        assert_eq!(findings.len(), 1, "verdict: {verdict}");
+        assert_eq!(findings[0]["agent"], "filtered");
+        assert_eq!(findings[0]["policy_source"], "agent");
+    }
+
+    // A policy that strips only ONE root is not flagged — the other
+    // still resolves via RootPreference's fallback.
+    #[test]
+    fn policy_stripping_one_root_is_not_flagged() {
+        let policy = ContextPolicy {
+            exclude: vec!["work_dir".into()],
+            ..Default::default()
+        };
+        let bp = bp_with(vec![agent("half", Some(meta_with_policy(policy)))]);
+        let verdict = classify_context_policy_lint(&bp, None);
+        assert!(checks_of(&verdict).is_empty(), "verdict: {verdict}");
+    }
+
+    // An include-list that omits both roots is equivalent to excluding
+    // them (allows() semantics) — flagged.
+    #[test]
+    fn include_list_omitting_both_roots_is_flagged() {
+        let policy = ContextPolicy {
+            include: Some(vec!["task_metadata".into()]),
+            ..Default::default()
+        };
+        let bp = bp_with(vec![agent("narrow", Some(meta_with_policy(policy)))]);
+        let verdict = classify_context_policy_lint(&bp, None);
+        assert_eq!(
+            checks_of(&verdict),
+            vec!["context_policy_strips_projection_roots"]
+        );
+    }
+
+    // AC: seedless simulated launch → projection_root_seed_missing WARN.
+    #[test]
+    fn seedless_simulated_launch_warns_seed_missing() {
+        let bp = bp_with(vec![agent("solo", None)]);
+        let sim = serde_json::json!({});
+        let verdict = classify_context_policy_lint(&bp, Some(&sim));
+        assert_eq!(checks_of(&verdict), vec!["projection_root_seed_missing"]);
+        assert_eq!(verdict["findings"][0]["severity"], "WARN");
+    }
+
+    // AC: the launch payload seeding the required field → OK.
+    #[test]
+    fn seeded_simulated_launch_produces_no_findings() {
+        let bp = bp_with(vec![agent("solo", None)]);
+        let sim = serde_json::json!({"project_root": "/repo"});
+        let verdict = classify_context_policy_lint(&bp, Some(&sim));
+        assert!(checks_of(&verdict).is_empty(), "verdict: {verdict}");
+    }
+
+    // The GH #78 P1a interaction: the launch seeds a root, but the
+    // agent's policy filters that very field out — seed simulation must
+    // apply the policy, not just check payload presence.
+    #[test]
+    fn seeded_field_filtered_by_policy_still_warns() {
+        let policy = ContextPolicy {
+            exclude: vec!["project_root".into()],
+            ..Default::default()
+        };
+        let bp = bp_with(vec![agent("solo", Some(meta_with_policy(policy)))]);
+        let sim = serde_json::json!({"project_root": "/repo"});
+        let verdict = classify_context_policy_lint(&bp, Some(&sim));
+        assert_eq!(checks_of(&verdict), vec!["projection_root_seed_missing"]);
+    }
+
+    // The finding names the declared placement preference.
+    #[test]
+    fn seed_missing_finding_carries_the_declared_root_preference() {
+        let mut bp = bp_with(vec![agent("solo", None)]);
+        bp.projection_placement = Some(mlua_swarm_schema::ProjectionPlacementSpec {
+            root: Some("project_root".into()),
+            dir_template: None,
+        });
+        let sim = serde_json::json!({});
+        let verdict = classify_context_policy_lint(&bp, Some(&sim));
+        assert_eq!(verdict["findings"][0]["root_preference"], "project_root");
+    }
+
+    // Sibling projection: both checks map to declared registry kinds.
+    #[test]
+    fn context_policy_findings_project_to_declared_diagnostics() {
+        let mut bp = bp_with(vec![agent(
+            "filtered",
+            Some(meta_with_policy(exclude_both_roots())),
+        )]);
+        bp.projection_placement = None;
+        let sim = serde_json::json!({});
+        let verdict = classify_context_policy_lint(&bp, Some(&sim));
+        let ds = diag_from_findings(
+            mlua_swarm_diag::BpDoctorFamily::ContextPolicyLint,
+            &verdict,
+        );
+        assert_eq!(ds.len(), 2, "verdict: {verdict}");
+        assert_eq!(ds[0].kind, "context-policy-strips-projection-roots");
+        assert_eq!(ds[1].kind, "projection-root-seed-missing");
+        for d in &ds {
+            assert!(
+                mlua_swarm_diag::lint_decl(d.kind).is_some(),
+                "kind {} must be declared",
+                d.kind
+            );
+            assert_eq!(d.level, mlua_swarm_diag::DiagLevel::Warn);
         }
     }
 }

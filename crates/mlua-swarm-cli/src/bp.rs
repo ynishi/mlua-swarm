@@ -99,7 +99,10 @@ struct BuildArgs {
     /// ref hard-fails the build (non-zero exit, no JSON emitted). Name
     /// mirrors "require refs to be embedded": not `--strict-refs`
     /// (which would misleadingly suggest refs themselves are
-    /// disallowed).
+    /// disallowed). Independent from the server-side `mse serve
+    /// --blueprint-strict-embed` switch (register-time raw-ref
+    /// reject) — the two layers are compared side by side in
+    /// `mse://guides/strict-embed-modes`.
     #[arg(long = "strict-embed")]
     strict_embed: bool,
 }

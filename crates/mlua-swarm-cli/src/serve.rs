@@ -146,6 +146,10 @@ pub struct Args {
     /// override (defers to the config file / built-in default `false`,
     /// which keeps the linker running server-side for
     /// backward-compat); passing it always forces `true`.
+    /// Independent from the client-side `mse bp build --strict-embed`
+    /// flag despite the shared token — that one pre-embeds at build
+    /// time, this one rejects at register time; side-by-side
+    /// comparison: `mse://guides/strict-embed-modes`.
     #[arg(long)]
     blueprint_strict_embed: bool,
     /// The (2) CLI override layer of the 4-tier cascade. Falls back when the BP

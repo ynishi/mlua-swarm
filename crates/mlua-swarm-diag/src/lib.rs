@@ -172,6 +172,9 @@ pub enum BpDoctorFamily {
     /// Wrapper-side tool drift (`bp_explain_agent`'s `tool_drift`
     /// wrapper-only classification).
     WrapperOnly,
+    /// GH #78: `context_policy` / projection-root vs launch-seed
+    /// cross-checks (silent `file_path: null` prevention).
+    ContextPolicyLint,
 }
 
 /// Which producing stage emitted a [`Diagnostic`]. Serialized
@@ -543,6 +546,24 @@ pub const LINT_DECLS: &[LintDecl] = &[
         LintCategory::Contract,
         "The worker wrapper grants tools the Blueprint never declares (informational).",
         "mse://guides/agent-md-authoring",
+    ),
+    decl(
+        "context-policy-strips-projection-roots",
+        DiagLevel::Warn,
+        LintCategory::Suspicious,
+        "An agent's effective context_policy filters out both 'work_dir' and \
+         'project_root', so the projection placement root can never resolve \
+         (step artifacts materialize with file_path: null).",
+        "mse://guides/operator-execution-model",
+    ),
+    decl(
+        "projection-root-seed-missing",
+        DiagLevel::Warn,
+        LintCategory::Contract,
+        "Under the simulated launch payload, no policy-surviving root field \
+         (work_dir / project_root) is seeded, so materialized step artifacts \
+         will carry file_path: null (content_url-only).",
+        "mse://guides/operator-execution-model",
     ),
 ];
 

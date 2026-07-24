@@ -46,6 +46,7 @@
 //! | `mse://guides/blueprint-ref-paths`           | `$file` / `$agent_md` refs, the 6-tier include cascade, and the `--strict-embed` opt-in. |
 //! | `mse://guides/bp-lifecycle`                  | Workflow-oriented lifecycle map (develop → trial-run → operate): per-stage feature routing + the `MainAi` vs `Automate` operator contract (GH #80). |
 //! | `mse://guides/lint-diagnostic-model`         | Unified Clippy-style `Diagnostic` model + `LINT_DECLS` registry + the 4-step add-a-lint recipe (GH #79). |
+//! | `mse://guides/strict-embed-modes`            | The two `strict-embed` layers side by side: client build-time pre-embed vs server register-time raw-ref reject (GH #78 P1b). |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
@@ -115,6 +116,7 @@ const SKIP_TIER_AND_SKIP_ON_BODY: &str =
 const BP_LIFECYCLE_BODY: &str = include_str!("./resources/guides/bp-lifecycle.md");
 const LINT_DIAGNOSTIC_MODEL_BODY: &str =
     include_str!("./resources/guides/lint-diagnostic-model.md");
+const STRICT_EMBED_MODES_BODY: &str = include_str!("./resources/guides/strict-embed-modes.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -232,6 +234,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "GH #79: the unified Clippy-style diagnostic model every feedback stage produces (compile-lint / bp_doctor / launch pre-flight). Wire shape (stable kind, internally-tagged stage, per-stage level, suggestion with Applicability auto-apply gate, mse:// docs_ref, Blueprint-document span), the mlua-swarm-diag LINT_DECLS registry, where diagnostics surface today (bp_build `diagnostic`, bp_doctor `diagnostics`), and the 4-step add-a-lint recipe (declare → document → produce → test).",
         mime_type: "text/markdown",
         body: ResourceBody::Static(LINT_DIAGNOSTIC_MODEL_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/strict-embed-modes",
+        title: "mse — The two strict-embed layers (build-time vs register-time)",
+        description: "GH #78 P1b: side-by-side comparison of the two switches sharing the `strict-embed` token — `mse bp build --strict-embed` (client, build-time: unresolved refs hard-fail the build) vs `mse serve --blueprint-strict-embed` / `blueprint_strict_embed` config (server, register-time: raw-ref bodies get 400). Covers flag surface, layer, trigger point, effect, failure mode, and the four composition postures.",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(STRICT_EMBED_MODES_BODY),
     },
     ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",

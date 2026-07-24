@@ -60,7 +60,12 @@ pub struct BlueprintsState {
     /// (backward-compat). Wired from
     /// [`crate::config::ResolvedConfig::blueprint_strict_embed`] via
     /// the CLI `--blueprint-strict-embed` flag or the config-file
-    /// `blueprint_strict_embed` key.
+    /// `blueprint_strict_embed` key. NOTE: independent from the
+    /// client-side `mse bp build --strict-embed` flag despite the
+    /// shared token — that one pre-embeds refs at build time, this one
+    /// rejects raw refs at register time; the two layers are compared
+    /// side by side in the bundled `mse://guides/strict-embed-modes`
+    /// resource (GH #78 P1b).
     pub strict_embed: bool,
     /// Migration gate for the deprecated `AgentProfile.worker_binding`
     /// Runner fallback, wired from the same server config the launch path
