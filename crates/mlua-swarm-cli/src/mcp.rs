@@ -1213,6 +1213,15 @@ fn classify_context_policy_lint(
                 })
                 .any(|f| policy.map_or(true, |p| p.allows(f)));
             if !seeded_and_surviving {
+                // Name the alternate root field so the "seed X or Y" hint
+                // never repeats the preferred field. `ROOT_FIELDS` has
+                // exactly two entries, so the alternate is deterministic
+                // given `root_preference`.
+                let alternate_root = if root_preference == "work_dir" {
+                    "project_root"
+                } else {
+                    "work_dir"
+                };
                 findings.push(serde_json::json!({
                     "check": "projection_root_seed_missing",
                     "severity": "WARN",
@@ -1224,8 +1233,8 @@ fn classify_context_policy_lint(
                          policy-surviving root seed (declared preference: \
                          '{root_preference}'); step artifacts will materialize with \
                          file_path: null (content_url-only). Seed '{root_preference}' \
-                         (or 'work_dir'/'project_root') in the launch request's \
-                         canonical fields, or via Blueprint defaults.",
+                         (or '{alternate_root}' as the fallback) in the launch \
+                         request's canonical fields, or via Blueprint defaults.",
                         agent.name
                     ),
                 }));
@@ -7177,6 +7186,45 @@ mod context_policy_lint_tests {
         let sim = serde_json::json!({});
         let verdict = classify_context_policy_lint(&bp, Some(&sim));
         assert_eq!(verdict["findings"][0]["root_preference"], "project_root");
+    }
+
+    /// jikki-caught regression (2026-07-24): the seed-missing message
+    /// used to repeat the preferred root as a literal — `Seed 'work_dir'
+    /// (or 'work_dir'/'project_root') ...` — because the alternate list
+    /// was hardcoded rather than derived from the preference. The fix
+    /// names the alternate deterministically; this test locks it in for
+    /// both preferences so the drift cannot recur.
+    #[test]
+    fn seed_missing_message_names_the_alternate_root_not_the_preferred_one() {
+        for (preference, alternate) in [("work_dir", "project_root"), ("project_root", "work_dir")]
+        {
+            let mut bp = bp_with(vec![agent("solo", None)]);
+            bp.projection_placement = Some(mlua_swarm_schema::ProjectionPlacementSpec {
+                root: Some(preference.into()),
+                dir_template: None,
+            });
+            let sim = serde_json::json!({});
+            let verdict = classify_context_policy_lint(&bp, Some(&sim));
+            let msg = verdict["findings"][0]["message"]
+                .as_str()
+                .expect("message string");
+            let preferred_quoted = format!("'{preference}'");
+            let alternate_quoted = format!("'{alternate}'");
+            // The preferred root is named exactly twice (the "declared
+            // preference: 'X'" clause and the "Seed 'X'" clause); the
+            // alternate is named exactly once (the "(or 'Y' as the
+            // fallback)" clause).
+            assert_eq!(
+                msg.matches(&preferred_quoted).count(),
+                2,
+                "preferred root '{preference}' occurrences: {msg}"
+            );
+            assert_eq!(
+                msg.matches(&alternate_quoted).count(),
+                1,
+                "alternate root '{alternate}' occurrences: {msg}"
+            );
+        }
     }
 
     // Sibling projection: both checks map to declared registry kinds.
