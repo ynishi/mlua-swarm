@@ -806,6 +806,11 @@ yourself.
 
 ## Related
 
+- `mse://guides/bp-lifecycle` — where this model sits in the develop →
+  trial-run → operate lifecycle. The `mse_pending_wait` → dispatch →
+  `mse_ack` loop described here is the **operate-stage `MainAi`
+  contract**; for trial runs prefer `OperatorKind::Automate` (the
+  default) so the engine drives the flow without an attached operator.
 - `mse://api/http-endpoints` — HTTP wire body schemas for the Task IF surface.
 - `mse://api/blueprint-schema` — Blueprint schema, including `default_init_ctx`.
 - `mse://guides/id-lifecycle` — the five ID layers (Blueprint, Task, Run, Step, Attempt).

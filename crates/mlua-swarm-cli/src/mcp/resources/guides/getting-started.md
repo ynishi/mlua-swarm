@@ -107,6 +107,10 @@ directly, e.g. `mse://guides/blueprint-authoring` or
 
 ## Where to go next
 
+- The lifecycle map (develop → trial-run → operate): which feature to
+  reach for at each stage of Blueprint work, including why trial runs
+  should use `OperatorKind::Automate` (the default) instead of a
+  hand-driven operator loop: `mse://guides/bp-lifecycle`.
 - Sample Blueprints ready to adapt: `mse://blueprints/samples/01-pure-ctx-eval`,
   `mse://blueprints/samples/02-verdict-loop`, `mse://blueprints/samples/03-fn-override`.
 - Full Blueprint authoring reference: `mse://guides/blueprint-authoring`.

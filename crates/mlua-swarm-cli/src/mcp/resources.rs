@@ -44,6 +44,7 @@
 //! | `mse://guides/bp-dsl-templates`              | `mse bp new` / `bp_new` template inventory + flag surface (GH #62 Axis A). |
 //! | `mse://guides/server-management`             | `mse server` subcommand reference, MCP-tool ↔ subcmd mapping, and recovery SOPs (GH #69). |
 //! | `mse://guides/blueprint-ref-paths`           | `$file` / `$agent_md` refs, the 6-tier include cascade, and the `--strict-embed` opt-in. |
+//! | `mse://guides/bp-lifecycle`                  | Workflow-oriented lifecycle map (develop → trial-run → operate): per-stage feature routing + the `MainAi` vs `Automate` operator contract (GH #80). |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
@@ -110,6 +111,7 @@ const SERVER_MANAGEMENT_BODY: &str = include_str!("./resources/guides/server-man
 const BLUEPRINT_REF_PATHS_BODY: &str = include_str!("./resources/guides/blueprint-ref-paths.md");
 const SKIP_TIER_AND_SKIP_ON_BODY: &str =
     include_str!("./resources/guides/skip-tier-and-skip-on.md");
+const BP_LIFECYCLE_BODY: &str = include_str!("./resources/guides/bp-lifecycle.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -213,6 +215,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "How the linker resolves `$file` and `$agent_md` refs: the 6-tier include cascade (bp.lua parent → in-bp includes → env → CLI `--include` → server config → bundled default), Warn-default behavior on unresolved refs, and the `--strict-embed` / `blueprint_strict_embed` opt-ins at each layer.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(BLUEPRINT_REF_PATHS_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/bp-lifecycle",
+        title: "mse — Blueprint lifecycle (develop → trial-run → operate)",
+        description: "GH #80: workflow-oriented map of the Blueprint authoring loop. Stage 1 Develop (bp_new templates, `mse bp lint`, `bp_build register=false` fix hints, `bp_doctor` six lint families), Stage 2 Trial-run (`OperatorKind::Automate` is the default; `swarm_run` blocking / `detach: true` + `swarm_status`; rekick vs `resume` vs `rerun-from`), Stage 3 Operate (the `MainAi` contract: the attached operator owns the `mse_pending_wait` → dispatch → `mse_ack` loop by design). Routes each stage to the feature-level reference guides.",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(BP_LIFECYCLE_BODY),
     },
     ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",

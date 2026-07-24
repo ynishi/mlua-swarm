@@ -117,6 +117,11 @@ legitimate shutdown/restart indefinitely.
 
 ## Where to go next
 
+- Which of these tools belongs to which stage of Blueprint work
+  (develop → trial-run → operate) — e.g. `bp_build` / `bp_doctor` are
+  develop-stage lint, `swarm_run` + `detach` is the trial-run loop, the
+  `mse_operator_*` family is the `MainAi` operate contract:
+  `mse://guides/bp-lifecycle`.
 - Blueprint shape reference: `mse://guides/blueprint-authoring`.
 - Worked samples to feed straight into `swarm_run`: `mse://blueprints/samples/*`.
 - Entry points and quickstart: `mse://guides/getting-started`.

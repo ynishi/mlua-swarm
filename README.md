@@ -58,10 +58,11 @@ Documentation is served from the code itself:
   (the crate root doc is the architecture overview).
 - **Guides / samples / schema** — bundled MCP resources under `mse://`,
   served by `mse mcp` and always version-matched to the binary:
-  `mse://guides/getting-started`, `mse://guides/blueprint-authoring`,
-  `mse://guides/mcp-tool-reference`, `mse://blueprints/samples/*`, and
-  the live Blueprint JSON Schema at `mse://api/blueprint-schema`
-  (also available as the `bp_schema` tool).
+  `mse://guides/getting-started`, `mse://guides/bp-lifecycle` (the
+  develop → trial-run → operate workflow map),
+  `mse://guides/blueprint-authoring`, `mse://guides/mcp-tool-reference`,
+  `mse://blueprints/samples/*`, and the live Blueprint JSON Schema at
+  `mse://api/blueprint-schema` (also available as the `bp_schema` tool).
 
 ## Workspace crates
 

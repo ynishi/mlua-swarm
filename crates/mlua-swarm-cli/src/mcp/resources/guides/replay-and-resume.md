@@ -22,8 +22,13 @@ final Ctx it would have reached without the restart.
 
 Resume does *not* re-kick a Task from scratch — that is the job of
 `POST /v1/tasks/:id/runs` (rekick), which always mints a fresh
-`RunId`. Resume and rekick are separate endpoints with separate
-semantics; nothing in the wire chooses between them for you.
+`RunId`. A third sibling, `POST /v1/runs/:id/rerun-from` (GH #71),
+re-executes a chosen step and everything downstream of a *terminal*
+Run under the same `RunId`, truncating the replay log at the cut
+point — the iterate-on-one-step debug loop. All three are separate
+endpoints with separate semantics; nothing in the wire chooses
+between them for you. Which one fits which stage of Blueprint work:
+`mse://guides/bp-lifecycle`.
 
 ## The Ctx-snapshot replay log
 
