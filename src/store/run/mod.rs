@@ -53,6 +53,15 @@ pub enum RunStatus {
     /// `EngineState` is process-local and unrecoverable; this variant
     /// records the fact without attempting to reconstruct or resume it.
     Interrupted,
+    /// A cancel request landed on the Run (via `POST /v1/runs/:id/cancel`
+    /// / `mse_cancel` / `swarm_cancel`). Terminal — the current wiring
+    /// records the intent + trace event; live in-flight abort of the
+    /// still-dispatching flow remains a v3 carry, so a Run that reaches
+    /// its Ok outcome after this marker keeps its terminal `result_ref`,
+    /// but the Cancelled marker itself is observable via
+    /// `swarm_status.cancel_requested` and `core.cancel_requested` on
+    /// the trace stream.
+    Cancelled,
 }
 
 /// One worker-reported degradation entry — a worker fell back to a

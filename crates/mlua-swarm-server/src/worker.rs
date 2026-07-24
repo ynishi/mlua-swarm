@@ -1067,11 +1067,11 @@ async fn reject_if_run_terminal(
         return Ok(());
     };
     match rec.status {
-        RunStatus::Done | RunStatus::Failed | RunStatus::Interrupted => {
+        RunStatus::Done | RunStatus::Failed | RunStatus::Interrupted | RunStatus::Cancelled => {
             Err(ApiError::gone(format!(
                 "run {run_id} is already terminal ({:?}): this attempt's output cannot be \
-                 delivered to a flow context; re-kick the task (POST /v1/tasks/:id/runs) and \
-                 fetch a fresh prompt",
+             delivered to a flow context; re-kick the task (POST /v1/tasks/:id/runs) and \
+             fetch a fresh prompt",
                 rec.status
             )))
         }

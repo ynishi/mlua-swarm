@@ -468,6 +468,7 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
             "/v1/runs/:id",
             get(tasks::run_get).delete(tasks::run_delete),
         )
+        .route("/v1/runs/:id/cancel", post(tasks::run_cancel))
         .route("/v1/runs/:id/steps", get(tasks::run_steps))
         .route("/v1/runs/:id/trace", get(tasks::run_trace))
         .route("/v1/runs/:id/bindings", get(tasks::run_bindings_explain))

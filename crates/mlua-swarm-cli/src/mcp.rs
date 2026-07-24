@@ -1197,17 +1197,14 @@ fn classify_context_policy_lint(
 
     let mut findings: Vec<serde_json::Value> = Vec::new();
     for agent in &bp.agents {
-        let (policy, policy_source): (Option<&mlua_swarm_schema::ContextPolicy>, &str) = match agent
-            .meta
-            .as_ref()
-            .and_then(|m| m.context_policy.as_ref())
-        {
-            Some(p) => (Some(p), "agent"),
-            None => match bp.default_context_policy.as_ref() {
-                Some(p) => (Some(p), "bp-global"),
-                None => (None, "none"),
-            },
-        };
+        let (policy, policy_source): (Option<&mlua_swarm_schema::ContextPolicy>, &str) =
+            match agent.meta.as_ref().and_then(|m| m.context_policy.as_ref()) {
+                Some(p) => (Some(p), "agent"),
+                None => match bp.default_context_policy.as_ref() {
+                    Some(p) => (Some(p), "bp-global"),
+                    None => (None, "none"),
+                },
+            };
 
         // Check 1 — static: the effective policy strips both root fields.
         if let Some(p) = policy {
@@ -2090,6 +2087,14 @@ struct SwarmStatusReq {
 #[derive(Deserialize, JsonSchema)]
 struct SwarmCancelReq {
     run_id: String,
+    /// Optional server bind (default `127.0.0.1:7777`). The tool
+    /// proxies to `POST /v1/runs/:id/cancel` on this bind so the
+    /// server-side `RunTraceStore` picks up the `core.cancel_requested`
+    /// event and the Run row's status flips to `Cancelled` — the
+    /// detach-launched path where the local `RunHandle` isn't the
+    /// authoritative source.
+    #[serde(default)]
+    bind: Option<String>,
 }
 
 // ---- tools ----
@@ -4348,36 +4353,54 @@ impl MseServer {
         &self,
         Parameters(req): Parameters<SwarmCancelReq>,
     ) -> Result<CallToolResult, McpError> {
-        let run_trace_store = {
+        // Flip the local `RunHandle.cancel_requested` mark first
+        // (unchanged pre-server-cancel behavior) so `swarm_status`
+        // surfaces the request even when the server-side proxy fails.
+        let has_local = {
             let mut inner = self.state.write().await;
-            match inner.runs.get_mut(&req.run_id) {
-                Some(h) => {
-                    h.status = RunStatus::Cancelled;
-                    h.cancel_requested = true;
-                    inner.run_trace_store.clone()
-                }
-                None => {
-                    return Err(McpError::invalid_params(
-                        format!("run_id not found: {}", req.run_id),
-                        None,
-                    ))
-                }
+            if let Some(h) = inner.runs.get_mut(&req.run_id) {
+                h.status = RunStatus::Cancelled;
+                h.cancel_requested = true;
+                true
+            } else {
+                false
             }
         };
-        // RunTrace rail: mark the cancel request on the stream
-        // (best-effort; unparseable ids — HTTP-proxied runs whose ids
-        // were minted server-side still parse, so this covers both).
-        if let Ok(rid) = RunId::parse(req.run_id.clone()) {
-            mlua_swarm::store::trace::TraceHandle::new(rid, run_trace_store)
-                .append(
-                    mlua_swarm::store::trace::kind::CANCEL_REQUESTED,
-                    None,
-                    None,
-                    serde_json::json!({}),
-                )
-                .await;
+        // Server-side proxy: `POST /v1/runs/:id/cancel` records the
+        // `core.cancel_requested` trace event on the persistent
+        // `RunTraceStore` and flips the Run row's status when it is
+        // still non-terminal. Without this, detach runs — whose
+        // `RunTraceStore` is the server's, not the local one — never
+        // showed the cancel event on `GET /v1/runs/:id/trace`.
+        let bind = req
+            .bind
+            .clone()
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+        let url = format!("http://{bind}/v1/runs/{}/cancel", req.run_id);
+        let server_ok = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(client) => client
+                .post(&url)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false),
+            Err(_) => false,
+        };
+        if !has_local && !server_ok {
+            return Err(McpError::invalid_params(
+                format!("run_id not found: {}", req.run_id),
+                None,
+            ));
         }
-        json_result(&serde_json::json!({ "ok": true, "run_id": req.run_id, "cancel_requested": true }))
+        json_result(&serde_json::json!({
+            "ok": true,
+            "run_id": req.run_id,
+            "cancel_requested": true,
+            "server_ack": server_ok,
+        }))
     }
 }
 
@@ -5673,6 +5696,7 @@ mod tests {
         let _ = server
             .swarm_cancel(Parameters(SwarmCancelReq {
                 run_id: run_id.clone(),
+                bind: None,
             }))
             .await
             .unwrap();
@@ -5709,6 +5733,7 @@ mod tests {
         let _ = server
             .swarm_cancel(Parameters(SwarmCancelReq {
                 run_id: run_id.clone(),
+                bind: None,
             }))
             .await
             .unwrap();
@@ -7056,10 +7081,7 @@ mod diag_sibling_tests {
         );
         let d = diag_from_tool_lint("scout", &verdict).expect("WARN must project");
         assert_eq!(d.kind, "tool-unknown-mcp-ref");
-        assert!(d
-            .notes
-            .iter()
-            .any(|n| n.contains("mcp__mse__no_such_tool")));
+        assert!(d.notes.iter().any(|n| n.contains("mcp__mse__no_such_tool")));
     }
 
     #[test]
@@ -7077,7 +7099,9 @@ mod diag_sibling_tests {
                 family: BpDoctorFamily::WorkerBindingLint
             }
         ));
-        let s = d.suggestion.expect("suggestion must carry the runner patch");
+        let s = d
+            .suggestion
+            .expect("suggestion must carry the runner patch");
         assert!(s.patch.contains("backend = \"ws_operator\""));
         assert!(!d.notes.is_empty(), "the classifier reason must carry over");
     }
@@ -7378,10 +7402,7 @@ mod context_policy_lint_tests {
         bp.projection_placement = None;
         let sim = serde_json::json!({});
         let verdict = classify_context_policy_lint(&bp, Some(&sim));
-        let ds = diag_from_findings(
-            mlua_swarm_diag::BpDoctorFamily::ContextPolicyLint,
-            &verdict,
-        );
+        let ds = diag_from_findings(mlua_swarm_diag::BpDoctorFamily::ContextPolicyLint, &verdict);
         assert_eq!(ds.len(), 2, "verdict: {verdict}");
         assert_eq!(ds[0].kind, "context-policy-strips-projection-roots");
         assert_eq!(ds[1].kind, "projection-root-seed-missing");

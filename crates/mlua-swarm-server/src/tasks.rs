@@ -1030,11 +1030,12 @@ pub async fn run_rerun_from(
     // already dispatching against this run_id.
     let current = run.status;
     match current {
-        RunStatus::Done | RunStatus::Failed | RunStatus::Interrupted => { /* ok */ }
+        RunStatus::Done | RunStatus::Failed | RunStatus::Interrupted | RunStatus::Cancelled => { /* ok */
+        }
         RunStatus::Running | RunStatus::Pending => {
             return Err(ApiError::conflict(format!(
                 "run {run_id} is {current:?}; rerun-from requires a terminal run \
-                 (Done / Failed / Interrupted)"
+                 (Done / Failed / Interrupted / Cancelled)"
             )));
         }
     }
@@ -1411,6 +1412,49 @@ pub async fn run_trace(
         run_id: run_id.to_string(),
         events,
     }))
+}
+
+/// `POST /v1/runs/:id/cancel` — record a cancel request on the Run's
+/// trace stream (`core.cancel_requested`) and mark the Run's status
+/// to `Cancelled` for still-in-flight rows. Idempotent: repeat calls
+/// re-append the trace event but keep the status setter idempotent
+/// on the store side. In-flight abort itself remains a v3 carry — the
+/// current effect is observational + status marker, matching the
+/// `swarm_cancel` MCP tool's local semantics but reflected onto the
+/// server-side `RunTraceStore` so `GET /v1/runs/:id/trace` reflects
+/// it too.
+pub async fn run_cancel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let run_id =
+        RunId::parse(id).map_err(|e| ApiError::bad_request(format!("invalid run id: {e}")))?;
+    // Load the row to prove it exists; a missing row is a 404 (aligned
+    // with `run_delete` — cancel needs an addressable Run).
+    let record = state
+        .run_store
+        .get(&run_id)
+        .await
+        .map_err(map_run_store_err)?;
+    // Best-effort trace append (never gates the response) — the
+    // authoritative record is the run_store status update below.
+    TraceHandle::new(run_id.clone(), state.run_trace_store.clone())
+        .append(trace_kind::CANCEL_REQUESTED, None, None, json!({}))
+        .await;
+    // Flip the Run's status to Cancelled when it's still non-terminal.
+    // Terminal Runs (Done / Failed / Interrupted / already Cancelled)
+    // keep their outcome — cancel arriving after finalize is an
+    // observation, not a rewrite.
+    if matches!(record.status, RunStatus::Pending | RunStatus::Running) {
+        if let Err(e) = state
+            .run_store
+            .update_status(&run_id, RunStatus::Cancelled)
+            .await
+        {
+            tracing::warn!(%run_id, error = %e, "run_cancel: update_status(Cancelled) failed");
+        }
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /v1/runs/:id` — retention prune: deletes the Run row and its
