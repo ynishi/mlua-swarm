@@ -1938,11 +1938,23 @@ struct SwarmRunReq {
     /// GH #37: opt into the detached (asynchronous) launch. `false`
     /// (default) keeps the blocking run-to-completion behavior. `true`
     /// returns `{run_id, task_id, status: "running"}` immediately — the
-    /// flow eval continues in the background bounded by `timeout_secs`
-    /// (in-process) / the server run TTL (id proxy); poll `swarm_status`
-    /// for the terminal status and result.
+    /// flow eval continues in the background bounded by `ttl_secs`
+    /// (detach path) / `timeout_secs` (in-process sync); poll
+    /// `swarm_status` for the terminal status and result.
     #[serde(default)]
     detach: Option<bool>,
+    /// Detach-path TTL in seconds — the lifetime bound of a
+    /// `detach: true` run (the timed-out future is dropped and the run
+    /// row is finalized with a `failed` result + `core.run_finished
+    /// { status: "failed", reason: "ttl <n>s exceeded" }` trace
+    /// event). Unset falls through the TTL resolution cascade: (1)
+    /// `TaskLaunchRequest.ttl_secs` from the request body (this
+    /// field), (2) the resolved Blueprint's
+    /// `metadata.default_run_ttl_secs`, (3) the server global
+    /// `default_run_ttl()` (1800s). Ignored on `detach: false` (sync)
+    /// launches — those are bounded by `timeout_secs`.
+    #[serde(default)]
+    ttl_secs: Option<u64>,
 }
 
 /// How to resolve a Blueprint for `swarm_run`. Symmetric with the
@@ -2499,6 +2511,7 @@ impl MseServer {
                     req.operator_kind,
                     req.operator_kind_overrides,
                     detach,
+                    req.ttl_secs,
                 )
                 .await;
         }
@@ -2797,6 +2810,7 @@ impl MseServer {
         operator_kind: Option<String>,
         operator_kind_overrides: Option<HashMap<String, String>>,
         detach: bool,
+        ttl_override: Option<u64>,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut inner = self.state.write().await;
@@ -2841,7 +2855,14 @@ impl MseServer {
             "init_ctx".into(),
             init_ctx.unwrap_or_else(|| serde_json::json!({})),
         );
-        payload.insert("ttl_secs".into(), JsonValue::from(ttl.as_secs()));
+        // Explicit `ttl_secs` (detach lifetime override) wins over the
+        // shortcut of `timeout_secs`-as-TTL — detach and sync are
+        // bounded by different clocks, so the caller gets a distinct
+        // knob for each.
+        payload.insert(
+            "ttl_secs".into(),
+            JsonValue::from(ttl_override.unwrap_or(ttl.as_secs())),
+        );
         if detach {
             // GH #37: opt the server into the detached launch — it answers
             // `202 {run_id, task_id, status: "running", final_ctx: null}`
@@ -4602,6 +4623,7 @@ mod tests {
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
+            ttl_secs: None,
         };
         let res = server.swarm_run(Parameters(req)).await.unwrap();
         assert!(!res.content.is_empty());
@@ -4662,6 +4684,7 @@ mod tests {
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
+            ttl_secs: None,
         };
         let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
         let text = extract_text_payload(&result);
@@ -4695,6 +4718,7 @@ mod tests {
             operator_kind: None,
             operator_kind_overrides: None,
             detach: Some(true),
+            ttl_secs: None,
         };
         let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
         let text = extract_text_payload(&result);
@@ -4738,6 +4762,7 @@ mod tests {
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
+            ttl_secs: None,
         };
         let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
         let parsed: serde_json::Value =
@@ -4783,6 +4808,7 @@ mod tests {
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
+            ttl_secs: None,
         };
         let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
         let text = extract_text_payload(&result);
@@ -4805,6 +4831,7 @@ mod tests {
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
+            ttl_secs: None,
         };
         let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
         let text = extract_text_payload(&result);
@@ -4832,6 +4859,7 @@ mod tests {
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
+            ttl_secs: None,
         };
         let result = server.swarm_run(Parameters(req)).await.expect("swarm_run");
         let _ = std::fs::remove_file(&name);
@@ -5686,6 +5714,7 @@ mod tests {
                 operator_kind: None,
                 operator_kind_overrides: None,
                 detach: None,
+                ttl_secs: None,
             }))
             .await
             .unwrap();
@@ -5723,6 +5752,7 @@ mod tests {
                 operator_kind: None,
                 operator_kind_overrides: None,
                 detach: None,
+                ttl_secs: None,
             }))
             .await
             .unwrap();
