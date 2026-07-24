@@ -128,8 +128,9 @@ use mlua_swarm::store::replay::{InMemoryReplayStore, ReplayStore};
 use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStore};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
 use mlua_swarm::{
-    CapToken, Compiler, Engine, LayerRegistry, LuaInProcessSpawnerFactory, MainAIMiddleware,
-    OperatorDelegateMiddleware, OperatorSpawnerFactory, Role, RunId, RustFnInProcessSpawnerFactory,
+    CapToken, Compiler, Engine, LayerRegistry, LongHoldMiddleware, LuaInProcessSpawnerFactory,
+    MainAIMiddleware, OperatorDelegateMiddleware, OperatorSpawnerFactory, Role, RunId,
+    RustFnInProcessSpawnerFactory,
     SeniorEscalationMiddleware, SessionId, SpawnerRegistry, SubprocessProcessSpawnerFactory,
     TaskId,
 };
@@ -244,14 +245,51 @@ pub fn build_router(engine: Engine) -> Router {
 /// Callers (the engine builder side) receive it via
 /// `Engine::new_with_layers(cfg, mse_server::default_layer_registry())`.
 pub fn default_layer_registry() -> LayerRegistry {
-    LayerRegistry::new()
+    default_layer_registry_with(LayerOptions::default())
+}
+
+/// Optional knobs the terminal `default_layer_registry_with` builder
+/// consumes — the only currently-tunable knob is the LongHold threshold.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LayerOptions {
+    /// When `Some(ms)`, wire [`LongHoldMiddleware`] as a **base layer**
+    /// (applied to every dispatched step) with `default_hold = ms`.
+    /// The layer stays observational: on threshold breach it broadcasts
+    /// `Event::TaskAttemptCompleted { long_hold_warn: true, .. }` and
+    /// (when the dispatcher registered a `TraceHandle` for the step)
+    /// appends a `mw.long_hold_warn` event to the persistent
+    /// `RunTraceStore`. `None` = the layer is not installed — the same
+    /// no-op default the pre-config shape had.
+    pub long_hold_warn_ms: Option<u64>,
+}
+
+/// Variant of [`default_layer_registry`] that also honours per-server
+/// [`LayerOptions`] (currently: the LongHold threshold). Called by
+/// `mse serve` with the resolved config value; every other caller
+/// (tests, in-tree bins that don't tune the LongHold knob) can keep
+/// using the zero-arg [`default_layer_registry`].
+pub fn default_layer_registry_with(options: LayerOptions) -> LayerRegistry {
+    let mut reg = LayerRegistry::new()
         .with_hint("main_ai", |_engine| Arc::new(MainAIMiddleware::new()))
         .with_hint("senior_escalation", |_engine| {
             Arc::new(SeniorEscalationMiddleware::new())
         })
         .with_hint("operator_delegate", |_engine| {
             Arc::new(OperatorDelegateMiddleware::new())
-        })
+        });
+    if let Some(ms) = options.long_hold_warn_ms {
+        // Bake the millisecond threshold into the factory closure so it
+        // rides into every per-launch stack build without any per-BP
+        // state. The `Engine::event_tx()` sender is captured at bind
+        // time (fresh per Engine — the factory takes `&Engine`).
+        reg = reg.with_base(move |engine| {
+            Arc::new(LongHoldMiddleware::new(
+                std::time::Duration::from_millis(ms),
+                engine.event_tx(),
+            ))
+        });
+    }
+    reg
 }
 
 /// Build form where the caller supplies a registry and an optional `BlueprintStore`.

@@ -111,6 +111,16 @@ pub struct FileConfig {
     /// configured bind (e.g. the mse-mcp tools' `bind` parameter).
     /// `None` = fall back to the built-in default `false`.
     pub inject_endpoint_for_worker: Option<bool>,
+    /// Observation threshold (milliseconds) for `LongHoldMiddleware`.
+    /// When `Some(ms)`, every dispatched step whose completion time
+    /// exceeds `ms` fires `Event::TaskAttemptCompleted { long_hold_warn:
+    /// true, .. }` on the broadcast event bus AND appends
+    /// `mw.long_hold_warn` to the persistent `RunTraceStore`
+    /// (best-effort, purely observational — never alters the step
+    /// signal or blocks completion). `None` (the default) leaves the
+    /// layer uninstalled, byte-for-byte compat with pre-config
+    /// behaviour.
+    pub long_hold_warn_ms: Option<u64>,
     /// Root path for the git-backed `BlueprintStore` (when using the git2 backend).
     pub git_store_path: Option<PathBuf>,
     /// Path to the SQLite database file backing the `IssueStore`. `None` = fall
@@ -194,6 +204,9 @@ pub struct CliOverrides {
     /// `--inject-endpoint-for-worker` flag (mirrors
     /// [`FileConfig::inject_endpoint_for_worker`]).
     pub inject_endpoint_for_worker: Option<bool>,
+    /// `--long-hold-warn-ms` value (mirrors
+    /// [`FileConfig::long_hold_warn_ms`]).
+    pub long_hold_warn_ms: Option<u64>,
     /// `--git-store-path` value.
     pub git_store_path: Option<PathBuf>,
     /// `--issue-store-path` value (mirrors [`FileConfig::issue_store_path`]).
@@ -291,6 +304,9 @@ pub struct ResolvedConfig {
     /// neither CLI nor config file provides one. See
     /// [`FileConfig::inject_endpoint_for_worker`].
     pub inject_endpoint_for_worker: bool,
+    /// Resolved `LongHoldMiddleware` threshold. `None` = the layer is
+    /// not installed. See [`FileConfig::long_hold_warn_ms`].
+    pub long_hold_warn_ms: Option<u64>,
     /// Server-wide [`mlua_swarm::core::config::CheckPolicy`]. Always set
     /// — defaults to `CheckPolicy::Warn` (byte-identical to the
     /// pre-`CheckPolicy` fail-open behaviour) when neither CLI nor config
@@ -322,6 +338,7 @@ impl Default for ResolvedConfig {
             token_secret: None,
             sync_timeout_secs: default_sync_timeout_secs(),
             inject_endpoint_for_worker: false,
+            long_hold_warn_ms: None,
             check_policy: CheckPolicy::default(),
         }
     }
@@ -396,6 +413,7 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .inject_endpoint_for_worker
             .or(file.inject_endpoint_for_worker)
             .unwrap_or(default.inject_endpoint_for_worker),
+        long_hold_warn_ms: cli.long_hold_warn_ms.or(file.long_hold_warn_ms),
         git_store_path: cli
             .git_store_path
             .or(file.git_store_path)

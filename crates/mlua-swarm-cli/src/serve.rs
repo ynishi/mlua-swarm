@@ -38,7 +38,7 @@ use mlua_swarm::{
 };
 use mlua_swarm_server::{
     build_blueprints_router_with_refs, build_enhance_log_router, build_enhance_settings_router,
-    build_issues_router, default_layer_registry, default_registry_with_enhance_flow,
+    build_issues_router, default_registry_with_enhance_flow,
     doctor::{build_doctor_router, DoctorInfo},
 };
 use serde_json::json;
@@ -162,6 +162,17 @@ pub struct Args {
     /// `inject_endpoint_for_worker`.
     #[arg(long)]
     inject_endpoint_for_worker: bool,
+    /// Install the observational LongHold layer as a base layer with
+    /// this threshold in milliseconds. Every dispatched step whose
+    /// completion time exceeds the threshold emits
+    /// `Event::TaskAttemptCompleted { long_hold_warn: true, .. }` on
+    /// the broadcast bus and appends a `mw.long_hold_warn` event to
+    /// the persistent `RunTraceStore`. Purely observational — never
+    /// alters the step signal or blocks completion. Omit / leave unset
+    /// to skip the layer entirely (byte-for-byte compat with the
+    /// pre-config shape).
+    #[arg(long)]
+    long_hold_warn_ms: Option<u64>,
     /// The (2) CLI override layer of the 4-tier cascade. Falls back when the BP
     /// top-level `default_agent_kind` JSON literal is absent; if that is also
     /// absent, the Schema-impl `Default` = `Operator` is used. The value is the
@@ -246,6 +257,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         } else {
             None
         },
+        long_hold_warn_ms: args.long_hold_warn_ms,
         git_store_path: args.git_store_path.clone(),
         issue_store_path: args.issue_store_path.clone(),
         enhance_setting_store_path: args.enhance_setting_store_path.clone(),
@@ -288,7 +300,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // `Blueprint.spawner_hints` values ("main_ai" / "senior_escalation" /
     // "operator_delegate") get wrapped into the SpawnerStack inside
     // TaskLaunchService.
-    let engine = Engine::new_with_layers(make_cfg(), default_layer_registry());
+    let engine = Engine::new_with_layers(
+        make_cfg(),
+        mlua_swarm_server::default_layer_registry_with(mlua_swarm_server::LayerOptions {
+            long_hold_warn_ms: cfg.long_hold_warn_ms,
+        }),
+    );
 
     // The Operator callback registry is held directly on the engine
     // (state.engine is the SoT). On WS connect, the operator_ws handler
