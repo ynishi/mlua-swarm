@@ -532,13 +532,13 @@ async fn rerun_from_after_consumed_log_returns_helpful_422() {
         run_store
             .append_step_entry(
                 &run_id,
-                StepEntry {
-                    step_id: StepId::new(),
-                    step_ref: Some(name.into()),
-                    status: Some("passed".into()),
-                    binding_digest: None,
-                    at: 0,
-                },
+                StepEntry::basic(
+                    StepId::new(),
+                    Some(name.into()),
+                    Some("passed".into()),
+                    None,
+                    0,
+                ),
             )
             .await
             .expect("seed step entry");

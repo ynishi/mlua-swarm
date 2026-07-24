@@ -89,6 +89,15 @@ pub struct DegradationEntry {
 /// One entry in a Run's step trace — appended as the engine dispatches
 /// (and finishes) each step. Purely observational: no field here is
 /// consulted for flow control.
+///
+/// The per-step stats extension (started/completed timestamps, duration,
+/// token usage, model, worker kind, variant-specific `adapter_data`) is
+/// additive: every field is `Option` + `#[serde(default)]` so rows
+/// written before the extension deserialize unchanged, and a dispatch
+/// where no boundary reported stats still appends a valid entry. The
+/// entry stays **write-once** — in-flight visibility belongs to the
+/// sibling [`crate::store::trace::TraceEvent`] stream, never to
+/// in-place updates here.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StepEntry {
     /// The step this entry traces.
@@ -105,6 +114,82 @@ pub struct StepEntry {
     pub binding_digest: Option<BindingDigest>,
     /// Unix epoch seconds — when this entry was recorded.
     pub at: u64,
+    /// The attempt number the stats below describe (the LAST attempt the
+    /// dispatch ran), when a worker boundary reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// Unix epoch milliseconds — when the dispatcher began this step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    /// Unix epoch milliseconds — when the step reached its outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
+    /// Wall-clock dispatch duration in milliseconds (dispatcher-measured,
+    /// worker-kind independent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Worker kind label (`"agent_block"` / `"subprocess"` / `"operator"`
+    /// / …) as reported by the worker boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_kind: Option<String>,
+    /// The model that served the attempt, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Normalized token usage, when a worker boundary reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::store::trace::TokenUsage>,
+    /// Number of LLM turns the attempt ran, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_turns: Option<u32>,
+    /// Worker-kind-specific raw payload (size-capped, engine-opaque).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_data: Option<serde_json::Value>,
+}
+
+impl StepEntry {
+    /// Construct an entry with only the pre-stats fields set — the shape
+    /// every pre-extension writer produced. Stats fields default to
+    /// `None`; the dispatcher's fold fills them when available.
+    pub fn basic(
+        step_id: StepId,
+        step_ref: Option<String>,
+        status: Option<String>,
+        binding_digest: Option<BindingDigest>,
+        at: u64,
+    ) -> Self {
+        Self {
+            step_id,
+            step_ref,
+            status,
+            binding_digest,
+            at,
+            attempt: None,
+            started_at_ms: None,
+            completed_at_ms: None,
+            duration_ms: None,
+            worker_kind: None,
+            model: None,
+            usage: None,
+            num_turns: None,
+            adapter_data: None,
+        }
+    }
+
+    /// Fold a boundary-reported [`crate::store::trace::WorkerStats`]
+    /// into this entry (the dispatcher's outcome-time fold). `None`
+    /// fields in `stats` leave the entry untouched; `adapter_data` is
+    /// size-capped via [`crate::store::trace::cap_payload`].
+    pub fn with_worker_stats(mut self, stats: crate::store::trace::WorkerStats) -> Self {
+        self.worker_kind = stats.worker_kind.or(self.worker_kind);
+        self.model = stats.model.or(self.model);
+        self.usage = stats.usage.or(self.usage);
+        self.num_turns = stats.num_turns.or(self.num_turns);
+        self.adapter_data = stats
+            .adapter_data
+            .map(crate::store::trace::cap_payload)
+            .or(self.adapter_data);
+        self
+    }
 }
 
 /// One persisted `Run` row — one kick of a [`crate::store::task::TaskRecord`].
@@ -149,6 +234,22 @@ pub struct RunRecord {
     pub created_at: u64,
     /// Unix epoch seconds — last update time.
     pub updated_at: u64,
+}
+
+/// Filter/paging parameters for [`RunStore::list`] — the `GET /v1/runs`
+/// collection query. All filters AND together; results are newest-first
+/// (`created_at` descending, ties broken by insertion order where the
+/// backend tracks one).
+#[derive(Debug, Clone, Default)]
+pub struct RunListFilter {
+    /// Only Runs kicked from this Task.
+    pub task_id: Option<TaskId>,
+    /// Only Runs currently in this status.
+    pub status: Option<RunStatus>,
+    /// Page size cap. `None` = no cap.
+    pub limit: Option<usize>,
+    /// Skip the first N matching rows (after ordering).
+    pub offset: Option<usize>,
 }
 
 /// Errors surfaced by a [`RunStore`] implementation.
@@ -293,6 +394,14 @@ pub struct RunContext {
     /// (same crate-level convention — dispatcher writes are short critical
     /// sections, no `.await` held across).
     pub last_failure: Arc<Mutex<Option<LastFailure>>>,
+    /// Optional [`crate::store::trace::TraceHandle`] bound to this Run —
+    /// the write port for the per-Run [`crate::store::trace::TraceEvent`]
+    /// stream. When present the dispatcher appends `core.*` events
+    /// around every step and registers the handle with the engine
+    /// (`Engine::trace_handle`) so middlewares/workers can append their
+    /// own kinds. `None` (the default) disables the trace rail entirely
+    /// — pre-trace callers keep their behavior byte-for-byte.
+    pub trace: Option<crate::store::trace::TraceHandle>,
 }
 
 impl RunContext {
@@ -309,7 +418,17 @@ impl RunContext {
             binding_digests: Arc::new(HashMap::new()),
             resume: false,
             last_failure: Arc::new(Mutex::new(None)),
+            trace: None,
         }
+    }
+
+    /// Builder-style setter: attach a
+    /// [`crate::store::trace::TraceHandle`] so the dispatcher appends
+    /// `core.*` trace events around every step and exposes the handle
+    /// to middlewares/workers via the engine.
+    pub fn with_trace(mut self, trace: crate::store::trace::TraceHandle) -> Self {
+        self.trace = Some(trace);
+        self
     }
 
     /// GH #76 error surface: write the aborting-step breadcrumb (last-write-wins).
@@ -430,6 +549,7 @@ impl std::fmt::Debug for RunContext {
                 "last_failure",
                 &self.last_failure.lock().ok().and_then(|slot| slot.clone()),
             )
+            .field("trace", &self.trace.is_some())
             .finish()
     }
 }
@@ -504,6 +624,16 @@ pub trait RunStore: Send + Sync {
     /// List every Run currently `Running` (issue #35 ST2 boot sweep +
     /// ST4 occupancy check reuse this). No ordering guarantee.
     async fn list_running(&self) -> Result<Vec<RunRecord>, RunStoreError>;
+
+    /// List Runs matching `filter`, newest-first (`created_at`
+    /// descending) — the `GET /v1/runs` collection read.
+    async fn list(&self, filter: &RunListFilter) -> Result<Vec<RunRecord>, RunStoreError>;
+
+    /// Delete a Run row (the `DELETE /v1/runs/:id` retention operation).
+    /// The caller is responsible for pruning the sibling trace stream
+    /// ([`crate::store::trace::RunTraceStore::delete_run`]) — the two
+    /// stores are deliberately uncoupled at the trait level.
+    async fn delete(&self, id: &RunId) -> Result<(), RunStoreError>;
 }
 
 // ──────────────────────────────────────────────────────────────────────────

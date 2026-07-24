@@ -741,6 +741,26 @@ pub struct EngineState {
     /// Maximum length of `event_log_tail` before older entries are
     /// dropped.
     pub event_log_max: usize,
+    /// Per-attempt normalized worker stats reported by worker
+    /// boundaries (`Engine::record_worker_stats`) and drained by the
+    /// dispatcher's outcome fold (`Engine::take_worker_stats`) into the
+    /// terminal `StepEntry`. Entries a dispatcher never drains (direct
+    /// `dispatch_attempt_with` callers without an `EngineDispatcher`)
+    /// share the process-lifetime accumulation caveat of `prompts` /
+    /// `agent_ctx` (GH #23 sweep TODO).
+    pub worker_stats: HashMap<(StepId, u32), crate::store::trace::WorkerStats>,
+    /// Per-dispatch [`crate::store::trace::TraceHandle`] registry —
+    /// inserted by `EngineDispatcher::dispatch` before spawning a step
+    /// (when its `RunContext` carries a trace handle), removed after
+    /// the outcome fold. Middlewares and other engine-adjacent writers
+    /// read it via `Engine::trace_handle` to append their own trace
+    /// kinds without any plumbing through `Ctx`. Known limitation
+    /// (holistic review, LOW): a dispatch future dropped between insert
+    /// and fold (sync-launch timeout race, caller abort) strands its
+    /// entry for the process lifetime — the same accumulation caveat as
+    /// `worker_stats` / `prompts` (GH #23 sweep TODO); each stranded
+    /// entry is one map slot + an `Arc` clone, not a per-run buffer.
+    pub trace_handles: HashMap<StepId, crate::store::trace::TraceHandle>,
 }
 
 impl EngineState {
@@ -764,6 +784,8 @@ impl EngineState {
             worker_artifact_names: HashMap::new(),
             event_log_tail: Vec::new(),
             event_log_max: 1024,
+            worker_stats: HashMap::new(),
+            trace_handles: HashMap::new(),
         }
     }
 

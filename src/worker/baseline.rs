@@ -55,6 +55,7 @@ pub fn extend_with_baseline(base: RustFnInProcessSpawnerFactory) -> RustFnInProc
                 "echoed": inv.prompt,
             }),
             ok: true,
+            stats: None,
         })
     })
 }

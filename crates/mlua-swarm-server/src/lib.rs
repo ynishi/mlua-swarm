@@ -202,6 +202,15 @@ pub struct AppState {
     /// `InMemoryReplayStore` (process-volatile); callers can swap in a
     /// `SqliteReplayStore` via the `replay_store` argument.
     pub replay_store: Arc<dyn ReplayStore>,
+    /// Per-Run trace stream (the RunTrace rail — see
+    /// `mlua_swarm::store::trace` module doc). A `TraceHandle` bound to
+    /// this store is threaded into `RunContext` at every dispatch site
+    /// (`core.*` events + middleware/worker insertion) and read back via
+    /// `GET /v1/runs/:id/trace`. Default = `InMemoryRunTraceStore`;
+    /// callers can swap in a `SqliteRunTraceStore` (typically sharing
+    /// the `SqliteRunStore` file) via the terminal builder's
+    /// `run_trace_store` argument.
+    pub run_trace_store: Arc<dyn mlua_swarm::store::trace::RunTraceStore>,
     /// Public HTTP base URL the server is reachable at (e.g.
     /// `"http://127.0.0.1:7777"`), sourced from the binary at boot time.
     /// When `Some`, `WSOperatorSession` renders it literally into the
@@ -297,6 +306,13 @@ pub fn build_router_with_ws_factory_and_output(
     )
 }
 
+// Backend-availability note for the trace rail: `build_router_full`
+// keeps its pre-trace signature (every existing caller gets the
+// in-memory default); a persistent `RunTraceStore` is injected via the
+// terminal `build_router_full_with_legacy_worker_binding_policy`'s
+// `run_trace_store` argument (the CLI `serve` path does this, sharing
+// the `SqliteRunStore` file).
+
 /// 8-argument variant of [`build_router_with_ws_factory_and_output`].
 /// Passing `base_url = Some(...)` (e.g. `"http://127.0.0.1:7777"`) makes
 /// `WSOperatorSession` render the actual server bind into the Spawn
@@ -338,6 +354,7 @@ pub fn build_router_full(
         task_store,
         run_store,
         replay_store,
+        None,
         sync_timeout_secs,
         mlua_swarm::LegacyWorkerBindingPolicy::Allow,
     )
@@ -357,6 +374,7 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
     task_store: Option<Arc<dyn TaskStore>>,
     run_store: Option<Arc<dyn RunStore>>,
     replay_store: Option<Arc<dyn ReplayStore>>,
+    run_trace_store: Option<Arc<dyn mlua_swarm::store::trace::RunTraceStore>>,
     sync_timeout_secs: u64,
     legacy_worker_binding_policy: mlua_swarm::LegacyWorkerBindingPolicy,
 ) -> Router {
@@ -401,6 +419,10 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
         Some(s) => s,
         None => Arc::new(InMemoryReplayStore::new()),
     };
+    let run_trace_store: Arc<dyn mlua_swarm::store::trace::RunTraceStore> = match run_trace_store {
+        Some(s) => s,
+        None => Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
+    };
     let state = AppState {
         engine,
         sessions: Arc::new(Mutex::new(SessionStore::default())),
@@ -412,6 +434,7 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
         task_store,
         run_store,
         replay_store,
+        run_trace_store,
         base_url,
         sync_timeout_secs,
     };
@@ -436,7 +459,17 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
             "/v1/tasks/:id/runs/:run/steps/:step/content",
             get(projection::step_content),
         )
-        .route("/v1/runs/:id", get(tasks::run_get))
+        // Run collection + sub-resources (per-step run stats / trace rail):
+        // `GET /v1/runs` = filtered list, `DELETE /v1/runs/:id` = retention
+        // prune (run row + trace stream together), `:id/steps` = the
+        // terminal per-step stats, `:id/trace` = the TraceEvent stream.
+        .route("/v1/runs", get(tasks::runs_list))
+        .route(
+            "/v1/runs/:id",
+            get(tasks::run_get).delete(tasks::run_delete),
+        )
+        .route("/v1/runs/:id/steps", get(tasks::run_steps))
+        .route("/v1/runs/:id/trace", get(tasks::run_trace))
         .route("/v1/runs/:id/bindings", get(tasks::run_bindings_explain))
         // Resume an Interrupted Run under the SAME run_id (replay cursor +
         // stored launch-input snapshot); see `tasks::run_resume`.
@@ -456,10 +489,7 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
         // restart. Order matters: the `by-role` route is declared BEFORE
         // the `:sid` route so `axum` matches `by-role/:role` as its own
         // path, not as a `:sid` extract of literal `by-role`.
-        .route(
-            "/v1/operators",
-            post(operators_create).get(operators_list),
-        )
+        .route("/v1/operators", post(operators_create).get(operators_list))
         .route("/v1/operators/:sid/ws", get(operators_ws_connect))
         .route(
             "/v1/operators/by-role/:role",
@@ -503,6 +533,7 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
         // GH #32: structured worker degradation reporting — independent channel,
         // never touches OutputStore / the fold path. See the `worker` module doc.
         .route("/v1/worker/degradation", post(worker::worker_degradation))
+        .route("/v1/worker/stats", post(worker::worker_stats))
         // Data path (v9 Big Response handling, independent from Domain / verdict flow)
         .route("/v1/data/emit", post(data::data_emit))
         .route(
@@ -1164,8 +1195,19 @@ async fn run_flow_form(
         .await
         .map_err(ApiError::engine)?;
 
+    let trace =
+        mlua_swarm::store::trace::TraceHandle::new(run_id.clone(), state.run_trace_store.clone());
+    trace
+        .append(
+            mlua_swarm::store::trace::kind::RUN_STARTED,
+            None,
+            None,
+            json!({"mode": "launch"}),
+        )
+        .await;
     let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone())
-        .with_replay_store(state.replay_store.clone());
+        .with_replay_store(state.replay_store.clone())
+        .with_trace(trace);
 
     // GH #37 detached launch: the eval driver runs in its own spawned
     // task — its lifetime is bound to `ttl_secs`, not to this request's
@@ -1801,6 +1843,7 @@ mod tests {
             task_store: Arc::new(mlua_swarm::store::task::InMemoryTaskStore::new()),
             run_store: Arc::new(mlua_swarm::store::run::InMemoryRunStore::new()),
             replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
+            run_trace_store: Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         }
@@ -1995,9 +2038,9 @@ mod tests {
         let api = ApiError::from_task_resolve(&err, "task T-abc: bp resolve");
         assert_eq!(api.status, StatusCode::CONFLICT);
         assert!(api.message.starts_with("task T-abc: bp resolve:"));
-        assert!(api.message.contains(
-            "blueprint scout is archived; POST /v1/blueprints/scout/unarchive first"
-        ));
+        assert!(api
+            .message
+            .contains("blueprint scout is archived; POST /v1/blueprints/scout/unarchive first"));
     }
 
     #[test]

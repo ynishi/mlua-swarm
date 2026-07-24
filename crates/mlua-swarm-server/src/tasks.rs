@@ -47,8 +47,11 @@ use mlua_swarm::core::config::CheckPolicy;
 use mlua_swarm::service::merge_init_ctx_3layer;
 use mlua_swarm::service::TaskLaunchError;
 use mlua_swarm::store::replay::ReplayCursor;
-use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStoreError, SnapshotOrigin};
+use mlua_swarm::store::run::{
+    RunContext, RunListFilter, RunRecord, RunStatus, RunStoreError, SnapshotOrigin, StepEntry,
+};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStoreError};
+use mlua_swarm::store::trace::{kind as trace_kind, TraceEvent, TraceHandle, TraceQuery};
 use mlua_swarm::{
     validate_bound_agent_snapshots, OperatorKind, Role, RunId, TaskId, TaskInputSpec,
 };
@@ -256,6 +259,18 @@ pub(crate) async fn finalize_run(
             tracing::warn!(%task_id, %run_id, error = %e, "finalize_run: dispatch failed");
         }
     }
+    // Trace rail: mark the Run's terminal status on the stream (the
+    // `core.run_started` counterpart appended at the launch sites).
+    // Best-effort like every other persistence in this fn.
+    let status = if outcome.is_ok() { "done" } else { "failed" };
+    TraceHandle::new(run_id.clone(), state.run_trace_store.clone())
+        .append(
+            trace_kind::RUN_FINISHED,
+            None,
+            None,
+            json!({ "status": status }),
+        )
+        .await;
     outcome
 }
 
@@ -555,8 +570,18 @@ pub async fn task_rekick(
         .await
         .map_err(ApiError::engine)?;
 
+    let trace = TraceHandle::new(run_id.clone(), state.run_trace_store.clone());
+    trace
+        .append(
+            trace_kind::RUN_STARTED,
+            None,
+            None,
+            json!({"mode": "rekick"}),
+        )
+        .await;
     let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone())
-        .with_replay_store(state.replay_store.clone());
+        .with_replay_store(state.replay_store.clone())
+        .with_trace(trace);
 
     // GH #37 detached rekick: same driver-detach semantics as
     // `run_flow_form` — the eval runs in its own spawned task bounded by
@@ -784,10 +809,20 @@ pub async fn run_resume(
     // replay_cursor all wired. No new RunRecord is minted. `with_resume()`
     // marks this as a resume so any binding backfill is stamped
     // `resume_backfill` (and, D2, keeps legacy replay keys).
+    let trace = TraceHandle::new(run_id.clone(), state.run_trace_store.clone());
+    trace
+        .append(
+            trace_kind::RUN_STARTED,
+            None,
+            None,
+            json!({"mode": "resume"}),
+        )
+        .await;
     let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone())
         .with_replay_store(state.replay_store.clone())
         .with_replay_cursor(Arc::new(Mutex::new(cursor)))
-        .with_resume();
+        .with_resume()
+        .with_trace(trace);
 
     let input = snapshot.into_input();
     let task_id = run.task_id.clone();
@@ -1108,10 +1143,20 @@ pub async fn run_rerun_from(
     // `with_resume()` — a rerun-from re-derives its snapshot from the current
     // Blueprint exactly like resume, so a binding backfill here is stamped
     // `resume_backfill` (and keeps legacy replay keys, D2).
+    let trace = TraceHandle::new(run_id.clone(), state.run_trace_store.clone());
+    trace
+        .append(
+            trace_kind::RUN_STARTED,
+            None,
+            None,
+            json!({"mode": "rerun_from"}),
+        )
+        .await;
     let run_ctx = RunContext::new(run_id.clone(), state.run_store.clone())
         .with_replay_store(state.replay_store.clone())
         .with_replay_cursor(Arc::new(Mutex::new(cursor)))
-        .with_resume();
+        .with_resume()
+        .with_trace(trace);
 
     let input = snapshot.into_input();
     let task_id = run.task_id.clone();
@@ -1188,6 +1233,203 @@ pub async fn run_get(
         .await
         .map_err(map_run_store_err)?;
     Ok(Json(run))
+}
+
+/// Query params for `GET /v1/runs` (the Run collection read).
+#[derive(Debug, Deserialize, Default)]
+pub struct RunsListQuery {
+    /// Only Runs kicked from this Task.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Only Runs currently in this status (`pending` / `running` / `done`
+    /// / `failed` / `interrupted`).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Page size cap. Omitted = no cap.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Skip the first N matching rows (after newest-first ordering).
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+/// Response body for `GET /v1/runs`.
+#[derive(Debug, Serialize)]
+pub struct RunsListResponse {
+    /// Matching Runs, newest-first.
+    pub runs: Vec<RunRecord>,
+}
+
+/// `GET /v1/runs?task_id=&status=&limit=&offset=` — filtered Run
+/// collection, newest-first. The collection read that was missing from
+/// the Run CRUD surface (only `GET /v1/runs/:id` existed before the
+/// per-step run stats work).
+pub async fn runs_list(
+    State(state): State<AppState>,
+    Query(q): Query<RunsListQuery>,
+) -> Result<Json<RunsListResponse>, ApiError> {
+    let task_id = q
+        .task_id
+        .map(TaskId::parse)
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("invalid task_id: {e}")))?;
+    let status = q
+        .status
+        .as_deref()
+        .map(|s| {
+            serde_json::from_value::<RunStatus>(Value::String(s.to_string())).map_err(|_| {
+                ApiError::bad_request(format!(
+                    "invalid status {s:?} (expected pending/running/done/failed/interrupted)"
+                ))
+            })
+        })
+        .transpose()?;
+    let runs = state
+        .run_store
+        .list(&RunListFilter {
+            task_id,
+            status,
+            limit: q.limit,
+            offset: q.offset,
+        })
+        .await
+        .map_err(map_run_store_err)?;
+    Ok(Json(RunsListResponse { runs }))
+}
+
+/// Response body for `GET /v1/runs/:id/steps`.
+#[derive(Debug, Serialize)]
+pub struct RunStepsResponse {
+    /// The Run the steps belong to.
+    pub run_id: String,
+    /// Terminal per-step stats entries, in append (dispatch) order.
+    pub steps: Vec<StepEntry>,
+}
+
+/// `GET /v1/runs/:id/steps` — the Run's terminal per-step stats
+/// (`StepEntry` list) as a standalone sub-resource. Same data
+/// `GET /v1/runs/:id` embeds; split out so stats consumers don't drag
+/// the full RunRecord (launch snapshot etc.) per poll.
+pub async fn run_steps(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<RunStepsResponse>, ApiError> {
+    let run_id =
+        RunId::parse(id).map_err(|e| ApiError::bad_request(format!("invalid run id: {e}")))?;
+    let run = state
+        .run_store
+        .get(&run_id)
+        .await
+        .map_err(map_run_store_err)?;
+    Ok(Json(RunStepsResponse {
+        run_id: run.id.to_string(),
+        steps: run.step_entries,
+    }))
+}
+
+/// Query params for `GET /v1/runs/:id/trace` — see
+/// `mlua_swarm::store::trace::TraceQuery` for semantics (`latest` wins
+/// over `after`; `kind` entries are comma-separated prefix matches).
+#[derive(Debug, Deserialize, Default)]
+pub struct RunTraceQuery {
+    /// Forward-paging cursor: only events with `seq > after`.
+    #[serde(default)]
+    pub after: Option<u64>,
+    /// Page size cap.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Tail mode: the LAST n matching events (ascending order).
+    #[serde(default)]
+    pub latest: Option<usize>,
+    /// Comma-separated kind filters, prefix match (e.g. `kind=mw.` or
+    /// `kind=core.step_completed,worker.`).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Exact `step_ref` filter.
+    #[serde(default)]
+    pub step: Option<String>,
+    /// Exact attempt filter.
+    #[serde(default)]
+    pub attempt: Option<u32>,
+}
+
+/// Response body for `GET /v1/runs/:id/trace`.
+#[derive(Debug, Serialize)]
+pub struct RunTraceResponse {
+    /// The Run the events belong to.
+    pub run_id: String,
+    /// Matching trace events, ascending by `seq`.
+    pub events: Vec<TraceEvent>,
+}
+
+/// `GET /v1/runs/:id/trace?after=&limit=&latest=&kind=&step=&attempt=` —
+/// the Run's TraceEvent stream (the RunTrace rail). Note the trace rail
+/// is deliberately uncoupled from `RunStore` (a trace can outlive or
+/// precede its Run row), so an unknown Run id returns an empty list, not
+/// 404.
+pub async fn run_trace(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RunTraceQuery>,
+) -> Result<Json<RunTraceResponse>, ApiError> {
+    let run_id =
+        RunId::parse(id).map_err(|e| ApiError::bad_request(format!("invalid run id: {e}")))?;
+    let query = TraceQuery {
+        after: q.after,
+        limit: q.limit,
+        latest: q.latest,
+        kinds: q
+            .kind
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|k| !k.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        step_ref: q.step,
+        attempt: q.attempt,
+    };
+    let events = state
+        .run_trace_store
+        .list(&run_id, &query)
+        .await
+        .map_err(|e| ApiError::engine(format!("trace list: {e}")))?;
+    Ok(Json(RunTraceResponse {
+        run_id: run_id.to_string(),
+        events,
+    }))
+}
+
+/// `DELETE /v1/runs/:id` — retention prune: deletes the Run row and its
+/// trace stream together (`404` when the Run row is absent; the trace
+/// stream is pruned best-effort either way). Replay rows are untouched —
+/// `ReplayStore` has its own truncation semantics owned by the
+/// rerun-from path.
+///
+/// Trust tier: same auth-free open-router posture as every other route
+/// in this module (`POST /v1/tasks` included) — the server is a
+/// local-first, loopback-bound single-operator daemon. Flagged in
+/// holistic review as the surface's first unauthenticated destructive
+/// verb; acceptable under the loopback bind, revisit if the bind ever
+/// goes non-local.
+pub async fn run_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let run_id =
+        RunId::parse(id).map_err(|e| ApiError::bad_request(format!("invalid run id: {e}")))?;
+    state
+        .run_store
+        .delete(&run_id)
+        .await
+        .map_err(map_run_store_err)?;
+    if let Err(e) = state.run_trace_store.delete_run(&run_id).await {
+        tracing::warn!(%run_id, error = %e, "run_delete: trace delete_run failed (run row already deleted)");
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Whether a Run-scoped binding has only a declaration or also carries a
@@ -1475,6 +1717,7 @@ mod tests {
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
             replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
+            run_trace_store: Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         }

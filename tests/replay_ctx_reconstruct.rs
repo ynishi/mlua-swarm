@@ -84,12 +84,14 @@ fn build_spawner() -> SpawnerRig {
         Ok(WorkerResult {
             value: json!({ "by": "step-a", "prompt": inv.prompt }),
             ok: true,
+            stats: None,
         })
     });
     sp.register("step-b", |inv| async move {
         Ok(WorkerResult {
             value: json!({ "by": "step-b", "prompt": inv.prompt }),
             ok: true,
+            stats: None,
         })
     });
     let inner: Arc<dyn SpawnerAdapter> = Arc::new(sp);

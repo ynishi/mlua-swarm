@@ -19,3 +19,4 @@ pub mod output;
 pub mod replay;
 pub mod run;
 pub mod task;
+pub mod trace;

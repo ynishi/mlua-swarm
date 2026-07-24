@@ -86,6 +86,10 @@ struct Inner {
     /// In-process run trace (issue #13): in-memory only — the stdio MCP
     /// adapter has no persistence; `swarm_status` reads step_entries here.
     run_store: Arc<dyn RunStore>,
+    /// In-process RunTrace rail (per-step run stats): the TraceEvent
+    /// stream `swarm_run` / `swarm_status` surface as `log_tail`.
+    /// In-memory only, same lifetime caveat as `run_store`.
+    run_trace_store: Arc<dyn mlua_swarm::store::trace::RunTraceStore>,
 }
 
 #[derive(Clone)]
@@ -110,12 +114,15 @@ impl MseServer {
         let launch = Arc::new(TaskLaunchService::new(engine, compiler));
         let task_app = Arc::new(TaskApplication::new(launch, store.clone()));
         let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_trace_store: Arc<dyn mlua_swarm::store::trace::RunTraceStore> =
+            Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new());
         Self {
             state: Arc::new(RwLock::new(Inner {
                 runs: HashMap::new(),
                 task_app,
                 store,
                 run_store,
+                run_trace_store,
             })),
             op_client: Arc::new(OperatorClientState::new()),
         }
@@ -139,6 +146,25 @@ async fn fetch_run_via_http(bind: &str, run_id: &str) -> Option<JsonValue> {
         return None;
     }
     resp.json::<JsonValue>().await.ok()
+}
+
+/// Best-effort `GET /v1/runs/:id/trace?latest=50` — the server-side
+/// RunTrace tail `swarm_status` folds into `log_tail`. Same silent-`None`
+/// error contract as [`fetch_run_via_http`].
+async fn fetch_trace_tail_via_http(bind: &str, run_id: &str) -> Option<Vec<JsonValue>> {
+    let url = format!("http://{bind}/v1/runs/{run_id}/trace?latest=50");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.json::<JsonValue>().await.ok()?;
+    body.get("events")
+        .and_then(|e| e.as_array())
+        .map(|a| a.to_vec())
 }
 
 /// GH #67: reflect a server-reported run status string back into the local
@@ -2466,7 +2492,7 @@ impl MseServer {
         // dispatch below finishes.
         let task_id_typed = TaskId::new();
 
-        let (task_app, run_store) = {
+        let (task_app, run_store, run_trace_store) = {
             let mut inner = self.state.write().await;
             inner.runs.insert(
                 run_id.clone(),
@@ -2477,7 +2503,11 @@ impl MseServer {
                     cancel_requested: false,
                 },
             );
-            (inner.task_app.clone(), inner.run_store.clone())
+            (
+                inner.task_app.clone(),
+                inner.run_store.clone(),
+                inner.run_trace_store.clone(),
+            )
         };
 
         // Resolve Inline / File → Blueprint JSON.
@@ -2577,7 +2607,21 @@ impl MseServer {
             })
             .await
         {
-            Ok(()) => Some(RunContext::new(run_id_typed.clone(), run_store.clone())),
+            Ok(()) => {
+                let trace = mlua_swarm::store::trace::TraceHandle::new(
+                    run_id_typed.clone(),
+                    run_trace_store.clone(),
+                );
+                trace
+                    .append(
+                        mlua_swarm::store::trace::kind::RUN_STARTED,
+                        None,
+                        None,
+                        serde_json::json!({"mode": "launch"}),
+                    )
+                    .await;
+                Some(RunContext::new(run_id_typed.clone(), run_store.clone()).with_trace(trace))
+            }
             // A trace-store failure must not block the run itself.
             Err(_) => None,
         };
@@ -2637,10 +2681,26 @@ impl MseServer {
             .await
             .map(|v| v.len())
             .unwrap_or(0);
-        // log_tail: the task axis has no log store (that is exclusive to
-        // the enhance axis); this will be filled in when the enhance path
-        // integrates. For now, always an empty array.
-        let log_tail: Vec<JsonValue> = Vec::new();
+        // log_tail: the tail of the in-process RunTrace stream (per-step
+        // run stats — `core.*` dispatch events + any middleware/worker
+        // kinds). Field name kept for wire compat with pre-trace callers
+        // (it used to be a hardcoded empty array).
+        let log_tail: Vec<JsonValue> = run_trace_store
+            .list(
+                &run_id_typed,
+                &mlua_swarm::store::trace::TraceQuery {
+                    latest: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|events| {
+                events
+                    .into_iter()
+                    .filter_map(|e| serde_json::to_value(e).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let (status, body) = match result {
             Ok(Ok(out)) => (
@@ -2899,11 +2959,12 @@ impl MseServer {
         &self,
         Parameters(req): Parameters<SwarmStatusReq>,
     ) -> Result<CallToolResult, McpError> {
-        let (handle, run_store) = {
+        let (handle, run_store, run_trace_store) = {
             let inner = self.state.read().await;
             (
                 inner.runs.get(&req.run_id).cloned(),
                 inner.run_store.clone(),
+                inner.run_trace_store.clone(),
             )
         };
         let Some(h) = handle else {
@@ -2953,6 +3014,11 @@ impl MseServer {
                     body[field] = v;
                 }
             }
+            // RunTrace tail (per-step run stats): the server axis's
+            // `log_tail` source. Best-effort, silent on error.
+            if let Some(events) = fetch_trace_tail_via_http(&bind, &req.run_id).await {
+                body["log_tail"] = JsonValue::Array(events);
+            }
         } else {
             // Fallback: enrich from the local run store trace (in-process
             // runs — issue #13). Same best-effort behavior as before GH #67.
@@ -2961,6 +3027,20 @@ impl MseServer {
                     body["task_id"] = serde_json::json!(rec.task_id);
                     body["step_entries"] =
                         serde_json::to_value(&rec.step_entries).unwrap_or(JsonValue::Null);
+                }
+                if let Ok(events) = run_trace_store
+                    .list(
+                        &rid,
+                        &mlua_swarm::store::trace::TraceQuery {
+                            latest: Some(50),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    if !events.is_empty() {
+                        body["log_tail"] = serde_json::to_value(events).unwrap_or(JsonValue::Null);
+                    }
                 }
             }
         }
@@ -6616,12 +6696,14 @@ mod tests {
                 Ok(WorkerResult {
                     value: serde_json::json!({ "echoed": inv.prompt }),
                     ok: true,
+                    stats: None,
                 })
             })
             .register_fn("audit-fn", |_inv| async move {
                 Ok(WorkerResult {
                     value: serde_json::json!({ "finding": "clean" }),
                     ok: true,
+                    stats: None,
                 })
             });
         let mut registry = SpawnerRegistry::new();

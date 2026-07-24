@@ -1290,12 +1290,14 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!({ "echoed": inv.prompt }),
                     ok: true,
+                    stats: None,
                 })
             })
             .register_fn("audit-fn", |_inv| async move {
                 Ok(WorkerResult {
                     value: json!({ "finding": "clean" }),
                     ok: true,
+                    stats: None,
                 })
             });
         let svc = build_service(factory);
@@ -1344,6 +1346,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "echoed": inv.prompt }),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -1386,6 +1389,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "echoed": inv.prompt }),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -1473,6 +1477,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "echoed": inv.prompt }),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -1529,6 +1534,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "echoed": inv.prompt }),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -1570,6 +1576,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "echoed": inv.prompt }),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -1599,6 +1606,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "echoed": inv.prompt }),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service_with_cfg(
@@ -1641,6 +1649,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "echoed": inv.prompt }),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -1675,6 +1684,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "echoed": inv.prompt }),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -1704,6 +1714,7 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!(s.to_uppercase()),
                     ok: true,
+                    stats: None,
                 })
             })
             .register_fn("suffix", |inv| async move {
@@ -1711,6 +1722,7 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!(format!("{s}!")),
                     ok: true,
+                    stats: None,
                 })
             })
             .register_fn("wrap", |inv| async move {
@@ -1718,6 +1730,7 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!(format!("[{s}]")),
                     ok: true,
+                    stats: None,
                 })
             });
         let svc = build_service(factory);
@@ -1773,6 +1786,7 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!(format!("did:{s}")),
                     ok: true,
+                    stats: None,
                 })
             }
         });
@@ -1811,6 +1825,7 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!(inv.prompt),
                     ok: true,
+                    stats: None,
                 })
             })
             .register_fn("boom", |_inv| async move {
@@ -1846,6 +1861,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "echoed": inv.prompt }),
                 ok: true,
+                stats: None,
             })
         });
         let mut externs = mlua_flow_ir::ExternMap::new();
@@ -1876,6 +1892,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!(inv.prompt),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory); // default NoExterns
@@ -1925,6 +1942,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!(inv.prompt),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -1987,6 +2005,7 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!(inv.prompt.to_uppercase()),
                     ok: true,
+                    stats: None,
                 })
             })
             .register_fn("suffix", |inv| async move {
@@ -1994,6 +2013,7 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!(format!("{s}!")),
                     ok: true,
+                    stats: None,
                 })
             });
         let svc = build_service(factory);
@@ -2554,6 +2574,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!(inv.prompt),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -2587,6 +2608,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "echoed": inv.prompt }),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -2617,6 +2639,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!(inv.prompt),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -2640,6 +2663,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!(inv.prompt),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -2756,6 +2780,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!(inv.prompt),
                 ok: true,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -3095,6 +3120,7 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!({ "echoed": inv.prompt }),
                     ok: true,
+                    stats: None,
                 })
             }
         });
@@ -3305,6 +3331,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "verdict": "BLOCKED", "reason": "not applicable" }),
                 ok: false,
+                stats: None,
             })
         });
         let svc = build_service(factory);
@@ -3381,18 +3408,21 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!(inv.prompt.to_uppercase()),
                     ok: true,
+                    stats: None,
                 })
             })
             .register_fn("gate", |_inv| async move {
                 Ok(WorkerResult {
                     value: json!({ "verdict": "BLOCKED" }),
                     ok: false,
+                    stats: None,
                 })
             })
             .register_fn("never", |inv| async move {
                 Ok(WorkerResult {
                     value: json!(inv.prompt),
                     ok: true,
+                    stats: None,
                 })
             });
         let svc = build_service(factory);
@@ -3491,6 +3521,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "verdict": "BLOCKED" }),
                 ok: false,
+                stats: None,
             })
         });
         let svc = build_service(factory);

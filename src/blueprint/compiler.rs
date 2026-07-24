@@ -1872,6 +1872,7 @@ async fn run_lua_worker(
     Ok(crate::worker::adapter::WorkerResult {
         value: outcome.0,
         ok: outcome.1,
+        stats: None,
     })
 }
 
@@ -2297,6 +2298,7 @@ mod operator_spawner_factory_worker_binding_tests {
             Ok(WorkerResult {
                 value: Value::Null,
                 ok: true,
+                stats: None,
             })
         }
 
@@ -2548,6 +2550,7 @@ mod meta_ref_validation_tests {
             Ok(WorkerResult {
                 value: Value::String(inv.prompt),
                 ok: true,
+                stats: None,
             })
         });
         let mut reg = SpawnerRegistry::new();
@@ -2729,6 +2732,7 @@ mod audit_agent_validation_tests {
             Ok(WorkerResult {
                 value: Value::String(inv.prompt),
                 ok: true,
+                stats: None,
             })
         });
         let mut reg = SpawnerRegistry::new();
@@ -2840,6 +2844,7 @@ mod projection_placement_compile_tests {
             Ok(WorkerResult {
                 value: Value::String(inv.prompt),
                 ok: true,
+                stats: None,
             })
         });
         let mut reg = SpawnerRegistry::new();
@@ -2967,6 +2972,7 @@ mod verdict_contract_lint_tests {
             Ok(WorkerResult {
                 value: Value::String(inv.prompt),
                 ok: true,
+                stats: None,
             })
         });
         let mut reg = SpawnerRegistry::new();
@@ -3657,6 +3663,7 @@ mod subprocess_embed_compile_tests {
             format: Some("json".to_string()),
             result_ptr: None,
             ok_from: None,
+            stats: None,
         });
         let err = SubprocessProcessSpawnerFactory::build_embed(
             &agent,
@@ -3675,6 +3682,7 @@ mod subprocess_embed_compile_tests {
             format: None,
             result_ptr: Some("result".to_string()),
             ok_from: None,
+            stats: None,
         });
         let err = SubprocessProcessSpawnerFactory::build_embed(
             &agent,
@@ -3689,6 +3697,7 @@ mod subprocess_embed_compile_tests {
             format: None,
             result_ptr: None,
             ok_from: Some("status".to_string()),
+            stats: None,
         });
         let err = SubprocessProcessSpawnerFactory::build_embed(
             &agent,

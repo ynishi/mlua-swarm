@@ -355,7 +355,11 @@ impl SpawnerAdapter for ProcessSpawner {
                                         "raw": stdout.trim_end(),
                                         "stderr": String::from_utf8_lossy(&out.stderr).to_string(),
                                     }));
-                                Ok(WorkerResult { value, ok: out.status.success() })
+                                Ok(WorkerResult {
+                                    value,
+                                    ok: out.status.success(),
+                                    stats: Some(subprocess_base_stats(&out.status, None)),
+                                })
                             }
                             Err(e) => Err(WorkerError::Failed(format!("wait_with_output: {e}"))),
                         }
@@ -363,6 +367,11 @@ impl SpawnerAdapter for ProcessSpawner {
                     _ = cancel_inner.cancelled() => Err(WorkerError::Cancelled),
                 };
                 if let Ok(wr) = &result {
+                    if let Some(stats) = wr.stats.clone() {
+                        engine_for_emit
+                            .record_worker_stats(&task_id_for_emit, attempt, stats)
+                            .await;
+                    }
                     let ev = OutputEvent::Final {
                         content: ContentRef::Inline {
                             value: wr.value.clone(),
@@ -488,17 +497,89 @@ fn embed_references(embed: &EmbedTemplate, token: &str) -> bool {
         || embed.cwd.as_deref().is_some_and(|c| c.contains(token))
 }
 
+/// Baseline per-attempt stats every subprocess result carries: the
+/// worker kind, the template-declared model (when any), and the child's
+/// exit code as adapter data. Declared-pointer enrichment
+/// ([`enrich_declared_stats`]) layers usage/model/num_turns on top when
+/// the stdout parses and the template opted in.
+fn subprocess_base_stats(
+    status: &std::process::ExitStatus,
+    model: Option<&str>,
+) -> crate::store::trace::WorkerStats {
+    crate::store::trace::WorkerStats {
+        worker_kind: Some("subprocess".to_string()),
+        model: model.map(str::to_string),
+        usage: None,
+        num_turns: None,
+        adapter_data: Some(serde_json::json!({ "exit_code": status.code() })),
+    }
+}
+
+/// GH #83 stats declaration — apply `SubprocessOutput.stats` JSON
+/// Pointers to the parsed stdout, enriching `stats` in place. Pointer
+/// misses are silent (stats are observational; a CLI that omits usage
+/// on some runs must not fail the step).
+fn enrich_declared_stats(
+    stats: &mut crate::store::trace::WorkerStats,
+    parsed: &Value,
+    decl: &SubprocessOutput,
+) {
+    let Some(sd) = &decl.stats else { return };
+    if let Some(ptr) = sd.model_ptr.as_deref() {
+        if let Some(m) = parsed.pointer(ptr).and_then(|v| v.as_str()) {
+            stats.model = Some(m.to_string());
+        }
+    }
+    if let Some(ptr) = sd.num_turns_ptr.as_deref() {
+        if let Some(n) = parsed.pointer(ptr).and_then(|v| v.as_u64()) {
+            stats.num_turns = Some(n as u32);
+        }
+    }
+    if let Some(ptr) = sd.usage_ptr.as_deref() {
+        if let Some(u) = parsed.pointer(ptr) {
+            let input = u
+                .get("input_tokens")
+                .or_else(|| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64());
+            let output = u
+                .get("output_tokens")
+                .or_else(|| u.get("completion_tokens"))
+                .and_then(|v| v.as_u64());
+            if let (Some(i), Some(o)) = (input, output) {
+                let total = u
+                    .get("total_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(i + o);
+                stats.usage = Some(crate::store::trace::TokenUsage {
+                    input_tokens: i,
+                    output_tokens: o,
+                    total_tokens: total,
+                });
+                // Keep the raw usage object too — cache-token detail and
+                // provider-specific fields ride as adapter data.
+                if let Some(Value::Object(ad)) = stats.adapter_data.as_mut() {
+                    ad.insert("usage_raw".to_string(), u.clone());
+                }
+            }
+        }
+    }
+}
+
 /// GH #83 — plain-mode stdout normalization under a
 /// [`SubprocessOutput`] declaration. `decl = None` reproduces the
 /// historical JSON-or-raw wrap byte-for-byte (same expression as the
-/// spec-based path).
+/// spec-based path). `model` is the template-declared `{model}` value,
+/// recorded into the stats sidecar (a declared `stats.model_ptr`
+/// overrides it with the model the CLI reports it actually used).
 fn normalize_plain_output(
     out: &std::process::Output,
     decl: Option<&SubprocessOutput>,
+    model: Option<&str>,
 ) -> WorkerResult {
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = || String::from_utf8_lossy(&out.stderr).to_string();
     let exit_ok = out.status.success();
+    let mut stats = subprocess_base_stats(&out.status, model);
 
     let Some(decl) = decl else {
         let value: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
@@ -507,7 +588,11 @@ fn normalize_plain_output(
                 "stderr": stderr(),
             })
         });
-        return WorkerResult { value, ok: exit_ok };
+        return WorkerResult {
+            value,
+            ok: exit_ok,
+            stats: Some(stats),
+        };
     };
 
     let parsed: Result<Value, _> = serde_json::from_str(stdout.trim());
@@ -524,6 +609,7 @@ fn normalize_plain_output(
                         "parse_error": e.to_string(),
                     }),
                     ok: false,
+                    stats: Some(stats),
                 };
             }
             // Lenient (format undeclared): historical raw wrap; pointer
@@ -534,9 +620,12 @@ fn normalize_plain_output(
                     "stderr": stderr(),
                 }),
                 ok: exit_ok,
+                stats: Some(stats),
             };
         }
     };
+
+    enrich_declared_stats(&mut stats, &parsed, decl);
 
     let value = match decl.result_ptr.as_deref() {
         Some(ptr) => match parsed.pointer(ptr) {
@@ -549,6 +638,7 @@ fn normalize_plain_output(
                         "stderr": stderr(),
                     }),
                     ok: false,
+                    stats: Some(stats),
                 }
             }
         },
@@ -560,7 +650,11 @@ fn normalize_plain_output(
         Some(ptr) => parsed.pointer(ptr) == Some(&Value::Bool(true)),
     };
 
-    WorkerResult { value, ok }
+    WorkerResult {
+        value,
+        ok,
+        stats: Some(stats),
+    }
 }
 
 impl ProcessSpawner {
@@ -713,6 +807,7 @@ impl ProcessSpawner {
         let task_id_for_emit = task_id.clone();
         let stream_mode = self.stream_mode.clone();
         let output_decl = embed.output.clone();
+        let model_for_stats = embed.model.clone();
 
         tokio::spawn(async move {
             let result: Result<WorkerResult, WorkerError> = if let Some(mode) = stream_mode {
@@ -732,13 +827,22 @@ impl ProcessSpawner {
                 let result = tokio::select! {
                     output = child.wait_with_output() => {
                         match output {
-                            Ok(out) => Ok(normalize_plain_output(&out, output_decl.as_ref())),
+                            Ok(out) => Ok(normalize_plain_output(
+                                &out,
+                                output_decl.as_ref(),
+                                model_for_stats.as_deref(),
+                            )),
                             Err(e) => Err(WorkerError::Failed(format!("wait_with_output: {e}"))),
                         }
                     }
                     _ = cancel_inner.cancelled() => Err(WorkerError::Cancelled),
                 };
                 if let Ok(wr) = &result {
+                    if let Some(stats) = wr.stats.clone() {
+                        engine_for_emit
+                            .record_worker_stats(&task_id_for_emit, attempt, stats)
+                            .await;
+                    }
                     let ev = OutputEvent::Final {
                         content: ContentRef::Inline {
                             value: wr.value.clone(),
@@ -827,6 +931,9 @@ async fn run_streaming_mode(
         Some((value, ok)) => Ok(WorkerResult {
             value,
             ok: ok && status.success(),
+            // Streaming keeps its event protocol untouched; only the
+            // baseline exit-code stats ride along.
+            stats: Some(subprocess_base_stats(&status, None)),
         }),
         None => {
             // No Final present: push a synthesized Final so dispatch can pull it from output_tail.
@@ -848,7 +955,11 @@ async fn run_streaming_mode(
                     },
                 )
                 .await;
-            Ok(WorkerResult { value, ok: false })
+            Ok(WorkerResult {
+                value,
+                ok: false,
+                stats: Some(subprocess_base_stats(&status, None)),
+            })
         }
     }
 }
@@ -1138,12 +1249,12 @@ mod embed_tests {
     #[test]
     fn normalize_without_decl_is_historical_json_or_raw() {
         let out = fake_output(r#"{"a": 1}"#, "", 0);
-        let wr = normalize_plain_output(&out, None);
+        let wr = normalize_plain_output(&out, None, None);
         assert_eq!(wr.value, serde_json::json!({"a": 1}));
         assert!(wr.ok);
 
         let out = fake_output("plain text\n", "warned", 0);
-        let wr = normalize_plain_output(&out, None);
+        let wr = normalize_plain_output(&out, None, None);
         assert_eq!(
             wr.value,
             serde_json::json!({"raw": "plain text", "stderr": "warned"})
@@ -1151,7 +1262,7 @@ mod embed_tests {
         assert!(wr.ok);
 
         let out = fake_output("boom", "", 1);
-        let wr = normalize_plain_output(&out, None);
+        let wr = normalize_plain_output(&out, None, None);
         assert!(!wr.ok, "non-zero exit is a failed step");
     }
 
@@ -1161,9 +1272,10 @@ mod embed_tests {
             format: Some("json".to_string()),
             result_ptr: Some("/result".to_string()),
             ok_from: Some("exit_code".to_string()),
+            stats: None,
         };
         let out = fake_output(r#"{"result": {"answer": 42}, "noise": true}"#, "", 0);
-        let wr = normalize_plain_output(&out, Some(&decl));
+        let wr = normalize_plain_output(&out, Some(&decl), None);
         assert_eq!(wr.value, serde_json::json!({"answer": 42}));
         assert!(wr.ok);
     }
@@ -1174,9 +1286,10 @@ mod embed_tests {
             format: Some("json".to_string()),
             result_ptr: None,
             ok_from: None,
+            stats: None,
         };
         let out = fake_output("not json at all", "stderr text", 0);
-        let wr = normalize_plain_output(&out, Some(&decl));
+        let wr = normalize_plain_output(&out, Some(&decl), None);
         assert!(!wr.ok, "declared-JSON unparsable stdout is a failed step");
         assert_eq!(wr.value["raw"], "not json at all");
         assert_eq!(wr.value["stderr"], "stderr text");
@@ -1189,9 +1302,10 @@ mod embed_tests {
             format: Some("json".to_string()),
             result_ptr: Some("/missing".to_string()),
             ok_from: None,
+            stats: None,
         };
         let out = fake_output(r#"{"present": 1}"#, "", 0);
-        let wr = normalize_plain_output(&out, Some(&decl));
+        let wr = normalize_plain_output(&out, Some(&decl), None);
         assert!(!wr.ok);
         assert!(wr.value["error"]
             .as_str()
@@ -1205,18 +1319,19 @@ mod embed_tests {
             format: Some("json".to_string()),
             result_ptr: Some("/result".to_string()),
             ok_from: Some("/ok".to_string()),
+            stats: None,
         };
         // Pointer true → ok even though we also check it beats exit code.
         let out = fake_output(r#"{"result": "r", "ok": true}"#, "", 0);
-        let wr = normalize_plain_output(&out, Some(&decl));
+        let wr = normalize_plain_output(&out, Some(&decl), None);
         assert!(wr.ok);
         // Pointer false → failed step despite exit 0.
         let out = fake_output(r#"{"result": "r", "ok": false}"#, "", 0);
-        let wr = normalize_plain_output(&out, Some(&decl));
+        let wr = normalize_plain_output(&out, Some(&decl), None);
         assert!(!wr.ok);
         // Pointer missing / non-bool → failed step.
         let out = fake_output(r#"{"result": "r", "ok": "yes"}"#, "", 0);
-        let wr = normalize_plain_output(&out, Some(&decl));
+        let wr = normalize_plain_output(&out, Some(&decl), None);
         assert!(!wr.ok);
     }
 }

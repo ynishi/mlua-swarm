@@ -2218,6 +2218,106 @@ impl Engine {
         .flatten()
     }
 
+    /// Record normalized per-attempt worker stats reported by a worker
+    /// boundary (spawner fold site / result captor / `POST
+    /// /v1/worker/submit`). Last-write-wins per `(task_id, attempt)`.
+    /// Best-effort: a state-lock failure is logged and swallowed —
+    /// stats are observational and must never fail the attempt that
+    /// produced them. Drained by [`Self::take_worker_stats`] at the
+    /// dispatcher's outcome fold.
+    pub async fn record_worker_stats(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+        stats: crate::store::trace::WorkerStats,
+    ) {
+        if stats.is_empty() {
+            return;
+        }
+        let key = (task_id.clone(), attempt);
+        if let Err(e) = self
+            .with_state("record_worker_stats", move |s| {
+                s.worker_stats.insert(key, stats);
+            })
+            .await
+        {
+            tracing::warn!(
+                task_id = %task_id,
+                attempt,
+                error = %e,
+                "record_worker_stats failed (swallowed — stats are observational)"
+            );
+        }
+    }
+
+    /// Drain every recorded worker-stats entry for `task_id`, returning
+    /// the highest-attempt one (the attempt whose outcome the dispatcher
+    /// is folding). Removing ALL of the task's entries — not just the
+    /// returned one — keeps retries from leaking earlier attempts into
+    /// `EngineState` for the process lifetime.
+    pub async fn take_worker_stats(
+        &self,
+        task_id: &StepId,
+    ) -> Option<(u32, crate::store::trace::WorkerStats)> {
+        let key_task = task_id.clone();
+        self.with_state("take_worker_stats", move |s| {
+            let attempts: Vec<u32> = s
+                .worker_stats
+                .keys()
+                .filter(|(tid, _)| *tid == key_task)
+                .map(|(_, a)| *a)
+                .collect();
+            let mut best: Option<(u32, crate::store::trace::WorkerStats)> = None;
+            for attempt in attempts {
+                if let Some(stats) = s.worker_stats.remove(&(key_task.clone(), attempt)) {
+                    if best.as_ref().map(|(a, _)| attempt >= *a).unwrap_or(true) {
+                        best = Some((attempt, stats));
+                    }
+                }
+            }
+            best
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Returns the [`crate::store::trace::TraceHandle`] the dispatcher
+    /// registered for `task_id`'s in-flight step, if any — the
+    /// pervasive-insertion read port middlewares (and any other writer
+    /// holding an `Engine`) use to append their own trace kinds. `None`
+    /// = no trace rail for this dispatch (RunContext without a trace
+    /// handle, or the step already folded).
+    pub async fn trace_handle(&self, task_id: &StepId) -> Option<crate::store::trace::TraceHandle> {
+        let key = task_id.clone();
+        self.with_state("trace_handle", move |s| s.trace_handles.get(&key).cloned())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Register (or clear, with `None`) the per-dispatch trace handle
+    /// for `task_id`. Called only by `EngineDispatcher::dispatch` —
+    /// insert before spawn, clear after the outcome fold. Best-effort:
+    /// registry failures are swallowed (trace is observational).
+    pub(crate) async fn set_trace_handle(
+        &self,
+        task_id: &StepId,
+        handle: Option<crate::store::trace::TraceHandle>,
+    ) {
+        let key = task_id.clone();
+        let _ = self
+            .with_state("set_trace_handle", move |s| match handle {
+                Some(h) => {
+                    s.trace_handles.insert(key, h);
+                }
+                None => {
+                    s.trace_handles.remove(&key);
+                }
+            })
+            .await;
+    }
+
     /// Returns the [`crate::core::agent_context::AgentContextView`]
     /// snapshotted for `(task_id, attempt)`, if `AgentContextMiddleware`
     /// stashed one — the same lookup [`Self::fetch_worker_payload`] /
@@ -5646,7 +5746,13 @@ mod skip_tier_tests {
         let inner_for_worker = inner_verdict.clone();
         let factory = RustFnInProcessSpawnerFactory::new().register_fn("analyst", move |_inv| {
             let value = wrap_skip_marker(inner_for_worker.clone());
-            async move { Ok(WorkerResult { value, ok: true }) }
+            async move {
+                Ok(WorkerResult {
+                    value,
+                    ok: true,
+                    stats: None,
+                })
+            }
         });
         let def = AgentDef {
             name: "analyst".into(),
@@ -5704,7 +5810,13 @@ mod skip_tier_tests {
         let inner_for_worker = inner_verdict.clone();
         let factory = RustFnInProcessSpawnerFactory::new().register_fn("analyst", move |_inv| {
             let value = wrap_skip_marker(inner_for_worker.clone());
-            async move { Ok(WorkerResult { value, ok: true }) }
+            async move {
+                Ok(WorkerResult {
+                    value,
+                    ok: true,
+                    stats: None,
+                })
+            }
         });
         let def = AgentDef {
             name: "analyst".into(),
@@ -5748,7 +5860,13 @@ mod skip_tier_tests {
         let inner_for_worker = inner_verdict.clone();
         let factory = RustFnInProcessSpawnerFactory::new().register_fn("analyst", move |_inv| {
             let value = wrap_skip_marker(inner_for_worker.clone());
-            async move { Ok(WorkerResult { value, ok: true }) }
+            async move {
+                Ok(WorkerResult {
+                    value,
+                    ok: true,
+                    stats: None,
+                })
+            }
         });
         let def = AgentDef {
             name: "analyst".into(),

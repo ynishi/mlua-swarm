@@ -331,7 +331,11 @@ impl Operator for WSOperatorSession {
                 value,
                 ok,
                 error: None,
-            }) => Ok(WorkerResult { value, ok }),
+            }) => Ok(WorkerResult {
+                value,
+                ok,
+                stats: None,
+            }),
             Ok(PendingReply::SpawnAck {
                 error: Some(msg), ..
             }) => Err(WorkerError::Failed(msg)),
@@ -350,6 +354,7 @@ impl Operator for WSOperatorSession {
                 Ok(WorkerResult {
                     value: marker,
                     ok: true,
+                    stats: None,
                 })
             }
             Ok(_) => Err(WorkerError::Failed(

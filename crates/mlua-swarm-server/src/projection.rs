@@ -1250,6 +1250,7 @@ mod tests {
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
             replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
+            run_trace_store: Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         }
@@ -1715,12 +1716,14 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!(inv.prompt),
                     ok: true,
+                    stats: None,
                 })
             })
             .register_fn("step-b", |inv| async move {
                 Ok(WorkerResult {
                     value: json!(inv.prompt),
                     ok: true,
+                    stats: None,
                 })
             });
         let mut reg = SpawnerRegistry::new();
@@ -1743,6 +1746,7 @@ mod tests {
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
             replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
+            run_trace_store: Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         };
@@ -2348,6 +2352,7 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!({ "step1_out": inv.prompt }),
                     ok: true,
+                    stats: None,
                 })
             })
             .register_fn("step2", move |_inv| {
@@ -2359,6 +2364,7 @@ mod tests {
                     Ok(WorkerResult {
                         value: json!("step2 done"),
                         ok: true,
+                        stats: None,
                     })
                 }
             });
@@ -2382,6 +2388,7 @@ mod tests {
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
             replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
+            run_trace_store: Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         };

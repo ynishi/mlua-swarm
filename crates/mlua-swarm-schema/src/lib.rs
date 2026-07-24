@@ -1050,6 +1050,37 @@ pub struct SubprocessOutput {
     /// must be boolean `true` for ok.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ok_from: Option<String>,
+    /// Declarative stdout → per-step worker-stats mapping (token usage
+    /// / model / num_turns), applied by the engine after a successful
+    /// JSON parse. `None` = no stats extraction (the engine still
+    /// records exit code + declared model as baseline stats).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<SubprocessStats>,
+}
+
+/// Declarative stats extraction for a [`SubprocessOutput`] — JSON
+/// Pointers (RFC 6901) into the parsed stdout, mirroring the
+/// `result_ptr` idiom. Lets a declared CLI backend (e.g. `claude -p
+/// --output-format json`, `codex exec --json`) surface token usage
+/// without any engine-side backend branch. Same IN-immutability
+/// discipline as the rest of this crate: pointers only, no logic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubprocessStats {
+    /// JSON Pointer selecting a usage OBJECT out of the parsed stdout.
+    /// The engine reads `input_tokens`/`output_tokens` (falling back to
+    /// the OpenAI-style `prompt_tokens`/`completion_tokens` spelling)
+    /// and an optional `total_tokens` from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_ptr: Option<String>,
+    /// JSON Pointer selecting the model name STRING that actually
+    /// served the run (overrides the template's declared `{model}`
+    /// value in the recorded stats when present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ptr: Option<String>,
+    /// JSON Pointer selecting the number of LLM turns (a JSON number).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_turns_ptr: Option<String>,
 }
 
 /// One [`Blueprint::runners`] registry entry — a named [`Runner`]
@@ -2848,6 +2879,7 @@ mod tests {
                 format: Some("json".to_string()),
                 result_ptr: Some("/result".to_string()),
                 ok_from: Some("exit_code".to_string()),
+                stats: None,
             }),
             stream_mode: None,
         }

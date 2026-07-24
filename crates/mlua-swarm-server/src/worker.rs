@@ -932,6 +932,84 @@ pub async fn worker_degradation(
     }
 }
 
+/// Request body for `POST /v1/worker/stats` — a worker's self-reported
+/// per-attempt stats (per-step run stats, operator axis). Every field
+/// optional; an all-empty body is accepted and dropped.
+#[derive(Debug, Deserialize)]
+pub struct StatsBody {
+    /// Worker kind label. Defaults to `"operator"` — this endpoint's
+    /// primary caller is the WS-operator / SubAgent axis, whose spawn
+    /// path has no in-process fold site to attach stats at.
+    #[serde(default)]
+    pub worker_kind: Option<String>,
+    /// The model that served the attempt, self-reported.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Normalized token usage.
+    #[serde(default)]
+    pub usage: Option<mlua_swarm::store::trace::TokenUsage>,
+    /// Number of LLM turns the attempt ran.
+    #[serde(default)]
+    pub num_turns: Option<u32>,
+    /// Free-form worker-specific detail (size-capped on fold).
+    #[serde(default)]
+    pub adapter_data: Option<Value>,
+}
+
+/// `POST /v1/worker/stats`. Bearer = same short-handle / full-`CapToken`
+/// forms as [`worker_submit`]. Body = JSON ([`StatsBody`]).
+///
+/// Records normalized per-attempt worker stats via
+/// `Engine::record_worker_stats`; the dispatcher's outcome fold drains
+/// them into the terminal `StepEntry`. Sibling of
+/// [`worker_degradation`] on the observational plane: never touches the
+/// fold path / step OUTPUT, and SHOULD be called before the final
+/// `/v1/worker/submit` (the dispatcher folds at outcome time — stats
+/// arriving after the fold are dropped with the attempt's cleanup).
+pub async fn worker_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StatsBody>,
+) -> Result<StatusCode, ApiError> {
+    let bearer = extract_bearer_raw(&headers)?;
+    let task_id = if let Some(handle) = parse_worker_handle(&bearer) {
+        state
+            .engine
+            .task_id_from_handle(handle)
+            .await
+            .map_err(map_handle_lookup_err)?
+    } else {
+        let token = CapToken::decode(bearer.trim())
+            .map_err(|e| ApiError::bad_request(format!("invalid token: {e}")))?;
+        state
+            .engine
+            .task_id_from_token(&token)
+            .await
+            .map_err(|e| ApiError::engine(format!("task_id_from_token: {e}")))?
+    };
+    let attempt = state
+        .engine
+        .task_attempt(&task_id)
+        .await
+        .map_err(|e| ApiError::engine(format!("task_attempt: {e}")))?;
+    // GH #37: the same terminal-run guard as the sibling worker routes —
+    // a dead Run must not accumulate signals.
+    reject_if_run_terminal(&state, &task_id, attempt).await?;
+
+    let stats = mlua_swarm::store::trace::WorkerStats {
+        worker_kind: Some(body.worker_kind.unwrap_or_else(|| "operator".to_string())),
+        model: body.model,
+        usage: body.usage,
+        num_turns: body.num_turns,
+        adapter_data: body.adapter_data,
+    };
+    state
+        .engine
+        .record_worker_stats(&task_id, attempt, stats)
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// GH #37: terminal-run guard shared by [`worker_submit`] / [`worker_artifact`].
 ///
 /// Resolves the dispatch task's `AgentContextView.run_id` (threaded at
@@ -1200,6 +1278,7 @@ mod tests {
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store,
             replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
+            run_trace_store: Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
         }
@@ -1299,13 +1378,13 @@ mod tests {
     }
 
     fn step_entry(step_id: &StepId, step_ref: &str) -> StepEntry {
-        StepEntry {
-            step_id: step_id.clone(),
-            step_ref: Some(step_ref.to_string()),
-            status: Some("passed".to_string()),
-            binding_digest: None,
-            at: 0,
-        }
+        StepEntry::basic(
+            step_id.clone(),
+            Some(step_ref.to_string()),
+            Some("passed".to_string()),
+            None,
+            0,
+        )
     }
 
     fn run_record(task_id: &TaskId, run_id: &RunId, step_entries: Vec<StepEntry>) -> RunRecord {

@@ -718,15 +718,17 @@ impl SpawnerAdapter for LongHoldWrapped {
         let default_hold = self.default_hold;
         let event_tx = self.event_tx.clone();
         let task_id_inner = task_id.clone();
+        let engine_for_trace = engine.clone();
         Ok(wrap_join(handle, move |signal| {
             let elapsed = started.elapsed();
             let default_hold = default_hold;
             let event_tx = event_tx.clone();
             let task_id_inner = task_id_inner.clone();
+            let engine_for_trace = engine_for_trace.clone();
             async move {
                 if elapsed > default_hold {
                     let _ = event_tx.send(Event::TaskAttemptCompleted {
-                        task_id: task_id_inner,
+                        task_id: task_id_inner.clone(),
                         attempt,
                         result: serde_json::json!({
                             "long_hold_warn": true,
@@ -734,6 +736,24 @@ impl SpawnerAdapter for LongHoldWrapped {
                             "default_hold_ms": default_hold.as_millis() as u64,
                         }),
                     });
+                    // RunTrace rail: mirror the warn onto the persisted
+                    // per-Run stream via the dispatcher-registered handle
+                    // (`Engine::trace_handle`) — the middleware
+                    // insertion-point exemplar. No handle (traceless
+                    // dispatch) = no-op; append itself is best-effort.
+                    if let Some(trace) = engine_for_trace.trace_handle(&task_id_inner).await {
+                        trace
+                            .append(
+                                crate::store::trace::kind::LONG_HOLD_WARN,
+                                None,
+                                Some(attempt),
+                                serde_json::json!({
+                                    "elapsed_ms": elapsed.as_millis() as u64,
+                                    "default_hold_ms": default_hold.as_millis() as u64,
+                                }),
+                            )
+                            .await;
+                    }
                 }
                 signal
             }
@@ -1048,6 +1068,7 @@ mod operator_delegate_worker_binding_tests {
             Ok(WorkerResult {
                 value: Value::Null,
                 ok: true,
+                stats: None,
             })
         }
     }
@@ -1278,12 +1299,14 @@ mod after_run_audit_tests {
                 Ok(WorkerResult {
                     value: serde_json::json!({ "result": "done" }),
                     ok: true,
+                    stats: None,
                 })
             })
             .register_fn("auditor", |_inv| async move {
                 Ok(WorkerResult {
                     value: serde_json::json!({ "finding": "clean" }),
                     ok: true,
+                    stats: None,
                 })
             })
             .register_fn("bad-auditor", |_inv| async move {

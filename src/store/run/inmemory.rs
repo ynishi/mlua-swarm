@@ -2,8 +2,8 @@
 //! default.
 
 use super::{
-    DegradationEntry, Inner, RunId, RunRecord, RunStatus, RunStore, RunStoreError, SharedInner,
-    StepEntry, TaskId,
+    DegradationEntry, Inner, RunId, RunListFilter, RunRecord, RunStatus, RunStore, RunStoreError,
+    SharedInner, StepEntry, TaskId,
 };
 use async_trait::async_trait;
 use std::sync::Mutex;
@@ -156,6 +156,43 @@ impl RunStore for InMemoryRunStore {
             .collect();
         Ok(records)
     }
+
+    async fn list(&self, filter: &RunListFilter) -> Result<Vec<RunRecord>, RunStoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut records: Vec<RunRecord> = inner
+            .order
+            .iter()
+            .filter_map(|id| inner.records.get(id).cloned())
+            .filter(|r| {
+                filter
+                    .task_id
+                    .as_ref()
+                    .map(|t| &r.task_id == t)
+                    .unwrap_or(true)
+                    && filter.status.map(|s| r.status == s).unwrap_or(true)
+            })
+            .collect();
+        // Newest-first; `order` index breaks `created_at` ties stably
+        // (later insertion sorts first within the same second).
+        records.reverse();
+        records.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        let offset = filter.offset.unwrap_or(0);
+        let records: Vec<RunRecord> = records
+            .into_iter()
+            .skip(offset)
+            .take(filter.limit.unwrap_or(usize::MAX))
+            .collect();
+        Ok(records)
+    }
+
+    async fn delete(&self, id: &RunId) -> Result<(), RunStoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.records.remove(id).is_none() {
+            return Err(RunStoreError::NotFound(id.clone()));
+        }
+        inner.order.retain(|r| r != id);
+        Ok(())
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -239,25 +276,25 @@ mod tests {
         s.create(mk("R-1", "T-1", 100)).await.unwrap();
         s.append_step_entry(
             &RunId::parse("R-1").unwrap(),
-            StepEntry {
-                step_id: crate::types::StepId::parse("ST-1").unwrap(),
-                step_ref: Some("step-a".into()),
-                status: Some("dispatched".into()),
-                binding_digest: None,
-                at: 101,
-            },
+            StepEntry::basic(
+                crate::types::StepId::parse("ST-1").unwrap(),
+                Some("step-a".into()),
+                Some("dispatched".into()),
+                None,
+                101,
+            ),
         )
         .await
         .unwrap();
         s.append_step_entry(
             &RunId::parse("R-1").unwrap(),
-            StepEntry {
-                step_id: crate::types::StepId::parse("ST-2").unwrap(),
-                step_ref: Some("step-b".into()),
-                status: Some("passed".into()),
-                binding_digest: None,
-                at: 102,
-            },
+            StepEntry::basic(
+                crate::types::StepId::parse("ST-2").unwrap(),
+                Some("step-b".into()),
+                Some("passed".into()),
+                None,
+                102,
+            ),
         )
         .await
         .unwrap();
@@ -324,13 +361,13 @@ mod tests {
         let err = s
             .append_step_entry(
                 &RunId::parse("R-nope").unwrap(),
-                StepEntry {
-                    step_id: crate::types::StepId::parse("ST-1").unwrap(),
-                    step_ref: None,
-                    status: None,
-                    binding_digest: None,
-                    at: 1,
-                },
+                StepEntry::basic(
+                    crate::types::StepId::parse("ST-1").unwrap(),
+                    None,
+                    None,
+                    None,
+                    1,
+                ),
             )
             .await
             .unwrap_err();

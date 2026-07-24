@@ -433,6 +433,30 @@ impl AsyncDispatcher for EngineDispatcher {
             }
         }
 
+        // Trace rail: when the RunContext carries a TraceHandle, register
+        // it with the engine for the duration of this step (the
+        // pervasive-insertion port middlewares/workers read via
+        // `Engine::trace_handle`) and mark dispatch start on the stream.
+        // The dispatcher also measures wall-clock timing here — the one
+        // worker-kind-independent place both endpoints of the dispatch
+        // are visible.
+        let trace = self.run_ctx.as_ref().and_then(|rc| rc.trace.clone());
+        let started_at_ms = crate::store::trace::now_unix_ms();
+        let started = std::time::Instant::now();
+        if let Some(handle) = &trace {
+            self.engine
+                .set_trace_handle(&tid, Some(handle.clone()))
+                .await;
+            handle
+                .append(
+                    crate::store::trace::kind::STEP_DISPATCHED,
+                    Some(ref_),
+                    None,
+                    serde_json::json!({ "step_id": tid.to_string() }),
+                )
+                .await;
+        }
+
         // Route dispatch through the replay-aware sibling. When
         // `run_ctx` carries a `replay_cursor` populated by the caller
         // (`POST /v1/runs/:id/resume`), a matching row short-circuits
@@ -450,6 +474,16 @@ impl AsyncDispatcher for EngineDispatcher {
                 self.run_ctx.as_ref(),
             )
             .await;
+
+        let completed_at_ms = crate::store::trace::now_unix_ms();
+        let duration_ms = started.elapsed().as_millis() as u64;
+        // Drain boundary-reported worker stats UNCONDITIONALLY (even when
+        // no RunContext consumes them) so retried/undrained attempts never
+        // accumulate in EngineState for the process lifetime.
+        let worker_stats = self.engine.take_worker_stats(&tid).await;
+        if trace.is_some() {
+            self.engine.set_trace_handle(&tid, None).await;
+        }
 
         // issue #13 run_id propagation: append one step_entry per dispatched
         // step (`RunStore.append_step_entry` is append-only — there is no
@@ -472,13 +506,21 @@ impl AsyncDispatcher for EngineDispatcher {
                 Ok(DispatchOutcome::Timeout) => "timeout",
                 Err(_) => "failed",
             };
-            let entry = StepEntry {
-                step_id: tid.clone(),
-                step_ref: Some(ref_.to_string()),
-                status: Some(status.to_string()),
-                binding_digest: self.binding_digests.get(ref_).cloned(),
-                at: now_unix(),
-            };
+            let mut entry = StepEntry::basic(
+                tid.clone(),
+                Some(ref_.to_string()),
+                Some(status.to_string()),
+                self.binding_digests.get(ref_).cloned(),
+                now_unix(),
+            );
+            entry.started_at_ms = Some(started_at_ms);
+            entry.completed_at_ms = Some(completed_at_ms);
+            entry.duration_ms = Some(duration_ms);
+            let attempt = worker_stats.as_ref().map(|(a, _)| *a);
+            entry.attempt = attempt;
+            if let Some((_, stats)) = worker_stats {
+                entry = entry.with_worker_stats(stats);
+            }
             if let Err(e) = rc.run_store.append_step_entry(&rc.run_id, entry).await {
                 tracing::warn!(
                     run_id = %rc.run_id,
@@ -486,6 +528,19 @@ impl AsyncDispatcher for EngineDispatcher {
                     error = %e,
                     "EngineDispatcher::dispatch: append_step_entry failed"
                 );
+            }
+            if let Some(handle) = &trace {
+                handle
+                    .append(
+                        crate::store::trace::kind::STEP_COMPLETED,
+                        Some(ref_),
+                        attempt,
+                        serde_json::json!({
+                            "status": status,
+                            "duration_ms": duration_ms,
+                        }),
+                    )
+                    .await;
             }
         }
 
@@ -717,6 +772,7 @@ mod tests {
                 Ok(WorkerResult {
                     value: json!({ "ok": true }),
                     ok: true,
+                    stats: None,
                 })
             }
         });
@@ -790,6 +846,7 @@ mod tests {
             Ok(WorkerResult {
                 value: json!({ "verdict": "BLOCKED", "reason": "not-applicable" }),
                 ok: false,
+                stats: None,
             })
         });
         let def = AgentDef {
@@ -902,26 +959,26 @@ mod tests {
         run_store
             .append_step_entry(
                 &run_id,
-                StepEntry {
-                    step_id: sid1.clone(),
-                    step_ref: Some("stage-1".to_string()),
-                    status: Some("passed".to_string()),
-                    binding_digest: None,
-                    at: now_unix(),
-                },
+                StepEntry::basic(
+                    sid1.clone(),
+                    Some("stage-1".to_string()),
+                    Some("passed".to_string()),
+                    None,
+                    now_unix(),
+                ),
             )
             .await
             .expect("append 1");
         run_store
             .append_step_entry(
                 &run_id,
-                StepEntry {
-                    step_id: sid2.clone(),
-                    step_ref: Some("stage-2".to_string()),
-                    status: Some("blocked".to_string()),
-                    binding_digest: None,
-                    at: now_unix(),
-                },
+                StepEntry::basic(
+                    sid2.clone(),
+                    Some("stage-2".to_string()),
+                    Some("blocked".to_string()),
+                    None,
+                    now_unix(),
+                ),
             )
             .await
             .expect("append 2");

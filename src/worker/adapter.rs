@@ -63,6 +63,16 @@ pub struct WorkerResult {
     /// (distinct from `Result::Err` — a worker fn can return `Ok(..)`
     /// with `ok: false` to signal an agent-level failure).
     pub ok: bool,
+    /// Optional normalized per-attempt stats sidecar (token usage /
+    /// model / num_turns / adapter-specific raw data), produced by the
+    /// worker boundary that knows them (agent-block result captor,
+    /// subprocess stdout normalization, …). The spawner's fold site
+    /// forwards it to `Engine::record_worker_stats`; it never rides
+    /// into `OutputEvent::Final` (the BP-chain value stays stats-free).
+    /// `None` = no stats reported — every pre-stats worker fn is
+    /// unaffected (`#[serde(default)]` keeps wire compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<crate::store::trace::WorkerStats>,
 }
 
 /// First stage of the two-stage pipeline: builds a `Box<dyn Worker>` for
@@ -300,6 +310,15 @@ impl<W: Worker + From<crate::worker::WorkerJoinHandler> + Send + Sync + 'static>
             };
             // Fold WorkerResult into OutputEvent::Final. Contract: one Final per attempt.
             if let Ok(wr) = &result {
+                // Stats sidecar: forward boundary-reported stats to the
+                // engine (drained by the dispatcher's outcome fold into
+                // the terminal StepEntry). This single fold site covers
+                // every InProc worker kind (RustFn / Lua / AgentBlock).
+                if let Some(stats) = wr.stats.clone() {
+                    engine_for_emit
+                        .record_worker_stats(&task_id_for_emit, attempt, stats)
+                        .await;
+                }
                 let ev = crate::worker::output::OutputEvent::Final {
                     content: crate::worker::output::ContentRef::Inline {
                         value: wr.value.clone(),

@@ -1128,6 +1128,7 @@ impl mlua_swarm::Operator for LintStubOperator {
         Ok(mlua_swarm::WorkerResult {
             value: serde_json::Value::Null,
             ok: true,
+            stats: None,
         })
     }
     fn requires_worker_binding(&self) -> bool {

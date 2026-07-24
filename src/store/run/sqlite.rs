@@ -36,7 +36,8 @@
 //! rows written before resume support simply read back `None`.
 
 use super::{
-    DegradationEntry, RunId, RunRecord, RunStatus, RunStore, RunStoreError, StepEntry, TaskId,
+    DegradationEntry, RunId, RunListFilter, RunRecord, RunStatus, RunStore, RunStoreError,
+    StepEntry, TaskId,
 };
 use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
@@ -97,6 +98,11 @@ impl SqliteRunStore {
     /// migrations.
     pub async fn open(path: impl AsRef<Path>) -> Result<(Self, AsyncIsleDriver), RunStoreError> {
         let (isle, driver) = AsyncIsle::spawn(path.as_ref().to_path_buf(), |conn| {
+            // The trace store (`SqliteRunTraceStore`) shares this file
+            // from its own confined connection; a short busy wait
+            // absorbs its write transactions instead of surfacing
+            // SQLITE_BUSY here.
+            conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
             conn.execute_batch(SCHEMA_SQL)?;
             migrate_add_column_if_missing(conn, "degradations_json", "TEXT NOT NULL DEFAULT '[]'")?;
             migrate_add_column_if_missing(conn, "input_json", "TEXT")
@@ -109,6 +115,7 @@ impl SqliteRunStore {
     /// Open an ephemeral in-memory database (tests, doctests).
     pub async fn open_in_memory() -> Result<(Self, AsyncIsleDriver), RunStoreError> {
         let (isle, driver) = AsyncIsle::open_in_memory(|conn| {
+            conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
             conn.execute_batch(SCHEMA_SQL)?;
             migrate_add_column_if_missing(conn, "degradations_json", "TEXT NOT NULL DEFAULT '[]'")?;
             migrate_add_column_if_missing(conn, "input_json", "TEXT")
@@ -217,7 +224,12 @@ impl RunStore for SqliteRunStore {
 
         self.isle
             .call(move |conn| {
-                let tx = conn.transaction()?;
+                // Immediate: the trace store shares this file from its own
+                // connection; RESERVED-up-front keeps the busy wait
+                // effective (a DEFERRED read-then-upgrade racing it gets
+                // an instant SQLITE_BUSY instead).
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let exists: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM runs WHERE id = ?1",
                     params![id],
@@ -337,7 +349,10 @@ impl RunStore for SqliteRunStore {
         let updated = self
             .isle
             .call(move |conn| {
-                let tx = conn.transaction()?;
+                // Immediate — see `create`'s comment (shared-file busy-wait
+                // effectiveness).
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let existing: Option<String> = tx
                     .query_row(
                         "SELECT step_entries_json FROM runs WHERE id = ?1",
@@ -382,7 +397,10 @@ impl RunStore for SqliteRunStore {
         let updated = self
             .isle
             .call(move |conn| {
-                let tx = conn.transaction()?;
+                // Immediate — see `create`'s comment (shared-file busy-wait
+                // effectiveness).
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let existing: Option<String> = tx
                     .query_row(
                         "SELECT degradations_json FROM runs WHERE id = ?1",
@@ -549,6 +567,68 @@ impl RunStore for SqliteRunStore {
             .map_err(map_isle_err)?;
         rows.into_iter().map(row_to_record).collect()
     }
+
+    async fn list(&self, filter: &RunListFilter) -> Result<Vec<RunRecord>, RunStoreError> {
+        let task_id = filter.task_id.as_ref().map(|t| t.to_string());
+        let status_json = filter
+            .status
+            .map(|s| serde_json::to_string(&s))
+            .transpose()
+            .map_err(|e| RunStoreError::Other(format!("encode status: {e}")))?;
+        let limit = filter.limit.map(|l| l as i64).unwrap_or(-1);
+        let offset = filter.offset.map(|o| o as i64).unwrap_or(0);
+        let rows = self
+            .isle
+            .call(move |conn| {
+                // `?1 IS NULL OR …` folds each optional filter into one
+                // statement; `LIMIT -1` is SQLite's "no cap". `rowid`
+                // breaks `created_at` ties newest-insertion-first.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {RUN_SELECT_COLUMNS} FROM runs \
+                     WHERE (?1 IS NULL OR task_id = ?1) \
+                       AND (?2 IS NULL OR status = ?2) \
+                     ORDER BY created_at DESC, rowid DESC \
+                     LIMIT ?3 OFFSET ?4"
+                ))?;
+                let iter = stmt.query_map(params![task_id, status_json, limit, offset], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                    ))
+                })?;
+                let mut out = Vec::new();
+                for r in iter {
+                    out.push(r?);
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(map_isle_err)?;
+        rows.into_iter().map(row_to_record).collect()
+    }
+
+    async fn delete(&self, id: &RunId) -> Result<(), RunStoreError> {
+        let id_str = id.to_string();
+        let id_for_notfound = id.clone();
+        let n = self
+            .isle
+            .call(move |conn| conn.execute("DELETE FROM runs WHERE id = ?1", params![id_str]))
+            .await
+            .map_err(map_isle_err)?;
+        if n == 0 {
+            Err(RunStoreError::NotFound(id_for_notfound))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -641,25 +721,25 @@ mod tests {
         s.create(mk("R-1", "T-1", 100)).await.unwrap();
         s.append_step_entry(
             &RunId::parse("R-1").unwrap(),
-            StepEntry {
-                step_id: crate::types::StepId::parse("ST-1").unwrap(),
-                step_ref: Some("step-a".into()),
-                status: Some("dispatched".into()),
-                binding_digest: None,
-                at: 101,
-            },
+            StepEntry::basic(
+                crate::types::StepId::parse("ST-1").unwrap(),
+                Some("step-a".into()),
+                Some("dispatched".into()),
+                None,
+                101,
+            ),
         )
         .await
         .unwrap();
         s.append_step_entry(
             &RunId::parse("R-1").unwrap(),
-            StepEntry {
-                step_id: crate::types::StepId::parse("ST-2").unwrap(),
-                step_ref: Some("step-b".into()),
-                status: Some("passed".into()),
-                binding_digest: None,
-                at: 102,
-            },
+            StepEntry::basic(
+                crate::types::StepId::parse("ST-2").unwrap(),
+                Some("step-b".into()),
+                Some("passed".into()),
+                None,
+                102,
+            ),
         )
         .await
         .unwrap();
@@ -677,13 +757,13 @@ mod tests {
         let err = s
             .append_step_entry(
                 &RunId::parse("R-nope").unwrap(),
-                StepEntry {
-                    step_id: crate::types::StepId::parse("ST-1").unwrap(),
-                    step_ref: None,
-                    status: None,
-                    binding_digest: None,
-                    at: 1,
-                },
+                StepEntry::basic(
+                    crate::types::StepId::parse("ST-1").unwrap(),
+                    None,
+                    None,
+                    None,
+                    1,
+                ),
             )
             .await
             .unwrap_err();
@@ -783,13 +863,13 @@ mod tests {
             s.create(mk("R-keep", "T-keep", 42)).await.unwrap();
             s.append_step_entry(
                 &RunId::parse("R-keep").unwrap(),
-                StepEntry {
-                    step_id: crate::types::StepId::parse("ST-1").unwrap(),
-                    step_ref: Some("step-a".into()),
-                    status: Some("dispatched".into()),
-                    binding_digest: None,
-                    at: 43,
-                },
+                StepEntry::basic(
+                    crate::types::StepId::parse("ST-1").unwrap(),
+                    Some("step-a".into()),
+                    Some("dispatched".into()),
+                    None,
+                    43,
+                ),
             )
             .await
             .unwrap();

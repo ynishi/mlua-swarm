@@ -141,6 +141,47 @@ impl WorkerResultCaptor {
             .unwrap_or_else(|| payload.clone());
         (value, ok)
     }
+
+    /// Stats-sidecar extraction (per-step run stats): the DefaultAgent
+    /// invoker's `agent_result` payload carries the full `agent.run`
+    /// return, whose `usage` (`{input_tokens, output_tokens,
+    /// total_tokens}`, all turns summed) and `num_turns` used to be
+    /// DROPPED here — the exact gap this recovers. `None` when the
+    /// payload carries neither (caller-script `worker_result` shapes).
+    /// The raw `usage` object also rides as `adapter_data` so
+    /// provider-specific detail (cache tokens etc.) survives.
+    fn extract_stats(payload: &Value) -> Option<crate::store::trace::WorkerStats> {
+        let usage_raw = payload.get("usage");
+        let usage = usage_raw.and_then(|u| {
+            let input = u.get("input_tokens").and_then(|v| v.as_u64());
+            let output = u.get("output_tokens").and_then(|v| v.as_u64());
+            match (input, output) {
+                (Some(i), Some(o)) => Some(crate::store::trace::TokenUsage {
+                    input_tokens: i,
+                    output_tokens: o,
+                    total_tokens: u
+                        .get("total_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(i + o),
+                }),
+                _ => None,
+            }
+        });
+        let num_turns = payload
+            .get("num_turns")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+        if usage.is_none() && num_turns.is_none() {
+            return None;
+        }
+        Some(crate::store::trace::WorkerStats {
+            worker_kind: Some("agent_block".to_string()),
+            model: None,
+            usage,
+            num_turns,
+            adapter_data: usage_raw.cloned(),
+        })
+    }
 }
 
 #[async_trait]
@@ -153,7 +194,8 @@ impl Handler for WorkerResultCaptor {
         _meta: Value,
     ) -> Result<Value, BlockError> {
         let (value, ok) = Self::extract(&payload);
-        let wr = WorkerResult { value, ok };
+        let stats = Self::extract_stats(&payload);
+        let wr = WorkerResult { value, ok, stats };
         if let Ok(mut guard) = self.tx.lock() {
             if let Some(tx) = guard.take() {
                 let _ = tx.send(wr);

@@ -440,6 +440,22 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
         None => Arc::new(InMemoryReplayStore::new()),
     };
+    // The trace rail shares the Run store's database FILE (one Run = one
+    // artifact on disk) in its own `run_trace` table — see
+    // `mlua_swarm::store::trace::sqlite`. Ephemeral mode (no
+    // run_store_path) keeps the whole rail in-memory.
+    let run_trace_store: Arc<dyn mlua_swarm::store::trace::RunTraceStore> =
+        match &cfg.run_store_path {
+            Some(path) => {
+                eprintln!("mse serve: SqliteRunTraceStore at {}", path.display());
+                let (s, driver) = mlua_swarm::store::trace::SqliteRunTraceStore::open(path)
+                    .await
+                    .unwrap_or_else(|e| panic!("mse serve: SqliteRunTraceStore open failed: {e}"));
+                isle_drivers.push(driver);
+                Arc::new(s)
+            }
+            None => Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
+        };
 
     recover_interrupted_runs(&task_store, &run_store, &replay_store).await;
 
@@ -459,6 +475,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(task_store),
         Some(run_store),
         Some(replay_store),
+        Some(run_trace_store),
         cfg.sync_timeout_secs,
         cfg.legacy_worker_binding_policy,
     );
