@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/ynishi/mlua-swarm/compare/v0.16.0...v0.17.0) - 2026-07-24
+
+### Added
+
+- SubprocessDef declarative CLI invocation templates for headless workers (GH #83)
+- unified Clippy-style Diagnostic model + LintDecl registry (GH #79)
+- unify recovery contract for archived BPs + operator sessions (GH #81)
+- context_policy_lint bp_doctor family + strict-embed layers guide (GH #78)
+- F.fanout DSL builder + bp new fanout template + bundled sample (GH #82)
+
+### Fixed
+
+- register mlua-swarm-dsl / mlua-swarm-compile with release-plz version_group (lockstep bump to 0.16.0)
+- projection_root_seed_missing message names alternate root deterministically (GH #78)
+
+### Other
+
+- add mse://guides/bp-lifecycle guide + lifecycle cross-links (GH #80)
+
 ## [0.16.0](https://github.com/ynishi/mlua-swarm/compare/v0.15.0...v0.16.0) - 2026-07-23
 
 ### Added
