@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "mlua-swarm-compile"
-version = "0.12.8"
+version = "0.16.0"
 dependencies = [
  "blake3",
  "mlua-swarm-schema",
@@ -1783,7 +1783,7 @@ dependencies = [
 
 [[package]]
 name = "mlua-swarm-dsl"
-version = "0.12.4"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "mlua",
