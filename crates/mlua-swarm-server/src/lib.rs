@@ -1248,6 +1248,19 @@ async fn run_flow_form(
                     {
                         tracing::warn!(%bg_task_id, error = %e, "run_flow_form: detached ttl task update_status(Failed) failed");
                     }
+                    // This arm never reaches `finalize_run`, so the trace
+                    // stream gets its terminal marker here.
+                    mlua_swarm::store::trace::TraceHandle::new(
+                        bg_run_id.clone(),
+                        bg_state.run_trace_store.clone(),
+                    )
+                    .append(
+                        mlua_swarm::store::trace::kind::RUN_FINISHED,
+                        None,
+                        None,
+                        json!({ "status": "failed", "reason": format!("ttl {ttl_secs}s exceeded") }),
+                    )
+                    .await;
                     return;
                 }
             };

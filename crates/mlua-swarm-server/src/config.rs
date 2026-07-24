@@ -102,6 +102,15 @@ pub struct FileConfig {
     /// (backward-compat). `None` = fall back to the built-in default
     /// `false`.
     pub blueprint_strict_embed: Option<bool>,
+    /// Opt-in: inject the server's public endpoint (base URL) into
+    /// worker-facing data — the WS Spawn directive's `base_url` line and
+    /// the `StepPointer.content_url` absolute-URL prefix. Default
+    /// `false` = the endpoint is never handed to workers (directive
+    /// renders its historical placeholder, `content_url` stays a
+    /// relative path); workers reach the server through their own
+    /// configured bind (e.g. the mse-mcp tools' `bind` parameter).
+    /// `None` = fall back to the built-in default `false`.
+    pub inject_endpoint_for_worker: Option<bool>,
     /// Root path for the git-backed `BlueprintStore` (when using the git2 backend).
     pub git_store_path: Option<PathBuf>,
     /// Path to the SQLite database file backing the `IssueStore`. `None` = fall
@@ -182,6 +191,9 @@ pub struct CliOverrides {
     /// `--blueprint-strict-embed` flag (mirrors
     /// [`FileConfig::blueprint_strict_embed`]).
     pub blueprint_strict_embed: Option<bool>,
+    /// `--inject-endpoint-for-worker` flag (mirrors
+    /// [`FileConfig::inject_endpoint_for_worker`]).
+    pub inject_endpoint_for_worker: Option<bool>,
     /// `--git-store-path` value.
     pub git_store_path: Option<PathBuf>,
     /// `--issue-store-path` value (mirrors [`FileConfig::issue_store_path`]).
@@ -273,6 +285,12 @@ pub struct ResolvedConfig {
     /// provides one. A per-request `TaskLaunchRequest.timeout_secs`
     /// override, when present, takes priority over this server-wide value.
     pub sync_timeout_secs: u64,
+    /// Opt-in endpoint injection into worker-facing data (WS Spawn
+    /// directive `base_url` line / `StepPointer.content_url` absolute
+    /// prefix). Always set — defaults to `false` (never injected) when
+    /// neither CLI nor config file provides one. See
+    /// [`FileConfig::inject_endpoint_for_worker`].
+    pub inject_endpoint_for_worker: bool,
     /// Server-wide [`mlua_swarm::core::config::CheckPolicy`]. Always set
     /// — defaults to `CheckPolicy::Warn` (byte-identical to the
     /// pre-`CheckPolicy` fail-open behaviour) when neither CLI nor config
@@ -303,6 +321,7 @@ impl Default for ResolvedConfig {
             default_agent_kind: None,
             token_secret: None,
             sync_timeout_secs: default_sync_timeout_secs(),
+            inject_endpoint_for_worker: false,
             check_policy: CheckPolicy::default(),
         }
     }
@@ -373,6 +392,10 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .blueprint_strict_embed
             .or(file.blueprint_strict_embed)
             .unwrap_or(default.blueprint_strict_embed),
+        inject_endpoint_for_worker: cli
+            .inject_endpoint_for_worker
+            .or(file.inject_endpoint_for_worker)
+            .unwrap_or(default.inject_endpoint_for_worker),
         git_store_path: cli
             .git_store_path
             .or(file.git_store_path)

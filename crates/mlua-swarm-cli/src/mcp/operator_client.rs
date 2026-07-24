@@ -134,6 +134,13 @@ enum ClientMsgMirror {
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// Operator-proxied per-step run stats (usage / model /
+        /// num_turns…): the harness reports the SubAgent's resource
+        /// usage to the Operator on completion, and the Operator
+        /// attaches it here so the server folds it into the terminal
+        /// `StepEntry`. Omitted from the wire when `None`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stats: Option<Value>,
     },
     /// Controlled halt for the current spawn (issue #7). See
     /// server-side `ClientMsg::SpawnHalt` for semantics: server marks
@@ -186,6 +193,7 @@ fn build_client_msg(
     value: Option<Value>,
     ok: bool,
     error: Option<String>,
+    stats: Option<Value>,
 ) -> Result<ClientMsgMirror, ClientError> {
     match kind {
         "answer" => Ok(ClientMsgMirror::Answer {
@@ -202,6 +210,7 @@ fn build_client_msg(
             value: value.unwrap_or_else(|| serde_json::json!({})),
             ok,
             error,
+            stats,
         }),
         "spawn_halt" => Ok(ClientMsgMirror::SpawnHalt {
             req_id,
@@ -491,6 +500,12 @@ impl OperatorClientState {
     /// Sends the `ClientMsg` corresponding to `kind` over `sid`'s WS
     /// connection. `kind` validation happens before the session lookup, so an
     /// invalid `kind` fails the same way regardless of whether `sid` exists.
+    // The argument list mirrors the `mse_ack` MCP tool's flat parameter
+    // surface one-to-one (kind-discriminated union on the wire); bundling
+    // them into a struct only this call would consume adds indirection
+    // without removing the union shape — same rationale as the server's
+    // `build_router_full` allow.
+    #[allow(clippy::too_many_arguments)]
     pub async fn ack(
         &self,
         sid: &str,
@@ -499,8 +514,9 @@ impl OperatorClientState {
         value: Option<Value>,
         ok: bool,
         error: Option<String>,
+        stats: Option<Value>,
     ) -> Result<(), ClientError> {
-        let msg = build_client_msg(kind, req_id, value, ok, error)?;
+        let msg = build_client_msg(kind, req_id, value, ok, error, stats)?;
         let entry = self.get_entry(sid).await?;
         let text = serde_json::to_string(&msg).map_err(|e| ClientError::Ws(e.to_string()))?;
         let result = entry
@@ -537,7 +553,9 @@ impl OperatorClientState {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Http(format!("DELETE {url} failed: {status} {body}")));
+            return Err(ClientError::Http(format!(
+                "DELETE {url} failed: {status} {body}"
+            )));
         }
         Ok(())
     }
@@ -743,6 +761,7 @@ mod tests {
             Some(serde_json::json!({"verdict": "ok"})),
             true,
             None,
+            None,
         )
         .expect("valid kind");
         let v = serde_json::to_value(&msg).unwrap();
@@ -753,7 +772,8 @@ mod tests {
 
     #[test]
     fn build_client_msg_hook_ack_omits_reason_when_none() {
-        let msg = build_client_msg("hook_ack", "r2".into(), None, true, None).expect("valid kind");
+        let msg =
+            build_client_msg("hook_ack", "r2".into(), None, true, None, None).expect("valid kind");
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "hook_ack");
         assert_eq!(v["ok"], true);
@@ -768,6 +788,7 @@ mod tests {
             None,
             false,
             Some("rejected".into()),
+            None,
         )
         .expect("valid kind");
         let v = serde_json::to_value(&msg).unwrap();
@@ -777,7 +798,8 @@ mod tests {
 
     #[test]
     fn build_client_msg_spawn_ack_defaults_value_to_empty_object() {
-        let msg = build_client_msg("spawn_ack", "r4".into(), None, true, None).expect("valid kind");
+        let msg =
+            build_client_msg("spawn_ack", "r4".into(), None, true, None, None).expect("valid kind");
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "spawn_ack");
         assert_eq!(v["value"], serde_json::json!({}));
@@ -785,7 +807,7 @@ mod tests {
 
     #[test]
     fn build_client_msg_rejects_unknown_kind() {
-        let err = build_client_msg("bogus", "r5".into(), None, true, None).unwrap_err();
+        let err = build_client_msg("bogus", "r5".into(), None, true, None, None).unwrap_err();
         assert!(matches!(err, ClientError::InvalidAckKind(k) if k == "bogus"));
     }
 
@@ -800,6 +822,7 @@ mod tests {
             Some(serde_json::json!({"partial": 1})),
             true,
             Some("dogfood shape verified".into()),
+            None,
         )
         .expect("valid kind");
         let v = serde_json::to_value(&msg).unwrap();
@@ -814,8 +837,8 @@ mod tests {
 
     #[test]
     fn build_client_msg_spawn_halt_defaults_value_to_empty_object() {
-        let msg =
-            build_client_msg("spawn_halt", "r7".into(), None, true, None).expect("valid kind");
+        let msg = build_client_msg("spawn_halt", "r7".into(), None, true, None, None)
+            .expect("valid kind");
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "spawn_halt");
         assert_eq!(v["value"], serde_json::json!({}));
@@ -884,7 +907,7 @@ mod tests {
     async fn ack_unknown_kind_errors_before_sid_lookup() {
         let state = OperatorClientState::with_http_base("http://127.0.0.1:1");
         let err = state
-            .ack("no-such-sid", "r1".into(), "bogus", None, true, None)
+            .ack("no-such-sid", "r1".into(), "bogus", None, true, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, ClientError::InvalidAckKind(k) if k == "bogus"));
@@ -894,7 +917,7 @@ mod tests {
     async fn ack_unknown_sid_errors_for_valid_kind() {
         let state = OperatorClientState::with_http_base("http://127.0.0.1:1");
         let err = state
-            .ack("no-such-sid", "r1".into(), "answer", None, true, None)
+            .ack("no-such-sid", "r1".into(), "answer", None, true, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, ClientError::UnknownSid(s) if s == "no-such-sid"));

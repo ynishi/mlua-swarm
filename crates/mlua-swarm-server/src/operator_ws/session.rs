@@ -331,10 +331,15 @@ impl Operator for WSOperatorSession {
                 value,
                 ok,
                 error: None,
+                stats,
             }) => Ok(WorkerResult {
                 value,
                 ok,
-                stats: None,
+                // Operator-proxied stats (the harness reports the
+                // SubAgent's usage to the Operator, who attaches it to
+                // this ack). Best-effort decode — an unknown shape is
+                // dropped, never a spawn failure.
+                stats: stats.and_then(decode_ack_stats),
             }),
             Ok(PendingReply::SpawnAck {
                 error: Some(msg), ..
@@ -366,6 +371,23 @@ impl Operator for WSOperatorSession {
 
     fn requires_worker_binding(&self) -> bool {
         true
+    }
+}
+
+/// Decode an ack-attached stats `Value` into
+/// [`mlua_swarm::store::trace::WorkerStats`], defaulting `worker_kind`
+/// to `"operator"` (the axis this ack rode in on). Best-effort: a shape
+/// that doesn't decode, or an all-empty stats object, maps to `None` —
+/// stats must never gate the ack itself.
+fn decode_ack_stats(v: serde_json::Value) -> Option<mlua_swarm::store::trace::WorkerStats> {
+    let mut stats: mlua_swarm::store::trace::WorkerStats = serde_json::from_value(v).ok()?;
+    if stats.worker_kind.is_none() {
+        stats.worker_kind = Some("operator".to_string());
+    }
+    if stats.is_empty() {
+        None
+    } else {
+        Some(stats)
     }
 }
 
@@ -1231,6 +1253,7 @@ mod tests {
                     value: serde_json::json!({}),
                     ok: false,
                     error: Some("real crash".into()),
+                    stats: None,
                 },
             )
             .await;
@@ -1309,6 +1332,7 @@ mod tests {
                     value: serde_json::json!({}),
                     ok: true,
                     error: None,
+                    stats: None,
                 },
             )
             .await;
@@ -1373,6 +1397,7 @@ mod tests {
                     value: serde_json::json!({}),
                     ok: true,
                     error: None,
+                    stats: None,
                 },
             )
             .await;
@@ -1429,6 +1454,7 @@ mod tests {
                     value: serde_json::json!({}),
                     ok: true,
                     error: None,
+                    stats: None,
                 },
             )
             .await;
@@ -1493,6 +1519,7 @@ mod tests {
                     value: serde_json::json!({}),
                     ok: true,
                     error: None,
+                    stats: None,
                 },
             )
             .await;
@@ -1636,6 +1663,7 @@ mod tests {
                     value: serde_json::json!({}),
                     ok: true,
                     error: None,
+                    stats: None,
                 },
             )
             .await;
@@ -1710,6 +1738,7 @@ mod tests {
                     value: serde_json::json!({}),
                     ok: true,
                     error: None,
+                    stats: None,
                 },
             )
             .await;
@@ -1773,6 +1802,7 @@ mod tests {
                     value: serde_json::json!({}),
                     ok: true,
                     error: None,
+                    stats: None,
                 },
             )
             .await;
@@ -1845,6 +1875,7 @@ mod tests {
                     value: serde_json::json!({}),
                     ok: true,
                     error: None,
+                    stats: None,
                 },
             )
             .await;
@@ -1931,6 +1962,7 @@ mod tests {
                     value: serde_json::json!({}),
                     ok: true,
                     error: None,
+                    stats: None,
                 },
             )
             .await;

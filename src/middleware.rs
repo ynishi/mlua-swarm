@@ -626,6 +626,16 @@ impl SpawnerAdapter for OperatorDelegateWrapped {
                 _ = cancel_inner.cancelled() => Err(crate::worker::adapter::WorkerError::Cancelled),
             };
             if let Ok(wr) = &result {
+                // Stats sidecar (operator axis): the WS ack may carry the
+                // Operator's proxy report of the SubAgent's usage — forward
+                // it to the engine so the dispatcher's outcome fold lands it
+                // on the terminal StepEntry (same funnel as the InProc /
+                // subprocess fold sites).
+                if let Some(stats) = wr.stats.clone() {
+                    engine_clone
+                        .record_worker_stats(&task_id_clone, attempt, stats)
+                        .await;
+                }
                 // If the SubAgent has already pushed a Final through
                 // /v1/worker/result or /v1/worker/submit POST, skip a second
                 // emit here — the POST value is the canonical one (protocol

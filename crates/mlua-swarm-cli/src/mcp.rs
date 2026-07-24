@@ -1746,6 +1746,19 @@ struct OperatorAckReq {
     /// (for logs). Ignored for `answer`.
     #[serde(default)]
     error: Option<String>,
+    /// `spawn_ack` only: Operator-proxied per-step run stats for the
+    /// SubAgent this ack closes. The SubAgent cannot observe its own
+    /// token usage — the harness reports it to the OPERATOR in the
+    /// completion notification (`subagent_tokens` etc.), so pass it
+    /// here and the server folds it into the terminal `StepEntry`
+    /// (surfaced by `GET /v1/runs/:id/steps` / `swarm_status`). Shape:
+    /// `{"usage": {"input_tokens": N, "output_tokens": N,
+    /// "total_tokens": N}, "model": "...", "num_turns": N,
+    /// "adapter_data": {...}}` — every field optional. Ignored for the
+    /// other kinds.
+    #[serde(default)]
+    #[schemars(schema_with = "any_json_schema")]
+    stats: Option<JsonValue>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2124,7 +2137,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Ack a pending frame popped via mse_pending_wait. kind=\"answer\" (SeniorBridge.ask reply, pass `value`), kind=\"hook_ack\" (SpawnHook.before OK/NG, pass `ok` + optional `error` as the rejection reason), kind=\"spawn_ack\" (Operator.execute result, pass `value` + `ok` + optional `error`), kind=\"spawn_halt\" (issue #7: controlled halt for the current spawn — pass optional `value` (partial ctx) + optional `error` (halt reason); the step lands as WorkerResult{ok:true, value:{halted:true, reason, value}} — a normal termination, not a worker error). Sends the corresponding ClientMsg over the sid's WS connection. Returns {sent: true}."
+        description = "Ack a pending frame popped via mse_pending_wait. kind=\"answer\" (SeniorBridge.ask reply, pass `value`), kind=\"hook_ack\" (SpawnHook.before OK/NG, pass `ok` + optional `error` as the rejection reason), kind=\"spawn_ack\" (Operator.execute result, pass `value` + `ok` + optional `error` + optional `stats` — the Operator's proxy report of the SubAgent's resource usage from the harness completion notification, e.g. {\"usage\": {\"input_tokens\": N, \"output_tokens\": N, \"total_tokens\": N}, \"model\": \"...\", \"num_turns\": N}; the server folds it into the terminal StepEntry per-step run stats), kind=\"spawn_halt\" (issue #7: controlled halt for the current spawn — pass optional `value` (partial ctx) + optional `error` (halt reason); the step lands as WorkerResult{ok:true, value:{halted:true, reason, value}} — a normal termination, not a worker error). Sends the corresponding ClientMsg over the sid's WS connection. Returns {sent: true}."
     )]
     async fn mse_ack(
         &self,
@@ -2132,7 +2145,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         self.op_client
             .ack(
-                &req.sid, req.req_id, &req.kind, req.value, req.ok, req.error,
+                &req.sid, req.req_id, &req.kind, req.value, req.ok, req.error, req.stats,
             )
             .await
             .map_err(client_error_to_mcp)?;
@@ -4335,20 +4348,36 @@ impl MseServer {
         &self,
         Parameters(req): Parameters<SwarmCancelReq>,
     ) -> Result<CallToolResult, McpError> {
-        let mut inner = self.state.write().await;
-        match inner.runs.get_mut(&req.run_id) {
-            Some(h) => {
-                h.status = RunStatus::Cancelled;
-                h.cancel_requested = true;
-                json_result(
-                    &serde_json::json!({ "ok": true, "run_id": req.run_id, "cancel_requested": true }),
-                )
+        let run_trace_store = {
+            let mut inner = self.state.write().await;
+            match inner.runs.get_mut(&req.run_id) {
+                Some(h) => {
+                    h.status = RunStatus::Cancelled;
+                    h.cancel_requested = true;
+                    inner.run_trace_store.clone()
+                }
+                None => {
+                    return Err(McpError::invalid_params(
+                        format!("run_id not found: {}", req.run_id),
+                        None,
+                    ))
+                }
             }
-            None => Err(McpError::invalid_params(
-                format!("run_id not found: {}", req.run_id),
-                None,
-            )),
+        };
+        // RunTrace rail: mark the cancel request on the stream
+        // (best-effort; unparseable ids — HTTP-proxied runs whose ids
+        // were minted server-side still parse, so this covers both).
+        if let Ok(rid) = RunId::parse(req.run_id.clone()) {
+            mlua_swarm::store::trace::TraceHandle::new(rid, run_trace_store)
+                .append(
+                    mlua_swarm::store::trace::kind::CANCEL_REQUESTED,
+                    None,
+                    None,
+                    serde_json::json!({}),
+                )
+                .await;
         }
+        json_result(&serde_json::json!({ "ok": true, "run_id": req.run_id, "cancel_requested": true }))
     }
 }
 
@@ -5581,6 +5610,7 @@ mod tests {
                 value: None,
                 ok: true,
                 error: None,
+                stats: None,
             }))
             .await
             .unwrap_err();
@@ -5599,6 +5629,7 @@ mod tests {
                 value: Some(serde_json::json!({"v": 1})),
                 ok: true,
                 error: None,
+                stats: None,
             }))
             .await
             .unwrap_err();

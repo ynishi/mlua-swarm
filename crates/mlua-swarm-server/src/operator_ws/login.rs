@@ -345,11 +345,17 @@ async fn handle_operator_socket(
                             value,
                             ok,
                             error,
+                            stats,
                         } => {
                             session_for_read
                                 .resolve_pending(
                                     &req_id,
-                                    PendingReply::SpawnAck { value, ok, error },
+                                    PendingReply::SpawnAck {
+                                        value,
+                                        ok,
+                                        error,
+                                        stats,
+                                    },
                                 )
                                 .await;
                         }

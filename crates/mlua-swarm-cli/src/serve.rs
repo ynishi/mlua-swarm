@@ -152,6 +152,16 @@ pub struct Args {
     /// comparison: `mse://guides/strict-embed-modes`.
     #[arg(long)]
     blueprint_strict_embed: bool,
+    /// Opt-in: inject the server's public endpoint (base URL) into
+    /// worker-facing data — the WS Spawn directive's `base_url` line and
+    /// the `StepPointer.content_url` absolute-URL prefix. Default off:
+    /// workers are never handed the server endpoint (the directive
+    /// renders its placeholder; `content_url` stays a relative path) and
+    /// reach the server via their own configured bind (e.g. the mse-mcp
+    /// tools' `bind` parameter). Overrides the config file's
+    /// `inject_endpoint_for_worker`.
+    #[arg(long)]
+    inject_endpoint_for_worker: bool,
     /// The (2) CLI override layer of the 4-tier cascade. Falls back when the BP
     /// top-level `default_agent_kind` JSON literal is absent; if that is also
     /// absent, the Schema-impl `Default` = `Operator` is used. The value is the
@@ -227,6 +237,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         blueprint_ref_base: args.blueprint_ref_base.clone(),
         blueprint_ref_includes: args.blueprint_ref_includes.clone(),
         blueprint_strict_embed: if args.blueprint_strict_embed {
+            Some(true)
+        } else {
+            None
+        },
+        inject_endpoint_for_worker: if args.inject_endpoint_for_worker {
             Some(true)
         } else {
             None
@@ -461,8 +476,17 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     // Issue #8: source the public base URL from the same bind the
     // listener will use, so `WSOperatorSession` can render it into
-    // Spawn directives literally (no example port drift).
-    let base_url: std::sync::Arc<str> = format!("http://{}", cfg.bind).into();
+    // Spawn directives literally (no example port drift). Since the
+    // `inject_endpoint_for_worker` opt-in this is OFF by default —
+    // `None` makes the directive render its historical placeholder and
+    // keeps `StepPointer.content_url` a relative path, so the server
+    // endpoint is never handed to workers unless explicitly requested
+    // (`--inject-endpoint-for-worker` / config `inject_endpoint_for_worker`).
+    let base_url: Option<std::sync::Arc<str>> = if cfg.inject_endpoint_for_worker {
+        Some(format!("http://{}", cfg.bind).into())
+    } else {
+        None
+    };
 
     // Router assembly (fixed combined mode): merges task, ws_operator_factory, and every enhance route.
     let mut app = mlua_swarm_server::build_router_full_with_legacy_worker_binding_policy(
@@ -471,7 +495,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(store.clone()),
         Some(op_factory.clone()),
         output_store,
-        Some(base_url),
+        base_url,
         Some(task_store),
         Some(run_store),
         Some(replay_store),

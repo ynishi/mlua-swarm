@@ -622,6 +622,16 @@ pub async fn task_rekick(
                     {
                         tracing::warn!(%bg_task_id, error = %e, "task_rekick: detached ttl task update_status failed");
                     }
+                    // This arm never reaches `finalize_run`, so the trace
+                    // stream gets its terminal marker here.
+                    TraceHandle::new(bg_run_id.clone(), bg_state.run_trace_store.clone())
+                        .append(
+                            trace_kind::RUN_FINISHED,
+                            None,
+                            None,
+                            json!({ "status": "failed", "reason": format!("ttl {ttl_secs}s exceeded") }),
+                        )
+                        .await;
                     return;
                 }
             };

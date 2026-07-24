@@ -913,6 +913,22 @@ pub async fn worker_degradation(
         return Ok(StatusCode::NO_CONTENT);
     };
 
+    // RunTrace mirror: the degradation also lands on the per-Run trace
+    // stream (`worker.degradation`) so the timeline is self-contained —
+    // the authoritative record stays `RunRecord.degradations` below.
+    mlua_swarm::store::trace::TraceHandle::new(run_id.clone(), state.run_trace_store.clone())
+        .append(
+            mlua_swarm::store::trace::kind::WORKER_DEGRADATION,
+            Some(agent.as_str()),
+            Some(attempt),
+            serde_json::json!({
+                "tool": body.tool.as_str(),
+                "error": body.error.as_str(),
+                "fallback": body.fallback.as_str(),
+            }),
+        )
+        .await;
+
     let entry = DegradationEntry {
         tool: body.tool,
         error: body.error,

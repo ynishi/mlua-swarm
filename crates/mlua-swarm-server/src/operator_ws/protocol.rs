@@ -214,6 +214,17 @@ pub enum ClientMsg {
         /// When `Some`, the Operator surfaces it as a `WorkerError`.
         #[serde(default)]
         error: Option<String>,
+        /// Per-step run stats: the Operator's proxy report of the
+        /// SubAgent's resource usage. The SubAgent (a Claude Code
+        /// worker) cannot observe its own token usage — the harness
+        /// reports it to the OPERATOR when the SubAgent completes
+        /// (`subagent_tokens` / `duration_ms` in the completion
+        /// notification), so the Operator attaches it to the ack it was
+        /// already sending. Free-form JSON here (decoded into
+        /// `WorkerStats` on the session side, unknown shapes dropped
+        /// silently) so wire compat never gates an ack.
+        #[serde(default)]
+        stats: Option<Value>,
     },
     /// Controlled halt for the current spawn (issue #7). Distinct from
     /// `SpawnAck { ok: false, error: Some(_) }`, which is the fail-loud
@@ -263,6 +274,10 @@ pub(super) enum PendingReply {
         value: Value,
         ok: bool,
         error: Option<String>,
+        /// Operator-proxied per-step run stats (see `ClientMsg::SpawnAck`'s
+        /// `stats` field doc) — still the raw wire `Value`; decoded into
+        /// `WorkerStats` by `WSOperatorSession::execute`.
+        stats: Option<Value>,
     },
     /// `spawn_halt` — controlled halt for the current spawn (issue #7).
     /// See the `ClientMsg::SpawnHalt` doc for semantics.
