@@ -516,7 +516,19 @@ impl AsyncDispatcher for EngineDispatcher {
             entry.started_at_ms = Some(started_at_ms);
             entry.completed_at_ms = Some(completed_at_ms);
             entry.duration_ms = Some(duration_ms);
-            let attempt = worker_stats.as_ref().map(|(a, _)| *a);
+            // `attempt` from worker_stats when a boundary reported one;
+            // fall back to the engine's own attempt counter so
+            // non-stats-carrying workers (RustFn / Lua) still populate
+            // the field — the "every StepEntry has attempt" invariant.
+            // `task_attempt` failure is swallowed (the row is deleted
+            // between the outcome and this lookup, or the caller drove
+            // dispatch without a task record) — the field stays None,
+            // same fail-open convention as the append itself.
+            let attempt = if let Some((a, _)) = &worker_stats {
+                Some(*a)
+            } else {
+                self.engine.task_attempt(&tid).await.ok()
+            };
             entry.attempt = attempt;
             if let Some((_, stats)) = worker_stats {
                 entry = entry.with_worker_stats(stats);

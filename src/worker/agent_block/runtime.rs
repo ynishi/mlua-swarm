@@ -195,7 +195,10 @@ impl Handler for WorkerResultCaptor {
     ) -> Result<Value, BlockError> {
         let (value, ok) = Self::extract(&payload);
         let stats = Self::extract_stats(&payload);
-        let wr = WorkerResult { value, ok, stats };
+        // Even when the SDK payload carries no usage (script-side
+        // `worker_result` shapes), the boundary still knows its own
+        // kind — surface it so `StepEntry.worker_kind` is never empty.
+        let wr = WorkerResult { value, ok, stats }.ensure_worker_kind("agent_block");
         if let Ok(mut guard) = self.tx.lock() {
             if let Some(tx) = guard.take() {
                 let _ = tx.send(wr);

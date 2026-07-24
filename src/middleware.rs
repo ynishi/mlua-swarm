@@ -625,12 +625,15 @@ impl SpawnerAdapter for OperatorDelegateWrapped {
                 r = operator.execute(&ctx_clone, None, prompt, worker, token_for_op) => r,
                 _ = cancel_inner.cancelled() => Err(crate::worker::adapter::WorkerError::Cancelled),
             };
+            let result = result.map(|wr| wr.ensure_worker_kind("operator"));
             if let Ok(wr) = &result {
                 // Stats sidecar (operator axis): the WS ack may carry the
                 // Operator's proxy report of the SubAgent's usage — forward
                 // it to the engine so the dispatcher's outcome fold lands it
                 // on the terminal StepEntry (same funnel as the InProc /
-                // subprocess fold sites).
+                // subprocess fold sites). Even without an ack-attached
+                // stats blob, `ensure_worker_kind` above guarantees a
+                // `worker_kind: "operator"` label always rides.
                 if let Some(stats) = wr.stats.clone() {
                     engine_clone
                         .record_worker_stats(&task_id_clone, attempt, stats)

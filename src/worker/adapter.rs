@@ -75,6 +75,28 @@ pub struct WorkerResult {
     pub stats: Option<crate::store::trace::WorkerStats>,
 }
 
+impl WorkerResult {
+    /// Ensure `stats.worker_kind` is set — the design invariant that
+    /// every dispatched step's terminal `StepEntry` carries at least
+    /// its worker kind label ("rust_fn" / "lua" / "agent_block" /
+    /// "subprocess" / "operator" / …), even when no LLM-shaped stats
+    /// (usage / model / num_turns) apply. Idempotent: if a boundary
+    /// already reported a `worker_kind` (agent_block / subprocess
+    /// stats sidecar, operator ack), that value wins; otherwise the
+    /// fold site's `kind` becomes the value. Called at every worker
+    /// fold site (`InProcSpawner` spawn task, subprocess spawn task,
+    /// `OperatorDelegateMiddleware`).
+    pub fn ensure_worker_kind(mut self, kind: &str) -> Self {
+        let stats = self
+            .stats
+            .get_or_insert_with(crate::store::trace::WorkerStats::default);
+        if stats.worker_kind.is_none() {
+            stats.worker_kind = Some(kind.to_string());
+        }
+        self
+    }
+}
+
 /// First stage of the two-stage pipeline: builds a `Box<dyn Worker>` for
 /// one attempt. Every concrete spawner (`InProcSpawner`, `ProcessSpawner`,
 /// the Operator spawner) implements this; the engine only ever holds a

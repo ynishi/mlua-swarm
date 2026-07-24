@@ -56,7 +56,8 @@ pub fn extend_with_baseline(base: RustFnInProcessSpawnerFactory) -> RustFnInProc
             }),
             ok: true,
             stats: None,
-        })
+        }
+        .ensure_worker_kind("rust_fn"))
     })
 }
 

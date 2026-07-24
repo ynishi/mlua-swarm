@@ -1873,7 +1873,8 @@ async fn run_lua_worker(
         value: outcome.0,
         ok: outcome.1,
         stats: None,
-    })
+    }
+    .ensure_worker_kind("lua"))
 }
 
 impl Default for LuaInProcessSpawnerFactory {
