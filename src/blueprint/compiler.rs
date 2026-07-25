@@ -2430,7 +2430,7 @@ mod operator_spawner_factory_worker_binding_tests {
             }) as Arc<dyn Operator>,
         );
         let profile = AgentProfile {
-            worker_binding: Some("mse-worker-coder".to_string()),
+            worker_binding: Some("code-worker".to_string()),
             tools: vec!["Read".to_string(), "Edit".to_string()],
             ..Default::default()
         };

@@ -790,7 +790,7 @@ pub struct AgentProfile {
     #[serde(default)]
     pub version_hash: Option<String>,
     /// Claude Code SubAgent definition name this agent binds to at spawn
-    /// time (e.g. "mse-worker-coder"). Why: the Blueprint is the single
+    /// time (e.g. "code-worker"). Why: the Blueprint is the single
     /// source of truth for the declaration↔executor binding — an external
     /// registry would duplicate what `tools` already declares and drift.
     /// `None` is valid for agents whose operator backend never dispatches
@@ -2045,13 +2045,13 @@ mod tests {
     #[test]
     fn agent_profile_worker_binding_roundtrips_when_some() {
         let profile = AgentProfile {
-            worker_binding: Some("mse-worker-coder".to_string()),
+            worker_binding: Some("code-worker".to_string()),
             ..Default::default()
         };
         let json = serde_json::to_value(&profile).expect("serializes");
-        assert_eq!(json["worker_binding"], "mse-worker-coder");
+        assert_eq!(json["worker_binding"], "code-worker");
         let back: AgentProfile = serde_json::from_value(json).expect("deserializes");
-        assert_eq!(back.worker_binding.as_deref(), Some("mse-worker-coder"));
+        assert_eq!(back.worker_binding.as_deref(), Some("code-worker"));
     }
 
     #[test]
@@ -2737,7 +2737,7 @@ mod tests {
         let mut bp = minimal_bp(None);
         bp.runners = vec![RunnerDef {
             name: "claude-worker".to_string(),
-            runner: ws_runner("mse-worker-coder", vec!["Read", "Grep"]),
+            runner: ws_runner("code-worker", vec!["Read", "Grep"]),
         }];
         let json = serde_json::to_string(&bp).expect("serializes");
         let back: Blueprint = serde_json::from_str(&json).expect("deserializes");
@@ -2831,10 +2831,10 @@ mod tests {
 
     #[test]
     fn runner_ws_claude_code_roundtrips_through_json_and_tags_backend() {
-        let runner = ws_runner("mse-worker-coder", vec!["Read", "Grep"]);
+        let runner = ws_runner("code-worker", vec!["Read", "Grep"]);
         let json = serde_json::to_value(&runner).expect("serializes");
         assert_eq!(json["backend"], "ws_claude_code");
-        assert_eq!(json["variant"], "mse-worker-coder");
+        assert_eq!(json["variant"], "code-worker");
         assert_eq!(json["tools"], serde_json::json!(["Read", "Grep"]));
         let back: Runner = serde_json::from_value(json).expect("deserializes");
         assert_eq!(back, runner);
@@ -2866,7 +2866,7 @@ mod tests {
 
     #[test]
     fn runner_tools_omitted_when_empty() {
-        let runner = ws_runner("mse-worker-coder", vec![]);
+        let runner = ws_runner("code-worker", vec![]);
         let json = serde_json::to_value(&runner).expect("serializes");
         assert!(
             json.as_object().unwrap().get("tools").is_none(),
@@ -2895,7 +2895,7 @@ mod tests {
     fn runner_def_roundtrips_through_json() {
         let def = RunnerDef {
             name: "claude-worker".to_string(),
-            runner: ws_runner("mse-worker-coder", vec!["Read"]),
+            runner: ws_runner("code-worker", vec!["Read"]),
         };
         let json = serde_json::to_value(&def).expect("serializes");
         let back: RunnerDef = serde_json::from_value(json).expect("deserializes");

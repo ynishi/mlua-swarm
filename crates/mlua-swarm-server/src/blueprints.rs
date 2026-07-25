@@ -1155,7 +1155,7 @@ mod explain_agent_tests {
         let profile = AgentProfile {
             system_prompt: "Hello {{ name }}, mode={{ mode }}".to_string(),
             tools: vec!["Read".to_string(), "Grep".to_string()],
-            worker_binding: Some("mse-worker-knowledge".to_string()),
+            worker_binding: Some("knowledge-worker".to_string()),
             ..Default::default()
         };
         let meta = AgentMeta {
@@ -1186,7 +1186,7 @@ mod explain_agent_tests {
         assert_eq!(resp.agent.kind, AgentKind::RustFn);
 
         let binding = resp.worker_binding.expect("worker_binding present");
-        assert_eq!(binding.variant, "mse-worker-knowledge");
+        assert_eq!(binding.variant, "knowledge-worker");
         assert!(resp.binding_note.is_none());
 
         assert_eq!(
@@ -1311,7 +1311,7 @@ mod explain_agent_tests {
     #[tokio::test]
     async fn runner_resolves_from_legacy_worker_binding_when_nothing_else_declared() {
         let profile = AgentProfile {
-            worker_binding: Some("mse-worker-knowledge".to_string()),
+            worker_binding: Some("knowledge-worker".to_string()),
             tools: vec!["Read".to_string()],
             ..Default::default()
         };
@@ -1336,7 +1336,7 @@ mod explain_agent_tests {
         assert_eq!(
             resp.runner.resolved,
             Some(mlua_swarm_schema::Runner::WsClaudeCode {
-                variant: "mse-worker-knowledge".to_string(),
+                variant: "knowledge-worker".to_string(),
                 tools: vec!["Read".to_string()],
             })
         );
@@ -1416,7 +1416,7 @@ mod explain_agent_tests {
         let bound_profile = AgentProfile {
             system_prompt: "hello world".to_string(),
             tools: vec!["Read".to_string(), "Grep".to_string()],
-            worker_binding: Some("mse-worker-knowledge".to_string()),
+            worker_binding: Some("knowledge-worker".to_string()),
             ..Default::default()
         };
         let bound_meta = AgentMeta {
@@ -1488,7 +1488,7 @@ mod explain_agent_tests {
             .worker_binding
             .as_ref()
             .expect("worker_binding present");
-        assert_eq!(binding.variant, "mse-worker-knowledge");
+        assert_eq!(binding.variant, "knowledge-worker");
         assert_eq!(bound.declared_tools_count, 2);
         assert_eq!(bound.system_prompt_bytes, "hello world".len());
         // work_dir (agent_inline override) + extra (bp-global carry) = 2 keys.
@@ -1651,12 +1651,7 @@ mod explain_agent_tests {
         let bp = bp_with_agents(
             "binding-reqs-two-runners-bp",
             vec![
-                runner_agent(
-                    "worker",
-                    "mse-worker-knowledge",
-                    &["Read", "Grep"],
-                    "sonnet",
-                ),
+                runner_agent("worker", "knowledge-worker", &["Read", "Grep"], "sonnet"),
                 runner_agent("reader", "mse-worker-reader", &["Read"], "haiku"),
             ],
             true,
@@ -1686,10 +1681,7 @@ mod explain_agent_tests {
             worker.backend,
             mlua_swarm_schema::BindingBackend::WsClaudeCode
         );
-        assert_eq!(
-            worker.launch_variant.as_deref(),
-            Some("mse-worker-knowledge")
-        );
+        assert_eq!(worker.launch_variant.as_deref(), Some("knowledge-worker"));
         assert_eq!(worker.requested_tools, vec!["Grep", "Read"]);
         assert_eq!(worker.requested_model.as_deref(), Some("sonnet"));
 
@@ -1757,7 +1749,7 @@ mod explain_agent_tests {
             "binding-reqs-legacy-reject-bp",
             vec![runner_agent(
                 "worker",
-                "mse-worker-knowledge",
+                "knowledge-worker",
                 &["Read"],
                 "sonnet",
             )],

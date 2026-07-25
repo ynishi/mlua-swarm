@@ -3047,8 +3047,8 @@ mod tests {
         let blueprint = bp(
             step("planner", path("$.in"), path("$.out")),
             vec![
-                legacy_agent("planner", "mse-worker-planner", vec!["Read", "Grep"]),
-                legacy_agent("coder", "mse-worker-coder", vec![]),
+                legacy_agent("planner", "planning-worker", vec!["Read", "Grep"]),
+                legacy_agent("coder", "code-worker", vec![]),
                 agent("no-binding", "echo"),
             ],
         );

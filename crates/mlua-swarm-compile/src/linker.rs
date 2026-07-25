@@ -27,7 +27,7 @@
 //! ```jsonc
 //! {
 //!   "agents": [
-//!     { "$agent_md": "agents/domain-researcher.md" }
+//!     { "$agent_md": "agents/researcher.md" }
 //!   ]
 //! }
 //! ```

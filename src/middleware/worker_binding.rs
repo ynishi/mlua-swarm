@@ -140,7 +140,7 @@ mod tests {
         map.insert(
             "planner".to_string(),
             WorkerBinding {
-                variant: "mse-worker-knowledge".to_string(),
+                variant: "knowledge-worker".to_string(),
                 tools: vec!["Read".to_string()],
                 request_digest: Some(
                     "sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -167,7 +167,7 @@ mod tests {
             .get(WORKER_BINDING_KEY)
             .expect("worker_binding key present");
         let wb: WorkerBinding = serde_json::from_value(v.clone()).expect("round-trip");
-        assert_eq!(wb.variant, "mse-worker-knowledge");
+        assert_eq!(wb.variant, "knowledge-worker");
         assert_eq!(wb.tools, vec!["Read".to_string()]);
         // The requesting side's self-check inputs survive the ctx.meta.runtime
         // round-trip so the Operator can correlate and compare its environment.

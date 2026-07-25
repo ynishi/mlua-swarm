@@ -5,12 +5,12 @@
 //!
 //! ```text
 //! ---
-//! name: impl-lead
+//! name: implementer
 //! description: Implementation worker ...
 //! model: sonnet
 //! effort: high
 //! tools: Read, Edit, Write, Grep, Glob
-//! worker_binding: mse-worker-coder
+//! worker_binding: code-worker
 //! permissionMode: bypassPermissions
 //! memory: user
 //! abtest: true
@@ -299,12 +299,12 @@ fn normalize_tools(v: &Value) -> Vec<String> {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "---\nname: impl-lead\ndescription: Implementation worker\nmodel: sonnet\neffort: high\ntools: Read, Edit, Grep\npermissionMode: bypassPermissions\nmemory: user\nabtest: true\n---\nYou are the implementation lead.\n\nWork in the caller-provided task directory.\n";
+    const SAMPLE: &str = "---\nname: implementer\ndescription: Implementation worker\nmodel: sonnet\neffort: high\ntools: Read, Edit, Grep\npermissionMode: bypassPermissions\nmemory: user\nabtest: true\n---\nYou are the implementation lead.\n\nWork in the caller-provided task directory.\n";
 
     #[test]
     fn parses_full_frontmatter() {
         let def = parse(SAMPLE, "sample", AgentKind::Operator).expect("parse ok");
-        assert_eq!(def.name, "impl-lead");
+        assert_eq!(def.name, "implementer");
         assert!(matches!(def.kind, AgentKind::Operator));
         let p = def.profile.expect("profile present");
         assert_eq!(p.model.as_deref(), Some("sonnet"));
@@ -329,10 +329,10 @@ mod tests {
 
     #[test]
     fn worker_binding_extracted_as_first_class_field() {
-        let t = "---\nname: x\nworker_binding: mse-worker-coder\n---\nbody\n";
+        let t = "---\nname: x\nworker_binding: code-worker\n---\nbody\n";
         let def = parse(t, "x", AgentKind::Operator).unwrap();
         let p = def.profile.expect("profile present");
-        assert_eq!(p.worker_binding.as_deref(), Some("mse-worker-coder"));
+        assert_eq!(p.worker_binding.as_deref(), Some("code-worker"));
         // must not leak into extras alongside the first-class field.
         assert!(matches!(p.extras, Value::Null));
     }

@@ -773,9 +773,9 @@ mod tests {
     #[test]
     fn directive_omits_project_name_alias_when_none() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
@@ -789,9 +789,9 @@ mod tests {
     #[test]
     fn directive_emits_project_name_alias_when_some() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(Some("mse-task-7785"), None, None),
             None,
             None,
@@ -819,11 +819,14 @@ mod tests {
         // The SoT is not pointed at an AI personal memory file (which is
         // outside the MainAI's reach) — reach-axis consistency. Path
         // references coming from the subagent registration convention (for
-        // example `agents/mse-worker.md`) are a separate case and are
-        // allowed. The pattern is assembled by string concat so that no
-        // gitignored dir literal remains in the source and the
-        // internal-doc-leak / secret-pre-commit-checker mechanical pattern
-        // match is avoided.
+        // example `agents/<variant>.md`) are a separate case and are
+        // allowed. This one forbidden pattern is assembled by string
+        // concat rather than written literally, so that a scan for it does
+        // not match its own assertion — do not "simplify" it back into a
+        // literal. (Unrelated: the wrapper-path assertion further down
+        // does carry a literal, because `.claude/agents/<variant>.md` is
+        // the documented Claude Code wrapper convention this server
+        // renders — see `DEFAULT_WRAPPER_DIR` — not a leaked path.)
         let forbidden_doc_ref = format!(".{}/CLAUDE.md", "claude");
         assert!(
             !d.contains(&forbidden_doc_ref),
@@ -834,9 +837,9 @@ mod tests {
     #[test]
     fn directive_omits_data_endpoint_when_none() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
@@ -851,9 +854,9 @@ mod tests {
     fn directive_emits_data_endpoint_when_some() {
         let base = "http://127.0.0.1:7785";
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             Some(base),
             None,
@@ -888,20 +891,20 @@ mod tests {
     #[test]
     fn directive_carries_declared_subagent_type_and_has_no_fallback() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
             None,
         );
         assert!(
-            d.contains("subagent_type=\"mse-worker-coder\""),
+            d.contains("subagent_type=\"code-worker\""),
             "directive must carry the Blueprint-declared subagent_type literally: {d}"
         );
         assert!(
-            d.contains(".claude/agents/mse-worker-coder.md"),
+            d.contains(".claude/agents/code-worker.md"),
             "directive must reference the declared subagent's own .md path: {d}"
         );
         // The old hardcoded default and its silent-fallback text must be gone.
@@ -927,9 +930,9 @@ mod tests {
     #[test]
     fn directive_renders_actual_base_url_when_some() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             Some("http://127.0.0.1:8888"),
@@ -951,9 +954,9 @@ mod tests {
     #[test]
     fn directive_falls_back_to_mse_doctor_pointer_when_none() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
@@ -976,9 +979,9 @@ mod tests {
             Some("http://192.0.2.1:9000"),
         ] {
             let d = default_spawn_directive(
-                "impl-lead",
+                "implementer",
                 "task-x",
-                "mse-worker-coder",
+                "code-worker",
                 &view_with(Some("mse-task-alias"), None, None),
                 Some("http://127.0.0.1:7785"),
                 base,
@@ -999,9 +1002,9 @@ mod tests {
     #[test]
     fn directive_never_contains_stale_tasks_id_route() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
@@ -1018,9 +1021,9 @@ mod tests {
     #[test]
     fn directive_renders_actual_run_id_when_some() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
@@ -1037,9 +1040,9 @@ mod tests {
     #[test]
     fn directive_falls_back_to_run_id_placeholder_when_none() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
@@ -1058,9 +1061,9 @@ mod tests {
     #[test]
     fn directive_omits_project_root_and_work_dir_when_both_none() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
@@ -1075,9 +1078,9 @@ mod tests {
     #[test]
     fn directive_splices_project_root_and_work_dir_when_both_present() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, Some("/repo"), Some("/repo/work")),
             None,
             None,
@@ -1098,9 +1101,9 @@ mod tests {
     #[test]
     fn directive_splices_project_root_only_when_work_dir_absent() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, Some("/repo"), None),
             None,
             None,
@@ -1126,9 +1129,9 @@ mod tests {
             ..view_with(None, Some("/repo"), None)
         };
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view,
             None,
             None,
@@ -1148,9 +1151,9 @@ mod tests {
     #[test]
     fn directive_omits_task_metadata_when_none() {
         let d = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
@@ -1613,9 +1616,9 @@ mod tests {
     #[test]
     fn with_task_directive_splices_string_seed_verbatim() {
         let directive = default_spawn_directive_with_task_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
@@ -1635,9 +1638,9 @@ mod tests {
     #[test]
     fn with_task_directive_renders_object_seed_as_json_literal() {
         let directive = default_spawn_directive_with_task_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
@@ -1657,9 +1660,9 @@ mod tests {
     #[test]
     fn with_task_directive_omits_line_when_null() {
         let wrapped = default_spawn_directive_with_task_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,
@@ -1667,9 +1670,9 @@ mod tests {
             &serde_json::Value::Null,
         );
         let plain = default_spawn_directive(
-            "impl-lead",
+            "implementer",
             "task-x",
-            "mse-worker-coder",
+            "code-worker",
             &view_with(None, None, None),
             None,
             None,

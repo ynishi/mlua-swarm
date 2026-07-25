@@ -1171,7 +1171,7 @@ mod operator_delegate_worker_binding_tests {
         ctx.meta.runtime.insert(
             crate::middleware::worker_binding::WORKER_BINDING_KEY.to_string(),
             serde_json::to_value(WorkerBinding {
-                variant: "mse-worker-coder".to_string(),
+                variant: "code-worker".to_string(),
                 tools: vec!["Edit".to_string()],
                 request_digest: None,
                 requested_model: None,
@@ -1185,7 +1185,7 @@ mod operator_delegate_worker_binding_tests {
             .expect("delegate spawn ok");
 
         let got = recorded_worker(&seen).await.expect("binding forwarded");
-        assert_eq!(got.variant, "mse-worker-coder");
+        assert_eq!(got.variant, "code-worker");
         assert_eq!(got.tools, vec!["Edit".to_string()]);
     }
 
