@@ -101,6 +101,14 @@ with the transport removed:
 | final OUT | `POST /v1/worker/submit` | the worker's return value (`agent_block`: `bus.emit(<any kind>, ...)`, first emit wins) |
 | named part | `POST /v1/worker/artifact?name=<name>` | `agent_block`: `bus.emit("artifact", {name = ..., content = ...})` |
 
+Staged parts fold identically on both lanes: stage at least one and the
+step's value becomes `{"out": <final>, "parts": {<name>: <value>}}`, so a
+downstream cond reads `$.<step>.parts["verdict"]` and a downstream `in`
+reads `$.<step>.out`. Stage none and the value stays the plain final body.
+Only the worker's OWN parts fold — an `Artifact` another producer appends
+to the same attempt's tail (`AfterRunAuditMiddleware`'s `audit:<step_ref>`
+sidecar) is deliberately invisible to the BP chain.
+
 Both verdict channels work on both lanes: `channel: "body"` compares the
 final body, `channel: "part"` compares a staged `verdict` part.
 

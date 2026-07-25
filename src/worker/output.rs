@@ -34,6 +34,17 @@ pub trait OutputSink: Send + Sync {
 /// `engine`, `token`, `task_id`, and `attempt`, and calls
 /// `engine.submit_output` for every `emit`. Injected by the `InProcSpawner`
 /// into `WorkerInvocation`.
+///
+/// `InProcSpawner::spawn` is this type's **sole constructor**, which is
+/// what makes it the in-process lane's "the worker itself did this"
+/// boundary: an `OutputEvent::Artifact` arriving here is a part the worker
+/// staged, as opposed to one some other producer appended to the same
+/// shared tail (`AfterRunAuditMiddleware` calls `submit_output` directly
+/// for exactly that reason). `emit` therefore records `Artifact` names
+/// into `EngineState.worker_artifact_names` — the allowlist the Final-pull
+/// folds `{out, parts}` from. Adding a second constructor for a non-worker
+/// producer would break that invariant; such a producer should call
+/// `Engine::submit_output` directly instead.
 #[derive(Clone)]
 pub struct EngineSink {
     engine: crate::core::engine::Engine,
@@ -64,8 +75,24 @@ impl EngineSink {
 #[async_trait]
 impl OutputSink for EngineSink {
     async fn emit(&self, event: OutputEvent) -> Result<(), EngineError> {
+        // Read the part name off the event before handing it over.
+        let staged_part = match &event {
+            OutputEvent::Artifact { name, .. } => Some(name.clone()),
+            _ => None,
+        };
         self.engine
             .submit_output(&self.token, &self.task_id, self.attempt, event)
-            .await
+            .await?;
+        // Only after the tail write lands: a rejected or failed submit must
+        // not leave a name in the allowlist pointing at an `Artifact` that
+        // is not on the tail. See the type doc for why recording here (and
+        // not inside `submit_output`) is what keeps a non-worker producer's
+        // artifact out of the BP-chain value.
+        if let Some(name) = staged_part {
+            self.engine
+                .record_worker_artifact_name(&self.task_id, self.attempt, name)
+                .await?;
+        }
+        Ok(())
     }
 }

@@ -723,6 +723,11 @@ bus.emit("artifact", { name = "verdict", content = "PASS" })
 bus.emit("worker_result", { ok = true, response = "the full prose report" })
 ```
 
+The step's value is then `{"out": "the full prose report", "parts":
+{"verdict": "PASS"}}` — downstream reads the report at `$.<step>.out` and
+branches on `$.<step>.parts["verdict"]`. A step that stages nothing keeps
+the plain body, unwrapped.
+
 Pick the channel by what the body has to carry. A gate whose body IS the
 report needs `channel: "part"` — under `channel: "body"` that same script
 has its `Final` rejected at completion time, and the step fails with

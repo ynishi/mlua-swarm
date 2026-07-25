@@ -720,8 +720,15 @@ pub struct EngineState {
     /// `OutputEvent::Final` off the tail and decides Pass / Blocked.
     pub output_store: HashMap<(StepId, u32), Vec<crate::worker::output::OutputEvent>>,
     /// GH #36 ST1 (named multi-part worker output): the set of `Artifact`
-    /// names staged via `Engine::stage_worker_artifact_trusted` (= `POST
-    /// /v1/worker/artifact`) for `(task_id, attempt)`, in staging order.
+    /// names a WORKER staged for `(task_id, attempt)`, in staging order.
+    ///
+    /// Two population paths, one per lane, both meaning "the worker itself
+    /// staged this part": `Engine::stage_worker_artifact_trusted` (= `POST
+    /// /v1/worker/artifact`, the out-of-process lane) and
+    /// `crate::worker::output::EngineSink::emit` (the in-process lane's
+    /// `WorkerInvocation.sink`, which `InProcSpawner::spawn` is the sole
+    /// constructor of — so an `Artifact` arriving through it is by
+    /// construction the worker's own).
     ///
     /// `output_store` is a SHARED per-attempt tail — besides a worker's own
     /// staged parts, other producers append `OutputEvent::Artifact` events
@@ -733,7 +740,7 @@ pub struct EngineState {
     /// `"parts"`, not every `Artifact` that happens to land on the tail —
     /// this set is that distinguishing signal, so a step under audit keeps
     /// its BP-chain value byte-identical to pre-GH-#36 unless the WORKER
-    /// itself opted in via `/v1/worker/artifact`.
+    /// itself opted in.
     pub worker_artifact_names: HashMap<(StepId, u32), Vec<String>>,
     /// Bounded in-process tail of recent `Event`s (most recent last),
     /// trimmed to `event_log_max` by `push_event`.
@@ -764,6 +771,25 @@ pub struct EngineState {
 }
 
 impl EngineState {
+    /// Append `name` to the worker's own staged-part allowlist for
+    /// `(task_id, attempt)` — see [`Self::worker_artifact_names`].
+    ///
+    /// One statement, but shared by both lanes' population paths so the
+    /// "which map, keyed how" decision lives in one place: a lane that
+    /// records into the wrong shape would silently drop its parts out of
+    /// the `{out, parts}` fold rather than fail.
+    pub(crate) fn record_worker_artifact_name(
+        &mut self,
+        task_id: StepId,
+        attempt: u32,
+        name: String,
+    ) {
+        self.worker_artifact_names
+            .entry((task_id, attempt))
+            .or_default()
+            .push(name);
+    }
+
     /// Construct an empty `EngineState` with `event_log_max = 1024`.
     pub fn new() -> Self {
         Self {

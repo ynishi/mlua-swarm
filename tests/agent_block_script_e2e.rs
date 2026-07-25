@@ -140,6 +140,13 @@ bus.emit("worker_result", { ok = true, response = "PASS" })
 /// completion-time contract check reads the STAGED part, not the body.
 /// Before the sink bridge, staging had no route out of this backend and a
 /// `channel: "part"` contract always failed with `VerdictPartMissing`.
+///
+/// The staged part must ALSO reach the flow ctx as `parts.verdict`. The
+/// contract check reads the output tail directly, so it was satisfied
+/// even while the part was missing from the `{out, parts}` fold — the
+/// gate passed and `$.<step>.parts["verdict"]` still read `null`, because
+/// only the HTTP staging route registered the name in the fold's
+/// worker-owned allowlist. The in-process sink registers it too now.
 #[tokio::test]
 async fn script_mode_gate_satisfies_a_part_channel_verdict_contract() {
     let (script, dir) = write_script(
@@ -161,9 +168,66 @@ bus.emit("worker_result", { ok = true, response = "the full prose report" })
         .expect("launch must complete");
     assert_eq!(
         out.final_ctx["danger_result"],
-        json!("the full prose report"),
-        "the body stays the report; the verdict rode the staged part"
+        json!({
+            "out": "the full prose report",
+            "parts": {"verdict": "PASS"},
+        }),
+        "the body stays the report under `out`, and the staged verdict is \
+         addressable at `parts.verdict` — the shape a downstream \
+         `$.<step>.parts[\"verdict\"]` cond reads"
     );
+}
+
+/// Multiple staged parts all fold, keyed by name, and a part staged twice
+/// is last-write-wins — the same semantics the HTTP staging route has.
+#[tokio::test]
+async fn script_mode_multiple_staged_parts_fold_by_name() {
+    let (script, dir) = write_script(
+        "verdict-parts-many",
+        r#"
+bus.emit("artifact", { name = "verdict", content = "BLOCKED" })
+bus.emit("artifact", { name = "evidence", content = { count = 2 } })
+bus.emit("artifact", { name = "verdict", content = "PASS" })
+bus.emit("worker_result", { ok = true, response = "report" })
+"#,
+    );
+    let bp = script_agent_bp(
+        "gh86-script-verdict-parts-many",
+        &script,
+        &dir,
+        json!({"channel": "part", "values": ["PASS", "BLOCKED"]}),
+    );
+    let out = service()
+        .launch(launch_input(bp, json!({})))
+        .await
+        .expect("launch must complete");
+    assert_eq!(
+        out.final_ctx["danger_result"],
+        json!({
+            "out": "report",
+            "parts": {"verdict": "PASS", "evidence": {"count": 2}},
+        }),
+        "every staged name folds; a name staged twice keeps the last value"
+    );
+}
+
+/// A step that stages nothing keeps the plain body — the pre-GH-#36
+/// shape. Registering in-process part names must not start wrapping
+/// every in-process step in `{out, parts}`.
+#[tokio::test]
+async fn script_mode_without_staged_parts_keeps_the_plain_body() {
+    let (script, dir) = write_script(
+        "no-parts",
+        r#"
+bus.emit("worker_result", { ok = true, response = "just the body" })
+"#,
+    );
+    let bp = script_agent_bp("gh86-script-no-parts", &script, &dir, Value::Null);
+    let out = service()
+        .launch(launch_input(bp, json!({})))
+        .await
+        .expect("launch must complete");
+    assert_eq!(out.final_ctx["danger_result"], json!("just the body"));
 }
 
 /// The staged part is what the `part` contract validates: a gate staging
@@ -582,6 +646,18 @@ bus.emit("worker_result", {{ ok = true, response = "audited" }})
         out.final_ctx["result"]["echoed"],
         json!("do the thing"),
         "the audited step's own outcome is untouched by the audit"
+    );
+    // The exclusion invariant, asserted directly rather than implied by the
+    // line above: the audit's `audit:<step_ref>` Artifact lands on the
+    // AUDITED step's tail, but it is not a part the worker staged, so it
+    // must stay out of the `{out, parts}` fold. `AfterRunAuditMiddleware`
+    // calls `Engine::submit_output` directly for that reason — only the
+    // worker's own sink registers names in the fold's allowlist.
+    assert!(
+        out.final_ctx["result"].get("parts").is_none(),
+        "an audit sidecar must not wrap the audited step's BP-chain value \
+         in a parts fold, got: {}",
+        out.final_ctx["result"]
     );
 
     let seen = std::fs::read_to_string(&marker)

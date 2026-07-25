@@ -818,10 +818,7 @@ impl Engine {
                 .entry((task_id_for_apply.clone(), attempt))
                 .or_default()
                 .push(ev.clone());
-            s.worker_artifact_names
-                .entry((task_id_for_apply.clone(), attempt))
-                .or_default()
-                .push(name_for_apply);
+            s.record_worker_artifact_name(task_id_for_apply.clone(), attempt, name_for_apply);
             s.push_event(crate::core::state::Event::WorkerOutput {
                 task_id: task_id_for_apply,
                 attempt,
@@ -834,12 +831,52 @@ impl Engine {
         Ok(())
     }
 
+    /// The in-process lane's half of the "this part is the WORKER's own"
+    /// signal: record `name` in `EngineState.worker_artifact_names` for an
+    /// `Artifact` that already went through [`Self::submit_output`].
+    ///
+    /// The out-of-process lane gets this for free inside
+    /// [`Self::stage_worker_artifact_trusted`] (one `with_state`, tail
+    /// append + name record together). An in-process worker has no HTTP
+    /// route to call: it stages through `WorkerInvocation.sink`, which
+    /// lands on the generic `submit_output` — the same entry point OTHER
+    /// `Artifact` producers use (`AfterRunAuditMiddleware`'s
+    /// `"audit:<step_ref>"` sidecar), so `submit_output` itself must NOT
+    /// record. The distinction lives one layer up, in
+    /// [`crate::worker::output::EngineSink`]: `InProcSpawner::spawn` is
+    /// its sole constructor, so an `Artifact` arriving through that sink
+    /// is by construction the worker's own, and the sink calls this
+    /// immediately after its `submit_output` succeeds.
+    ///
+    /// Without it a `channel: "part"` in-process gate passes the
+    /// completion-time contract check (which reads the tail directly) yet
+    /// its part never folds into `{out, parts}` — so a downstream
+    /// `$.<step>.parts["verdict"]` cond reads `null`, the exact
+    /// half-working state GH #86's sink bridge left behind.
+    ///
+    /// Two calls rather than one atomic `with_state` is deliberate here:
+    /// the tail write must be allowed to fail (contract rejection, strict
+    /// `CheckPolicy`) WITHOUT leaving a phantom name behind, so the record
+    /// is strictly downstream of a successful submit.
+    pub(crate) async fn record_worker_artifact_name(
+        &self,
+        task_id: &StepId,
+        attempt: u32,
+        name: String,
+    ) -> Result<(), EngineError> {
+        let task_id = task_id.clone();
+        self.with_state("record_worker_artifact_name", move |s| {
+            s.record_worker_artifact_name(task_id, attempt, name);
+        })
+        .await
+    }
+
     /// GH #36 ST1: the set of `Artifact` names staged for `(task_id,
-    /// attempt)` via [`Self::stage_worker_artifact_trusted`] — see
-    /// `EngineState.worker_artifact_names`'s doc. Used by
-    /// [`Self::dispatch_attempt_with`]'s Final-pull to distinguish a
-    /// worker's own named parts from any other `Artifact` producer on the
-    /// same tail.
+    /// attempt)` by the worker itself — see
+    /// `EngineState.worker_artifact_names`'s doc for the two lanes that
+    /// populate it. Used by [`Self::dispatch_attempt_with`]'s Final-pull
+    /// to distinguish a worker's own named parts from any other `Artifact`
+    /// producer on the same tail.
     async fn worker_artifact_names_for(&self, task_id: &StepId, attempt: u32) -> Vec<String> {
         let key = (task_id.clone(), attempt);
         self.with_state("worker_artifact_names_for", move |s| {
