@@ -637,12 +637,27 @@ is the default cwd for `sh.exec` and for MCP servers started by
 `io.open("rel/path")` still resolves against the server's own cwd.
 
 **Result.** A script returns its result by calling `bus.emit(<kind>,
-payload)` — **not** by returning a value from the chunk, and only the first
-emit counts. The host takes `payload.content`, else `payload.response`,
-else the whole payload, as the step OUTPUT body. For a `verdict` contract
-on `channel: "body"`, that value IS the verdict scalar. `channel: "part"`
-is not reachable from this backend yet (staging a named part needs a sink
-bridge the in-process worker does not expose).
+payload)` — **not** by returning a value from the chunk. One kind is
+reserved:
+
+| emit kind | effect |
+|---|---|
+| `"artifact"` | stages a named part — `{ name = "...", content = ... }`, `name` required — and lets the script keep running. Any number of these. |
+| anything else | the terminal result, **first emit wins**. The host takes `payload.content`, else `payload.response`, else the whole payload, as the step OUTPUT body. |
+
+Both verdict channels work. `channel: "body"` compares the terminal value:
+
+```lua
+bus.emit("worker_result", { ok = true, response = "PASS" })
+```
+
+`channel: "part"` compares a staged `verdict` part, leaving the body free
+for the report:
+
+```lua
+bus.emit("artifact", { name = "verdict", content = "PASS" })
+bus.emit("worker_result", { ok = true, response = "the full prose report" })
+```
 
 **Tool grant.** The effective set is the resolved
 `agent_block_in_process` Runner's `tools` when a Runner is declared,

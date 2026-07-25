@@ -147,7 +147,14 @@ pub trait SpawnerAdapter: Send + Sync {
 /// without `sink`, the `WorkerResult` returned by the fn is still
 /// folded into a `Final` event on the spawner side, running alongside
 /// the older return-value path.
+/// `#[non_exhaustive]`: this struct is the in-process seam every backend
+/// reads task context off, so it is expected to keep growing (GH #86 added
+/// `context`). Marking it non-exhaustive makes each future field a
+/// non-breaking addition. Construct it with [`WorkerInvocation::new`] plus
+/// the `with_*` setters — the same shape `agent-block-core` moved
+/// `BlockConfig` to, and for the same reason.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct WorkerInvocation {
     /// Capability token authorizing this attempt.
     pub token: CapToken,
@@ -188,6 +195,54 @@ pub struct WorkerInvocation {
     /// "not wired for this invocation" convention `sink` / `cancel_token`
     /// use above). It is never `None` on the `InProcSpawner` path.
     pub context: Option<AgentContextView>,
+}
+
+impl WorkerInvocation {
+    /// The five fields every invocation must carry. The optional rails
+    /// (`sink` / `cancel_token` / `context`) default to `None` and are
+    /// added with the `with_*` setters below — `InProcSpawner::spawn`
+    /// wires all three.
+    pub fn new(
+        token: CapToken,
+        task_id: StepId,
+        attempt: u32,
+        agent: impl Into<String>,
+        prompt: impl Into<String>,
+    ) -> Self {
+        Self {
+            token,
+            task_id,
+            attempt,
+            agent: agent.into(),
+            prompt: prompt.into(),
+            sink: None,
+            cancel_token: None,
+            context: None,
+        }
+    }
+
+    /// Attach the intake sink (see the [`Self::sink`] field doc).
+    pub fn with_sink(
+        mut self,
+        sink: std::sync::Arc<dyn crate::worker::output::OutputSink>,
+    ) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Attach the upstream cancel token (see the [`Self::cancel_token`]
+    /// field doc).
+    pub fn with_cancel_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+
+    /// Attach the materialized task context (see the [`Self::context`]
+    /// field doc).
+    pub fn with_context(mut self, context: AgentContextView) -> Self {
+        self.context = Some(context);
+        self
+    }
 }
 
 impl std::fmt::Debug for WorkerInvocation {
@@ -332,22 +387,16 @@ impl<W: Worker + From<crate::worker::WorkerJoinHandler> + Send + Sync + 'static>
             task_id.clone(),
             attempt,
         )) as std::sync::Arc<dyn crate::worker::output::OutputSink>;
-        let inv = WorkerInvocation {
-            token,
-            task_id,
-            attempt,
-            agent: ctx.agent.clone(),
-            prompt,
-            sink: Some(sink),
-            cancel_token: Some(cancel_inner.clone()),
+        let inv = WorkerInvocation::new(token, task_id, attempt, ctx.agent.clone(), prompt)
+            .with_sink(sink)
+            .with_cancel_token(cancel_inner.clone())
             // The one place task-level context enters the in-process lane
             // (mirrors how `Engine::fetch_worker_payload` fills
             // `WorkerPayload.context` for the out-of-process lane). Reads
             // the policy-applied view `AgentContextMiddleware` stashed, and
             // degrades to the raw `Ctx` projection when that layer is not
             // on this spawner stack.
-            context: Some(AgentContextView::materialized_or_from_ctx(ctx)),
-        };
+            .with_context(AgentContextView::materialized_or_from_ctx(ctx));
 
         tokio::spawn(async move {
             let result = tokio::select! {

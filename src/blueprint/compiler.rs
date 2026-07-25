@@ -1821,6 +1821,23 @@ async fn run_lua_worker(
             g.set("_ATTEMPT", inv.attempt as i64)
                 .map_err(|e| format!("set _ATTEMPT: {e}"))?;
 
+            // 1b. GH #86: the task-context tier, off the same
+            //     `WorkerInvocation.context` seam the AgentBlock backend
+            //     reads — same global name (`_TASK_METADATA`) so a Lua gate
+            //     is portable between the two in-process backends. Absent
+            //     `task_metadata` leaves the global unset (nil), matching
+            //     every other "insert nothing when absent" contract here.
+            if let Some(meta) = inv.context.as_ref().and_then(|v| v.task_metadata.as_ref()) {
+                let lua_val = lua
+                    .to_value(meta)
+                    .map_err(|e| format!("_TASK_METADATA to_value: {e}"))?;
+                g.set(
+                    crate::worker::agent_block::runtime::TASK_METADATA_GLOBAL,
+                    lua_val,
+                )
+                .map_err(|e| format!("set _TASK_METADATA: {e}"))?;
+            }
+
             // 2. _CTX = JSON parse(_PROMPT); nil on parse failure (co-exists with the plain-string prompt path).
             if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&inv.prompt) {
                 let lua_val = lua
@@ -2467,8 +2484,8 @@ mod lua_inline_source_tests {
     }
 
     fn test_invocation(prompt: &str) -> crate::worker::adapter::WorkerInvocation {
-        crate::worker::adapter::WorkerInvocation {
-            token: CapToken {
+        crate::worker::adapter::WorkerInvocation::new(
+            CapToken {
                 agent_id: "a".into(),
                 role: Role::Worker,
                 scopes: vec!["*".into()],
@@ -2478,14 +2495,11 @@ mod lua_inline_source_tests {
                 nonce: "test-nonce".into(),
                 sig_hex: "".into(),
             },
-            task_id: StepId::parse("ST-test").expect("StepId parse"),
-            attempt: 1,
-            agent: "g".into(),
-            prompt: prompt.into(),
-            sink: None,
-            cancel_token: None,
-            context: None,
-        }
+            StepId::parse("ST-test").expect("StepId parse"),
+            1,
+            "g",
+            prompt,
+        )
     }
 
     #[test]

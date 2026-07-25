@@ -77,7 +77,7 @@
 //! |---|---|
 //! | `_PROMPT` | The step's evaluated `in`, via `inv.prompt` → `BlockConfig.prompt`. A **String** — a structured `in` arrives JSON-stringified, so a script that wants a table calls `std.json.decode(_PROMPT)`. |
 //! | `_CONTEXT` | `profile.system_prompt`, via `BlockConfig.context`. |
-//! | `_TASK_METADATA` | `view.task_metadata` (the launch's `init_ctx.task_metadata` bag), embedded as a Lua literal by [`build_prelude`]. |
+//! | [`TASK_METADATA_GLOBAL`] (`_TASK_METADATA`) | `view.task_metadata` (the launch's `init_ctx.task_metadata` bag), set through the SDK's `extra_globals` — converted natively, so nesting survives and the chunk text is never rewritten. |
 //!
 //! No server-process env is involved in any of them. The per-task working
 //! directory is not a Lua global — it becomes the SDK's `project_root`
@@ -88,14 +88,19 @@
 //! server's own cwd.
 //!
 //! A script returns its result by calling `bus.emit(<kind>, payload)` —
-//! **not** by returning a value from the chunk — and
-//! [`WorkerResultCaptor`] normalises the payload into
-//! [`WorkerResult`]`.value` (`payload.content` → `payload.response` →
-//! the whole payload). Only the FIRST emit is taken. For a
-//! `VerdictChannel::Body` contract, that value IS the verdict scalar the
-//! engine compares. `VerdictChannel::Part` is NOT reachable from this
-//! backend today: staging a named part needs `WorkerInvocation.sink`,
-//! which this worker does not yet bridge to Lua.
+//! **not** by returning a value from the chunk. Two destinations:
+//!
+//! | emit kind | Effect |
+//! |---|---|
+//! | [`ARTIFACT_EVENT_KIND`] (`artifact`) | Stages a named part through [`WorkerInvocation::sink`] (`{name = ..., content = ...}`) and leaves the invocation running. Any number of these. |
+//! | anything else | The terminal result, **first emit wins**. [`WorkerResultCaptor`] normalises the payload into [`WorkerResult`]`.value` (`payload.content` → `payload.response` → the whole payload). |
+//!
+//! Both verdict channels are therefore reachable:
+//! `VerdictChannel::Body` compares the terminal value, and
+//! `VerdictChannel::Part` compares a staged `"verdict"` part — stage it
+//! with `bus.emit("artifact", {name = "verdict", content = "PASS"})`
+//! before the terminal emit, and the plain body stays free for the
+//! report.
 //!
 //! ## `project_root` resolution (issue #17, GH #20)
 //!
@@ -178,8 +183,27 @@ use tokio::sync::oneshot;
 /// boilerplate. Pulling out (1) first normalises the chain to a single
 /// LLM raw-text carry and brings the Worker pattern up to the token
 /// efficiency of the Phase 3 WS Operator path.
+///
+/// # Named parts (GH #86)
+///
+/// One event kind is reserved: [`ARTIFACT_EVENT_KIND`]. An emit under that
+/// kind is staged as an [`OutputEvent::Artifact`] through
+/// [`WorkerInvocation::sink`] and does **not** complete the invocation, so
+/// a script may stage any number of named parts and then finish with its
+/// terminal emit as usual. This is what makes `VerdictChannel::Part`
+/// reachable from this backend — the engine's completion-time contract
+/// check looks for a staged `"verdict"` artifact.
+///
+/// Reserving a kind is a deliberate step back from "kind-agnostic": with
+/// two destinations there is now something to route, so the script side
+/// has one string to coordinate. Every other kind keeps the old
+/// first-emit-wins result behavior.
 struct WorkerResultCaptor {
     tx: Mutex<Option<oneshot::Sender<WorkerResult>>>,
+    /// Intake for staged named parts; `None` when the caller path did not
+    /// wire one (an `artifact` emit then degrades to a `tracing::warn!`
+    /// rather than silently vanishing).
+    sink: Option<Arc<dyn crate::worker::output::OutputSink>>,
 }
 
 impl WorkerResultCaptor {
@@ -236,17 +260,60 @@ impl WorkerResultCaptor {
             adapter_data: usage_raw.cloned(),
         })
     }
+
+    /// GH #86: stage one named part from an [`ARTIFACT_EVENT_KIND`] emit.
+    ///
+    /// `payload.name` (string) is required — an emit without it cannot
+    /// address a part, so it is reported to the script as an error rather
+    /// than dropped. `payload.content` is the body; absent means the part
+    /// is staged empty (`Value::Null`), which is still a distinct,
+    /// addressable staging event.
+    async fn stage_artifact(&self, payload: &Value) -> Result<(), BlockError> {
+        let name = payload
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                BlockError::Runtime(format!(
+                    "bus.emit(\"{ARTIFACT_EVENT_KIND}\", ...) requires a string `name` field \
+                     naming the part (got: {payload})"
+                ))
+            })?
+            .to_string();
+        let Some(sink) = self.sink.as_ref() else {
+            tracing::warn!(
+                artifact = %name,
+                "agent-block staged an artifact but no OutputSink is wired for this \
+                 invocation; the part is dropped"
+            );
+            return Ok(());
+        };
+        let content = payload.get("content").cloned().unwrap_or(Value::Null);
+        sink.emit(crate::worker::output::OutputEvent::Artifact {
+            name: name.clone(),
+            content: crate::worker::output::ContentRef::Inline { value: content },
+        })
+        .await
+        .map_err(|e| BlockError::Runtime(format!("staging artifact '{name}': {e}")))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl Handler for WorkerResultCaptor {
     async fn call(
         &self,
-        _kind: String,
+        kind: String,
         _id: String,
         payload: Value,
         _meta: Value,
     ) -> Result<Value, BlockError> {
+        // GH #86: the one reserved kind routes to the named-part intake and
+        // leaves the invocation running; everything else is the terminal
+        // result (first emit wins).
+        if kind == ARTIFACT_EVENT_KIND {
+            self.stage_artifact(&payload).await?;
+            return Ok(Value::Null);
+        }
         let (value, ok) = Self::extract(&payload);
         let stats = Self::extract_stats(&payload);
         // Even when the SDK payload carries no usage (script-side
@@ -262,116 +329,22 @@ impl Handler for WorkerResultCaptor {
     }
 }
 
-/// Which Lua chunk this `AgentDef` runs, deferred so the per-invocation
-/// prelude (see [`build_prelude`]) can be spliced in at dispatch time
-/// rather than baked at compile time.
-#[derive(Clone, Debug)]
-enum ScriptPlan {
-    /// ScriptBasedAgent (`spec.script_path` present) — a caller-supplied
-    /// script, read at invocation time so its on-disk content is never
-    /// pinned to compile time.
-    CallerScript(PathBuf),
-    /// PromptBasedAgent (`spec.script_path` absent) — the host-generated
-    /// invoker built by [`build_inline_agent_invoker`].
-    Invoker { source: String, name: String },
-}
+/// The Lua global carrying the launch's `init_ctx.task_metadata` bag into
+/// a script, set through the SDK's `extra_globals` (agent-block-core
+/// v0.30+).
+///
+/// Underscore-prefixed to sit alongside the SDK's own globals.
+/// `_PROMPT` / `_CONTEXT` / `_SCRIPT_NAME` are reserved by the SDK and
+/// must not be used here; this name is ours.
+pub const TASK_METADATA_GLOBAL: &str = "_TASK_METADATA";
 
-impl ScriptPlan {
-    /// The directory whose `package.path` entry the prelude must restore
-    /// — `Some` only for [`Self::CallerScript`], since that is the sole
-    /// variant whose `script_dir` changes when injection forces the
-    /// Inline route (see [`build_prelude`]).
-    fn caller_script_dir(&self) -> Option<&Path> {
-        match self {
-            ScriptPlan::CallerScript(path) => path.parent(),
-            ScriptPlan::Invoker { .. } => None,
-        }
-    }
-
-    /// Resolve to the SDK's [`ScriptSource`] for one invocation, splicing
-    /// `prelude` in front of the chunk body.
-    ///
-    /// With an empty prelude a [`Self::CallerScript`] stays
-    /// `ScriptSource::Path` — byte-for-byte the pre-GH-#86 path, with no
-    /// host-side read and no line-number shift. A non-empty prelude forces
-    /// the read-and-inline route, because `ScriptSource::Path` gives the
-    /// host nowhere to inject.
-    fn resolve(&self, prelude: &str) -> Result<ScriptSource, WorkerError> {
-        match self {
-            ScriptPlan::CallerScript(path) if prelude.is_empty() => {
-                Ok(ScriptSource::Path(path.clone()))
-            }
-            ScriptPlan::CallerScript(path) => {
-                let body = std::fs::read_to_string(path).map_err(|e| {
-                    WorkerError::Failed(format!("agent-block script {}: {e}", path.display()))
-                })?;
-                Ok(ScriptSource::Inline {
-                    source: format!("{prelude}{body}"),
-                    // Keep the on-disk file name so `_SCRIPT_NAME`, tracing
-                    // attribution, and error messages still point at the
-                    // author's file rather than at a synthetic chunk.
-                    name: path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "gate.lua".to_string()),
-                })
-            }
-            ScriptPlan::Invoker { source, name } => Ok(ScriptSource::Inline {
-                source: format!("{prelude}{source}"),
-                name: name.clone(),
-            }),
-        }
-    }
-}
-
-/// Build the one-line prelude spliced in front of the chunk body, or an
-/// empty string when there is nothing to inject.
+/// The one `bus.emit` kind this backend reserves: an emit under it stages
+/// a named part instead of completing the invocation (GH #86).
 ///
-/// Deliberately **exactly one line** (a single trailing `\n`, no interior
-/// newlines) so the line numbers a script author sees in a Lua stack trace
-/// are off by a constant `+1` rather than by an amount that varies with
-/// what got injected.
-///
-/// Two things go in:
-///
-/// 1. `_TASK_METADATA` — the launch's `init_ctx.task_metadata` bag as a Lua
-///    literal. This is the delivery point the in-process lane previously
-///    lacked entirely (the WS Operator lane has always received it, as a
-///    `task_metadata:` line of the Spawn directive header via
-///    `AgentContextView::to_directive_header`).
-/// 2. A `package.path` restoration, for `script_dir` only. The SDK derives
-///    `script_dir` from `ScriptSource::Path(p)` as `p.parent()` but from
-///    `ScriptSource::Inline` as `project_root`, and puts it at the FRONT of
-///    `package.path`. Since injecting forces the Inline route, a caller
-///    script that `require`s a sibling module would otherwise stop
-///    resolving it; re-prepending its own directory keeps that working.
-///
-/// # Trust boundary
-///
-/// `task_metadata` is **caller-supplied at launch time**, and this splices
-/// it into a chunk that is then executed — so [`json_to_lua_literal`]'s
-/// escaping is a security boundary here, not just formatting. It is what
-/// keeps a hostile value (an unbalanced quote / brace, a `--[[` comment
-/// opener, an embedded newline) inert string data instead of executable
-/// Lua. `prelude_escaping_contains_a_hostile_task_metadata_payload`
-/// asserts that through a real Lua VM; keep it passing before widening
-/// what gets embedded here.
-fn build_prelude(task_metadata: Option<&Value>, script_dir: Option<&Path>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(dir) = script_dir {
-        let dir = dir.to_string_lossy();
-        let patterns =
-            json_to_lua_literal(&Value::String(format!("{dir}/?.lua;{dir}/?/init.lua;")));
-        parts.push(format!("package.path={patterns}..package.path"));
-    }
-    if let Some(meta) = task_metadata {
-        parts.push(format!("_TASK_METADATA={}", json_to_lua_literal(meta)));
-    }
-    if parts.is_empty() {
-        return String::new();
-    }
-    format!("{};\n", parts.join("; "))
-}
+/// Payload shape: `{ name = "<part>", content = <any> }`. `name` is
+/// required. Reaching `VerdictChannel::Part` from a script means staging
+/// `{ name = "verdict", content = "PASS" }` before the terminal emit.
+pub const ARTIFACT_EVENT_KIND: &str = "artifact";
 
 /// Settings baked per `AgentDef` — the static portion of one
 /// invocation. Everything task-dependent (`project_root` /
@@ -387,7 +360,7 @@ fn build_prelude(task_metadata: Option<&Value>, script_dir: Option<&Path>) -> St
 #[derive(Clone)]
 struct AgentBlockSettings {
     /// The chunk to run — see [`ScriptPlan`].
-    script: ScriptPlan,
+    script: ScriptSource,
     /// Compile-time fallback cwd: `spec.project_root`, else
     /// `env::current_dir()`. Outranked per invocation by the context
     /// view's `work_dir` / `project_root`.
@@ -413,6 +386,7 @@ async fn run_agent_block_worker(
     let (tx, rx) = oneshot::channel();
     let captor: Arc<dyn Handler> = Arc::new(WorkerResultCaptor {
         tx: Mutex::new(Some(tx)),
+        sink: inv.sink.clone(),
     });
 
     // GH #86: the task-context tier, read off the ONE in-process seam
@@ -420,29 +394,30 @@ async fn run_agent_block_worker(
     // the materialized `AgentContextView`) instead of a hand-rolled `Ctx`
     // peek in a spawner wrapper.
     let project_root = resolve_project_root(inv.context.as_ref(), &settings.spec_project_root);
-    let prelude = build_prelude(
-        inv.context.as_ref().and_then(|v| v.task_metadata.as_ref()),
-        settings.script.caller_script_dir(),
-    );
-    let script = settings.script.resolve(&prelude)?;
 
     // Bridge the shutdown token: forward `WorkerInvocation.cancel_token`
     // into the SDK's `shutdown_token` if one is set; otherwise use a
     // fresh token (no external cancel).
     let shutdown_token = inv.cancel_token.clone().unwrap_or_default();
-    let config = BlockConfig {
-        script,
-        project_root,
-        relay_url: None,
-        secret_key: None,
-        mcp_rpc_timeout: settings.mcp_rpc_timeout,
-        prompt: Some(PromptSource::Inline(inv.prompt)),
-        context: settings.profile_context.clone().map(PromptSource::Inline),
-        host_handlers: HashMap::new(),
-        host_handler: Some(captor),
-        auto_serve_bus: true,
-        shutdown_token: Some(shutdown_token.clone()),
-    };
+
+    let mut builder = BlockConfig::builder(settings.script.clone(), project_root)
+        .mcp_rpc_timeout(settings.mcp_rpc_timeout)
+        .prompt(PromptSource::Inline(inv.prompt))
+        .host_handler(captor)
+        .auto_serve_bus(true)
+        .shutdown_token(shutdown_token.clone());
+    if let Some(system) = settings.profile_context.clone() {
+        builder = builder.context(PromptSource::Inline(system));
+    }
+    // The task-context globals. `extra_globals` (SDK v0.30) sets each entry
+    // on both Isles before the chunk runs, converting the JSON natively —
+    // so nothing is spliced into the script text: no line-number shift, no
+    // `script_dir` / `package.path` disturbance, and no string-escaping
+    // trust boundary around caller-supplied values.
+    if let Some(meta) = inv.context.as_ref().and_then(|v| v.task_metadata.clone()) {
+        builder = builder.extra_globals(HashMap::from([(TASK_METADATA_GLOBAL.to_string(), meta)]));
+    }
+    let config = builder.build();
 
     let run_handle = tokio::spawn(run(config));
     let run_result = run_handle
@@ -544,7 +519,7 @@ fn mcp_tools_of(tools: &[String]) -> Vec<&str> {
 /// conversion on the Rust side and embed the result directly. The
 /// event name is `agent_result` — the same convention the SDK's
 /// internal `DEFAULT_AGENT_INVOKER` uses.
-fn build_inline_agent_invoker(mcp_servers: &[Value]) -> ScriptPlan {
+pub fn build_inline_agent_invoker(mcp_servers: &[Value]) -> ScriptSource {
     let mcp_lua = json_array_to_lua_literal(mcp_servers);
     let source = format!(
         r##"local agent = require("agent")
@@ -557,7 +532,7 @@ local r = agent.run({{
 bus.emit("agent_result", r)
 "##
     );
-    ScriptPlan::Invoker {
+    ScriptSource::Inline {
         source,
         name: "mlua_swarm_engine_default_agent_invoker.lua".into(),
     }
@@ -726,7 +701,7 @@ impl crate::blueprint::compiler::SpawnerFactory for AgentBlockInProcessSpawnerFa
                         ),
                     });
                 }
-                ScriptPlan::CallerScript(PathBuf::from(s))
+                ScriptSource::Path(PathBuf::from(s))
             }
             None => build_inline_agent_invoker(&needed_mcp_servers),
         };
@@ -849,7 +824,7 @@ mod tests {
             vec![serde_json::json!({"name": "outline", "command": "outline-mcp", "args": []})];
         let script = build_inline_agent_invoker(&servers);
         match script {
-            ScriptPlan::Invoker { source, name } => {
+            ScriptSource::Inline { source, name } => {
                 assert!(name.ends_with(".lua"));
                 assert!(source.contains("require(\"agent\")"));
                 assert!(source.contains("mcp_servers = mcp_servers"));
@@ -859,7 +834,7 @@ mod tests {
                 assert!(source.contains("[\"command\"]=\"outline-mcp\""));
                 assert!(source.contains("[\"args\"]={}"), "args empty array literal");
             }
-            other => panic!("expected Invoker, got: {other:?}"),
+            other => panic!("expected Inline, got: {other:?}"),
         }
     }
 
@@ -867,10 +842,10 @@ mod tests {
     fn build_inline_agent_invoker_with_empty_servers_still_valid() {
         let script = build_inline_agent_invoker(&[]);
         match script {
-            ScriptPlan::Invoker { source, .. } => {
+            ScriptSource::Inline { source, .. } => {
                 assert!(source.contains("local mcp_servers = {}"));
             }
-            other => panic!("expected Invoker, got: {other:?}"),
+            other => panic!("expected Inline, got: {other:?}"),
         }
     }
 
@@ -921,6 +896,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let captor = WorkerResultCaptor {
             tx: Mutex::new(Some(tx)),
+            sink: None,
         };
         let payload = serde_json::json!({ "ok": true, "response": "hello" });
         let ack = captor
@@ -1176,153 +1152,132 @@ mod tests {
         assert_eq!(resolved, PathBuf::from("/ctx-work"));
     }
 
-    // ─── GH #86: task_metadata delivery via the generated prelude ─────────
+    // ─── GH #86: task_metadata delivery via SDK extra_globals ─────────────
 
-    /// Nothing to inject → empty prelude, which is what keeps a caller
-    /// script on the untouched `ScriptSource::Path` route.
-    #[test]
-    fn prelude_is_empty_when_there_is_nothing_to_inject() {
-        assert_eq!(build_prelude(None, None), "");
-    }
+    /// An `artifact` emit must reach the sink as an
+    /// `OutputEvent::Artifact` AND leave the invocation running, so the
+    /// script can stage parts and still finish with its terminal emit.
+    #[tokio::test]
+    async fn artifact_kind_stages_a_named_part_without_completing() {
+        use crate::worker::output::{ContentRef, OutputEvent, OutputSink};
 
-    #[test]
-    fn prelude_embeds_task_metadata_as_a_lua_literal() {
-        let meta = serde_json::json!({"issue": 20});
-        let prelude = build_prelude(Some(&meta), None);
-        assert_eq!(prelude, "_TASK_METADATA={[\"issue\"]=20};\n");
-    }
-
-    /// Exactly one line, always — the invariant that keeps a script
-    /// author's Lua stack-trace line numbers off by a constant `+1`
-    /// instead of by an amount that varies with what got injected.
-    #[test]
-    fn prelude_is_always_exactly_one_line() {
-        let meta = serde_json::json!({"a": 1, "b": [2, 3], "c": "x\ny"});
-        for prelude in [
-            build_prelude(Some(&meta), None),
-            build_prelude(None, Some(Path::new("/gates"))),
-            build_prelude(Some(&meta), Some(Path::new("/gates"))),
-        ] {
-            assert!(
-                prelude.ends_with('\n'),
-                "must terminate the line: {prelude:?}"
-            );
-            assert_eq!(
-                prelude.matches('\n').count(),
-                1,
-                "exactly one newline (a `\\n` INSIDE a metadata string must stay escaped): {prelude:?}"
-            );
-        }
-    }
-
-    /// The prelude splices a **caller-supplied** value (the launch's
-    /// `init_ctx.task_metadata`) into a chunk that then gets executed, so
-    /// the Lua-literal escaping is load-bearing as a trust boundary, not
-    /// just as formatting. Run the generated prelude through a real Lua VM
-    /// and assert a hostile payload comes back out as inert string data —
-    /// if escaping ever regressed, `breakout` would be set and the values
-    /// would not round-trip.
-    #[test]
-    fn prelude_escaping_contains_a_hostile_task_metadata_payload() {
-        let hostile = serde_json::json!({
-            "quote": "\"; breakout = true; local _ = \"",
-            "close_brace": "}; breakout = true; local _ = {",
-            "comment": "--[[ breakout = true ]]",
-            "newline": "line1\nbreakout = true\nline2",
-            "backslash": "c:\\path\\to",
-        });
-        let prelude = build_prelude(Some(&hostile), None);
-        let lua = mlua::Lua::new();
-        lua.load(&prelude)
-            .exec()
-            .expect("the generated prelude must be valid Lua");
-
-        let globals = lua.globals();
-        assert!(
-            globals.get::<Option<bool>>("breakout").unwrap().is_none(),
-            "no payload may escape its string literal: {prelude}"
-        );
-        let meta: mlua::Table = globals.get("_TASK_METADATA").expect("_TASK_METADATA set");
-        for key in ["quote", "close_brace", "comment", "newline", "backslash"] {
-            let got: String = meta.get(key).expect("key present");
-            assert_eq!(
-                got,
-                hostile[key].as_str().unwrap(),
-                "value must round-trip verbatim for key {key}"
-            );
-        }
-    }
-
-    #[test]
-    fn prelude_restores_the_caller_scripts_own_package_path() {
-        let prelude = build_prelude(None, Some(Path::new("/gates")));
-        assert!(
-            prelude.contains("package.path=\"/gates/?.lua;/gates/?/init.lua;\"..package.path"),
-            "the script's own dir must be re-prepended: {prelude}"
-        );
-    }
-
-    // ─── ScriptPlan resolution ────────────────────────────────────────────
-
-    /// The zero-injection path must stay byte-for-byte the pre-GH-#86
-    /// behavior: `ScriptSource::Path`, no host-side read (so a script that
-    /// does not exist yet at spawn time still fails inside the SDK, where
-    /// it always did), and no line-number shift.
-    #[test]
-    fn caller_script_stays_a_path_when_the_prelude_is_empty() {
-        let plan = ScriptPlan::CallerScript(PathBuf::from("/nonexistent/gate.lua"));
-        match plan
-            .resolve("")
-            .expect("empty prelude must not read the file")
-        {
-            ScriptSource::Path(p) => assert_eq!(p, PathBuf::from("/nonexistent/gate.lua")),
-            other => panic!("expected Path, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn caller_script_inlines_with_the_prelude_and_keeps_its_file_name() {
-        let dir = std::env::temp_dir().join(format!("gh86-plan-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create dir");
-        let path = dir.join("danger.lua");
-        std::fs::write(&path, "return 1\n").expect("write script");
-
-        let plan = ScriptPlan::CallerScript(path.clone());
-        match plan.resolve("_TASK_METADATA={};\n").expect("resolve") {
-            ScriptSource::Inline { source, name } => {
-                assert_eq!(name, "danger.lua", "author's file name is preserved");
-                assert_eq!(source, "_TASK_METADATA={};\nreturn 1\n");
+        #[derive(Default)]
+        struct RecordingSink(Mutex<Vec<OutputEvent>>);
+        #[async_trait]
+        impl OutputSink for RecordingSink {
+            async fn emit(&self, event: OutputEvent) -> Result<(), crate::EngineError> {
+                self.0.lock().unwrap().push(event);
+                Ok(())
             }
-            other => panic!("expected Inline, got: {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    #[test]
-    fn caller_script_read_failure_is_a_worker_error() {
-        let plan = ScriptPlan::CallerScript(PathBuf::from("/nonexistent/gate.lua"));
-        let err = plan
-            .resolve("_TASK_METADATA={};\n")
-            .expect_err("missing file must surface");
-        assert!(
-            format!("{err}").contains("/nonexistent/gate.lua"),
-            "names the unreadable path: {err}"
-        );
-    }
+        let sink = Arc::new(RecordingSink::default());
+        let (tx, mut rx) = oneshot::channel();
+        let captor = WorkerResultCaptor {
+            tx: Mutex::new(Some(tx)),
+            sink: Some(sink.clone()),
+        };
 
-    #[test]
-    fn invoker_takes_the_prelude_without_a_package_path_fix() {
-        let plan = build_inline_agent_invoker(&[]);
-        assert!(
-            plan.caller_script_dir().is_none(),
-            "the invoker's script_dir is already project_root — nothing to restore"
-        );
-        match plan.resolve("_TASK_METADATA={};\n").expect("resolve") {
-            ScriptSource::Inline { source, .. } => {
-                assert!(source.starts_with("_TASK_METADATA={};\n"));
-                assert!(source.contains("require(\"agent\")"));
+        captor
+            .call(
+                ARTIFACT_EVENT_KIND.into(),
+                "evt-1".into(),
+                serde_json::json!({ "name": "verdict", "content": "PASS" }),
+                Value::Null,
+            )
+            .await
+            .expect("staging must succeed");
+
+        let staged = sink.0.lock().unwrap().clone();
+        assert_eq!(staged.len(), 1, "exactly one artifact staged");
+        match &staged[0] {
+            OutputEvent::Artifact { name, content } => {
+                assert_eq!(name, "verdict");
+                // `ContentRef` is not `PartialEq`; match the variant.
+                match content {
+                    ContentRef::Inline { value } => {
+                        assert_eq!(value, &serde_json::json!("PASS"))
+                    }
+                    other => panic!("expected Inline content, got: {other:?}"),
+                }
             }
-            other => panic!("expected Inline, got: {other:?}"),
+            other => panic!("expected Artifact, got: {other:?}"),
         }
+        assert!(
+            rx.try_recv().is_err(),
+            "an artifact emit must NOT complete the invocation"
+        );
+
+        // The terminal emit still lands afterwards.
+        captor
+            .call(
+                "worker_result".into(),
+                "evt-2".into(),
+                serde_json::json!({ "ok": true, "response": "done" }),
+                Value::Null,
+            )
+            .await
+            .expect("terminal emit");
+        assert_eq!(
+            rx.await.expect("recv").value,
+            serde_json::json!("done"),
+            "the non-reserved kind still completes the invocation"
+        );
+    }
+
+    /// An `artifact` emit with no `name` cannot address a part, so it is
+    /// an error back to the script rather than a silent drop.
+    #[tokio::test]
+    async fn artifact_without_a_name_is_reported_to_the_script() {
+        let (tx, _rx) = oneshot::channel();
+        let captor = WorkerResultCaptor {
+            tx: Mutex::new(Some(tx)),
+            sink: None,
+        };
+        let err = captor
+            .call(
+                ARTIFACT_EVENT_KIND.into(),
+                "evt-1".into(),
+                serde_json::json!({ "content": "PASS" }),
+                Value::Null,
+            )
+            .await
+            .expect_err("a nameless artifact must fail loud");
+        assert!(
+            format!("{err}").contains("name"),
+            "names the missing field: {err}"
+        );
+    }
+
+    /// The global name must not collide with the three the SDK reserves
+    /// for itself — a collision would be silently overwritten one way or
+    /// the other depending on injection order.
+    #[test]
+    fn task_metadata_global_does_not_shadow_an_sdk_reserved_name() {
+        for reserved in ["_PROMPT", "_CONTEXT", "_SCRIPT_NAME"] {
+            assert_ne!(TASK_METADATA_GLOBAL, reserved);
+        }
+    }
+
+    /// Script mode keeps `ScriptSource::Path`: delivering `task_metadata`
+    /// through `extra_globals` means the chunk itself is never rewritten,
+    /// so a caller script's own directory stays on `package.path` (sibling
+    /// `require` keeps working) and its Lua stack-trace line numbers are
+    /// unshifted. The `sibling_require_resolves_*` e2e is the behavioural
+    /// half of this claim.
+    #[tokio::test]
+    async fn script_mode_never_rewrites_the_caller_chunk() {
+        use crate::blueprint::compiler::SpawnerFactory;
+
+        let ad = agent_block_def(
+            "gate-danger",
+            serde_json::json!({ "script_path": "/nonexistent/gate.lua" }),
+            &[],
+        );
+        // A build must succeed without touching the file: the path is
+        // handed to the SDK verbatim, exactly as before GH #86.
+        AgentBlockInProcessSpawnerFactory::new()
+            .build(&ad, None)
+            .expect("script mode must not read the script at build time");
     }
 }

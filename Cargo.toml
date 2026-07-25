@@ -47,8 +47,8 @@ serde_yaml = "0.9"
 minijinja = "2"
 mlua = { version = "0.11", features = ["lua54", "vendored", "serde"] }
 tempfile = "3"
-agent-block-core = "0.28.1"
-agent-block-types = "0.28.1"
+agent-block-core = "0.31.0"
+agent-block-types = "0.31.0"
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json"] }

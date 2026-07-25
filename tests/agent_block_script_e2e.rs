@@ -134,6 +134,86 @@ bus.emit("worker_result", { ok = true, response = "PASS" })
     assert_eq!(out.final_ctx["danger_result"], json!("PASS"));
 }
 
+/// GH #86: `VerdictChannel::Part` (Pattern B) is reachable from a script.
+/// The gate stages a named `verdict` part via the reserved `artifact`
+/// emit kind, then finishes with a separate plain-body report — and the
+/// completion-time contract check reads the STAGED part, not the body.
+/// Before the sink bridge, staging had no route out of this backend and a
+/// `channel: "part"` contract always failed with `VerdictPartMissing`.
+#[tokio::test]
+async fn script_mode_gate_satisfies_a_part_channel_verdict_contract() {
+    let (script, dir) = write_script(
+        "verdict-part",
+        r#"
+bus.emit("artifact", { name = "verdict", content = "PASS" })
+bus.emit("worker_result", { ok = true, response = "the full prose report" })
+"#,
+    );
+    let bp = script_agent_bp(
+        "gh86-script-verdict-part",
+        &script,
+        &dir,
+        json!({"channel": "part", "values": ["PASS", "BLOCKED"]}),
+    );
+    let out = service()
+        .launch(launch_input(bp, json!({})))
+        .await
+        .expect("launch must complete");
+    assert_eq!(
+        out.final_ctx["danger_result"],
+        json!("the full prose report"),
+        "the body stays the report; the verdict rode the staged part"
+    );
+}
+
+/// The staged part is what the `part` contract validates: a gate staging
+/// a token outside its declared `values` fails even though its plain body
+/// is unremarkable.
+#[tokio::test]
+async fn script_mode_gate_staging_an_undeclared_part_verdict_fails_the_step() {
+    let (script, dir) = write_script(
+        "verdict-part-bad",
+        r#"
+bus.emit("artifact", { name = "verdict", content = "MAYBE" })
+bus.emit("worker_result", { ok = true, response = "looks fine to me" })
+"#,
+    );
+    let bp = script_agent_bp(
+        "gh86-script-verdict-part-bad",
+        &script,
+        &dir,
+        json!({"channel": "part", "values": ["PASS", "BLOCKED"]}),
+    );
+    let result = service().launch(launch_input(bp, json!({}))).await;
+    assert!(
+        result.is_err(),
+        "an undeclared staged verdict must fail the step: {result:?}"
+    );
+}
+
+/// A `part` contract with nothing staged fails — the gate must not pass
+/// just because its body happened to look acceptable.
+#[tokio::test]
+async fn script_mode_part_contract_without_a_staged_verdict_fails_the_step() {
+    let (script, dir) = write_script(
+        "verdict-part-missing",
+        r#"
+bus.emit("worker_result", { ok = true, response = "PASS" })
+"#,
+    );
+    let bp = script_agent_bp(
+        "gh86-script-verdict-part-missing",
+        &script,
+        &dir,
+        json!({"channel": "part", "values": ["PASS", "BLOCKED"]}),
+    );
+    let result = service().launch(launch_input(bp, json!({}))).await;
+    assert!(
+        result.is_err(),
+        "a part contract with no staged verdict must fail: {result:?}"
+    );
+}
+
 /// A gate emitting a token OUTSIDE its declared `values` is rejected by
 /// the completion-time contract check — the enforcement is live on the
 /// in-process AgentBlock path, not just on the HTTP submit routes.
@@ -226,7 +306,8 @@ bus.emit("worker_result", {
 }
 
 /// GH #86: the launch's `init_ctx.task_metadata` bag reaches the script
-/// as the `_TASK_METADATA` Lua global, injected by the generated prelude.
+/// as the `_TASK_METADATA` Lua global, set through the SDK's
+/// `extra_globals` (so the JSON is converted natively — nesting intact).
 /// Before this, the in-process lane resolved the value and then dropped
 /// it, while the WS Operator lane had always received it as a
 /// `task_metadata:` line of the Spawn directive header.
@@ -259,14 +340,18 @@ bus.emit("worker_result", {
     );
 }
 
-/// The no-metadata case keeps the untouched `ScriptSource::Path` route
-/// (empty prelude), so `_TASK_METADATA` is simply absent rather than an
-/// empty table — and, critically, the script's own directory is still on
-/// `package.path` so a sibling `require` resolves. The metadata case
-/// above takes the inline route, where the prelude has to restore that
-/// path itself; this pair pins both sides of that branch.
+/// Delivering `task_metadata` must not disturb the chunk itself.
+///
+/// Because it rides on the SDK's `extra_globals` rather than on anything
+/// spliced into the source, a caller script keeps `ScriptSource::Path` in
+/// both cases — so its own directory stays at the front of `package.path`
+/// and a sibling `require` resolves whether or not metadata was supplied.
+/// (An earlier iteration injected a generated prelude, which forced the
+/// inline route and would have moved `script_dir` to `project_root`; this
+/// test is the regression guard for that whole class.) With no metadata,
+/// `_TASK_METADATA` is simply absent rather than an empty table.
 #[tokio::test]
-async fn sibling_require_resolves_on_both_the_path_and_inline_routes() {
+async fn sibling_require_resolves_with_and_without_task_metadata() {
     let (script, dir) = write_script(
         "sibling-require",
         r#"
@@ -283,20 +368,19 @@ bus.emit("worker_result", {
     )
     .expect("write sibling module");
 
-    // (a) no task_metadata → empty prelude → ScriptSource::Path route.
-    let bp = script_agent_bp("gh86-sibling-path", &script, &dir, Value::Null);
+    // (a) no task_metadata supplied.
+    let bp = script_agent_bp("gh86-sibling-no-meta", &script, &dir, Value::Null);
     let out = service()
         .launch(launch_input(bp, json!({})))
         .await
-        .expect("Path route must complete");
+        .expect("no-metadata launch must complete");
     assert_eq!(
         out.final_ctx["danger_result"],
         json!({"helped": "from-sibling", "meta": "absent"})
     );
 
-    // (b) task_metadata present → prelude → inline route, where the
-    // generated `package.path` line is what keeps `require` working.
-    let bp = script_agent_bp("gh86-sibling-inline", &script, &dir, Value::Null);
+    // (b) task_metadata present — same chunk, same route, plus the global.
+    let bp = script_agent_bp("gh86-sibling-with-meta", &script, &dir, Value::Null);
     let mut input = launch_input(bp, json!({}));
     input.task_input = Some(TaskInputSpec {
         project_root: None,
@@ -306,11 +390,11 @@ bus.emit("worker_result", {
     let out = service()
         .launch(input)
         .await
-        .expect("inline route must complete");
+        .expect("with-metadata launch must complete");
     assert_eq!(
         out.final_ctx["danger_result"],
         json!({"helped": "from-sibling", "meta": "present"}),
-        "the prelude must re-prepend the script's own dir to package.path"
+        "supplying task_metadata must not disturb the chunk or package.path"
     );
 }
 

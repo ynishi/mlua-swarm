@@ -72,8 +72,9 @@
 //! |---|---|
 //! | WS Operator (`operator_ws::session`) | [`AgentContextView::to_directive_header`] spliced into the Spawn directive, plus the full view on `WorkerPayload.context` |
 //! | Subprocess (`crate::worker::process_spawner`) | `work_dir` / `project_root` → the `{work_dir}` template placeholder |
-//! | AgentBlock (`crate::worker::agent_block::runtime`) | `work_dir` / `project_root` → the SDK's `project_root`; `task_metadata` → the `_TASK_METADATA` Lua global |
-//! | RustFn / Lua in-process | Carried on `inv.context`; no rendering of their own yet |
+//! | AgentBlock (`crate::worker::agent_block::runtime`) | `work_dir` / `project_root` → the SDK's `project_root`; `task_metadata` → the `_TASK_METADATA` Lua global (via the SDK's `extra_globals`) |
+//! | Lua in-process (`compiler::run_lua_worker`) | `task_metadata` → the `_TASK_METADATA` Lua global, the same name AgentBlock uses, so a Lua gate is portable between the two |
+//! | RustFn in-process | Carried on `inv.context`; no rendering of its own (a Rust closure reads the typed view directly if it wants it) |
 //!
 //! A field added to [`AgentContextView`] (either a named field, or an
 //! `extra` entry) reaches both carriers automatically — only a backend
