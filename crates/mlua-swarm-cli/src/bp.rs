@@ -727,9 +727,7 @@ fn render_fanout_template(
     out.push_str("-- each operator agent's explicit `ws_operator` Runner; the\n");
     out.push_str("-- operator's `kind = main_ai`; `strict_refs` + `strict_kind`).\n");
     out.push_str("--\n");
-    out.push_str(
-        "-- Launch prerequisite (mirrors `pipeline` / `verdict` — GH #64): each\n",
-    );
+    out.push_str("-- Launch prerequisite (mirrors `pipeline` / `verdict` — GH #64): each\n");
     out.push_str("-- checker reads its input from `$.d.<checker>`. Seed every\n");
     out.push_str("-- checker under `d` when starting a run:\n");
     out.push_str("--\n");
@@ -737,9 +735,7 @@ fn render_fanout_template(
         "--   swarm_run(blueprint = ..., init_ctx = {{ d = {{ {init_ctx_sample} }} }})\n"
     ));
     out.push_str("--\n");
-    out.push_str(
-        "-- The fanout `join = \"all\"` gathers every branch's final ctx into an\n",
-    );
+    out.push_str("-- The fanout `join = \"all\"` gathers every branch's final ctx into an\n");
     out.push_str("-- ordered array at `$.results`; the aggregate stage reads that\n");
     out.push_str("-- array and produces the final decision.\n");
     out.push_str("--\n");
@@ -1606,12 +1602,16 @@ mod tests {
         // The halted-at case is a serde shape error, not a CompileError —
         // the string fallback must still synthesize the Diagnostic and
         // the derived hint.
-        let err = anyhow!("compile lint: blueprint shape invalid after $agent_md expansion: missing field `at`");
+        let err = anyhow!(
+            "compile lint: blueprint shape invalid after $agent_md expansion: missing field `at`"
+        );
         let d = diagnostic_for_error(&err).expect("string path must recognize the serde error");
         assert_eq!(d.kind, "halted-at-missing");
         let hint = fix_hint_for_error(&err).expect("halted-at hint must fire");
         assert_eq!(hint.kind, "halted-at-missing");
-        assert!(hint.patch_suggestion.contains("halted_at = \"$.halted_at\""));
+        assert!(hint
+            .patch_suggestion
+            .contains("halted_at = \"$.halted_at\""));
     }
 
     #[test]
@@ -1637,8 +1637,8 @@ mod tests {
                 .any(|c| c.downcast_ref::<mlua_swarm::CompileError>().is_some()),
             "typed CompileError must survive the compile_lint anyhow chain: {err:#}"
         );
-        let d = diagnostic_for_error(&err)
-            .expect("typed CompileError must project into a Diagnostic");
+        let d =
+            diagnostic_for_error(&err).expect("typed CompileError must project into a Diagnostic");
         assert!(
             mlua_swarm_diag::lint_decl(d.kind).is_some(),
             "projected kind '{}' must be a declared lint",

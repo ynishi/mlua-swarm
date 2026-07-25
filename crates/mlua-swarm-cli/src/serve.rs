@@ -722,7 +722,10 @@ async fn mark_run_interrupted(
 ) {
     let envelope = serde_json::json!({ "error": reason });
     if let Err(e) = run_store.set_result(&run.id, envelope).await {
-        eprintln!("mse serve: {context}: run {} set_result failed: {e}", run.id);
+        eprintln!(
+            "mse serve: {context}: run {} set_result failed: {e}",
+            run.id
+        );
     }
     if let Err(e) = run_store
         .update_status(&run.id, mlua_swarm::store::run::RunStatus::Interrupted)
@@ -770,7 +773,14 @@ async fn interrupt_running_on_shutdown(
         }
     };
     for run in running {
-        mark_run_interrupted(task_store, run_store, &run, "server shutdown", "shutdown drain").await;
+        mark_run_interrupted(
+            task_store,
+            run_store,
+            &run,
+            "server shutdown",
+            "shutdown drain",
+        )
+        .await;
     }
 }
 

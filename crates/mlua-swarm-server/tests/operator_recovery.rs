@@ -182,7 +182,10 @@ async fn by_role_delete_returns_404_when_no_session_holds_the_role() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .delete(format!("{}/v1/operators/by-role/no-such-role", server.base_url))
+        .delete(format!(
+            "{}/v1/operators/by-role/no-such-role",
+            server.base_url
+        ))
         .send()
         .await
         .expect("by-role delete request");

@@ -130,9 +130,8 @@ use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
 use mlua_swarm::{
     CapToken, Compiler, Engine, LayerRegistry, LongHoldMiddleware, LuaInProcessSpawnerFactory,
     MainAIMiddleware, OperatorDelegateMiddleware, OperatorSpawnerFactory, Role, RunId,
-    RustFnInProcessSpawnerFactory,
-    SeniorEscalationMiddleware, SessionId, SpawnerRegistry, SubprocessProcessSpawnerFactory,
-    TaskId,
+    RustFnInProcessSpawnerFactory, SeniorEscalationMiddleware, SessionId, SpawnerRegistry,
+    SubprocessProcessSpawnerFactory, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

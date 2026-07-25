@@ -654,8 +654,10 @@ mod tests {
     fn unit_stage_variants_serialize_internally_tagged() {
         let v = serde_json::to_value(DiagStage::CompileLint).expect("stage must serialize");
         assert_eq!(v["type"], "CompileLint");
-        let step = serde_json::to_value(DiagElement::Step { ref_: "scout".into() })
-            .expect("element must serialize");
+        let step = serde_json::to_value(DiagElement::Step {
+            ref_: "scout".into(),
+        })
+        .expect("element must serialize");
         assert_eq!(step["type"], "Step");
         assert_eq!(step["ref"], "scout");
     }

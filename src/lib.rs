@@ -124,12 +124,6 @@ pub use blueprint::compiler::{
     RustFnInProcessSpawnerFactory, SpawnerFactory, SpawnerFactoryKind, SpawnerRegistry,
     SubprocessProcessSpawnerFactory, WORKER_BINDING_REQUIRED_MSG_PREFIX,
 };
-/// GH #79: the unified diagnostic vocabulary crate, re-exported so
-/// downstream users of `mlua-swarm` reach the `Diagnostic` /
-/// `LintDecl` types (`impl From<&CompileError> for diag::Diagnostic`
-/// lives in [`blueprint::compiler`]) without a separate dependency
-/// declaration.
-pub use mlua_swarm_diag as diag;
 pub use blueprint::loader::{expand_file_refs, load_blueprint_from_path, LoadError};
 pub use blueprint::{
     current_schema_version, AgentDef, AgentKind, AgentMeta, AgentProviderCapability,
@@ -159,6 +153,12 @@ pub use middleware::{
     AuditMiddleware, LayerFactory, LayerRegistry, LongHoldMiddleware, MainAIMiddleware,
     OperatorDelegateMiddleware, SeniorEscalationMiddleware, SpawnerLayer, SpawnerStack,
 };
+/// GH #79: the unified diagnostic vocabulary crate, re-exported so
+/// downstream users of `mlua-swarm` reach the `Diagnostic` /
+/// `LintDecl` types (`impl From<&CompileError> for diag::Diagnostic`
+/// lives in [`blueprint::compiler`]) without a separate dependency
+/// declaration.
+pub use mlua_swarm_diag as diag;
 pub use operator::{Operator, OperatorSpawner, WorkerBinding};
 pub use service::{
     TaskInputSpec, TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService,
