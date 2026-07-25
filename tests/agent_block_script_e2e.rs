@@ -340,6 +340,42 @@ bus.emit("worker_result", {
     );
 }
 
+/// GH #86 / GH #21: Blueprint-declared agent context
+/// (`default_agent_ctx` / `AgentMeta.ctx`, `ContextPolicy`-filtered)
+/// reaches the script as the `_AGENT_CTX` Lua table. The WS Operator lane
+/// has always received these as directive-header lines; before this the
+/// in-process lane resolved them into `AgentContextView.extra` and then
+/// rendered nothing.
+#[tokio::test]
+async fn blueprint_declared_agent_ctx_reaches_the_script() {
+    let (script, dir) = write_script(
+        "agent-ctx",
+        r#"
+bus.emit("worker_result", {
+    ok = true,
+    response = {
+        conventions = _AGENT_CTX and _AGENT_CTX.org_conventions or "none",
+        depth = _AGENT_CTX and _AGENT_CTX.nested and _AGENT_CTX.nested.level or "none",
+    },
+})
+"#,
+    );
+    let mut bp = script_agent_bp("gh86-script-agent-ctx", &script, &dir, Value::Null);
+    bp["default_agent_ctx"] = json!({
+        "org_conventions": "two-space indent",
+        "nested": { "level": 2 },
+    });
+    let out = service()
+        .launch(launch_input(bp, json!({})))
+        .await
+        .expect("launch must complete");
+    assert_eq!(
+        out.final_ctx["danger_result"],
+        json!({"conventions": "two-space indent", "depth": 2}),
+        "BP-declared agent ctx must arrive as a real Lua table, nesting intact"
+    );
+}
+
 /// Delivering `task_metadata` must not disturb the chunk itself.
 ///
 /// Because it rides on the SDK's `extra_globals` rather than on anything
@@ -396,6 +432,102 @@ bus.emit("worker_result", {
         json!({"helped": "from-sibling", "meta": "present"}),
         "supplying task_metadata must not disturb the chunk or package.path"
     );
+}
+
+/// GH #86 AC "the bundled sample dispatches end to end": the shape of
+/// `mse://blueprints/samples/05-after-run-audit-agent-block` — a `rust_fn`
+/// worker running the flow's only step, with an `agent_block` auditor
+/// auto-kicked in-process after that step settles via `audits` — actually
+/// reaches the AgentBlock backend and runs.
+///
+/// The bundled sample's auditor is PromptBasedAgent, so dispatching *it*
+/// verbatim would call a model: non-deterministic, billable, and not
+/// runnable in CI. This runs the identical wiring with a ScriptBased
+/// auditor instead, which exercises everything up to (and excluding) the
+/// model call: audits resolution, the in-process kick, the AgentBlock
+/// spawner, and the artifact fold onto the audited step's output tail.
+/// The sample's own compile is covered by
+/// `json_sample_bodies_compile_under_the_lint_registry`.
+#[tokio::test]
+async fn after_run_audit_kicks_an_agent_block_auditor_in_process() {
+    use mlua_swarm::{AgentBlockInProcessSpawnerFactory, RustFnInProcessSpawnerFactory};
+
+    // The auditor writes a marker so the assertion is positive evidence
+    // that the script body ran, not merely that the launch survived — an
+    // audit is observational and never gates the flow, so a green launch
+    // alone would also be consistent with the auditor never dispatching.
+    let marker = std::env::temp_dir().join(format!(
+        "gh86-audit-marker-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let (script, dir) = write_script(
+        "auditor",
+        &format!(
+            r#"
+local f = assert(io.open({marker:?}, "w"))
+f:write(tostring(_PROMPT))
+f:close()
+bus.emit("worker_result", {{ ok = true, response = "audited" }})
+"#,
+            marker = marker.display().to_string()
+        ),
+    );
+    let bp = json!({
+        "schema_version": "0.1.0",
+        "id": "gh86-after-run-audit-agent-block",
+        "flow": {
+            "kind": "step",
+            "ref": "worker",
+            "in": {"op": "lit", "value": "do the thing"},
+            "out": {"op": "path", "at": "$.result"}
+        },
+        "agents": [
+            { "name": "worker", "kind": "rust_fn", "spec": {"fn_id": "identity"} },
+            {
+                "name": "auditor",
+                "kind": "agent_block",
+                "spec": {
+                    "script_path": script.display().to_string(),
+                    "project_root": dir.display().to_string()
+                },
+                "runner": {"backend": "agent_block_in_process", "tools": []}
+            }
+        ],
+        "audits": [{ "agent": "auditor", "steps": ["worker"], "mode": "sync" }]
+    });
+
+    // The audit lane needs both backends registered, unlike the
+    // single-agent cases above.
+    let mut reg = SpawnerRegistry::new();
+    reg.register::<AgentBlockInProcessSpawnerFactory>(Arc::new(
+        AgentBlockInProcessSpawnerFactory::new(),
+    ));
+    reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(
+        mlua_swarm::worker::baseline::extend_with_baseline(RustFnInProcessSpawnerFactory::new()),
+    ));
+    let svc = TaskLaunchService::new(Engine::new(EngineCfg::default()), Compiler::new(reg));
+
+    let out = svc
+        .launch(launch_input(bp, json!({})))
+        .await
+        .expect("launch must complete");
+    assert_eq!(
+        out.final_ctx["result"]["echoed"],
+        json!("do the thing"),
+        "the audited step's own outcome is untouched by the audit"
+    );
+
+    let seen = std::fs::read_to_string(&marker)
+        .expect("the auditor script must have run in-process and written its marker");
+    assert!(
+        seen.contains("worker"),
+        "the auditor's prompt should name the step it audits, got: {seen:?}"
+    );
+    let _ = std::fs::remove_file(&marker);
 }
 
 /// A gate that finishes without emitting anything is a failed step, not a

@@ -1823,19 +1823,20 @@ async fn run_lua_worker(
 
             // 1b. GH #86: the task-context tier, off the same
             //     `WorkerInvocation.context` seam the AgentBlock backend
-            //     reads — same global name (`_TASK_METADATA`) so a Lua gate
-            //     is portable between the two in-process backends. Absent
-            //     `task_metadata` leaves the global unset (nil), matching
-            //     every other "insert nothing when absent" contract here.
-            if let Some(meta) = inv.context.as_ref().and_then(|v| v.task_metadata.as_ref()) {
+            //     reads, rendered through the same shared mapping
+            //     (`context_globals`) so a Lua gate sees identical globals
+            //     on either in-process backend and stays portable between
+            //     them. An absent field contributes no entry, so the
+            //     global is simply nil — the "insert nothing when absent"
+            //     contract the rest of this axis follows.
+            for (name, value) in
+                crate::worker::agent_block::runtime::context_globals(inv.context.as_ref())
+            {
                 let lua_val = lua
-                    .to_value(meta)
-                    .map_err(|e| format!("_TASK_METADATA to_value: {e}"))?;
-                g.set(
-                    crate::worker::agent_block::runtime::TASK_METADATA_GLOBAL,
-                    lua_val,
-                )
-                .map_err(|e| format!("set _TASK_METADATA: {e}"))?;
+                    .to_value(&value)
+                    .map_err(|e| format!("{name} to_value: {e}"))?;
+                g.set(name.as_str(), lua_val)
+                    .map_err(|e| format!("set {name}: {e}"))?;
             }
 
             // 2. _CTX = JSON parse(_PROMPT); nil on parse failure (co-exists with the plain-string prompt path).

@@ -72,9 +72,31 @@
 //! |---|---|
 //! | WS Operator (`operator_ws::session`) | [`AgentContextView::to_directive_header`] spliced into the Spawn directive, plus the full view on `WorkerPayload.context` |
 //! | Subprocess (`crate::worker::process_spawner`) | `work_dir` / `project_root` → the `{work_dir}` template placeholder |
-//! | AgentBlock (`crate::worker::agent_block::runtime`) | `work_dir` / `project_root` → the SDK's `project_root`; `task_metadata` → the `_TASK_METADATA` Lua global (via the SDK's `extra_globals`) |
-//! | Lua in-process (`compiler::run_lua_worker`) | `task_metadata` → the `_TASK_METADATA` Lua global, the same name AgentBlock uses, so a Lua gate is portable between the two |
+//! | AgentBlock (`crate::worker::agent_block::runtime`) | `work_dir` / `project_root` → the SDK's `project_root`; `task_metadata` → `_TASK_METADATA`; `extra` → `_AGENT_CTX` (both via the SDK's `extra_globals`) |
+//! | Lua in-process (`compiler::run_lua_worker`) | The same two globals, rendered from the same shared `agent_block::runtime::context_globals` mapping, so a Lua gate is portable between the two in-process backends |
 //! | RustFn in-process | Carried on `inv.context`; no rendering of its own (a Rust closure reads the typed view directly if it wants it) |
+//!
+//! ### Why `steps` is out-of-process only
+//!
+//! [`AgentContextView::steps`] is populated on exactly one path — the
+//! `WorkerPayload` clone that `GET /v1/worker/prompt` returns — and stays
+//! empty on the in-process carrier. That is by construction, not an
+//! oversight on the in-process side:
+//!
+//! - A [`StepPointer`] is a *fetch instruction* (`content_url`,
+//!   `file_path`, `sha256`). It exists because a worker in another
+//!   process cannot read the flow ctx, so it needs somewhere to go get a
+//!   prior step's OUTPUT. Assembling one requires server-side state
+//!   (projection root, OutputStore, the HTTP base a `content_url` is
+//!   relative to) that lives above this crate.
+//! - An in-process worker has a strictly better route to the same data:
+//!   the step's own `in` expression. `Step.in` is an `Expr` over ctx, so
+//!   a Blueprint author writes `in: $.<prior_step>` (or any projection of
+//!   it) and the value arrives directly — no pointer, no fetch, no
+//!   policy-filtered pointer list to walk.
+//!
+//! So the two carriers are not asymmetric in capability, only in
+//! mechanism. A gate that needs prior-step output declares it in `in`.
 //!
 //! A field added to [`AgentContextView`] (either a named field, or an
 //! `extra` entry) reaches both carriers automatically — only a backend

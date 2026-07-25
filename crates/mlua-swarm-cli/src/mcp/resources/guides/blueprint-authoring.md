@@ -495,7 +495,7 @@ Instead of writing an `AgentDef` object inline, you can reference an
 `agent.md` file (frontmatter + Markdown body) and let the loader expand it:
 
 ```jsonc
-{ "agents": [ { "$agent_md": "agents/domain-researcher.md" } ] }
+{ "agents": [ { "$agent_md": "agents/researcher.md" } ] }
 ```
 
 This parses the file's frontmatter + body into a fully-populated `AgentDef`
@@ -505,7 +505,7 @@ overriding just `spec.operator_ref` or `meta` while keeping the rest of the
 `agent.md` content:
 
 ```jsonc
-{ "$agent_md": "agents/domain-researcher.md", "spec": { "operator_ref": "role-a" } }
+{ "$agent_md": "agents/researcher.md", "spec": { "operator_ref": "role-a" } }
 ```
 
 **Path hygiene**: refs are resolved relative to the Blueprint file's own
@@ -628,6 +628,15 @@ env:
 | `_PROMPT` | the step's evaluated `in`, as a **String** — a structured `in` arrives JSON-stringified, so use `std.json.decode(_PROMPT)` if you want a table |
 | `_CONTEXT` | `profile.system_prompt` |
 | `_TASK_METADATA` | the launch's `init_ctx.task_metadata` bag, as a real Lua table |
+| `_AGENT_CTX` | the Blueprint-declared agent context (`default_agent_ctx` / `AgentMeta.ctx`) after `ContextPolicy` filtering, as a real Lua table |
+
+An absent field sets no global at all, so a script can branch on `nil`.
+A `kind: lua` agent gets the same `_TASK_METADATA` / `_AGENT_CTX` pair, so
+a gate is portable between the two in-process backends.
+
+Prior-step OUTPUT is not delivered as a global: an in-process gate reads
+it through its own `in` expression (`in: $.<prior_step>`), which is more
+direct than the pointer list a WebSocket worker has to fetch.
 
 The per-task working directory is not a global: `init_ctx.work_dir` /
 `init_ctx.project_root` outrank `spec.project_root` and become the SDK's

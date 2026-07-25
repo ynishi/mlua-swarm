@@ -11,12 +11,16 @@
 //! removed — they were the collision source when a single process
 //! hosts multiple agent.md files.
 //!
-//! ## Two modes (via `ScriptSource`, v0.27.0)
+//! ## Two modes (via `ScriptSource`)
 //!
-//! | Mode | Trigger | Path |
+//! | Mode | Trigger | Chunk |
 //! |---|---|---|
-//! | **PromptBasedAgent** (default) | `spec.script_path` absent | `ScriptSource::DefaultAgent` — the SDK's embedded invoker (the `agent` StdPkg module invoked with `_PROMPT` / `_CONTEXT`); event kind = `agent_result`. |
-//! | **ScriptBasedAgent** | `spec.script_path = "<path>"` | `ScriptSource::Path(...)` — a caller-provided Lua script; event kind = `worker_result`. |
+//! | **PromptBasedAgent** (default) | `spec.script_path` absent | `ScriptSource::Inline` — the invoker [`build_inline_agent_invoker`] generates, which calls the SDK's `agent` StdPkg module with the resolved `mcp_servers` embedded. NOT the SDK's own `DefaultAgent`: that one passes no tools, so a frontmatter `tools:` line could never reach the model. |
+//! | **ScriptBasedAgent** | `spec.script_path = "<path>"` | `ScriptSource::Path(...)` — a caller-provided Lua script, handed to the SDK verbatim. |
+//!
+//! Neither mode requires the script to agree on an event-kind string: the
+//! `host_handler` sink takes any kind as the terminal result (see
+//! "Per-task input and result" below for the one reserved exception).
 //!
 //! `profile.system_prompt` (the agent.md body) is injected into the
 //! `_CONTEXT` Lua global through `BlockConfig.context`, and applies to
@@ -70,14 +74,21 @@
 //! [`WorkerInvocation::context`], the in-process twin of
 //! `WorkerPayload.context`, filled once by `InProcSpawner::spawn` from the
 //! materialized [`AgentContextView`]. Nothing here peeks at `Ctx`
-//! directly, and no `SpawnerAdapter` wrapper re-resolves it — the three
-//! Lua-visible surfaces below are all derived from that one value:
+//! directly, and no `SpawnerAdapter` wrapper re-resolves it — every
+//! Lua-visible surface below is derived from that one value:
 //!
 //! | Lua surface | Source |
 //! |---|---|
 //! | `_PROMPT` | The step's evaluated `in`, via `inv.prompt` → `BlockConfig.prompt`. A **String** — a structured `in` arrives JSON-stringified, so a script that wants a table calls `std.json.decode(_PROMPT)`. |
 //! | `_CONTEXT` | `profile.system_prompt`, via `BlockConfig.context`. |
 //! | [`TASK_METADATA_GLOBAL`] (`_TASK_METADATA`) | `view.task_metadata` (the launch's `init_ctx.task_metadata` bag), set through the SDK's `extra_globals` — converted natively, so nesting survives and the chunk text is never rewritten. |
+//! | [`AGENT_CTX_GLOBAL`] (`_AGENT_CTX`) | `view.extra` — the Blueprint-declared agent context (`default_agent_ctx` / `AgentMeta.ctx`, GH #21) after `ContextPolicy` filtering. |
+//!
+//! Both come from [`context_globals`], the single place this mapping is
+//! decided; the Lua in-process worker renders the same two globals from
+//! it, so a gate is portable between the two backends. `view.steps`
+//! (prior-step OUTPUT pointers) is deliberately NOT rendered — see the
+//! carrier note in [`crate::core::agent_context`].
 //!
 //! No server-process env is involved in any of them. The per-task working
 //! directory is not a Lua global — it becomes the SDK's `project_root`
@@ -338,6 +349,46 @@ impl Handler for WorkerResultCaptor {
 /// must not be used here; this name is ours.
 pub const TASK_METADATA_GLOBAL: &str = "_TASK_METADATA";
 
+/// The Lua global carrying the Blueprint-declared agent context — the
+/// `AgentContextView.extra` bag, which `AgentContextMiddleware` fills from
+/// `Blueprint.default_agent_ctx` / `AgentMeta.ctx` (GH #21) after applying
+/// `ContextPolicy`.
+///
+/// The WS Operator lane has always received these as `{key}: {value}`
+/// lines of the Spawn directive header
+/// (`AgentContextView::to_directive_header`); this is the in-process
+/// equivalent. Delivered as ONE table rather than one global per key,
+/// because the keys are Blueprint-author-chosen and must not be able to
+/// shadow `_PROMPT` / `_CONTEXT` / `_SCRIPT_NAME` or each other's
+/// namespace.
+pub const AGENT_CTX_GLOBAL: &str = "_AGENT_CTX";
+
+/// The Lua globals this backend derives from the materialized context
+/// view — the single place the mapping "view field → Lua global" is
+/// decided, so [`crate::blueprint::compiler`]'s Lua worker can render the
+/// same surface and keep a gate portable between the two in-process
+/// backends.
+///
+/// Absent / empty inputs contribute no entry at all (rather than an empty
+/// table), so a script sees `nil` and can branch on presence — the same
+/// "insert nothing when absent" contract the rest of this axis follows.
+pub fn context_globals(view: Option<&AgentContextView>) -> HashMap<String, Value> {
+    let mut globals = HashMap::new();
+    let Some(view) = view else {
+        return globals;
+    };
+    if let Some(meta) = view.task_metadata.clone() {
+        globals.insert(TASK_METADATA_GLOBAL.to_string(), meta);
+    }
+    if !view.extra.is_empty() {
+        globals.insert(
+            AGENT_CTX_GLOBAL.to_string(),
+            Value::Object(view.extra.clone()),
+        );
+    }
+    globals
+}
+
 /// The one `bus.emit` kind this backend reserves: an emit under it stages
 /// a named part instead of completing the invocation (GH #86).
 ///
@@ -414,8 +465,9 @@ async fn run_agent_block_worker(
     // so nothing is spliced into the script text: no line-number shift, no
     // `script_dir` / `package.path` disturbance, and no string-escaping
     // trust boundary around caller-supplied values.
-    if let Some(meta) = inv.context.as_ref().and_then(|v| v.task_metadata.clone()) {
-        builder = builder.extra_globals(HashMap::from([(TASK_METADATA_GLOBAL.to_string(), meta)]));
+    let globals = context_globals(inv.context.as_ref());
+    if !globals.is_empty() {
+        builder = builder.extra_globals(globals);
     }
     let config = builder.build();
 
@@ -779,7 +831,7 @@ impl crate::worker::Worker for AgentBlockWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::agent_context::{TASK_PROJECT_ROOT_KEY, TASK_WORK_DIR_KEY};
+    use crate::core::agent_context::{TASK_METADATA_KEY, TASK_PROJECT_ROOT_KEY, TASK_WORK_DIR_KEY};
 
     #[test]
     fn resolve_needed_mcp_servers_filters_by_tool_prefix() {
@@ -1247,6 +1299,59 @@ mod tests {
             format!("{err}").contains("name"),
             "names the missing field: {err}"
         );
+    }
+
+    // ─── GH #86: the shared view → Lua-global mapping ─────────────────────
+
+    #[test]
+    fn context_globals_renders_task_metadata_and_agent_ctx() {
+        let mut view = view_with(&[(TASK_METADATA_KEY, serde_json::json!({"issue": 86}))]);
+        view.extra.insert(
+            "org_conventions".to_string(),
+            serde_json::json!("two-space indent"),
+        );
+        let globals = context_globals(Some(&view));
+        assert_eq!(
+            globals.get(TASK_METADATA_GLOBAL),
+            Some(&serde_json::json!({"issue": 86}))
+        );
+        assert_eq!(
+            globals.get(AGENT_CTX_GLOBAL),
+            Some(&serde_json::json!({"org_conventions": "two-space indent"})),
+            "Blueprint-declared agent ctx must reach the in-process lane too"
+        );
+    }
+
+    /// Absent fields contribute no entry, so a script sees `nil` and can
+    /// branch on presence — an empty table would be indistinguishable from
+    /// "the author declared an empty ctx".
+    #[test]
+    fn context_globals_omits_absent_fields() {
+        assert!(context_globals(None).is_empty(), "no view → no globals");
+        assert!(
+            context_globals(Some(&view_with(&[]))).is_empty(),
+            "empty view → no globals"
+        );
+
+        let view = view_with(&[(TASK_METADATA_KEY, serde_json::json!({"issue": 86}))]);
+        let globals = context_globals(Some(&view));
+        assert!(globals.contains_key(TASK_METADATA_GLOBAL));
+        assert!(
+            !globals.contains_key(AGENT_CTX_GLOBAL),
+            "an empty `extra` must not render an empty _AGENT_CTX table"
+        );
+    }
+
+    /// Neither global may collide with an SDK-reserved name, and the two
+    /// must not collide with each other.
+    #[test]
+    fn context_globals_use_names_the_sdk_does_not_reserve() {
+        for name in [TASK_METADATA_GLOBAL, AGENT_CTX_GLOBAL] {
+            for reserved in ["_PROMPT", "_CONTEXT", "_SCRIPT_NAME"] {
+                assert_ne!(name, reserved);
+            }
+        }
+        assert_ne!(TASK_METADATA_GLOBAL, AGENT_CTX_GLOBAL);
     }
 
     /// The global name must not collide with the three the SDK reserves

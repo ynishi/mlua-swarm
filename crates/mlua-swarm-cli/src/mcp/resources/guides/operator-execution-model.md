@@ -738,7 +738,7 @@ variant equality, and request digest before creating the final
     "provider_id": "main-ai-self-report",
     "provider_revision": "2026-07-22",
     "capabilities": [{
-      "launch_variant": "mse-worker-coder",
+      "launch_variant": "code-worker",
       "resolved_model": "claude-sonnet-4",
       "effective_tools": ["Read", "Edit"]
     }]
