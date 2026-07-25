@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/ynishi/mlua-swarm/compare/v0.17.0...v0.18.0) - 2026-07-25
+
+### Added
+
+- server-side POST /v1/runs/:id/cancel + RunStatus::Cancelled
+- operator-proxied ack stats + worker-endpoint injection opt-in + trace kind wiring
+- per-step run stats + RunTrace rail (issue: run stats/trace 統合)
+- *(server)* wire LongHoldMiddleware via long_hold_warn_ms config
+- *(mcp)* swarm_run gains ttl_secs — detach-path lifetime knob
+
+### Fixed
+
+- *(run-stats)* OperatorSpawner fold records ack stats + operator kind
+- *(run-stats)* every StepEntry always carries worker_kind + attempt
+- rekick operator pin + interrupted-run recovery/shutdown hardening
+
+### Other
+
+- *(fmt)* apply rustfmt across 6 drifted files
+
 ## [0.17.0](https://github.com/ynishi/mlua-swarm/compare/v0.16.0...v0.17.0) - 2026-07-24
 
 ### Added
