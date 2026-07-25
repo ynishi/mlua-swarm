@@ -87,6 +87,37 @@ gate) reads:
 materialization skips fail-open (WARN) — or fails the step under
 `check_policy: strict`.
 
+## The in-process twin
+
+Everything above describes a worker in **another process** — a WebSocket
+Operator reaching back over HTTP. A worker that runs *inside* the server
+(`kind: agent_block`, `kind: lua`, `kind: rust_fn`) has the same contract
+with the transport removed:
+
+| | Out-of-process | In-process |
+|---|---|---|
+| IN | `GET /v1/worker/prompt` → `WorkerPayload` | `WorkerInvocation`, handed to the worker directly |
+| task context | `WorkerPayload.context` (the `AgentContextView`) | `WorkerInvocation.context` — the same view, same middleware, same policy filtering |
+| final OUT | `POST /v1/worker/submit` | the worker's return value (`agent_block`: `bus.emit(<any kind>, ...)`, first emit wins) |
+| named part | `POST /v1/worker/artifact?name=<name>` | `agent_block`: `bus.emit("artifact", {name = ..., content = ...})` |
+
+Both verdict channels work on both lanes: `channel: "body"` compares the
+final body, `channel: "part"` compares a staged `verdict` part.
+
+For a Lua-visible worker (`agent_block` script mode, or `kind: lua`) the
+context view arrives as globals rather than as a JSON field —
+`_TASK_METADATA` (the launch's `init_ctx.task_metadata`) and `_AGENT_CTX`
+(the Blueprint's `default_agent_ctx` / `AgentMeta.ctx`), both real Lua
+tables, both `nil` when the field is absent. See
+`mse://guides/blueprint-authoring` § "In-process agents" for the full
+list.
+
+One asymmetry is deliberate: the pointer list to prior steps' OUTPUT is
+out-of-process only. It exists because a worker in another process cannot
+read the flow ctx and needs somewhere to fetch from. An in-process worker
+declares what it needs in its own `in` expression (`in: $.<prior_step>`)
+and gets the value directly — no pointer, no fetch.
+
 ## Keep worker defaults generic
 
 None of the above lives in a worker's own prompt or defaults. Placement,

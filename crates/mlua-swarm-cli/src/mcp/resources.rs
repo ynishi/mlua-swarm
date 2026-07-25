@@ -40,7 +40,7 @@
 //! | `mse://guides/operator-execution-model`      | 3-hop execution model for `AgentKind::Operator` (WS thin-path). |
 //! | `mse://guides/agent-md-authoring`            | SubAgent (agent.md) canonical shape, size targets, fetch-vs-embed policy. |
 //! | `mse://guides/dsl-authoring`                 | flow_dsl/bp_dsl authoring DSL: Expr/Node builders, pipeline conventions, JSON→DSL migration SOP. |
-//! | `mse://guides/worker-io-contract`            | Worker I/O contract: fetch-based IN, path-free tool-call OUT, server-side file materialization. |
+//! | `mse://guides/worker-io-contract`            | Worker I/O contract: fetch-based IN, path-free tool-call OUT, server-side file materialization, and the in-process twin of the same contract. |
 //! | `mse://guides/bp-dsl-templates`              | `mse bp new` / `bp_new` template inventory + flag surface (GH #62 Axis A). |
 //! | `mse://guides/server-management`             | `mse server` subcommand reference, MCP-tool ↔ subcmd mapping, and recovery SOPs (GH #69). |
 //! | `mse://guides/blueprint-ref-paths`           | `$file` / `$agent_md` refs, the 6-tier include cascade, and the `--strict-embed` opt-in. |
@@ -196,7 +196,7 @@ pub const RESOURCES: &[ResourceEntry] = &[
     ResourceEntry {
         uri: "mse://guides/worker-io-contract",
         title: "mse — Worker I/O contract",
-        description: "Why worker IN is one authenticated prompt fetch and OUT is path-free tool calls (submit / artifact?name=), with the server-side projection sink materializing the next step's IN files. Design rationale + authoring checklist.",
+        description: "Why worker IN is one authenticated prompt fetch and OUT is path-free tool calls (submit / artifact?name=), with the server-side projection sink materializing the next step's IN files. Includes the in-process twin of that contract (WorkerInvocation instead of the HTTP fetch, `bus.emit` instead of submit/artifact) and the one deliberate asymmetry: prior-step pointers are out-of-process only. Design rationale + authoring checklist.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(WORKER_IO_CONTRACT_BODY),
     },
