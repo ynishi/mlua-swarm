@@ -332,6 +332,31 @@ rewriting; `Blueprint.flow` stays exactly what the author wrote, and
 the contract lives entirely in the Blueprint/schema/compiler/server
 layers described here.
 
+#### Symptom → cause: `dispatch failed: no Final in output_tail`
+
+The rejection above is what an author most often meets from the *other*
+end — as a missing-Final symptom on a step that looks like it ran fine.
+This table is the reverse lookup, because the symptom string does not
+contain the word "verdict":
+
+| symptom | likely cause | fix |
+|---|---|---|
+| `no Final in output_tail`, and the worker's own logs show it emitted a result | `channel: "body"` contract + a terminal value that is not one of `values` (a report / JSON object / prose where a bare token was required) | switch the agent to `channel: "part"` and stage the token separately, or emit the bare token as the body |
+| `no Final in output_tail` on a `channel: "part"` agent | nothing was staged under the name `verdict` for that attempt | stage it before the terminal emit (`bus.emit("artifact", …)` in-process, `POST /v1/worker/artifact?name=verdict` over HTTP) |
+| `verdict contract violation: … is not a member of the declared values …` | same as row 1, seen with the cause attached | as above |
+
+Rows 1 and 2 are the same rejection as row 3 — only the diagnostic
+differs by route. In-process (`kind: agent_block` / `kind: lua`) and HTTP
+completions carry the cause into the dispatch error; the WS Operator
+fallback emit logs a `tracing::warn!` server-side and leaves the attempt
+without a `Final`, so on that route the bare symptom is still what the
+caller sees.
+
+Both halves are also visible **before** any dispatch: `bp_doctor`'s
+`verdict_contract_lint` family reports every declared verdict value that
+no downstream `cond` reads, which is the state a decorative contract is
+in. See the next section.
+
 ### Declared verdict values must be handled downstream (opt-in strict mode)
 
 The two register-time checks above are the **forward-direction** lint:
@@ -344,11 +369,41 @@ author declares a verdict value (e.g. `"BLOCKED"`) but forgets to write
 a branch that handles it.
 
 By default the reverse-direction lint only surfaces
-`tracing::warn!` — the compile still succeeds. This preserves back-
-compat with existing Blueprints that intentionally leave some declared
-values as silent-pass informational tokens (an agent may want to
+`tracing::warn!` at compile — the compile still succeeds. This preserves
+back-compat with existing Blueprints that intentionally leave some
+declared values as silent-pass informational tokens (an agent may want to
 document "we may emit `INFO` as well" without demanding every caller
 branch on it).
+
+That default is quiet in the wrong place, though: a `tracing::warn!` goes
+to the server's log, not to the response the author is reading. So the
+same check is also exposed as a **report-only `bp_doctor` family**,
+`verdict_contract_lint`, which runs on an already-registered Blueprint
+with no opt-in and reports one `verdict_value_unhandled` WARN per
+unhandled declared value:
+
+```
+bp_doctor(id = "<bp>")
+  → verdict_contract_lint: { findings: [
+      { check: "verdict_value_unhandled", severity: "WARN",
+        agent: "gate-danger", value: "PASS", channel: "body",
+        declared_values: ["PASS", "BLOCKED"], step_ref: "gate-danger",
+        message: "… no downstream Branch/Loop cond ever compares against it …" }
+    ] }
+```
+
+Findings also appear in the unified `diagnostics` array under the kind
+`verdict-value-unhandled` — the same kind the strict compile error
+projects to. Disable the family with `disable_verdict_contract_lint=true`
+for a Blueprint that deliberately declares informational tokens.
+
+The state worth catching this way is a flow with **no `Branch` at all**
+plus a `channel: "body"` contract on every gate: it compiles clean, every
+declared value is unhandled, and the contract is not merely decorative —
+`channel: "body"` constrains the terminal OUTPUT value too, so each gate
+that returns a report has its `Final` rejected at completion time. The
+lint reports it as N findings before the first dispatch; without it the
+first signal is a missing-Final symptom at run time.
 
 To promote the warning to a hard `CompileError::VerdictValueUnhandled`,
 opt in via `Blueprint.metadata`:
@@ -667,6 +722,13 @@ for the report:
 bus.emit("artifact", { name = "verdict", content = "PASS" })
 bus.emit("worker_result", { ok = true, response = "the full prose report" })
 ```
+
+Pick the channel by what the body has to carry. A gate whose body IS the
+report needs `channel: "part"` — under `channel: "body"` that same script
+has its `Final` rejected at completion time, and the step fails with
+`dispatch failed: no Final in output_tail` (see § Symptom → cause above;
+the in-process lane carries the contract violation into the dispatch
+error, so the cause travels with it).
 
 **Tool grant.** The effective set is the resolved
 `agent_block_in_process` Runner's `tools` when a Runner is declared,

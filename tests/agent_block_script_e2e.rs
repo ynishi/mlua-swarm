@@ -217,6 +217,12 @@ bus.emit("worker_result", { ok = true, response = "PASS" })
 /// A gate emitting a token OUTSIDE its declared `values` is rejected by
 /// the completion-time contract check — the enforcement is live on the
 /// in-process AgentBlock path, not just on the HTTP submit routes.
+///
+/// The failure must also NAME the contract it violated. The rejection
+/// happens inside `submit_output`, whose `Result` this lane used to
+/// discard: the attempt then failed with the bare `no Final in
+/// output_tail` symptom and no cause anywhere, not even a log line. See
+/// `InProcSpawner::spawn`'s emit block.
 #[tokio::test]
 async fn script_mode_gate_emitting_an_undeclared_verdict_fails_the_step() {
     let (script, dir) = write_script(
@@ -232,9 +238,66 @@ bus.emit("worker_result", { ok = true, response = "MAYBE" })
         json!({"channel": "body", "values": ["PASS", "BLOCKED"]}),
     );
     let result = service().launch(launch_input(bp, json!({}))).await;
+    let err = result.expect_err("an undeclared verdict token must fail the step");
+    assert_verdict_rejection_is_diagnosable(&err.to_string(), "MAYBE");
+}
+
+/// The realistic shape of the same mistake, and the one that motivated
+/// making the rejection diagnosable: an in-process gate declares
+/// `channel: "body"` but emits its whole JSON report as the body, because
+/// the report is what downstream wants to read. Every payload key the
+/// captor understands (`response` / `content`) fails identically — the
+/// body channel compares the terminal VALUE, so only a bare declared
+/// token can satisfy it. `channel: "part"` is the shape that keeps the
+/// body free for a report (see the sibling test above).
+#[tokio::test]
+async fn script_mode_report_body_under_a_body_channel_contract_names_the_contract() {
+    for payload_key in ["response", "content"] {
+        let (script, dir) = write_script(
+            &format!("verdict-report-body-{payload_key}"),
+            &format!(
+                r#"
+bus.emit("worker_result", {{ ok = true, {payload_key} = std.json.encode({{
+    verdict = "PASS",
+    summary = "0 findings",
+}}) }})
+"#
+            ),
+        );
+        let bp = script_agent_bp(
+            &format!("gh86-script-verdict-report-body-{payload_key}"),
+            &script,
+            &dir,
+            json!({"channel": "body", "values": ["PASS", "BLOCKED"]}),
+        );
+        let result = service().launch(launch_input(bp, json!({}))).await;
+        let err = result.expect_err(&format!(
+            "a report body must fail a body contract ({payload_key})"
+        ));
+        assert_verdict_rejection_is_diagnosable(&err.to_string(), "summary");
+    }
+}
+
+/// The diagnosability contract shared by every completion-time verdict
+/// rejection on this lane: the surfaced error must carry the rejected
+/// value and the declared token set, and must NOT degrade to the bare
+/// missing-Final symptom.
+fn assert_verdict_rejection_is_diagnosable(msg: &str, rejected_fragment: &str) {
     assert!(
-        result.is_err(),
-        "an undeclared verdict token must fail the step: {result:?}"
+        msg.contains("verdict contract violation"),
+        "the failure must name the violated contract, got: {msg}"
+    );
+    assert!(
+        msg.contains(rejected_fragment),
+        "the failure must echo the rejected value (looking for {rejected_fragment:?}): {msg}"
+    );
+    assert!(
+        msg.contains("PASS") && msg.contains("BLOCKED"),
+        "the failure must echo the declared values: {msg}"
+    );
+    assert!(
+        !msg.contains("no Final in output_tail"),
+        "the cause must replace the missing-Final symptom, not hide behind it: {msg}"
     );
 }
 

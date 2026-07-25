@@ -1237,13 +1237,103 @@ fn check_unhandled_verdict_values(
     strict_verdict_handling: bool,
     errors: &mut Vec<CompileError>,
 ) {
-    // Iterate in a stable order (BTreeMap-style sort by agent name, then
-    // by declared value) so the first `VerdictValueUnhandled` error
-    // surfaced under strict mode is deterministic across HashMap hash
-    // seeds. This mirrors GH #50's other lint diagnostics, which are
-    // stable because they walk the flow tree in source order.
+    for finding in fold_unhandled_verdict_values(verdict_contracts, referenced_values, step_agents)
+    {
+        if strict_verdict_handling {
+            errors.push(CompileError::VerdictValueUnhandled {
+                agent: finding.agent,
+                value: finding.value,
+                declared_values: finding.declared_values,
+                step_ref: finding.step_ref,
+            });
+        } else {
+            tracing::warn!(
+                agent = %finding.agent,
+                value = %finding.value,
+                step_ref = %finding.step_ref,
+                "declared verdict value has no downstream cond handler; \
+                 opt in to `metadata.strict_verdict_handling` to reject at compile"
+            );
+        }
+    }
+}
+
+/// One declared `verdict.values` entry that no downstream `Branch`/`Loop`
+/// `cond` ever compares against — the reverse-direction lint's finding,
+/// as data.
+///
+/// Exists so the same check can drive two very different surfaces without
+/// a second implementation: the compile gate
+/// ([`check_unhandled_verdict_values`], which turns a finding into a
+/// `CompileError` under `strict_verdict_handling` and a `tracing::warn!`
+/// otherwise) and the report-only `bp_doctor` `verdict_contract_lint`
+/// family (via [`unhandled_verdict_values`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnhandledVerdictValue {
+    /// The contract-bearing agent (= `AgentDef.name` = `Step.ref_`).
+    pub agent: String,
+    /// The declared value nothing handles.
+    pub value: String,
+    /// The agent's full declared token set, for the diagnostic's context.
+    pub declared_values: Vec<String>,
+    /// The first flow site that invokes `agent`, for attribution.
+    pub step_ref: String,
+}
+
+/// Report-only projection of the reverse-direction verdict lint: run both
+/// passes [`verify_verdict_conds`] runs and return the unhandled declared
+/// values as data instead of turning the first one into a `CompileError`.
+///
+/// Callable on an already-registered Blueprint with no `SpawnerRegistry`
+/// and no compile — the `bp_doctor` `verdict_contract_lint` family's
+/// producer. Forward-direction violations (`VerdictChannelMismatch` /
+/// `VerdictValueNotInContract`) are the compile gate's business and are
+/// deliberately dropped here: they already hard-fail `bp_build`, so
+/// re-reporting them as advisory findings would double-count.
+///
+/// A Blueprint whose flow declares contracts but has no `Branch`/`Loop`
+/// at all yields one finding per declared value — the shape that reads as
+/// "this contract is decorative", and the earliest signal that a
+/// `channel` was declared without anything downstream actually reading
+/// it.
+pub fn unhandled_verdict_values(
+    flow: &FlowNode,
+    verdict_contracts: &HashMap<String, VerdictContract>,
+) -> Vec<UnhandledVerdictValue> {
+    let mut step_outputs: HashMap<String, String> = HashMap::new();
+    let mut step_agents: HashMap<String, String> = HashMap::new();
+    collect_step_outputs_and_agents(flow, &mut step_outputs, &mut step_agents);
+
+    let mut referenced_values: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut discarded_errors: Vec<CompileError> = Vec::new();
+    collect_verdict_conds(
+        flow,
+        &step_outputs,
+        verdict_contracts,
+        &mut referenced_values,
+        &mut discarded_errors,
+    );
+    fold_unhandled_verdict_values(verdict_contracts, &referenced_values, &step_agents)
+}
+
+/// The shared core of [`check_unhandled_verdict_values`] and
+/// [`unhandled_verdict_values`]: given the two passes' output, fold out
+/// the declared values nothing references.
+///
+/// Iterates in a stable order (sorted by agent name, then declared-value
+/// order) so the first `VerdictValueUnhandled` error surfaced under
+/// strict mode is deterministic across HashMap hash seeds, and so the
+/// `bp_doctor` family's findings array is reproducible between calls.
+/// This mirrors GH #50's other lint diagnostics, which are stable because
+/// they walk the flow tree in source order.
+fn fold_unhandled_verdict_values(
+    verdict_contracts: &HashMap<String, VerdictContract>,
+    referenced_values: &HashMap<String, std::collections::HashSet<String>>,
+    step_agents: &HashMap<String, String>,
+) -> Vec<UnhandledVerdictValue> {
     let mut agents: Vec<&String> = verdict_contracts.keys().collect();
     agents.sort();
+    let mut findings = Vec::new();
     for agent in agents {
         let contract = &verdict_contracts[agent];
         let referenced = referenced_values.get(agent);
@@ -1256,24 +1346,15 @@ fn check_unhandled_verdict_values(
             if handled {
                 continue;
             }
-            if strict_verdict_handling {
-                errors.push(CompileError::VerdictValueUnhandled {
-                    agent: agent.clone(),
-                    value: value.clone(),
-                    declared_values: contract.values.clone(),
-                    step_ref: step_ref.clone(),
-                });
-            } else {
-                tracing::warn!(
-                    agent = %agent,
-                    value = %value,
-                    step_ref = %step_ref,
-                    "declared verdict value has no downstream cond handler; \
-                     opt in to `metadata.strict_verdict_handling` to reject at compile"
-                );
-            }
+            findings.push(UnhandledVerdictValue {
+                agent: agent.clone(),
+                value: value.clone(),
+                declared_values: contract.values.clone(),
+                step_ref: step_ref.clone(),
+            });
         }
     }
+    findings
 }
 
 // ─── CompiledAgentTable ───────────────────────────────────────────────────────

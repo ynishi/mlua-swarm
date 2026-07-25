@@ -52,6 +52,12 @@ Reading rules for consumers:
   `Error` at `{"type": "CompileLint"}` (the compile refuses) and `Warn`
   at `{"type": "BpDoctor", "family": "WorkerBindingLint"}`
   (report-only). One lint, one docs anchor, two enforcement points.
+  `verdict-value-unhandled` is the same shape with the stages weighted
+  differently: `Error` at `{"type": "CompileLint"}` but **only under**
+  `metadata.strict_verdict_handling`, and `Warn` at `{"type":
+  "BpDoctor", "family": "VerdictContractLint"}` unconditionally — the
+  report-only stage is the one that always runs, so an author who never
+  opts into strict mode still sees the finding.
 - **`suggestion.applicability` is the auto-apply gate**: only
   `MachineApplicable` patches are candidates for unreviewed
   application; `HasPlaceholders` patches contain tokens the author must
@@ -64,7 +70,7 @@ Reading rules for consumers:
 | surface | field | notes |
 |---|---|---|
 | `bp_build` MCP tool (`stage: "lint"` failures) | `diagnostic` (single object or `null`) | Typed projection of the Compiler's `CompileError` — no substring re-parse. The legacy `fix_hint` field derives from the same diagnostic and stays for back-compat. |
-| `bp_doctor` MCP tool | `diagnostics` (array) | One entry per finding across all six lint families, alongside the family-specific fields (which remain until a future major bump removes them). |
+| `bp_doctor` MCP tool | `diagnostics` (array) | One entry per finding across every lint family, alongside the family-specific fields (which remain until a future major bump removes them). |
 | `mse bp build` / `mse bp lint` (CLI stderr) | rendered as the `fix hint (…)` block | Same diagnostic, prose-rendered. |
 
 ## The registry: `LINT_DECLS`

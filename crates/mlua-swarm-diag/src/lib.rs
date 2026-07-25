@@ -175,6 +175,11 @@ pub enum BpDoctorFamily {
     /// GH #78: `context_policy` / projection-root vs launch-seed
     /// cross-checks (silent `file_path: null` prevention).
     ContextPolicyLint,
+    /// Declared `agents[].verdict` contracts nothing downstream reads —
+    /// the reverse-direction verdict lint, surfaced report-only on an
+    /// already-registered Blueprint (the compile stage only fires it under
+    /// `metadata.strict_verdict_handling`).
+    VerdictContractLint,
 }
 
 /// Which producing stage emitted a [`Diagnostic`]. Serialized
@@ -459,7 +464,8 @@ pub const LINT_DECLS: &[LintDecl] = &[
         DiagLevel::Error,
         LintCategory::Suspicious,
         "A declared verdict.values member is never referenced by any downstream cond \
-         (fires only under metadata.strict_verdict_handling).",
+         (compile stage: Error, only under metadata.strict_verdict_handling; bp_doctor \
+         verdict_contract_lint family: Warn, always).",
         "mse://guides/blueprint-authoring",
     ),
     decl(

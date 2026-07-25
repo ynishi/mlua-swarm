@@ -104,6 +104,16 @@ with the transport removed:
 Both verdict channels work on both lanes: `channel: "body"` compares the
 final body, `channel: "part"` compares a staged `verdict` part.
 
+The rejection is symmetric too, but the *diagnostic* is not, so know
+which lane you are on. Out-of-process, a contract violation answers the
+submit with HTTP 422. In-process, there is no HTTP response to carry it:
+the rejected `Final` never reaches `output_tail`, and the reason is
+folded into the attempt's failure instead (`Final rejected before
+output_tail: verdict contract violation: …`). The WS Operator fallback
+emit is the one route that keeps only a server-side `tracing::warn!`, so
+there the caller sees the bare `no Final in output_tail`. Reverse lookup
+for that symptom: `mse://guides/blueprint-authoring` § "Symptom → cause".
+
 For a Lua-visible worker (`agent_block` script mode, or `kind: lua`) the
 context view arrives as globals rather than as a JSON field —
 `_TASK_METADATA` (the launch's `init_ctx.task_metadata`) and `_AGENT_CTX`

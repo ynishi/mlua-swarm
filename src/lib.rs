@@ -119,10 +119,10 @@ pub use binding::{
     BindingProviderError, LegacyWorkerBindingPolicy, ManifestBindingProvider, UnboundAgent,
 };
 pub use blueprint::compiler::{
-    CompileError, CompiledAgentTable, CompiledBlueprint, Compiler, HostBridge,
-    LuaInProcessSpawnerFactory, LuaScriptSource, OperatorSpawnerFactory,
+    unhandled_verdict_values, CompileError, CompiledAgentTable, CompiledBlueprint, Compiler,
+    HostBridge, LuaInProcessSpawnerFactory, LuaScriptSource, OperatorSpawnerFactory,
     RustFnInProcessSpawnerFactory, SpawnerFactory, SpawnerFactoryKind, SpawnerRegistry,
-    SubprocessProcessSpawnerFactory, WORKER_BINDING_REQUIRED_MSG_PREFIX,
+    SubprocessProcessSpawnerFactory, UnhandledVerdictValue, WORKER_BINDING_REQUIRED_MSG_PREFIX,
 };
 pub use blueprint::loader::{expand_file_refs, load_blueprint_from_path, LoadError};
 pub use blueprint::{

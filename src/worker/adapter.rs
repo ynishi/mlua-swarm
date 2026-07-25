@@ -404,6 +404,30 @@ impl<W: Worker + From<crate::worker::WorkerJoinHandler> + Send + Sync + 'static>
                 _ = cancel_inner.cancelled() => Err(WorkerError::Cancelled),
             };
             // Fold WorkerResult into OutputEvent::Final. Contract: one Final per attempt.
+            //
+            // `submit_output` can REJECT this write — the GH #51
+            // completion-time verdict-contract check is embedded in it and
+            // runs BEFORE the `output_tail` append (see
+            // `Engine::verdict_contract_completion_check`). This used to be
+            // a discarded `let _ = …`, which made a rejection completely
+            // invisible on this lane: the worker still signalled success, so
+            // `dispatch_attempt_with`'s Final-pull reported the bare
+            // `no Final in output_tail` with no cause anywhere — not even a
+            // log line, while the WS Operator lane has always logged one
+            // (`crate::operator`'s fallback emit). Carry the rejection into
+            // the completion signal instead, so the reason travels all the
+            // way to `EngineError::DispatchFailed` and the author sees which
+            // contract they violated rather than a missing-Final symptom.
+            //
+            // Only the PRE-write rejections escalate to a failed attempt.
+            // `submit_output` also returns `Err` for post-write side
+            // effects (a strict-`CheckPolicy` materialize failure, say),
+            // and there the `Final` IS on the tail — the attempt has a
+            // value, the dispatcher can complete it, and failing it here
+            // would turn a fail-open projection miss into a dead step.
+            // Those still log, so the discarded-error hole is closed for
+            // both, but only the contract gate changes the outcome.
+            let mut emit_rejection: Option<String> = None;
             if let Ok(wr) = &result {
                 // Stats sidecar: forward boundary-reported stats to the
                 // engine (drained by the dispatcher's outcome fold into
@@ -420,11 +444,33 @@ impl<W: Worker + From<crate::worker::WorkerJoinHandler> + Send + Sync + 'static>
                     },
                     ok: wr.ok,
                 };
-                let _ = engine_for_emit
+                if let Err(e) = engine_for_emit
                     .submit_output(&token_for_emit, &task_id_for_emit, attempt, ev)
-                    .await;
+                    .await
+                {
+                    let blocks_the_final = matches!(
+                        e,
+                        crate::EngineError::VerdictValueRejected { .. }
+                            | crate::EngineError::VerdictPartMissing { .. }
+                    );
+                    tracing::warn!(
+                        step_id = %task_id_for_emit,
+                        attempt,
+                        error = %e,
+                        blocks_the_final,
+                        "in-process worker's Final submission returned an error"
+                    );
+                    if blocks_the_final {
+                        emit_rejection = Some(e.to_string());
+                    }
+                }
             }
-            let signal: Result<(), WorkerError> = result.map(|_| ());
+            let signal: Result<(), WorkerError> = match emit_rejection {
+                Some(reason) => Err(WorkerError::Failed(format!(
+                    "Final rejected before output_tail: {reason}"
+                ))),
+                None => result.map(|_| ()),
+            };
             let _ = tx.send(signal);
         });
 
