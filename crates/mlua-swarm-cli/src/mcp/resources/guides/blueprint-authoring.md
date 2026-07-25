@@ -620,15 +620,29 @@ Two modes, selected by whether `spec.script_path` is present:
 }
 ```
 
-**Input and result.** The step's evaluated `in` arrives as the `_PROMPT`
-Lua global and `profile.system_prompt` as `_CONTEXT` — per task, not
-through the server process env. The per-task working directory comes from
-the launch's `init_ctx.work_dir` / `init_ctx.project_root`, which outrank
-`spec.project_root`. A script returns its result by calling
-`bus.emit(<kind>, payload)` — **not** by returning a value from the chunk —
-and the host takes `payload.content`, else `payload.response`, else the
-whole payload, as the step OUTPUT body. For a `verdict` contract on
-`channel: "body"`, that value IS the verdict scalar.
+**Input.** Three Lua globals, all per-task and none via the server process
+env:
+
+| global | carries |
+|---|---|
+| `_PROMPT` | the step's evaluated `in`, as a **String** — a structured `in` arrives JSON-stringified, so use `std.json.decode(_PROMPT)` if you want a table |
+| `_CONTEXT` | `profile.system_prompt` |
+| `_TASK_METADATA` | the launch's `init_ctx.task_metadata` bag, as a real Lua table |
+
+The per-task working directory is not a global: `init_ctx.work_dir` /
+`init_ctx.project_root` outrank `spec.project_root` and become the SDK's
+`project_root`, which a script reads as `std.env.project_root()` and which
+is the default cwd for `sh.exec` and for MCP servers started by
+`mcp.connect`. It does **not** `chdir` the server process, so a bare
+`io.open("rel/path")` still resolves against the server's own cwd.
+
+**Result.** A script returns its result by calling `bus.emit(<kind>,
+payload)` — **not** by returning a value from the chunk, and only the first
+emit counts. The host takes `payload.content`, else `payload.response`,
+else the whole payload, as the step OUTPUT body. For a `verdict` contract
+on `channel: "body"`, that value IS the verdict scalar. `channel: "part"`
+is not reachable from this backend yet (staging a named part needs a sink
+bridge the in-process worker does not expose).
 
 **Tool grant.** The effective set is the resolved
 `agent_block_in_process` Runner's `tools` when a Runner is declared,

@@ -14,6 +14,7 @@
 //! The interface is now consolidated into the new `trait Worker` in
 //! `src/worker.rs`.
 
+use crate::core::agent_context::AgentContextView;
 use crate::core::ctx::Ctx;
 use crate::core::engine::Engine;
 use crate::types::{CapToken, StepId};
@@ -127,7 +128,7 @@ pub trait SpawnerAdapter: Send + Sync {
 // ─── InProcSpawner ────────────────────────────────────────────────────────
 
 /// Invocation context handed to a Worker fn. Bundles `token` +
-/// `task_id` + `prompt` + `sink`.
+/// `task_id` + `prompt` + `sink` + `context`.
 ///
 /// The `prompt` field was added in design intent, folding the old
 /// `Fn(inv, directive)` `directive` argument into the invocation. The
@@ -171,6 +172,22 @@ pub struct WorkerInvocation {
     /// down. `None` — like `sink` above — means the caller path is not
     /// carrying the cancel channel.
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// The materialized, policy-applied task context for this attempt —
+    /// the **in-process twin of [`crate::types::WorkerPayload::context`]**
+    /// (which is how the same view reaches an out-of-process Operator over
+    /// `GET /v1/worker/prompt`).
+    ///
+    /// This is the single seam through which task-level context reaches an
+    /// in-process worker. `InProcSpawner::spawn` fills it once, from
+    /// [`AgentContextView::materialized_or_from_ctx`], so a worker fn reads
+    /// `inv.context` instead of hand-rolling its own `Ctx` peek — the
+    /// duplication that previously left the Lua / RustFn workers with no
+    /// context at all while each other backend re-derived its own subset.
+    ///
+    /// `None` means the caller path did not carry a `Ctx` (the same
+    /// "not wired for this invocation" convention `sink` / `cancel_token`
+    /// use above). It is never `None` on the `InProcSpawner` path.
+    pub context: Option<AgentContextView>,
 }
 
 impl std::fmt::Debug for WorkerInvocation {
@@ -323,6 +340,13 @@ impl<W: Worker + From<crate::worker::WorkerJoinHandler> + Send + Sync + 'static>
             prompt,
             sink: Some(sink),
             cancel_token: Some(cancel_inner.clone()),
+            // The one place task-level context enters the in-process lane
+            // (mirrors how `Engine::fetch_worker_payload` fills
+            // `WorkerPayload.context` for the out-of-process lane). Reads
+            // the policy-applied view `AgentContextMiddleware` stashed, and
+            // degrades to the raw `Ctx` projection when that layer is not
+            // on this spawner stack.
+            context: Some(AgentContextView::materialized_or_from_ctx(ctx)),
         };
 
         tokio::spawn(async move {

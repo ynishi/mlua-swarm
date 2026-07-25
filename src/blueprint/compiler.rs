@@ -2484,6 +2484,7 @@ mod lua_inline_source_tests {
             prompt: prompt.into(),
             sink: None,
             cancel_token: None,
+            context: None,
         }
     }
 

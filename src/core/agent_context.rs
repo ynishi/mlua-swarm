@@ -51,14 +51,33 @@
 //! `Ctx` itself is not stored, so the view has to be snapshotted at
 //! dispatch time to still be servable when the Worker axis fetches it
 //! later). (b) is read back via [`AgentContextView::materialized_or_from_ctx`]
-//! by both the Spawner axis (WS `session.rs`) and the in-process
-//! AgentBlock axis (`crate::worker::agent_block::runtime`) — falling back
-//! to [`AgentContextView::from_ctx`] when the middleware was never layered
-//! (backward compat).
+//! by the Spawner axis — falling back to [`AgentContextView::from_ctx`]
+//! when the middleware was never layered (backward compat).
+//!
+//! ## Delivery points — where the view enters each backend
+//!
+//! The materialization above is backend-agnostic and shared. What differs
+//! per backend is only the **carrier**, and there are exactly two:
+//!
+//! | Carrier | Filled by | Serves |
+//! |---|---|---|
+//! | `WorkerPayload.context` | `Engine::fetch_worker_payload{,_trusted}` from rail (a) | Out-of-process workers, over `GET /v1/worker/prompt` |
+//! | [`crate::worker::adapter::WorkerInvocation::context`] | `InProcSpawner::spawn` from rail (b) | Every in-process worker (RustFn / Lua / AgentBlock) |
+//!
+//! Adding a backend means choosing one of those two carriers and deciding
+//! how to render the view into whatever the worker actually reads — NOT
+//! re-deriving the view. The renderings that exist today:
+//!
+//! | Backend | Rendering |
+//! |---|---|
+//! | WS Operator (`operator_ws::session`) | [`AgentContextView::to_directive_header`] spliced into the Spawn directive, plus the full view on `WorkerPayload.context` |
+//! | Subprocess (`crate::worker::process_spawner`) | `work_dir` / `project_root` → the `{work_dir}` template placeholder |
+//! | AgentBlock (`crate::worker::agent_block::runtime`) | `work_dir` / `project_root` → the SDK's `project_root`; `task_metadata` → the `_TASK_METADATA` Lua global |
+//! | RustFn / Lua in-process | Carried on `inv.context`; no rendering of their own yet |
 //!
 //! A field added to [`AgentContextView`] (either a named field, or an
-//! `extra` entry) reaches both axes automatically — no per-consumer wiring
-//! required. [`ContextPolicy`] filters the materialized view before it is
+//! `extra` entry) reaches both carriers automatically — only a backend
+//! that wants to *render* the new field needs an edit. [`ContextPolicy`] filters the materialized view before it is
 //! snapshotted / stashed; GH #21 Phase 1 wires it to Blueprint schema
 //! fields (`Blueprint.default_agent_ctx` / `default_context_policy`,
 //! `AgentMeta.ctx` / `context_policy`, resolved by

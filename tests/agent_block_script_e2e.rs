@@ -225,6 +225,95 @@ bus.emit("worker_result", {
     );
 }
 
+/// GH #86: the launch's `init_ctx.task_metadata` bag reaches the script
+/// as the `_TASK_METADATA` Lua global, injected by the generated prelude.
+/// Before this, the in-process lane resolved the value and then dropped
+/// it, while the WS Operator lane had always received it as a
+/// `task_metadata:` line of the Spawn directive header.
+#[tokio::test]
+async fn task_metadata_reaches_the_script_as_a_lua_global() {
+    let (script, dir) = write_script(
+        "task-metadata",
+        r#"
+bus.emit("worker_result", {
+    ok = true,
+    response = {
+        issue = _TASK_METADATA and _TASK_METADATA.issue or "no-metadata",
+        nested = _TASK_METADATA and _TASK_METADATA.nested and _TASK_METADATA.nested[2] or "none",
+    },
+})
+"#,
+    );
+    let bp = script_agent_bp("gh86-script-task-metadata", &script, &dir, Value::Null);
+    let mut input = launch_input(bp, json!({}));
+    input.task_input = Some(TaskInputSpec {
+        project_root: None,
+        work_dir: None,
+        task_metadata: Some(json!({"issue": 86, "nested": ["a", "b"]})),
+    });
+    let out = service().launch(input).await.expect("launch must complete");
+    assert_eq!(
+        out.final_ctx["danger_result"],
+        json!({"issue": 86, "nested": "b"}),
+        "task_metadata must arrive as a real Lua table, nesting intact"
+    );
+}
+
+/// The no-metadata case keeps the untouched `ScriptSource::Path` route
+/// (empty prelude), so `_TASK_METADATA` is simply absent rather than an
+/// empty table — and, critically, the script's own directory is still on
+/// `package.path` so a sibling `require` resolves. The metadata case
+/// above takes the inline route, where the prelude has to restore that
+/// path itself; this pair pins both sides of that branch.
+#[tokio::test]
+async fn sibling_require_resolves_on_both_the_path_and_inline_routes() {
+    let (script, dir) = write_script(
+        "sibling-require",
+        r#"
+local helper = require("helper")
+bus.emit("worker_result", {
+    ok = true,
+    response = { helped = helper.answer(), meta = _TASK_METADATA and "present" or "absent" },
+})
+"#,
+    );
+    std::fs::write(
+        dir.join("helper.lua"),
+        "return { answer = function() return \"from-sibling\" end }\n",
+    )
+    .expect("write sibling module");
+
+    // (a) no task_metadata → empty prelude → ScriptSource::Path route.
+    let bp = script_agent_bp("gh86-sibling-path", &script, &dir, Value::Null);
+    let out = service()
+        .launch(launch_input(bp, json!({})))
+        .await
+        .expect("Path route must complete");
+    assert_eq!(
+        out.final_ctx["danger_result"],
+        json!({"helped": "from-sibling", "meta": "absent"})
+    );
+
+    // (b) task_metadata present → prelude → inline route, where the
+    // generated `package.path` line is what keeps `require` working.
+    let bp = script_agent_bp("gh86-sibling-inline", &script, &dir, Value::Null);
+    let mut input = launch_input(bp, json!({}));
+    input.task_input = Some(TaskInputSpec {
+        project_root: None,
+        work_dir: None,
+        task_metadata: Some(json!({"issue": 86})),
+    });
+    let out = service()
+        .launch(input)
+        .await
+        .expect("inline route must complete");
+    assert_eq!(
+        out.final_ctx["danger_result"],
+        json!({"helped": "from-sibling", "meta": "present"}),
+        "the prelude must re-prepend the script's own dir to package.path"
+    );
+}
+
 /// A gate that finishes without emitting anything is a failed step, not a
 /// silently-empty success — the `bus.emit` contract is load-bearing and
 /// must fail loud when a script forgets it (e.g. an author who returned a

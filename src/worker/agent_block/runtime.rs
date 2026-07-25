@@ -66,29 +66,45 @@
 //!
 //! ## Per-task input and result (GH #86)
 //!
-//! The step's evaluated `in` expression reaches the script as the
-//! `_PROMPT` Lua global (via `BlockConfig.prompt`), and
-//! `profile.system_prompt` as `_CONTEXT` — both modes, no server-process
-//! env involved. The per-task working directory arrives through the
-//! materialized `AgentContextView` (see the next section), not through
-//! `spec`. A script returns its result by calling `bus.emit(<kind>,
-//! payload)` — **not** by returning a value from the chunk — and
+//! Task context reaches this backend through **one seam**:
+//! [`WorkerInvocation::context`], the in-process twin of
+//! `WorkerPayload.context`, filled once by `InProcSpawner::spawn` from the
+//! materialized [`AgentContextView`]. Nothing here peeks at `Ctx`
+//! directly, and no `SpawnerAdapter` wrapper re-resolves it — the three
+//! Lua-visible surfaces below are all derived from that one value:
+//!
+//! | Lua surface | Source |
+//! |---|---|
+//! | `_PROMPT` | The step's evaluated `in`, via `inv.prompt` → `BlockConfig.prompt`. A **String** — a structured `in` arrives JSON-stringified, so a script that wants a table calls `std.json.decode(_PROMPT)`. |
+//! | `_CONTEXT` | `profile.system_prompt`, via `BlockConfig.context`. |
+//! | `_TASK_METADATA` | `view.task_metadata` (the launch's `init_ctx.task_metadata` bag), embedded as a Lua literal by [`build_prelude`]. |
+//!
+//! No server-process env is involved in any of them. The per-task working
+//! directory is not a Lua global — it becomes the SDK's `project_root`
+//! (see the next section), which surfaces to a script as
+//! `std.env.project_root()` and as the default cwd of `sh.exec` and of
+//! MCP servers spawned by `mcp.connect`. It does NOT `chdir` the host
+//! process, so a bare `io.open("rel/path")` still resolves against the
+//! server's own cwd.
+//!
+//! A script returns its result by calling `bus.emit(<kind>, payload)` —
+//! **not** by returning a value from the chunk — and
 //! [`WorkerResultCaptor`] normalises the payload into
 //! [`WorkerResult`]`.value` (`payload.content` → `payload.response` →
-//! the whole payload). For a `VerdictChannel::Body` contract, that value
-//! IS the verdict scalar the engine compares.
+//! the whole payload). Only the FIRST emit is taken. For a
+//! `VerdictChannel::Body` contract, that value IS the verdict scalar the
+//! engine compares. `VerdictChannel::Part` is NOT reachable from this
+//! backend today: staging a named part needs `WorkerInvocation.sink`,
+//! which this worker does not yet bridge to Lua.
 //!
 //! ## `project_root` resolution (issue #17, GH #20)
 //!
 //! `spec.project_root` (above) is only the **compile-time fallback**
 //! tier — resolved once in [`AgentBlockInProcessSpawnerFactory::build`],
-//! before any `Ctx` exists. At spawn time,
-//! [`AgentBlockCtxAwareSpawner::spawn`] re-resolves the actual worker
-//! cwd per invocation through a materialized
-//! [`crate::core::agent_context::AgentContextView`]
-//! (`AgentContextView::materialized_or_from_ctx`, GH #20 Contract C —
-//! see that module's doc for the full narrative) with this priority
-//! (highest first):
+//! before any `Ctx` exists. Per invocation, [`resolve_project_root`]
+//! applies the task-context tier off [`WorkerInvocation::context`] (GH
+//! #20 Contract C — see [`crate::core::agent_context`] for the full
+//! narrative) with this priority (highest first):
 //!
 //! 1. `view.work_dir` — Task-level, set by `TaskInputMiddleware` from
 //!    the launch's `init_ctx.work_dir`.
@@ -99,9 +115,7 @@
 //! This lets a single Blueprint's `AgentDef.spec.project_root` (fixed at
 //! compile time) be overridden per task launch, so the same Blueprint
 //! can run against different caller-supplied project roots without a
-//! `spec` edit. GH #20 additionally threads `view.task_metadata` into
-//! `AgentBlockSettings::task_metadata` — the pull path this axis
-//! previously lacked entirely.
+//! `spec` edit.
 //!
 //! ## SDK paths introduced from v0.22.0 through v0.27.0
 //!
@@ -115,13 +129,7 @@
 //! | v0.27.0 | Embed the `compile_loop` StdPkg into core | `require("compile_loop")` hits directly |
 
 use crate::core::agent_context::AgentContextView;
-use crate::core::ctx::Ctx;
-use crate::core::engine::Engine;
-use crate::types::{CapToken, StepId};
-use crate::worker::adapter::{
-    InProcSpawner, SpawnError, SpawnerAdapter, WorkerError, WorkerInvocation, WorkerResult,
-};
-use crate::worker::Worker;
+use crate::worker::adapter::{InProcSpawner, WorkerError, WorkerInvocation, WorkerResult};
 use agent_block_core::bus::dispatcher::Handler;
 use agent_block_core::host::{PromptSource, ScriptSource};
 use agent_block_core::{run, BlockConfig};
@@ -129,7 +137,7 @@ use agent_block_types::error::BlockError;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -254,8 +262,122 @@ impl Handler for WorkerResultCaptor {
     }
 }
 
+/// Which Lua chunk this `AgentDef` runs, deferred so the per-invocation
+/// prelude (see [`build_prelude`]) can be spliced in at dispatch time
+/// rather than baked at compile time.
+#[derive(Clone, Debug)]
+enum ScriptPlan {
+    /// ScriptBasedAgent (`spec.script_path` present) — a caller-supplied
+    /// script, read at invocation time so its on-disk content is never
+    /// pinned to compile time.
+    CallerScript(PathBuf),
+    /// PromptBasedAgent (`spec.script_path` absent) — the host-generated
+    /// invoker built by [`build_inline_agent_invoker`].
+    Invoker { source: String, name: String },
+}
+
+impl ScriptPlan {
+    /// The directory whose `package.path` entry the prelude must restore
+    /// — `Some` only for [`Self::CallerScript`], since that is the sole
+    /// variant whose `script_dir` changes when injection forces the
+    /// Inline route (see [`build_prelude`]).
+    fn caller_script_dir(&self) -> Option<&Path> {
+        match self {
+            ScriptPlan::CallerScript(path) => path.parent(),
+            ScriptPlan::Invoker { .. } => None,
+        }
+    }
+
+    /// Resolve to the SDK's [`ScriptSource`] for one invocation, splicing
+    /// `prelude` in front of the chunk body.
+    ///
+    /// With an empty prelude a [`Self::CallerScript`] stays
+    /// `ScriptSource::Path` — byte-for-byte the pre-GH-#86 path, with no
+    /// host-side read and no line-number shift. A non-empty prelude forces
+    /// the read-and-inline route, because `ScriptSource::Path` gives the
+    /// host nowhere to inject.
+    fn resolve(&self, prelude: &str) -> Result<ScriptSource, WorkerError> {
+        match self {
+            ScriptPlan::CallerScript(path) if prelude.is_empty() => {
+                Ok(ScriptSource::Path(path.clone()))
+            }
+            ScriptPlan::CallerScript(path) => {
+                let body = std::fs::read_to_string(path).map_err(|e| {
+                    WorkerError::Failed(format!("agent-block script {}: {e}", path.display()))
+                })?;
+                Ok(ScriptSource::Inline {
+                    source: format!("{prelude}{body}"),
+                    // Keep the on-disk file name so `_SCRIPT_NAME`, tracing
+                    // attribution, and error messages still point at the
+                    // author's file rather than at a synthetic chunk.
+                    name: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "gate.lua".to_string()),
+                })
+            }
+            ScriptPlan::Invoker { source, name } => Ok(ScriptSource::Inline {
+                source: format!("{prelude}{source}"),
+                name: name.clone(),
+            }),
+        }
+    }
+}
+
+/// Build the one-line prelude spliced in front of the chunk body, or an
+/// empty string when there is nothing to inject.
+///
+/// Deliberately **exactly one line** (a single trailing `\n`, no interior
+/// newlines) so the line numbers a script author sees in a Lua stack trace
+/// are off by a constant `+1` rather than by an amount that varies with
+/// what got injected.
+///
+/// Two things go in:
+///
+/// 1. `_TASK_METADATA` — the launch's `init_ctx.task_metadata` bag as a Lua
+///    literal. This is the delivery point the in-process lane previously
+///    lacked entirely (the WS Operator lane has always received it, as a
+///    `task_metadata:` line of the Spawn directive header via
+///    `AgentContextView::to_directive_header`).
+/// 2. A `package.path` restoration, for `script_dir` only. The SDK derives
+///    `script_dir` from `ScriptSource::Path(p)` as `p.parent()` but from
+///    `ScriptSource::Inline` as `project_root`, and puts it at the FRONT of
+///    `package.path`. Since injecting forces the Inline route, a caller
+///    script that `require`s a sibling module would otherwise stop
+///    resolving it; re-prepending its own directory keeps that working.
+///
+/// # Trust boundary
+///
+/// `task_metadata` is **caller-supplied at launch time**, and this splices
+/// it into a chunk that is then executed — so [`json_to_lua_literal`]'s
+/// escaping is a security boundary here, not just formatting. It is what
+/// keeps a hostile value (an unbalanced quote / brace, a `--[[` comment
+/// opener, an embedded newline) inert string data instead of executable
+/// Lua. `prelude_escaping_contains_a_hostile_task_metadata_payload`
+/// asserts that through a real Lua VM; keep it passing before widening
+/// what gets embedded here.
+fn build_prelude(task_metadata: Option<&Value>, script_dir: Option<&Path>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(dir) = script_dir {
+        let dir = dir.to_string_lossy();
+        let patterns =
+            json_to_lua_literal(&Value::String(format!("{dir}/?.lua;{dir}/?/init.lua;")));
+        parts.push(format!("package.path={patterns}..package.path"));
+    }
+    if let Some(meta) = task_metadata {
+        parts.push(format!("_TASK_METADATA={}", json_to_lua_literal(meta)));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("{};\n", parts.join("; "))
+}
+
 /// Settings baked per `AgentDef` — the static portion of one
-/// invocation.
+/// invocation. Everything task-dependent (`project_root` /
+/// `task_metadata`) is resolved per invocation off
+/// [`WorkerInvocation::context`] instead, so this struct is built once at
+/// compile time and shared by every dispatch of the agent.
 ///
 /// v0.28.0 adopted `BlockConfig.host_handler` (a kind-agnostic
 /// single sink backed by `EventBus::on_any`); the older
@@ -264,28 +386,17 @@ impl Handler for WorkerResultCaptor {
 /// invocation is enough, so a single sink is enough.
 #[derive(Clone)]
 struct AgentBlockSettings {
-    /// Either a PromptBasedAgent — `ScriptSource::Inline` with an
-    /// in-line invoker that embeds `mcp_servers` — or a
-    /// ScriptBasedAgent (`ScriptSource::Path(...)`, a caller-supplied
-    /// script).
-    script: ScriptSource,
-    project_root: PathBuf,
+    /// The chunk to run — see [`ScriptPlan`].
+    script: ScriptPlan,
+    /// Compile-time fallback cwd: `spec.project_root`, else
+    /// `env::current_dir()`. Outranked per invocation by the context
+    /// view's `work_dir` / `project_root`.
+    spec_project_root: PathBuf,
     mcp_rpc_timeout: Duration,
     /// Agent persona — the `system_prompt` composed from the agent.md
     /// body and frontmatter. `None` maps to `BlockConfig.context = None`
     /// for backwards compatibility with the old path.
     profile_context: Option<String>,
-    /// GH #20 Contract C: `AgentContextView.task_metadata`, re-resolved
-    /// per invocation alongside `project_root` (see
-    /// [`AgentBlockCtxAwareSpawner::resolve_settings`]). `None` at
-    /// compile time (no `Ctx` exists yet in
-    /// [`AgentBlockInProcessSpawnerFactory::build`]) and whenever the
-    /// materialized view carries no task metadata. This is the pull
-    /// path the in-process AgentBlock axis previously lacked entirely —
-    /// the field exists here so a future consumption point (script /
-    /// env sink) has somewhere to read it from; wiring one is a future
-    /// issue.
-    task_metadata: Option<Value>,
 }
 
 /// One invocation's worth of an `agent-block-core` SDK call — the
@@ -304,13 +415,24 @@ async fn run_agent_block_worker(
         tx: Mutex::new(Some(tx)),
     });
 
+    // GH #86: the task-context tier, read off the ONE in-process seam
+    // (`WorkerInvocation.context`, filled by `InProcSpawner::spawn` from
+    // the materialized `AgentContextView`) instead of a hand-rolled `Ctx`
+    // peek in a spawner wrapper.
+    let project_root = resolve_project_root(inv.context.as_ref(), &settings.spec_project_root);
+    let prelude = build_prelude(
+        inv.context.as_ref().and_then(|v| v.task_metadata.as_ref()),
+        settings.script.caller_script_dir(),
+    );
+    let script = settings.script.resolve(&prelude)?;
+
     // Bridge the shutdown token: forward `WorkerInvocation.cancel_token`
     // into the SDK's `shutdown_token` if one is set; otherwise use a
     // fresh token (no external cancel).
     let shutdown_token = inv.cancel_token.clone().unwrap_or_default();
     let config = BlockConfig {
-        script: settings.script.clone(),
-        project_root: settings.project_root.clone(),
+        script,
+        project_root,
         relay_url: None,
         secret_key: None,
         mcp_rpc_timeout: settings.mcp_rpc_timeout,
@@ -422,7 +544,7 @@ fn mcp_tools_of(tools: &[String]) -> Vec<&str> {
 /// conversion on the Rust side and embed the result directly. The
 /// event name is `agent_result` — the same convention the SDK's
 /// internal `DEFAULT_AGENT_INVOKER` uses.
-pub fn build_inline_agent_invoker(mcp_servers: &[Value]) -> ScriptSource {
+fn build_inline_agent_invoker(mcp_servers: &[Value]) -> ScriptPlan {
     let mcp_lua = json_array_to_lua_literal(mcp_servers);
     let source = format!(
         r##"local agent = require("agent")
@@ -435,7 +557,7 @@ local r = agent.run({{
 bus.emit("agent_result", r)
 "##
     );
-    ScriptSource::Inline {
+    ScriptPlan::Invoker {
         source,
         name: "mlua_swarm_engine_default_agent_invoker.lua".into(),
     }
@@ -490,6 +612,18 @@ fn resolve_spec_project_root(spec: &Value) -> PathBuf {
         Some(s) => PathBuf::from(s),
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     }
+}
+
+/// Apply the task-context tier on top of the compile-time fallback:
+/// **`view.work_dir` > `view.project_root` > `spec_fallback`**.
+///
+/// `work_dir` outranks `project_root` because it names the exact directory
+/// this specific worker should run from. A `None` view (no `Ctx` on the
+/// caller path) leaves the compile-time fallback in place.
+fn resolve_project_root(view: Option<&AgentContextView>, spec_fallback: &Path) -> PathBuf {
+    view.and_then(|v| v.work_dir.as_deref().or(v.project_root.as_deref()))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| spec_fallback.to_path_buf())
 }
 
 /// The `SpawnerFactory` for AgentBlock. `KIND = AgentKind::AgentBlock`.
@@ -592,122 +726,44 @@ impl crate::blueprint::compiler::SpawnerFactory for AgentBlockInProcessSpawnerFa
                         ),
                     });
                 }
-                ScriptSource::Path(PathBuf::from(s))
+                ScriptPlan::CallerScript(PathBuf::from(s))
             }
             None => build_inline_agent_invoker(&needed_mcp_servers),
         };
 
         // issue #17: this is the compile-time fallback tier only —
         // `spec.project_root`, then `env::current_dir()`. No `Ctx` exists
-        // yet at `build()` time, so the higher-priority
-        // `ctx.meta.runtime` tier cannot be consulted here; it is
-        // re-resolved per invocation by `AgentBlockCtxAwareSpawner::spawn`
-        // below (see the module-level "`project_root` resolution" doc).
-        let project_root = resolve_spec_project_root(spec);
+        // yet at `build()` time, so the higher-priority task-context tier
+        // cannot be consulted here; `run_agent_block_worker` applies it per
+        // invocation off `WorkerInvocation.context` (see the module-level
+        // "`project_root` resolution" doc).
+        let spec_project_root = resolve_spec_project_root(spec);
         let mcp_rpc_timeout = match spec.get("mcp_rpc_timeout_ms").and_then(|v| v.as_u64()) {
             Some(ms) => Duration::from_millis(ms),
             None => Duration::from_secs(30),
         };
         let profile_context = agent_def.profile.as_ref().map(|p| p.system_prompt.clone());
 
-        let base_settings = Arc::new(AgentBlockSettings {
+        let settings = Arc::new(AgentBlockSettings {
             script,
-            project_root,
+            spec_project_root,
             mcp_rpc_timeout,
             profile_context,
-            // GH #20: no `Ctx` exists yet at compile time — the ctx-aware
-            // tier is re-resolved per invocation in `resolve_settings`.
-            task_metadata: None,
         });
 
-        Ok(Arc::new(AgentBlockCtxAwareSpawner {
-            agent_name,
-            base_settings,
-        }))
-    }
-}
-
-/// `SpawnerAdapter` wrapper that re-resolves this AgentBlock invocation's
-/// `project_root` from `ctx.meta.runtime` at spawn time (issue #17),
-/// honoring the **`ctx.meta.runtime` `work_dir` > `ctx.meta.runtime`
-/// `project_root` > `spec.project_root` > `env::current_dir()`**
-/// priority chain — see the module-level "`project_root` resolution"
-/// doc for the full rationale.
-///
-/// `AgentBlockInProcessSpawnerFactory::build` bakes the `spec`/`env`
-/// fallback tier into `base_settings` at compile time, since no `Ctx`
-/// exists yet at that point. This wrapper is the first place a `Ctx` —
-/// and therefore `ctx.meta.runtime` — becomes available: `spawn()` is
-/// the per-attempt entry point every `SpawnerAdapter` implements.
-///
-/// Delegates the actual invocation to a freshly built
-/// `InProcSpawner<AgentBlockWorker>` holding a single `agent_name`
-/// registry entry closed over the per-invocation-resolved settings —
-/// the same shape `AgentBlockInProcessSpawnerFactory::build` used to
-/// build directly, just constructed per spawn instead of once at
-/// compile time (this factory produces exactly one route per
-/// `AgentDef`, so a 1-entry registry built fresh per call carries no
-/// meaningful overhead over the old compile-time-built one).
-struct AgentBlockCtxAwareSpawner {
-    /// The agent name this route serves (`AgentDef.name`, same value the
-    /// compiled `CompiledAgentTable` looks this adapter up under).
-    agent_name: String,
-    /// Compile-time-resolved fallback settings (script / mcp timeout /
-    /// profile context are invocation-invariant; `project_root` here is
-    /// the `spec` / `env::current_dir()` tail of the priority chain).
-    base_settings: Arc<AgentBlockSettings>,
-}
-
-impl AgentBlockCtxAwareSpawner {
-    /// Applies the `AgentContextView` override tier on top of
-    /// `base_settings.project_root` / `.task_metadata` (GH #20 Contract
-    /// C — materializes the view via
-    /// `AgentContextView::materialized_or_from_ctx`, then reads
-    /// `work_dir` / `project_root` / `task_metadata` off it instead of
-    /// pulling individual `ctx.meta.runtime` keys). `work_dir` outranks
-    /// `project_root` (it names the exact directory this specific
-    /// worker should run from); either, if present, overrides the
-    /// compile-time `project_root` baseline entirely. `task_metadata`
-    /// (when present on the view) always overrides the compile-time
-    /// `None` baseline — there is no compile-time equivalent to
-    /// override. Neither `work_dir` nor `project_root` present AND no
-    /// `task_metadata` → the baseline settings are reused as-is (no
-    /// clone).
-    fn resolve_settings(&self, ctx: &Ctx) -> Arc<AgentBlockSettings> {
-        let view = AgentContextView::materialized_or_from_ctx(ctx);
-        let override_path = view.work_dir.as_deref().or(view.project_root.as_deref());
-        if override_path.is_none() && view.task_metadata.is_none() {
-            return self.base_settings.clone();
-        }
-        let mut settings = (*self.base_settings).clone();
-        if let Some(p) = override_path {
-            settings.project_root = PathBuf::from(p);
-        }
-        if let Some(meta) = view.task_metadata {
-            settings.task_metadata = Some(meta);
-        }
-        Arc::new(settings)
-    }
-}
-
-#[async_trait]
-impl SpawnerAdapter for AgentBlockCtxAwareSpawner {
-    async fn spawn(
-        &self,
-        engine: &Engine,
-        ctx: &Ctx,
-        task_id: StepId,
-        attempt: u32,
-        token: CapToken,
-    ) -> Result<Box<dyn Worker>, SpawnError> {
-        let settings = self.resolve_settings(ctx);
+        // A plain `InProcSpawner` with this agent's single route. GH #86
+        // removed the `AgentBlockCtxAwareSpawner` wrapper that used to sit
+        // here purely to re-resolve `ctx.meta.runtime` at spawn time: the
+        // task-context tier now arrives on `WorkerInvocation.context`, the
+        // same seam every other in-process worker reads, so the worker fn
+        // resolves it itself and no bespoke adapter is needed.
         let worker_fn: crate::worker::adapter::WorkerFn = Arc::new(move |inv| {
             let settings = settings.clone();
             Box::pin(run_agent_block_worker(settings, inv))
         });
         let mut sp: InProcSpawner<AgentBlockWorker> = InProcSpawner::<AgentBlockWorker>::typed();
-        sp.registry.insert(self.agent_name.clone(), worker_fn);
-        sp.spawn(engine, ctx, task_id, attempt, token).await
+        sp.registry.insert(agent_name, worker_fn);
+        Ok(Arc::new(sp))
     }
 }
 
@@ -748,7 +804,7 @@ impl crate::worker::Worker for AgentBlockWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::agent_context::{TASK_METADATA_KEY, TASK_PROJECT_ROOT_KEY, TASK_WORK_DIR_KEY};
+    use crate::core::agent_context::{TASK_PROJECT_ROOT_KEY, TASK_WORK_DIR_KEY};
 
     #[test]
     fn resolve_needed_mcp_servers_filters_by_tool_prefix() {
@@ -793,7 +849,7 @@ mod tests {
             vec![serde_json::json!({"name": "outline", "command": "outline-mcp", "args": []})];
         let script = build_inline_agent_invoker(&servers);
         match script {
-            ScriptSource::Inline { source, name } => {
+            ScriptPlan::Invoker { source, name } => {
                 assert!(name.ends_with(".lua"));
                 assert!(source.contains("require(\"agent\")"));
                 assert!(source.contains("mcp_servers = mcp_servers"));
@@ -803,7 +859,7 @@ mod tests {
                 assert!(source.contains("[\"command\"]=\"outline-mcp\""));
                 assert!(source.contains("[\"args\"]={}"), "args empty array literal");
             }
-            other => panic!("expected Inline, got: {other:?}"),
+            other => panic!("expected Invoker, got: {other:?}"),
         }
     }
 
@@ -811,10 +867,10 @@ mod tests {
     fn build_inline_agent_invoker_with_empty_servers_still_valid() {
         let script = build_inline_agent_invoker(&[]);
         match script {
-            ScriptSource::Inline { source, .. } => {
+            ScriptPlan::Invoker { source, .. } => {
                 assert!(source.contains("local mcp_servers = {}"));
             }
-            other => panic!("expected Inline, got: {other:?}"),
+            other => panic!("expected Invoker, got: {other:?}"),
         }
     }
 
@@ -1068,140 +1124,205 @@ mod tests {
         );
     }
 
-    fn test_settings(project_root: &str) -> Arc<AgentBlockSettings> {
-        Arc::new(AgentBlockSettings {
-            script: build_inline_agent_invoker(&[]),
-            project_root: PathBuf::from(project_root),
-            mcp_rpc_timeout: Duration::from_secs(30),
-            profile_context: None,
-            task_metadata: None,
-        })
-    }
-
-    fn ctx_with_runtime(pairs: &[(&str, &str)]) -> Ctx {
-        let mut ctx = Ctx::new(StepId::parse("ST-project-root").unwrap(), 1, "writer");
+    /// A view carrying exactly the task-context fields under test. Built
+    /// through the real `AgentContextView::from_ctx` so the field names
+    /// stay bound to the canonical `ctx.meta.runtime` keys rather than to
+    /// a hand-written literal that could drift from them.
+    fn view_with(pairs: &[(&str, Value)]) -> AgentContextView {
+        let mut ctx = crate::core::ctx::Ctx::new(
+            crate::types::StepId::parse("ST-project-root").unwrap(),
+            1,
+            "writer",
+        );
         for (k, v) in pairs {
-            ctx.meta
-                .runtime
-                .insert((*k).to_string(), serde_json::json!(v));
+            ctx.meta.runtime.insert((*k).to_string(), v.clone());
         }
-        ctx
+        AgentContextView::from_ctx(&ctx)
     }
 
-    #[test]
-    fn resolve_settings_falls_back_to_spec_project_root_when_ctx_meta_runtime_absent() {
-        let spawner = AgentBlockCtxAwareSpawner {
-            agent_name: "writer".into(),
-            base_settings: test_settings("/spec-root"),
-        };
-        let ctx = ctx_with_runtime(&[]);
-        let resolved = spawner.resolve_settings(&ctx);
-        assert_eq!(resolved.project_root, PathBuf::from("/spec-root"));
-    }
+    // ─── project_root priority chain (issue #17, now off the seam) ────────
 
     #[test]
-    fn resolve_settings_prefers_ctx_meta_runtime_project_root_over_spec() {
-        let spawner = AgentBlockCtxAwareSpawner {
-            agent_name: "writer".into(),
-            base_settings: test_settings("/spec-root"),
-        };
-        let ctx = ctx_with_runtime(&[(TASK_PROJECT_ROOT_KEY, "/ctx-root")]);
-        let resolved = spawner.resolve_settings(&ctx);
-        assert_eq!(resolved.project_root, PathBuf::from("/ctx-root"));
+    fn project_root_falls_back_to_spec_when_the_view_carries_neither() {
+        let view = view_with(&[]);
+        let resolved = resolve_project_root(Some(&view), Path::new("/spec-root"));
+        assert_eq!(resolved, PathBuf::from("/spec-root"));
     }
 
+    /// No `Ctx` on the caller path at all (`inv.context == None`) is the
+    /// same outcome as an empty view — the compile-time fallback stands.
     #[test]
-    fn resolve_settings_prefers_ctx_meta_runtime_work_dir_over_project_root() {
-        let spawner = AgentBlockCtxAwareSpawner {
-            agent_name: "writer".into(),
-            base_settings: test_settings("/spec-root"),
-        };
-        let ctx = ctx_with_runtime(&[
-            (TASK_PROJECT_ROOT_KEY, "/ctx-root"),
-            (TASK_WORK_DIR_KEY, "/ctx-work"),
-        ]);
-        let resolved = spawner.resolve_settings(&ctx);
-        assert_eq!(resolved.project_root, PathBuf::from("/ctx-work"));
-    }
-
-    /// GH #20: `task_metadata` on the materialized `AgentContextView`
-    /// (the pull path this axis previously lacked entirely) is threaded
-    /// into `AgentBlockSettings.task_metadata`, overriding the
-    /// compile-time `None` baseline.
-    #[test]
-    fn resolve_settings_picks_up_task_metadata_from_ctx() {
-        let spawner = AgentBlockCtxAwareSpawner {
-            agent_name: "writer".into(),
-            base_settings: test_settings("/spec-root"),
-        };
-        let mut ctx = Ctx::new(StepId::parse("ST-project-root").unwrap(), 1, "writer");
-        ctx.meta.runtime.insert(
-            TASK_METADATA_KEY.to_string(),
-            serde_json::json!({"issue": 20}),
-        );
-        let resolved = spawner.resolve_settings(&ctx);
+    fn project_root_falls_back_to_spec_without_a_view() {
         assert_eq!(
-            resolved.task_metadata,
-            Some(serde_json::json!({"issue": 20}))
+            resolve_project_root(None, Path::new("/spec-root")),
+            PathBuf::from("/spec-root")
         );
-        // No project_root / work_dir override present — the compile-time
-        // project_root baseline is left untouched.
-        assert_eq!(resolved.project_root, PathBuf::from("/spec-root"));
     }
 
-    /// Absent `task_metadata` in `ctx.meta.runtime` stays `None` — same
-    /// "insert nothing when absent" contract every other field follows.
     #[test]
-    fn resolve_settings_task_metadata_stays_none_when_absent() {
-        let spawner = AgentBlockCtxAwareSpawner {
-            agent_name: "writer".into(),
-            base_settings: test_settings("/spec-root"),
-        };
-        let ctx = ctx_with_runtime(&[]);
-        let resolved = spawner.resolve_settings(&ctx);
-        assert!(resolved.task_metadata.is_none());
+    fn project_root_prefers_the_view_over_spec() {
+        let view = view_with(&[(TASK_PROJECT_ROOT_KEY, serde_json::json!("/ctx-root"))]);
+        let resolved = resolve_project_root(Some(&view), Path::new("/spec-root"));
+        assert_eq!(resolved, PathBuf::from("/ctx-root"));
     }
 
-    /// End-to-end: a real `Ctx.meta.runtime["project_root"]` override
-    /// reaches the AgentBlock spawn path through
-    /// `AgentBlockCtxAwareSpawner::spawn` — not just the pure
-    /// `resolve_settings` helper above. `spawn()` on an agent name that
-    /// is not `ctx.agent` fails fast with `SpawnError::NotRegistered`
-    /// (mirrors the pre-issue-#17 `InProcSpawner` registry-miss
-    /// behavior), which is enough to prove the ctx-aware wrapper reached
-    /// the inner `InProcSpawner::spawn` dispatch — settings resolution
-    /// itself is covered by the `resolve_settings` tests above.
-    #[tokio::test]
-    async fn spawn_delegates_to_inner_spawner_and_fails_fast_on_agent_mismatch() {
-        use crate::core::config::EngineCfg;
-        use crate::types::Role;
+    #[test]
+    fn project_root_prefers_work_dir_over_project_root() {
+        let view = view_with(&[
+            (TASK_PROJECT_ROOT_KEY, serde_json::json!("/ctx-root")),
+            (TASK_WORK_DIR_KEY, serde_json::json!("/ctx-work")),
+        ]);
+        let resolved = resolve_project_root(Some(&view), Path::new("/spec-root"));
+        assert_eq!(resolved, PathBuf::from("/ctx-work"));
+    }
 
-        let spawner = AgentBlockCtxAwareSpawner {
-            agent_name: "writer".into(),
-            base_settings: test_settings("/spec-root"),
-        };
-        let ctx = ctx_with_runtime(&[(TASK_PROJECT_ROOT_KEY, "/ctx-root")]);
-        let mut mismatched_ctx = ctx.clone();
-        mismatched_ctx.agent = "not-writer".into();
+    // ─── GH #86: task_metadata delivery via the generated prelude ─────────
 
-        let engine = Engine::new(EngineCfg::default());
-        let token = engine
-            .attach("ut-op", Role::Operator, Duration::from_secs(30))
-            .await
-            .expect("attach");
-        let task_id = StepId::parse("ST-project-root").unwrap();
-        let result = spawner
-            .spawn(&engine, &mismatched_ctx, task_id, 1, token)
-            .await;
-        // `Box<dyn Worker>` (the `Ok` payload) does not implement `Debug`,
-        // so a plain `match` is used instead of `expect_err`/`unwrap_err`.
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("agent name mismatch must fail fast"),
-        };
+    /// Nothing to inject → empty prelude, which is what keeps a caller
+    /// script on the untouched `ScriptSource::Path` route.
+    #[test]
+    fn prelude_is_empty_when_there_is_nothing_to_inject() {
+        assert_eq!(build_prelude(None, None), "");
+    }
+
+    #[test]
+    fn prelude_embeds_task_metadata_as_a_lua_literal() {
+        let meta = serde_json::json!({"issue": 20});
+        let prelude = build_prelude(Some(&meta), None);
+        assert_eq!(prelude, "_TASK_METADATA={[\"issue\"]=20};\n");
+    }
+
+    /// Exactly one line, always — the invariant that keeps a script
+    /// author's Lua stack-trace line numbers off by a constant `+1`
+    /// instead of by an amount that varies with what got injected.
+    #[test]
+    fn prelude_is_always_exactly_one_line() {
+        let meta = serde_json::json!({"a": 1, "b": [2, 3], "c": "x\ny"});
+        for prelude in [
+            build_prelude(Some(&meta), None),
+            build_prelude(None, Some(Path::new("/gates"))),
+            build_prelude(Some(&meta), Some(Path::new("/gates"))),
+        ] {
+            assert!(
+                prelude.ends_with('\n'),
+                "must terminate the line: {prelude:?}"
+            );
+            assert_eq!(
+                prelude.matches('\n').count(),
+                1,
+                "exactly one newline (a `\\n` INSIDE a metadata string must stay escaped): {prelude:?}"
+            );
+        }
+    }
+
+    /// The prelude splices a **caller-supplied** value (the launch's
+    /// `init_ctx.task_metadata`) into a chunk that then gets executed, so
+    /// the Lua-literal escaping is load-bearing as a trust boundary, not
+    /// just as formatting. Run the generated prelude through a real Lua VM
+    /// and assert a hostile payload comes back out as inert string data —
+    /// if escaping ever regressed, `breakout` would be set and the values
+    /// would not round-trip.
+    #[test]
+    fn prelude_escaping_contains_a_hostile_task_metadata_payload() {
+        let hostile = serde_json::json!({
+            "quote": "\"; breakout = true; local _ = \"",
+            "close_brace": "}; breakout = true; local _ = {",
+            "comment": "--[[ breakout = true ]]",
+            "newline": "line1\nbreakout = true\nline2",
+            "backslash": "c:\\path\\to",
+        });
+        let prelude = build_prelude(Some(&hostile), None);
+        let lua = mlua::Lua::new();
+        lua.load(&prelude)
+            .exec()
+            .expect("the generated prelude must be valid Lua");
+
+        let globals = lua.globals();
         assert!(
-            matches!(&err, SpawnError::NotRegistered(name) if name == "not-writer"),
-            "expected NotRegistered(\"not-writer\"), got: {err:?}"
+            globals.get::<Option<bool>>("breakout").unwrap().is_none(),
+            "no payload may escape its string literal: {prelude}"
         );
+        let meta: mlua::Table = globals.get("_TASK_METADATA").expect("_TASK_METADATA set");
+        for key in ["quote", "close_brace", "comment", "newline", "backslash"] {
+            let got: String = meta.get(key).expect("key present");
+            assert_eq!(
+                got,
+                hostile[key].as_str().unwrap(),
+                "value must round-trip verbatim for key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn prelude_restores_the_caller_scripts_own_package_path() {
+        let prelude = build_prelude(None, Some(Path::new("/gates")));
+        assert!(
+            prelude.contains("package.path=\"/gates/?.lua;/gates/?/init.lua;\"..package.path"),
+            "the script's own dir must be re-prepended: {prelude}"
+        );
+    }
+
+    // ─── ScriptPlan resolution ────────────────────────────────────────────
+
+    /// The zero-injection path must stay byte-for-byte the pre-GH-#86
+    /// behavior: `ScriptSource::Path`, no host-side read (so a script that
+    /// does not exist yet at spawn time still fails inside the SDK, where
+    /// it always did), and no line-number shift.
+    #[test]
+    fn caller_script_stays_a_path_when_the_prelude_is_empty() {
+        let plan = ScriptPlan::CallerScript(PathBuf::from("/nonexistent/gate.lua"));
+        match plan
+            .resolve("")
+            .expect("empty prelude must not read the file")
+        {
+            ScriptSource::Path(p) => assert_eq!(p, PathBuf::from("/nonexistent/gate.lua")),
+            other => panic!("expected Path, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caller_script_inlines_with_the_prelude_and_keeps_its_file_name() {
+        let dir = std::env::temp_dir().join(format!("gh86-plan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("danger.lua");
+        std::fs::write(&path, "return 1\n").expect("write script");
+
+        let plan = ScriptPlan::CallerScript(path.clone());
+        match plan.resolve("_TASK_METADATA={};\n").expect("resolve") {
+            ScriptSource::Inline { source, name } => {
+                assert_eq!(name, "danger.lua", "author's file name is preserved");
+                assert_eq!(source, "_TASK_METADATA={};\nreturn 1\n");
+            }
+            other => panic!("expected Inline, got: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn caller_script_read_failure_is_a_worker_error() {
+        let plan = ScriptPlan::CallerScript(PathBuf::from("/nonexistent/gate.lua"));
+        let err = plan
+            .resolve("_TASK_METADATA={};\n")
+            .expect_err("missing file must surface");
+        assert!(
+            format!("{err}").contains("/nonexistent/gate.lua"),
+            "names the unreadable path: {err}"
+        );
+    }
+
+    #[test]
+    fn invoker_takes_the_prelude_without_a_package_path_fix() {
+        let plan = build_inline_agent_invoker(&[]);
+        assert!(
+            plan.caller_script_dir().is_none(),
+            "the invoker's script_dir is already project_root — nothing to restore"
+        );
+        match plan.resolve("_TASK_METADATA={};\n").expect("resolve") {
+            ScriptSource::Inline { source, .. } => {
+                assert!(source.starts_with("_TASK_METADATA={};\n"));
+                assert!(source.contains("require(\"agent\")"));
+            }
+            other => panic!("expected Inline, got: {other:?}"),
+        }
     }
 }
