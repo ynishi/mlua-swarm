@@ -687,6 +687,12 @@ impl Compiler {
             // `SubprocessDef` template + overrides (EmbedAgent mode). Any
             // other resolution keeps the historical spec-based hint — an
             // existing Subprocess BP (program/args in spec) is untouched.
+            //
+            // No sibling arm exists for `AgentKind::AgentBlock`: its Runner
+            // input (`tools`) already arrives as `profile.tools` off the
+            // pinned `BoundAgent` snapshot — see the note on
+            // `project_bound_agent_for_legacy_factories` / the
+            // `SUBPROCESS_*_HINT_KEY` consts.
             let subprocess_hint = if ad.kind == AgentKind::Subprocess {
                 resolve_subprocess_template_hint(bp, ad)?
             } else {
@@ -1371,6 +1377,15 @@ impl SpawnerFactoryKind for SubprocessProcessSpawnerFactory {
 pub const SUBPROCESS_TEMPLATE_HINT_KEY: &str = "subprocess_template";
 /// GH #83 — hint key carrying the `Runner::Subprocess` overrides.
 pub const SUBPROCESS_OVERRIDES_HINT_KEY: &str = "subprocess_overrides";
+
+// GH #86 note — no `agent_block_tools` build hint exists, deliberately.
+// `Runner::AgentBlockInProcess.tools` already reaches the AgentBlock
+// factory as `profile.tools`, projected from the immutable `BoundAgent`
+// snapshot by `project_bound_agent_for_legacy_factories` above. Re-deriving
+// it here (the shape GH #83's Subprocess sibling uses, which has no such
+// projection) would re-run `resolve_runner` against the LIVE Blueprint and
+// so let a `Blueprint.runners` edit change a pinned Run's enforced grant on
+// resume — exactly the drift `compile_bound` exists to prevent.
 
 /// GH #83 — reject any `{ident}` token outside the closed placeholder
 /// set. Only lowercase-identifier tokens (`[a-z_]+`) are placeholder
@@ -3639,6 +3654,140 @@ mod subprocess_embed_compile_tests {
         let bp = bp_with(vec![agent.clone()], vec![echo_def("echo")]);
         let hint = resolve_subprocess_template_hint(&bp, &agent).expect("resolves");
         assert!(hint.is_none(), "spec-based agents keep the historical path");
+    }
+
+    // ─── GH #86: AgentBlock tool-grant hint ───────────────────────────────
+    //
+    // Sibling of the `resolve_subprocess_template_hint` cases above; the
+    // shared `bp_with` / `Blueprint` fixture is why these live in the same
+    // module rather than a third one.
+
+    fn agent_block_agent(name: &str, runner: Option<Runner>, profile_tools: &[&str]) -> AgentDef {
+        AgentDef {
+            name: name.to_string(),
+            kind: AgentKind::AgentBlock,
+            spec: serde_json::json!({}),
+            profile: Some(AgentProfile {
+                system_prompt: "you are an in-process auditor".to_string(),
+                tools: profile_tools.iter().map(|t| t.to_string()).collect(),
+                ..Default::default()
+            }),
+            meta: None,
+            runner,
+            runner_ref: None,
+            verdict: None,
+        }
+    }
+
+    fn agent_block_runner(tools: &[&str]) -> Runner {
+        Runner::AgentBlockInProcess {
+            tools: tools.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    /// The AgentBlock tool grant reaches the factory through the
+    /// `BoundAgent` projection, NOT through a build hint: a declared
+    /// `Runner::AgentBlockInProcess` overwrites `profile.tools` with its own
+    /// list. Asserting on the projection is what pins the contract, since a
+    /// hint for this axis would bypass the pinned snapshot on resume.
+    #[test]
+    fn agent_block_runner_tools_are_projected_over_profile_tools() {
+        let agent = agent_block_agent(
+            "auditor",
+            Some(agent_block_runner(&["mcp__outline__list_docs"])),
+            &["Read"],
+        );
+        let bp = bp_with(vec![agent], vec![]);
+        let bound = resolve_bound_agents(&bp).expect("binds");
+        let effective = materialize_bound_blueprint(&bp, &bound);
+        assert_eq!(
+            effective.agents[0].profile.as_ref().unwrap().tools,
+            vec!["mcp__outline__list_docs".to_string()],
+            "the declared Runner tools replace profile.tools (['Read'])"
+        );
+    }
+
+    /// A declared-but-empty `tools` list is an enforced-empty grant: the
+    /// projection must still overwrite, or an agent.md's inherited `tools:`
+    /// line would silently survive a Blueprint that meant to revoke it.
+    #[test]
+    fn agent_block_projection_distinguishes_declared_empty_from_absent() {
+        let declared = agent_block_agent("auditor", Some(agent_block_runner(&[])), &["Read"]);
+        let bp = bp_with(vec![declared], vec![]);
+        let bound = resolve_bound_agents(&bp).expect("binds");
+        let effective = materialize_bound_blueprint(&bp, &bound);
+        assert!(
+            effective.agents[0]
+                .profile
+                .as_ref()
+                .unwrap()
+                .tools
+                .is_empty(),
+            "empty means enforced-empty, not 'unset'"
+        );
+
+        let absent = agent_block_agent("auditor", None, &["Read"]);
+        let bp = bp_with(vec![absent], vec![]);
+        let bound = resolve_bound_agents(&bp).expect("binds");
+        let effective = materialize_bound_blueprint(&bp, &bound);
+        assert_eq!(
+            effective.agents[0].profile.as_ref().unwrap().tools,
+            vec!["Read".to_string()],
+            "no Runner declared → the agent.md tools line stands"
+        );
+    }
+
+    /// End-to-end through `Compiler::compile`: the projected grant reaches
+    /// `AgentBlockInProcessSpawnerFactory::build`, whose ScriptBasedAgent
+    /// guard rejects an unenforceable MCP grant. A successful build returns
+    /// an opaque `Arc<dyn SpawnerAdapter>`, so this negative path is the
+    /// compile-level assertion available; the positive paths are covered in
+    /// `worker::agent_block::runtime`'s tests.
+    #[test]
+    fn compile_rejects_script_mode_with_a_declared_mcp_grant() {
+        let mut agent = agent_block_agent(
+            "auditor",
+            Some(agent_block_runner(&["mcp__outline__list_docs"])),
+            &[],
+        );
+        agent.spec = serde_json::json!({ "script_path": "gate.lua" });
+        let mut bp = bp_with(vec![agent], vec![]);
+        bp.strategy.strict_refs = false;
+
+        let mut registry = SpawnerRegistry::new();
+        registry.register::<crate::worker::agent_block::AgentBlockInProcessSpawnerFactory>(
+            Arc::new(crate::worker::agent_block::AgentBlockInProcessSpawnerFactory::new()),
+        );
+        // `CompiledBlueprint` is not `Debug`, so `expect_err` is unavailable.
+        let err = match Compiler::new(registry).compile(&bp) {
+            Err(e) => e,
+            Ok(_) => panic!("script mode + declared MCP grant must not compile"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("script_path"), "names the trigger: {msg}");
+        assert!(
+            msg.contains("mcp__outline__list_docs"),
+            "names the unenforceable tools: {msg}"
+        );
+    }
+
+    /// The guard must not catch a script-mode agent whose tools are all
+    /// inert (non-`mcp__`) — that shape compiled before the guard existed
+    /// and grants nothing this backend can enforce either way.
+    #[test]
+    fn compile_accepts_script_mode_with_only_inert_tools() {
+        let mut agent = agent_block_agent("auditor", None, &["Read", "WebSearch"]);
+        agent.spec = serde_json::json!({ "script_path": "gate.lua" });
+        let mut bp = bp_with(vec![agent], vec![]);
+        bp.strategy.strict_refs = false;
+
+        let mut registry = SpawnerRegistry::new();
+        registry.register::<crate::worker::agent_block::AgentBlockInProcessSpawnerFactory>(
+            Arc::new(crate::worker::agent_block::AgentBlockInProcessSpawnerFactory::new()),
+        );
+        if let Err(e) = Compiler::new(registry).compile(&bp) {
+            panic!("inert tools must not trip the MCP-grant guard: {e}");
+        }
     }
 
     #[test]

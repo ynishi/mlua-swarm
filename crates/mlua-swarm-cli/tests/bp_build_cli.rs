@@ -431,6 +431,104 @@ return {
 /// GH #62 Axis A CLI error path: an unknown template must exit non-zero
 /// with the accepted list named — closed set discoverable from the
 /// error rather than requiring the author to open the guide.
+/// GH #86 regression guard: a Blueprint declaring `kind = "agent_block"`
+/// must pass compile lint under the schema default `strategy.strict_kind
+/// = true`. This is the issue's own reproduction shape — before the
+/// `AgentBlockInProcessSpawnerFactory` registration, `lint_registry`
+/// covered four of the five `AgentKind` variants and this exact script
+/// failed with `unknown agent kind in SpawnerRegistry: AgentBlock`, with
+/// no strategy setting that opened a path (`strict_kind = false` merely
+/// moved the failure to `unresolved-agent-ref`, since an unresolvable
+/// kind is dropped from the routing table).
+#[test]
+fn bp_build_accepts_an_agent_block_agent_under_strict_kind() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let script_path = tmp.path().join("agent_block_gate.bp.lua");
+    fs::write(
+        &script_path,
+        r#"
+local F = require("flow_dsl")
+
+return {
+  id = "gh86-agent-block-gate",
+  flow = F.step({
+    agent = "gate-danger",
+    input = F.p("$.d.gate_danger"),
+    out = F.p("$.danger_result"),
+  }),
+  agents = {
+    {
+      name = "gate-danger",
+      kind = "agent_block",
+      -- ScriptBasedAgent mode; `tools = {}` is the enforced-empty grant
+      -- this mode requires (the script drives its own `mcp.connect`).
+      spec = { script_path = "gate.lua" },
+      runner = { backend = "agent_block_in_process", tools = {} },
+    },
+  },
+  operators = {},
+  strategy = { strict_refs = true, strict_kind = true },
+}
+"#,
+    )
+    .expect("write agent_block fixture script");
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .args(["bp", "build"])
+        .arg(&script_path)
+        .assert()
+        .success()
+        .stderr(contains("compile lint: OK"));
+}
+
+/// GH #86 sibling: the same Blueprint in ScriptBasedAgent mode with a
+/// declared `mcp__` grant is rejected, because a caller script opens its
+/// own MCP connections and the host has no choke point to enforce
+/// through — an unenforceable grant fails loud instead of being silently
+/// dropped. (Non-`mcp__` names select no server and do not trip this.)
+#[test]
+fn bp_build_rejects_agent_block_script_mode_with_a_declared_mcp_grant() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let script_path = tmp.path().join("agent_block_bad_grant.bp.lua");
+    fs::write(
+        &script_path,
+        r#"
+local F = require("flow_dsl")
+
+return {
+  id = "gh86-agent-block-bad-grant",
+  flow = F.step({
+    agent = "gate-danger",
+    input = F.p("$.d.gate_danger"),
+    out = F.p("$.danger_result"),
+  }),
+  agents = {
+    {
+      name = "gate-danger",
+      kind = "agent_block",
+      spec = { script_path = "gate.lua" },
+      runner = { backend = "agent_block_in_process", tools = { "mcp__outline__list_docs" } },
+    },
+  },
+  operators = {},
+  strategy = { strict_refs = true, strict_kind = true },
+}
+"#,
+    )
+    .expect("write agent_block bad-grant fixture script");
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .args(["bp", "build"])
+        .arg(&script_path)
+        .assert()
+        .failure()
+        .stderr(contains("compile lint FAILED"))
+        .stderr(contains("mcp__outline__list_docs"))
+        .stderr(contains("PromptBasedAgent mode"));
+}
+
 #[test]
 fn bp_new_unknown_template_exits_error_with_accepted_list() {
     Command::cargo_bin("mse")

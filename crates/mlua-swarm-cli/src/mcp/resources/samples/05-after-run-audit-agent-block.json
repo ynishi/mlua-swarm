@@ -24,6 +24,9 @@
       "name": "auditor",
       "kind": "agent_block",
       "spec": {},
+      "runner": {
+        "backend": "agent_block_in_process"
+      },
       "profile": {
         "system_prompt": "You are an after-run auditor running in-process via agent-block. The prompt names the step you must audit. Inspect that step's output and report findings as structured JSON: {\"verdict\": \"clean\"|\"degraded\", \"notes\": \"...\"}. Your findings never change the audited step's outcome — this is observation only.",
         "model": "claude-haiku-4-5-20251001"
@@ -43,6 +46,6 @@
     "strict_kind": true
   },
   "metadata": {
-    "description": "GH #34 reference sample — agent-block-backed after-run audit. `worker` (kind: rust_fn, the baseline `identity` fn) runs the flow's only step; `auditor` (kind: agent_block, PromptBasedAgent mode — spec.script_path absent) is auto-kicked in-process after `worker` settles, no operator round-trip involved. Findings persist as an `audit:worker` artifact on the worker step's own output tail — observational only, never gates the flow."
+    "description": "GH #34 reference sample — agent-block-backed after-run audit. `worker` (kind: rust_fn, the baseline `identity` fn) runs the flow's only step; `auditor` (kind: agent_block, PromptBasedAgent mode — spec.script_path absent) is auto-kicked in-process after `worker` settles, no operator round-trip involved. Findings persist as an `audit:worker` artifact on the worker step's own output tail — observational only, never gates the flow. The auditor's `agent_block_in_process` Runner (GH #86) declares the pairing `AgentDef.kind = agent_block` requires; its omitted `tools` is an enforced-empty grant, which is what this auditor wants — it reasons over the prompt alone and reaches no MCP server."
   }
 }

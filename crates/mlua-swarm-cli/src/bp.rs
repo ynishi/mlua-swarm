@@ -40,8 +40,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use mlua_swarm::{
-    Compiler, LuaInProcessSpawnerFactory, OperatorSpawnerFactory, RustFnInProcessSpawnerFactory,
-    SpawnerRegistry, SubprocessProcessSpawnerFactory,
+    AgentBlockInProcessSpawnerFactory, Compiler, LuaInProcessSpawnerFactory,
+    OperatorSpawnerFactory, RustFnInProcessSpawnerFactory, SpawnerRegistry,
+    SubprocessProcessSpawnerFactory,
 };
 use mlua_swarm_cli::dsl;
 
@@ -1137,11 +1138,27 @@ impl mlua_swarm::Operator for LintStubOperator {
 /// backend is registered — with a [`LintStubOperator`] pre-baked under
 /// every declared `Blueprint.operators[].name` so `kind = operator`
 /// agents' `spec.operator_ref` resolves too.
-fn lint_registry(bp: &mlua_swarm::Blueprint) -> SpawnerRegistry {
+pub(crate) fn lint_registry(bp: &mlua_swarm::Blueprint) -> SpawnerRegistry {
     let mut reg = SpawnerRegistry::new();
     reg.register::<SubprocessProcessSpawnerFactory>(Arc::new(SubprocessProcessSpawnerFactory));
-    reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(RustFnInProcessSpawnerFactory::new()));
+    // The baseline `fn_id = "identity"` worker is pre-baked exactly as
+    // `mlua_swarm_server::default_registry` does it — lint must resolve the
+    // same `fn_id`s the server will, and `identity` is the one every
+    // bootstrap / smoke Blueprint (including the bundled samples) leans on.
+    reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(
+        mlua_swarm::worker::baseline::extend_with_baseline(RustFnInProcessSpawnerFactory::new()),
+    ));
     reg.register::<LuaInProcessSpawnerFactory>(Arc::new(LuaInProcessSpawnerFactory::new()));
+    // GH #86: `AgentKind::AgentBlock` is a first-class variant of the closed
+    // enum, so lint must be able to resolve it — omitting it made every
+    // Blueprint declaring `kind = "agent_block"` fail lint with
+    // `unknown agent kind in SpawnerRegistry: AgentBlock` under the schema
+    // default `strict_kind = true`, with no strategy setting that opened a
+    // path (`strict_kind = false` merely moved the failure to
+    // `unresolved-agent-ref`).
+    reg.register::<AgentBlockInProcessSpawnerFactory>(Arc::new(
+        AgentBlockInProcessSpawnerFactory::new(),
+    ));
     let op_factory = OperatorSpawnerFactory::new();
     for op in &bp.operators {
         op_factory.register_operator(op.name.clone(), Arc::new(LintStubOperator));

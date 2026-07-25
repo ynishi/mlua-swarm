@@ -691,6 +691,34 @@ mod tests {
         }
     }
 
+    /// GH #86: the JSON samples must survive the real `Compiler` — not just
+    /// `serde` — under the registry `mse bp build` lints with. The
+    /// `agent_block` sample is the reason this test exists: `AgentKind::
+    /// AgentBlock` had no factory in `lint_registry`, so
+    /// `05-after-run-audit-agent-block` could never compile even though the
+    /// schema-level test above passed. Any future kind added to a sample but
+    /// not to the lint registry fails here instead of at an author's prompt.
+    #[test]
+    fn json_sample_bodies_compile_under_the_lint_registry() {
+        use mlua_swarm::Compiler;
+
+        for uri in [
+            "mse://blueprints/samples/01-pure-ctx-eval",
+            "mse://blueprints/samples/02-verdict-loop",
+            "mse://blueprints/samples/03-fn-override",
+            "mse://blueprints/samples/04-after-run-audit-operator",
+            "mse://blueprints/samples/05-after-run-audit-agent-block",
+        ] {
+            let entry = find_by_uri(uri).unwrap_or_else(|| panic!("sample must exist: {uri}"));
+            let body = body_for(entry).expect("sample body must generate");
+            let bp: Blueprint = serde_json::from_str(&body)
+                .unwrap_or_else(|e| panic!("{uri}: not a valid Blueprint: {e}"));
+            if let Err(e) = Compiler::new(crate::bp::lint_registry(&bp)).compile(&bp) {
+                panic!("{uri}: bundled sample must pass compile lint: {e}");
+            }
+        }
+    }
+
     /// Every bundled `samples/agents/*.md` must parse via
     /// `mlua_swarm_compile::agent_md::load_file` — they are the tier-6
     /// (`bundled_default`) fallback the CLI linker walks when resolving

@@ -128,10 +128,10 @@ use mlua_swarm::store::replay::{InMemoryReplayStore, ReplayStore};
 use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStore};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
 use mlua_swarm::{
-    CapToken, Compiler, Engine, LayerRegistry, LongHoldMiddleware, LuaInProcessSpawnerFactory,
-    MainAIMiddleware, OperatorDelegateMiddleware, OperatorSpawnerFactory, Role, RunId,
-    RustFnInProcessSpawnerFactory, SeniorEscalationMiddleware, SessionId, SpawnerRegistry,
-    SubprocessProcessSpawnerFactory, TaskId,
+    AgentBlockInProcessSpawnerFactory, CapToken, Compiler, Engine, LayerRegistry,
+    LongHoldMiddleware, LuaInProcessSpawnerFactory, MainAIMiddleware, OperatorDelegateMiddleware,
+    OperatorSpawnerFactory, Role, RunId, RustFnInProcessSpawnerFactory, SeniorEscalationMiddleware,
+    SessionId, SpawnerRegistry, SubprocessProcessSpawnerFactory, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -581,7 +581,7 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
         .with_state(state)
 }
 
-/// Default registry = Subprocess + RustFn (baseline `identity` worker pre-baked) + empty Operator factory.
+/// Default registry = Subprocess + RustFn (baseline `identity` worker pre-baked) + Lua + AgentBlock + empty Operator factory.
 ///
 /// `RustFnInProcessSpawnerFactory` gets one baseline entry (`fn_id = "identity"`)
 /// baked in via [`mlua_swarm::worker::baseline::extend_with_baseline`]. This
@@ -610,6 +610,16 @@ pub fn default_registry() -> SpawnerRegistry {
     // the enhance flow. See `LuaInProcessSpawnerFactory` docs for the spec
     // shape.
     reg.register::<LuaInProcessSpawnerFactory>(Arc::new(LuaInProcessSpawnerFactory::new()));
+    // GH #86: the stateless AgentBlock factory belongs on the vanilla path
+    // too — every per-agent specialization lives in `AgentDef.spec` /
+    // `.profile` / `.runner`, so registering it here grants no enhance-flow
+    // capability, it only makes the first-class `AgentKind::AgentBlock`
+    // dispatchable. Before this, a BP declaring `kind = "agent_block"`
+    // compiled only under `--enable-enhance-flow`; the enhance branch below
+    // still differs by baking the enhance-flow Lua `fn_id`s.
+    reg.register::<AgentBlockInProcessSpawnerFactory>(Arc::new(
+        AgentBlockInProcessSpawnerFactory::new(),
+    ));
     reg.register::<OperatorSpawnerFactory>(Arc::new(OperatorSpawnerFactory::new()));
     reg
 }
@@ -629,8 +639,7 @@ pub fn default_registry_with_enhance_flow() -> SpawnerRegistry {
     // The Factory is stateless (= 1 process → 1 factory shared by all AgentDefs).
     // Per-agent specialization (script_path / project_root, etc.) goes through AgentDef.spec.
     // The enhance-flow patch-spawner is declared literally in agents[].spec of `default_blueprint.yaml`.
-    let agent_block_factory =
-        mlua_swarm::worker::agent_block::AgentBlockInProcessSpawnerFactory::new();
+    let agent_block_factory = AgentBlockInProcessSpawnerFactory::new();
     let rustfn_factory =
         mlua_swarm::worker::baseline::extend_with_baseline(RustFnInProcessSpawnerFactory::new());
 
@@ -638,9 +647,7 @@ pub fn default_registry_with_enhance_flow() -> SpawnerRegistry {
     reg.register::<SubprocessProcessSpawnerFactory>(Arc::new(SubprocessProcessSpawnerFactory));
     reg.register::<RustFnInProcessSpawnerFactory>(Arc::new(rustfn_factory));
     reg.register::<LuaInProcessSpawnerFactory>(Arc::new(lua_factory));
-    reg.register::<mlua_swarm::worker::agent_block::AgentBlockInProcessSpawnerFactory>(Arc::new(
-        agent_block_factory,
-    ));
+    reg.register::<AgentBlockInProcessSpawnerFactory>(Arc::new(agent_block_factory));
     reg.register::<OperatorSpawnerFactory>(Arc::new(OperatorSpawnerFactory::new()));
     reg
 }

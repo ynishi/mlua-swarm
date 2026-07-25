@@ -24,13 +24,59 @@
 //!
 //! ## Spec shape (`AgentDef.spec`)
 //!
+//! This is the settled `spec` contract for `AgentKind::AgentBlock` (GH
+//! #86) — every key is optional, and every key the factory reads is
+//! listed here:
+//!
 //! ```jsonc
 //! {
 //!   "project_root": "<path>",          // optional, default = std::env::current_dir()
-//!   "script_path": "<path>",           // optional; absent => ScriptSource::DefaultAgent (PromptBased)
-//!   "mcp_rpc_timeout_ms": 30000        // optional, default = 30s
+//!   "script_path": "<path>",           // optional; absent => PromptBasedAgent mode
+//!   "mcp_rpc_timeout_ms": 30000,       // optional, default = 30s
+//!   "mcp_servers": [                   // optional; the pool the tool grant selects from
+//!     { "name": "outline", "command": "outline-mcp", "args": [] }
+//!   ]
 //! }
 //! ```
+//!
+//! ## Tool grant (GH #86)
+//!
+//! The factory reads the effective tool set off `profile.tools` — which
+//! is **already** the resolved `Runner::AgentBlockInProcess.tools`
+//! whenever the agent declares that Runner, because
+//! `compiler::project_bound_agent_for_legacy_factories` overwrites
+//! `profile.tools` from the immutable `BoundAgent` snapshot (including
+//! with an empty list, so a Blueprint can revoke an agent.md's inherited
+//! `tools:` line). No Runner declared → the agent.md line stands. There
+//! is deliberately no build hint for this axis: re-deriving the Runner
+//! here would bypass the pinned snapshot and let a `Blueprint.runners`
+//! edit change an in-flight Run's grant on resume.
+//!
+//! Enforcement is per mode:
+//!
+//! | Mode | Enforcement |
+//! |---|---|
+//! | PromptBasedAgent | Enforced at **server** granularity. Only the `spec.mcp_servers` entries named by an `mcp__<server>__<tool>` entry of the effective set are embedded into the invoker ([`resolve_needed_mcp_servers`]), so the LLM cannot reach an unlisted server — but it CAN reach every tool of a listed one (the SDK exposes a connected server's full tool list). Grant per server, not per tool. |
+//! | ScriptBasedAgent | Not enforceable — the script drives its own `mcp.connect`. Declared `mcp__` entries are therefore **rejected at compile time** rather than silently ignored; drop them and let the script own its connections. |
+//!
+//! Non-`mcp__`-prefixed names (`Read` / `Write` / `WebSearch`) do not
+//! select an MCP server and are inert in both modes (see
+//! [`mcp_tools_of`]) — the `opts.extra_tools` carry noted on
+//! [`resolve_needed_mcp_servers`].
+//!
+//! ## Per-task input and result (GH #86)
+//!
+//! The step's evaluated `in` expression reaches the script as the
+//! `_PROMPT` Lua global (via `BlockConfig.prompt`), and
+//! `profile.system_prompt` as `_CONTEXT` — both modes, no server-process
+//! env involved. The per-task working directory arrives through the
+//! materialized `AgentContextView` (see the next section), not through
+//! `spec`. A script returns its result by calling `bus.emit(<kind>,
+//! payload)` — **not** by returning a value from the chunk — and
+//! [`WorkerResultCaptor`] normalises the payload into
+//! [`WorkerResult`]`.value` (`payload.content` → `payload.response` →
+//! the whole payload). For a `VerdictChannel::Body` contract, that value
+//! IS the verdict scalar the engine compares.
 //!
 //! ## `project_root` resolution (issue #17, GH #20)
 //!
@@ -289,23 +335,23 @@ async fn run_agent_block_worker(
 
 // ─── tools / mcp_servers resolution ───────────────────────────────────────
 
-/// Cross-reference `profile.tools` (the CSV on the `tools:` line of an
-/// agent.md frontmatter) with `spec.mcp_servers` (the `"server name" →
-/// command + args` mapping provided by the `AgentDef` literal cascade)
-/// and resolve the `mcp_servers` config actually exposed to the LLM
-/// for this invocation.
+/// Cross-reference the agent's declared tool set (see
+/// [`resolve_effective_tools`] for which tier that comes from) with
+/// `spec.mcp_servers` (the `"server name" → command + args` mapping
+/// provided by the `AgentDef` literal cascade) and resolve the
+/// `mcp_servers` config actually exposed to the LLM for this invocation.
 ///
 /// Algorithm:
 ///
-/// 1. Extract `mcp__<server>__<tool>` patterns from `profile.tools`;
+/// 1. Extract `mcp__<server>__<tool>` patterns from `declared_tools`;
 ///    collect the `<server>` names.
 /// 2. Filter `spec.mcp_servers` to just the entries whose name is in
 ///    that set.
 ///
 /// This is the response to observation #3 — do not hand the LLM
-/// `mcp_servers` it does not need (only the servers the profile
+/// `mcp_servers` it does not need (only the servers the declaration
 /// explicitly asks for), and equally do not expose servers the
-/// profile does not know about even if the spec carries them
+/// declaration does not know about even if the spec carries them
 /// (caller intent wins).
 ///
 /// CC built-in tools (non-`mcp__`-prefixed names like `Read` / `Write`
@@ -313,13 +359,13 @@ async fn run_agent_block_worker(
 /// different layer — a carry that would come through a future
 /// `opts.extra_tools` Rust implementation.
 pub fn resolve_needed_mcp_servers(
-    profile_tools: &[String],
+    declared_tools: &[String],
     spec_mcp_servers: &[Value],
 ) -> Vec<Value> {
     use std::collections::HashSet;
-    // Step 1: server names from `mcp__<server>__<tool>` patterns in
-    // `profile.tools`.
-    let needed: HashSet<&str> = profile_tools
+    // Step 1: server names from `mcp__<server>__<tool>` patterns in the
+    // declared tool set.
+    let needed: HashSet<&str> = declared_tools
         .iter()
         .filter_map(|t| {
             let rest = t.strip_prefix("mcp__")?;
@@ -340,6 +386,23 @@ pub fn resolve_needed_mcp_servers(
                 .unwrap_or(false)
         })
         .cloned()
+        .collect()
+}
+
+/// GH #86 — the subset of an effective tool set that names an MCP server,
+/// i.e. the only entries this backend's grant model can act on.
+///
+/// Everything else (`Read` / `Write` / `WebSearch` …) selects no server and
+/// is inert here, so it is neither embedded nor treated as a grant that
+/// must be honored — see [`resolve_needed_mcp_servers`]'s `opts.extra_tools`
+/// carry. Used by the ScriptBasedAgent guard in
+/// [`AgentBlockInProcessSpawnerFactory::build`], which must not fail an
+/// agent whose declared tools are all inert.
+fn mcp_tools_of(tools: &[String]) -> Vec<&str> {
+    tools
+        .iter()
+        .filter(|t| t.starts_with("mcp__"))
+        .map(String::as_str)
         .collect()
 }
 
@@ -471,12 +534,19 @@ impl crate::blueprint::compiler::SpawnerFactory for AgentBlockInProcessSpawnerFa
         let spec = &agent_def.spec;
 
         // Resolve the actual mcp_servers config to pass to the real LLM by
-        // combining profile.tools (the `tools:` line of the agent.md
-        // frontmatter) with spec.mcp_servers (the first axis of AgentDef
-        // literal cascade — a "server name → command + args" mapping). The
-        // result is JSON-embedded into the Lua source by
-        // build_inline_agent_invoker and flows into `agent.run({mcp_servers=...})`.
-        let profile_tools: Vec<String> = agent_def
+        // combining the effective tool set with spec.mcp_servers (the first
+        // axis of AgentDef literal cascade — a "server name → command +
+        // args" mapping). The result is JSON-embedded into the Lua source by
+        // build_inline_agent_invoker and flows into
+        // `agent.run({mcp_servers=...})`.
+        //
+        // `profile.tools` IS the effective set: when the agent declares a
+        // `Runner::AgentBlockInProcess`, the compiler has already overwritten
+        // `profile.tools` with that Runner's `tools` off the pinned
+        // `BoundAgent` snapshot (`project_bound_agent_for_legacy_factories`),
+        // including with an empty list. No Runner declared → the agent.md
+        // `tools:` line stands as-is. See the module doc's "Tool grant".
+        let effective_tools: Vec<String> = agent_def
             .profile
             .as_ref()
             .map(|p| p.tools.clone())
@@ -486,7 +556,7 @@ impl crate::blueprint::compiler::SpawnerFactory for AgentBlockInProcessSpawnerFa
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        let needed_mcp_servers = resolve_needed_mcp_servers(&profile_tools, &spec_mcp_servers);
+        let needed_mcp_servers = resolve_needed_mcp_servers(&effective_tools, &spec_mcp_servers);
 
         // script: `spec.script_path` absent → PromptBasedAgent (the new Inline
         //         path, embedding tools and calling agent.run); present →
@@ -495,7 +565,35 @@ impl crate::blueprint::compiler::SpawnerFactory for AgentBlockInProcessSpawnerFa
         //         dependency was retired — the `host_handler` single sink
         //         captures every kind.
         let script = match spec.get("script_path").and_then(|v| v.as_str()) {
-            Some(s) => ScriptSource::Path(PathBuf::from(s)),
+            Some(s) => {
+                // GH #86: a caller script drives its own `mcp.connect`, so the
+                // host has no choke point to enforce an MCP grant through —
+                // the Inline invoker's "embed exactly the declared servers"
+                // lever does not exist on this path. Declaring MCP tools here
+                // would be a promise the runtime cannot keep, so it is
+                // rejected at compile time instead of silently ignored.
+                //
+                // Only `mcp__`-prefixed entries trigger this: everything else
+                // selects no server and is inert in both modes, so an agent.md
+                // `tools: Read, WebSearch` line must not fail a script-mode
+                // agent that compiled before this guard existed.
+                let mcp_tools = mcp_tools_of(&effective_tools);
+                if !mcp_tools.is_empty() {
+                    return Err(crate::blueprint::compiler::CompileError::InvalidSpec {
+                        name: agent_name,
+                        msg: format!(
+                            "agent_block ScriptBasedAgent mode (spec.script_path = {s:?}) cannot \
+                             enforce an MCP tool grant: the script opens its own connections via \
+                             `mcp.connect`, so the declared tools ({}) would be unenforceable. \
+                             Either drop spec.script_path to use PromptBasedAgent mode (where the \
+                             declared servers ARE the only ones embedded into the invoker), or \
+                             drop the mcp__ entries and let the script own its connections.",
+                            mcp_tools.join(", ")
+                        ),
+                    });
+                }
+                ScriptSource::Path(PathBuf::from(s))
+            }
             None => build_inline_agent_invoker(&needed_mcp_servers),
         };
 
@@ -801,6 +899,129 @@ mod tests {
         let _spawner = factory.build(&ad, None).expect("factory build");
         // = ScriptSource::Inline path (self-hosted invoker, mcp_servers embed);
         // the host_handler single sink captures every event kind.
+    }
+
+    // ─── GH #86: effective tool grant ─────────────────────────────────────
+
+    fn agent_block_def(name: &str, spec: Value, tools: &[&str]) -> crate::blueprint::AgentDef {
+        use crate::blueprint::{AgentDef, AgentKind, AgentProfile};
+        AgentDef {
+            name: name.into(),
+            kind: AgentKind::AgentBlock,
+            spec,
+            profile: Some(AgentProfile {
+                system_prompt: "You are an auditor.".into(),
+                tools: tools.iter().map(|t| t.to_string()).collect(),
+                ..Default::default()
+            }),
+            meta: None,
+            runner: None,
+            runner_ref: None,
+            verdict: None,
+        }
+    }
+
+    #[test]
+    fn mcp_tools_of_keeps_only_server_selecting_names() {
+        let tools = vec![
+            "Read".to_string(),
+            "mcp__outline__list_docs".to_string(),
+            "WebSearch".to_string(),
+        ];
+        assert_eq!(mcp_tools_of(&tools), vec!["mcp__outline__list_docs"]);
+        assert!(mcp_tools_of(&["Read".to_string()]).is_empty());
+    }
+
+    /// PromptBasedAgent mode is where the grant is enforced: only the
+    /// `spec.mcp_servers` entries named by the effective set (=
+    /// `profile.tools`, which the compiler has already overwritten from a
+    /// declared Runner) reach the invoker.
+    ///
+    /// Enforcement is per **server**, not per tool — granting
+    /// `mcp__outline__list_docs` embeds the whole `outline` server, and the
+    /// SDK exposes every tool of a connected server to the model.
+    #[tokio::test]
+    async fn effective_grant_narrows_the_embedded_mcp_servers() {
+        use crate::blueprint::compiler::SpawnerFactory;
+
+        let ad = agent_block_def(
+            "auditor",
+            serde_json::json!({
+                "mcp_servers": [
+                    {"name": "outline", "command": "outline-mcp", "args": []},
+                    {"name": "semantic-scholar", "command": "ss-mcp", "args": []},
+                ]
+            }),
+            &["mcp__outline__list_docs"],
+        );
+
+        // The pure resolution the factory performs, asserted directly (the
+        // built `Arc<dyn SpawnerAdapter>` is opaque).
+        let effective = ad.profile.as_ref().unwrap().tools.clone();
+        let servers = resolve_needed_mcp_servers(
+            &effective,
+            ad.spec["mcp_servers"].as_array().expect("array"),
+        );
+        let names: Vec<&str> = servers
+            .iter()
+            .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["outline"],
+            "semantic-scholar is declared in spec but not selected by the grant"
+        );
+
+        // And the build itself succeeds on this (PromptBased) path.
+        AgentBlockInProcessSpawnerFactory::new()
+            .build(&ad, None)
+            .expect("PromptBasedAgent mode accepts an MCP grant");
+    }
+
+    /// ScriptBasedAgent mode cannot enforce an MCP grant (the script drives
+    /// its own `mcp.connect`), so declared `mcp__` entries are rejected
+    /// rather than silently ignored.
+    #[tokio::test]
+    async fn script_mode_rejects_a_declared_mcp_grant() {
+        use crate::blueprint::compiler::{CompileError, SpawnerFactory};
+
+        let ad = agent_block_def(
+            "gate-danger",
+            serde_json::json!({ "script_path": "gate.lua" }),
+            &["mcp__outline__list_docs"],
+        );
+        let err = AgentBlockInProcessSpawnerFactory::new()
+            .build(&ad, None)
+            .err()
+            .expect("must reject");
+        match err {
+            CompileError::InvalidSpec { name, msg } => {
+                assert_eq!(name, "gate-danger");
+                assert!(msg.contains("mcp.connect"), "explains why: {msg}");
+                assert!(
+                    msg.contains("PromptBasedAgent"),
+                    "names the actionable alternative: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSpec, got: {other:?}"),
+        }
+    }
+
+    /// The guard is scoped to `mcp__` entries: an empty grant (the issue's
+    /// own repro BP) and an inert-only grant (an agent.md `tools: Read,
+    /// WebSearch` line, which compiled before the guard existed) both still
+    /// build in script mode.
+    #[tokio::test]
+    async fn script_mode_accepts_empty_and_inert_grants() {
+        use crate::blueprint::compiler::SpawnerFactory;
+
+        let spec = serde_json::json!({ "script_path": "gate.lua" });
+        for tools in [&[][..], &["Read", "WebSearch"][..]] {
+            let ad = agent_block_def("gate-danger", spec.clone(), tools);
+            AgentBlockInProcessSpawnerFactory::new()
+                .build(&ad, None)
+                .unwrap_or_else(|e| panic!("script mode must accept tools {tools:?}: {e}"));
+        }
     }
 
     #[tokio::test]

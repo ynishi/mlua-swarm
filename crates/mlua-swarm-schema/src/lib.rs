@@ -698,6 +698,12 @@ pub struct AgentDef {
     /// Worker IMPL kind (= see [`AgentKind`]).
     pub kind: AgentKind,
     /// Free-form schema per kind. Interpreted by the SpawnerFactory.
+    ///
+    /// Per-kind key contracts are documented on the [`AgentKind`] variants
+    /// (`fn_id` for `Lua` / `RustFn`, `program` + `args` for `Subprocess`,
+    /// `operator_ref` for `Operator`, and the `script_path` /
+    /// `project_root` / `mcp_rpc_timeout_ms` / `mcp_servers` set for
+    /// [`AgentKind::AgentBlock`]).
     #[serde(default)]
     pub spec: Value,
     /// Agent persona information (system_prompt / model / tools, etc.). Orthogonal to the
@@ -819,6 +825,23 @@ pub enum AgentKind {
     /// Rust closure (= factory-side registry looked up by `spec.fn_id`).
     RustFn,
     /// Headless LLM agent via the agent-block-core SDK (in-process).
+    ///
+    /// Pairs with a [`Runner::AgentBlockInProcess`]. Its `spec` contract
+    /// (GH #86 — every key optional):
+    ///
+    /// | key | meaning |
+    /// |---|---|
+    /// | `script_path` | Absent → **PromptBasedAgent** mode (the host embeds an invoker that calls the SDK's `agent` module). Present → **ScriptBasedAgent** mode (that Lua script runs instead). |
+    /// | `project_root` | Compile-time fallback cwd. Overridden per launch by `init_ctx.work_dir` / `init_ctx.project_root`. |
+    /// | `mcp_rpc_timeout_ms` | MCP RPC timeout; default `30000`. |
+    /// | `mcp_servers` | `[{name, command, args}]` pool the tool grant selects from. |
+    ///
+    /// The step's evaluated `in` reaches the agent as the `_PROMPT` Lua
+    /// global and `profile.system_prompt` as `_CONTEXT` — not through the
+    /// server process env. A script returns its result by calling
+    /// `bus.emit(<kind>, payload)`; the host reads `payload.content`, else
+    /// `payload.response`, else the whole payload, as the step OUTPUT body
+    /// (which is what a [`VerdictChannel::Body`] contract compares).
     AgentBlock,
     /// Child-process launch (= `spec.program` + `args`, via the ProcessSpawner path).
     Subprocess,
@@ -916,10 +939,27 @@ pub enum Runner {
     },
     /// In-process backend: agent-block runtime. `tools` is the effective
     /// (enforced) tool set for the in-process registry.
+    ///
+    /// Enforcement is per [`AgentKind::AgentBlock`] mode (GH #86) and is
+    /// **server-granular**: PromptBasedAgent embeds only the
+    /// `spec.mcp_servers` entries named by an `mcp__<server>__<tool>` entry
+    /// of this list, so an unlisted server is unreachable — but every tool
+    /// of a listed server is reachable. ScriptBasedAgent
+    /// (`spec.script_path` present) cannot be enforced at all — the script
+    /// drives its own `mcp.connect` — so declaring `mcp__` entries there is
+    /// a compile error rather than a silent no-op.
     AgentBlockInProcess {
         /// Effective (enforced) tool set passed to the agent-block
         /// runtime's registry — unlike WebSocket Runner tool requests, this
         /// list is not merely informational.
+        ///
+        /// Declaring this Runner at all overrides `profile.tools`,
+        /// **including when the list is empty**: an empty list is an
+        /// enforced-empty grant (the way a Blueprint revokes an agent.md's
+        /// inherited `tools:` line), not "unset". An agent that declares no
+        /// Runner keeps `profile.tools` as its effective set. The override
+        /// is applied once, when the Run's immutable `BoundAgent` snapshot
+        /// is projected for the compiler, so it is pinned for resume.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tools: Vec<String>,
     },

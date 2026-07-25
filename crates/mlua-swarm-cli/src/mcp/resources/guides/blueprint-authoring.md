@@ -473,7 +473,17 @@ backend:
 ```
 
 `AgentKind` is a closed enum (`lua`, `rust_fn`, `agent_block`, `subprocess`,
-`operator`) — there is no string-escape-hatch variant. When an agent omits
+`operator`) — there is no string-escape-hatch variant. `spec` is free-form
+per kind; the keys each kind reads are:
+
+| kind | `spec` keys |
+|---|---|
+| `lua` / `rust_fn` | `fn_id` (factory registry key), or an inline `source` chunk for `lua` |
+| `agent_block` | `script_path` / `project_root` / `mcp_rpc_timeout_ms` / `mcp_servers` — see the section below |
+| `subprocess` | `program` + `args` (or a `Runner::Subprocess` template, GH #83) |
+| `operator` | `operator_ref` |
+
+When an agent omits
 `kind`, resolution falls through a four-tier cascade (highest to lowest
 priority): (1) per-`AgentDef.kind` literal, (2) the Blueprint's top-level
 `default_agent_kind`, (3) a CLI-level default (e.g. `mse serve
@@ -582,6 +592,72 @@ capability snapshot digest as `BindingAttestation`. That attestation is included
 final `binding_digest` and persisted in the Run snapshot. Resume and replay
 reuse it without asking the provider to resolve mutable environment state
 again. MSE does not misreport declaration data as an enforced capability.
+
+### In-process agents: `kind = agent_block` (GH #86)
+
+An `agent_block` agent runs headless inside the server process over the
+agent-block-core SDK — no operator round-trip, no child process. It is the
+backend for deterministic in-process lanes (validation gates, after-run
+audits like `mse://blueprints/samples/05-after-run-audit-agent-block`).
+
+Two modes, selected by whether `spec.script_path` is present:
+
+| Mode | Trigger | What runs |
+|---|---|---|
+| **PromptBasedAgent** | `spec.script_path` absent | The host embeds an invoker that calls the SDK's `agent` module with the declared MCP servers. |
+| **ScriptBasedAgent** | `spec.script_path = "<path>"` | Your Lua script runs instead; it owns its own MCP connections. |
+
+`spec` keys (all optional):
+
+```jsonc
+{
+  "script_path": "gates/danger.lua",   // absent => PromptBasedAgent mode
+  "project_root": "/abs/path",         // compile-time fallback cwd
+  "mcp_rpc_timeout_ms": 30000,         // default 30s
+  "mcp_servers": [                     // pool the tool grant selects from
+    { "name": "outline", "command": "outline-mcp", "args": [] }
+  ]
+}
+```
+
+**Input and result.** The step's evaluated `in` arrives as the `_PROMPT`
+Lua global and `profile.system_prompt` as `_CONTEXT` — per task, not
+through the server process env. The per-task working directory comes from
+the launch's `init_ctx.work_dir` / `init_ctx.project_root`, which outrank
+`spec.project_root`. A script returns its result by calling
+`bus.emit(<kind>, payload)` — **not** by returning a value from the chunk —
+and the host takes `payload.content`, else `payload.response`, else the
+whole payload, as the step OUTPUT body. For a `verdict` contract on
+`channel: "body"`, that value IS the verdict scalar.
+
+**Tool grant.** The effective set is the resolved
+`agent_block_in_process` Runner's `tools` when a Runner is declared,
+otherwise `profile.tools`. A declared-but-empty list is an enforced-empty
+grant, not "unset" — that is how a Blueprint revokes an agent.md's
+inherited `tools:` line. The override is pinned into the Run's immutable
+`BoundAgent` snapshot at launch, so editing `Blueprint.runners` afterwards
+does not change an in-flight Run's grant.
+
+Enforcement is **server-granular**, and differs by mode. PromptBasedAgent
+embeds only the `spec.mcp_servers` entries named by an
+`mcp__<server>__<tool>` entry of the effective set — an unlisted server is
+unreachable, but *every* tool of a listed server is reachable (a connected
+MCP server exposes its full tool list to the model). ScriptBasedAgent
+cannot be enforced at all, because the script calls `mcp.connect` itself;
+declaring `mcp__` entries alongside `spec.script_path` is therefore a
+compile error rather than a silent no-op — drop them and let the script own
+its connections, or drop `spec.script_path` to get an enforced grant.
+Non-`mcp__` names (`Read`, `WebSearch`, …) select no server and are inert
+in both modes.
+
+```jsonc
+{
+  "name": "gate-danger",
+  "kind": "agent_block",
+  "spec": { "script_path": "gates/danger.lua" },
+  "runner": { "backend": "agent_block_in_process", "tools": [] }
+}
+```
 
 ### Execution assurance: `strategy.strict_binding`
 

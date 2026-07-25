@@ -29,12 +29,12 @@ use mlua_swarm::store::replay::{InMemoryReplayStore, ReplayStore, SqliteReplaySt
 use mlua_swarm::store::run::{InMemoryRunStore, RunStore, SqliteRunStore};
 use mlua_swarm::store::task::{InMemoryTaskStore, SqliteTaskStore, TaskStore};
 use mlua_swarm::{
-    Compiler, Engine, EngineCfg, EnhanceApplication, EnhanceApplicationConfig, Role,
-    TaskLaunchService,
+    AgentBlockInProcessSpawnerFactory, LuaInProcessSpawnerFactory, OperatorSpawnerFactory,
+    RustFnInProcessSpawnerFactory, SpawnerRegistry, SubprocessProcessSpawnerFactory,
 };
 use mlua_swarm::{
-    LuaInProcessSpawnerFactory, OperatorSpawnerFactory, RustFnInProcessSpawnerFactory,
-    SpawnerRegistry, SubprocessProcessSpawnerFactory,
+    Compiler, Engine, EngineCfg, EnhanceApplication, EnhanceApplicationConfig, Role,
+    TaskLaunchService,
 };
 use mlua_swarm_server::{
     build_blueprints_router_with_refs, build_enhance_log_router, build_enhance_settings_router,
@@ -370,6 +370,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             // `spec.source`. The enhance-flow branch above already carries
             // its own Lua factory (with the enhance-flow `fn_id`s baked in).
             r.register::<LuaInProcessSpawnerFactory>(Arc::new(LuaInProcessSpawnerFactory::new()));
+            // GH #86: same rationale as `default_registry` — the stateless
+            // AgentBlock factory makes `kind: agent_block` dispatchable on
+            // the vanilla path; it carries no enhance-flow specialization
+            // (that lives in the branch above's Lua `fn_id`s).
+            r.register::<AgentBlockInProcessSpawnerFactory>(Arc::new(
+                AgentBlockInProcessSpawnerFactory::new(),
+            ));
             r.register::<OperatorSpawnerFactory>(op_factory.clone());
             r
         };
