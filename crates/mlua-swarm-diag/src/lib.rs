@@ -469,6 +469,16 @@ pub const LINT_DECLS: &[LintDecl] = &[
         "mse://guides/blueprint-authoring",
     ),
     decl(
+        "verdict-contract-never-read",
+        DiagLevel::Warn,
+        LintCategory::Suspicious,
+        "Every declared verdict.values entry on an agent is unhandled — no downstream \
+         cond reads any of them, so the contract is decorative and the step cannot halt \
+         the flow. Per-agent aggregate of `verdict-value-unhandled`; separates a full \
+         gate loss from the per-value baseline that fires on the always-unread PASS token.",
+        "mse://guides/blueprint-authoring",
+    ),
+    decl(
         "halted-at-missing",
         DiagLevel::Error,
         LintCategory::Correctness,

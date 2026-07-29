@@ -119,8 +119,9 @@ pub use binding::{
     BindingProviderError, LegacyWorkerBindingPolicy, ManifestBindingProvider, UnboundAgent,
 };
 pub use blueprint::compiler::{
-    unhandled_verdict_values, CompileError, CompiledAgentTable, CompiledBlueprint, Compiler,
-    HostBridge, LuaInProcessSpawnerFactory, LuaScriptSource, OperatorSpawnerFactory,
+    agents_with_all_verdict_values_unread, unhandled_verdict_values, AgentContractUnread,
+    CompileError, CompiledAgentTable, CompiledBlueprint, Compiler, HostBridge,
+    LuaInProcessSpawnerFactory, LuaScriptSource, OperatorSpawnerFactory,
     RustFnInProcessSpawnerFactory, SpawnerFactory, SpawnerFactoryKind, SpawnerRegistry,
     SubprocessProcessSpawnerFactory, UnhandledVerdictValue, WORKER_BINDING_REQUIRED_MSG_PREFIX,
 };

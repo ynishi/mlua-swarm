@@ -1316,6 +1316,78 @@ pub fn unhandled_verdict_values(
     fold_unhandled_verdict_values(verdict_contracts, &referenced_values, &step_agents)
 }
 
+/// One agent whose entire declared `verdict.values` set went unread — the
+/// per-agent aggregate of [`UnhandledVerdictValue`]. Signals that the
+/// contract is decorative: the step declares a verdict, but every declared
+/// token is unhandled downstream, so the gate cannot halt the flow.
+///
+/// Separate from [`UnhandledVerdictValue`] because a normal Blueprint
+/// always leaks one per-value finding per agent (the halt gate only reads
+/// the halt token, so PASS is structurally unhandled). That baseline noise
+/// hides the actual defect this variant catches — the whole gate being
+/// dropped (e.g. `2db863e` opt-OUT authoring surviving the `bafe47d4`
+/// opt-in flip). Consumers surface both: per-value stays for parity with
+/// `strict_verdict_handling`, per-agent adds a WARN whose count equals the
+/// number of agents whose gate is fully dead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentContractUnread {
+    /// The contract-bearing agent (= `AgentDef.name` = `Step.ref_`).
+    pub agent: String,
+    /// The full declared token set — every one of these is unread.
+    pub declared_values: Vec<String>,
+    /// The first flow site that invokes `agent`, for attribution.
+    pub step_ref: String,
+}
+
+/// Per-agent aggregate of [`unhandled_verdict_values`]: return one entry
+/// per agent whose entire declared `verdict.values` set went unhandled.
+///
+/// Called by the `bp_doctor` `verdict_contract_lint` family alongside the
+/// per-value producer; the two views coexist. Agents with a partially
+/// handled contract (any single value read by a cond) contribute nothing
+/// here — the per-value findings already point at the specific gap.
+///
+/// Stable order (agent name sort) mirrors [`fold_unhandled_verdict_values`]
+/// so the `bp_doctor` findings array is reproducible between calls.
+pub fn agents_with_all_verdict_values_unread(
+    flow: &FlowNode,
+    verdict_contracts: &HashMap<String, VerdictContract>,
+) -> Vec<AgentContractUnread> {
+    let per_value = unhandled_verdict_values(flow, verdict_contracts);
+    let mut unread_counts: HashMap<String, usize> = HashMap::new();
+    for finding in &per_value {
+        *unread_counts.entry(finding.agent.clone()).or_default() += 1;
+    }
+    let mut agents: Vec<&String> = verdict_contracts.keys().collect();
+    agents.sort();
+    let mut out = Vec::new();
+    for agent in agents {
+        let contract = &verdict_contracts[agent];
+        let declared = contract.values.len();
+        if declared == 0 {
+            continue;
+        }
+        let unread = unread_counts.get(agent).copied().unwrap_or(0);
+        if unread != declared {
+            continue;
+        }
+        // Attribute to the first step that invokes this agent, matching the
+        // per-value producer's `step_ref` field so downstream renderers can
+        // cross-reference the two finding sets by agent + step.
+        let step_ref = per_value
+            .iter()
+            .find(|f| &f.agent == agent)
+            .map(|f| f.step_ref.clone())
+            .unwrap_or_else(|| agent.clone());
+        out.push(AgentContractUnread {
+            agent: agent.clone(),
+            declared_values: contract.values.clone(),
+            step_ref,
+        });
+    }
+    out
+}
+
 /// The shared core of [`check_unhandled_verdict_values`] and
 /// [`unhandled_verdict_values`]: given the two passes' output, fold out
 /// the declared values nothing references.

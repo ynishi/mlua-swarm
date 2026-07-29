@@ -405,6 +405,52 @@ that returns a report has its `Final` rejected at completion time. The
 lint reports it as N findings before the first dispatch; without it the
 first signal is a missing-Final symptom at run time.
 
+#### Aggregate: `verdict_contract_never_read`
+
+A normal halt gate always leaks one `verdict_value_unhandled` finding per
+agent (the halt cond only reads the halt token, so the always-unread
+`PASS` shows up as a per-value WARN even in a healthy Blueprint). That
+baseline noise structurally hides the actual defect this section is about
+— the whole gate being dropped so **every** declared value on an agent
+goes unread. The concrete regression: a bp.lua authored against the pre-
+`bafe47d4` cascade rules (pipeline-level `halt_on` implicitly gates every
+stage) rebuilt against the post-flip rules (stages must opt in explicitly
+via `gate = true` / stage-level `halt_on` / `retry`) — the opt-OUT stages
+silently stopped emitting gates, but each still leaks one baseline WARN,
+indistinguishable from a normal one.
+
+To separate the two, the family additionally emits a per-agent aggregate
+finding `verdict_contract_never_read` (WARN — one per agent whose entire
+declared `verdict.values` set is unread). The count of these equals the
+number of agents whose gate is fully dead; the per-value baseline stays
+in place for parity with `strict_verdict_handling`. Aggregate findings
+appear first in `findings[]`:
+
+```
+bp_doctor(id = "<bp>")
+  → verdict_contract_lint: { findings: [
+      { check: "verdict_contract_never_read", severity: "WARN",
+        agent: "gate-danger", channel: "body",
+        declared_values: ["PASS", "BLOCKED"], step_ref: "gate-danger",
+        message: "… no downstream Branch/Loop cond reads any of them — the
+                  contract is decorative and this step cannot halt the
+                  flow. Add a gate that reads the verdict (e.g.
+                  `gate = true` on the B.pipeline stage) …" },
+      { check: "verdict_value_unhandled", severity: "WARN",
+        agent: "gate-danger", value: "PASS", … },
+      { check: "verdict_value_unhandled", severity: "WARN",
+        agent: "gate-danger", value: "BLOCKED", … }
+    ] }
+```
+
+The aggregate projects to the `verdict-contract-never-read` diagnostic
+kind and carries a concrete `Suggestion { patch: "gate = true,",
+applicability: MaybeIncorrect }` — `MaybeIncorrect` because the fix
+presumes a `B.pipeline` stage record (a hand-rolled `Branch` needs the
+equivalent shape by hand). Both aggregate and per-value findings fold
+into `verdict_contract_lint_warn_count` and the top-level aggregate
+verdict; disabling the family drops both.
+
 To promote the warning to a hard `CompileError::VerdictValueUnhandled`,
 opt in via `Blueprint.metadata`:
 
