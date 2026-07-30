@@ -19,10 +19,40 @@ use mlua_swarm::{
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+/// Route `agent-block-core`'s three SQLite backends (`std.kv` / `std.sql`
+/// / `std.ts`, each defaulting to a file under `AGENT_BLOCK_HOME`
+/// (`$HOME/.agent-block/`)) to the `:memory:` sentinel so file locks
+/// disappear entirely. Two axes of contention drove the CI red on
+/// 4f5fbfb: (a) cross-test-binary — `cargo test --workspace` opens the
+/// same default `$HOME/.agent-block/{kv,db,ts}.sqlite` from several
+/// binaries in parallel processes → WAL journal lock; (b) intra-file —
+/// this file's 15 `#[tokio::test]`s run parallel on the shared runtime
+/// and would still contend inside one tempdir. Per-process tempdir
+/// isolation only addressed (a); `:memory:` removes the file layer
+/// altogether so (b) is a no-op too. Each SQLite connection open in
+/// `:memory:` mode gets its own private in-memory DB — none of these
+/// tests need agent-block state to survive across launches, so that
+/// per-launch isolation is a feature here.
+///
+/// `OnceLock` gates the `set_var` calls to exactly once per process,
+/// before any AgentBlock `Runtime` reads the env — the config surface
+/// re-reads at each open, so setting before the first launch is
+/// sufficient.
+static AGENT_BLOCK_STATE_ISOLATED: OnceLock<()> = OnceLock::new();
+
+fn isolate_agent_block_state() {
+    AGENT_BLOCK_STATE_ISOLATED.get_or_init(|| {
+        std::env::set_var("AGENT_BLOCK_KV_PATH", ":memory:");
+        std::env::set_var("AGENT_BLOCK_SQL_PATH", ":memory:");
+        std::env::set_var("AGENT_BLOCK_TS_PATH", ":memory:");
+    });
+}
+
 fn service() -> TaskLaunchService {
+    isolate_agent_block_state();
     let mut reg = SpawnerRegistry::new();
     reg.register::<AgentBlockInProcessSpawnerFactory>(Arc::new(
         AgentBlockInProcessSpawnerFactory::new(),
@@ -31,6 +61,7 @@ fn service() -> TaskLaunchService {
 }
 
 fn launch_input(bp: Value, init_ctx: Value) -> TaskLaunchInput {
+    isolate_agent_block_state();
     TaskLaunchInput::automate(
         serde_json::from_value(bp).expect("blueprint deserializes"),
         "gh86-e2e-op",
@@ -660,8 +691,29 @@ bus.emit("worker_result", {{ ok = true, response = "audited" }})
         out.final_ctx["result"]
     );
 
-    let seen = std::fs::read_to_string(&marker)
-        .expect("the auditor script must have run in-process and written its marker");
+    // `svc.launch(...).await` returning does not guarantee the AFTER_RUN
+    // audit lane has flushed its side-effects to the FS — the in-process
+    // auditor runs on a spawned task and, on macOS runners, the marker
+    // write has occasionally not appeared by the time `read_to_string`
+    // fires (the symptom that broke macOS CI on 4f5fbfb). Poll with a
+    // bounded budget instead of a single-shot read; the auditor writes
+    // synchronously once it starts, so any delay here is dispatch/schedule
+    // latency, capped at a few hundred ms in practice.
+    let seen = {
+        let budget = Duration::from_secs(2);
+        let start = std::time::Instant::now();
+        loop {
+            match std::fs::read_to_string(&marker) {
+                Ok(s) => break s,
+                Err(e) if start.elapsed() > budget => panic!(
+                    "the auditor script must have run in-process and written its marker \
+                     within {budget:?}: last error {e:?}, marker path {}",
+                    marker.display()
+                ),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    };
     assert!(
         seen.contains("worker"),
         "the auditor's prompt should name the step it audits, got: {seen:?}"
