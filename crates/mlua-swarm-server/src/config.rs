@@ -167,6 +167,19 @@ pub struct FileConfig {
     /// omits it. `None` = fall back to the built-in default (3600s / 60 min, see
     /// [`ResolvedConfig`]'s `Default` impl).
     pub sync_timeout_secs: Option<u64>,
+    /// Idle threshold (seconds) for the periodic stale-run sweep: a Run
+    /// still `Running` whose `updated_at` is older than this is marked
+    /// `Interrupted` so it becomes resumable without a restart. `0`
+    /// disables the sweep entirely. `None` = fall back to
+    /// [`default_stale_run_sweep_secs`] applied to the resolved
+    /// `sync_timeout_secs`.
+    pub stale_run_sweep_secs: Option<u64>,
+    /// R4 lock-hold guard threshold (milliseconds) for
+    /// `mlua_swarm::EngineCfg::max_hold_ms` — how long a single
+    /// `Engine::with_state` closure may hold the state lock before the
+    /// engine reports a suspected long operation inside the lock. `None`
+    /// = leave the engine's built-in default (50ms) in place.
+    pub engine_max_hold_ms: Option<u64>,
     /// Server-wide [`mlua_swarm::core::config::CheckPolicy`] — governs how
     /// submit-time projection sinks
     /// (`Engine::materialize_final_submission` /
@@ -233,6 +246,12 @@ pub struct CliOverrides {
     pub token_secret: Option<String>,
     /// `--sync-timeout-secs` value (mirrors [`FileConfig::sync_timeout_secs`]).
     pub sync_timeout_secs: Option<u64>,
+    /// `--stale-run-sweep-secs` value (mirrors
+    /// [`FileConfig::stale_run_sweep_secs`]).
+    pub stale_run_sweep_secs: Option<u64>,
+    /// `--engine-max-hold-ms` value (mirrors
+    /// [`FileConfig::engine_max_hold_ms`]).
+    pub engine_max_hold_ms: Option<u64>,
     /// `--check-policy` value (mirrors [`FileConfig::check_policy`]).
     /// Parsed at the caller (`serve.rs`) before landing here — invalid
     /// tokens are rejected before this struct is ever constructed.
@@ -298,6 +317,15 @@ pub struct ResolvedConfig {
     /// provides one. A per-request `TaskLaunchRequest.timeout_secs`
     /// override, when present, takes priority over this server-wide value.
     pub sync_timeout_secs: u64,
+    /// Idle threshold (seconds) the periodic stale-run sweep reaps at.
+    /// Always set — defaults to [`default_stale_run_sweep_secs`] applied
+    /// to the resolved `sync_timeout_secs` (3900s under the built-in
+    /// timeout). `0` disables the sweep: no sweeper task is spawned.
+    pub stale_run_sweep_secs: u64,
+    /// Resolved `EngineCfg.max_hold_ms` override in milliseconds. `None`
+    /// = the engine's built-in default (50ms) stands. See
+    /// [`FileConfig::engine_max_hold_ms`].
+    pub engine_max_hold_ms: Option<u64>,
     /// Opt-in endpoint injection into worker-facing data (WS Spawn
     /// directive `base_url` line / `StepPointer.content_url` absolute
     /// prefix). Always set — defaults to `false` (never injected) when
@@ -337,6 +365,8 @@ impl Default for ResolvedConfig {
             default_agent_kind: None,
             token_secret: None,
             sync_timeout_secs: default_sync_timeout_secs(),
+            stale_run_sweep_secs: default_stale_run_sweep_secs(default_sync_timeout_secs()),
+            engine_max_hold_ms: None,
             inject_endpoint_for_worker: false,
             long_hold_warn_ms: None,
             check_policy: CheckPolicy::default(),
@@ -354,6 +384,21 @@ impl Default for ResolvedConfig {
 /// GH #39.
 pub fn default_sync_timeout_secs() -> u64 {
     3600
+}
+
+/// Built-in default idle threshold for the periodic stale-run sweep,
+/// seconds: `max(sync_timeout_secs, default_run_ttl()) + 300`.
+///
+/// The two terms are the structural ceilings on how long a *live* Run can
+/// legitimately go without touching its row: a synchronous launch is
+/// bounded by `sync_timeout_secs`, a detached one by the run TTL. Anything
+/// idle beyond the larger of the two (plus a 300s margin) has no driver
+/// left to advance it — the case a dropped driver future (a cancelled
+/// synchronous launch) leaves behind, which no other finalizer covers.
+/// Erring long is deliberate: a late reap costs a resume kick, an early
+/// one would interrupt a run that is still working.
+pub fn default_stale_run_sweep_secs(sync_timeout_secs: u64) -> u64 {
+    sync_timeout_secs.max(crate::default_run_ttl()) + 300
 }
 
 fn default_bind() -> SocketAddr {
@@ -388,6 +433,13 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
     };
 
     let ephemeral = cli.ephemeral.or(file.ephemeral).unwrap_or(false);
+
+    // Resolved ahead of the struct literal because the stale-run sweep
+    // threshold's built-in default is derived from it.
+    let sync_timeout_secs = cli
+        .sync_timeout_secs
+        .or(file.sync_timeout_secs)
+        .unwrap_or_else(default_sync_timeout_secs);
 
     Ok(ResolvedConfig {
         bind,
@@ -454,10 +506,12 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .unwrap_or(default.seed_blueprint_id),
         default_agent_kind: cli.default_agent_kind.or(file.default_agent_kind),
         token_secret: cli.token_secret.or(file.token_secret),
-        sync_timeout_secs: cli
-            .sync_timeout_secs
-            .or(file.sync_timeout_secs)
-            .unwrap_or_else(default_sync_timeout_secs),
+        sync_timeout_secs,
+        stale_run_sweep_secs: cli
+            .stale_run_sweep_secs
+            .or(file.stale_run_sweep_secs)
+            .unwrap_or_else(|| default_stale_run_sweep_secs(sync_timeout_secs)),
+        engine_max_hold_ms: cli.engine_max_hold_ms.or(file.engine_max_hold_ms),
         check_policy: cli
             .check_policy
             .or(file.check_policy)
@@ -775,6 +829,118 @@ mod tests {
             resolved.sync_timeout_secs, 45,
             "cli sync_timeout_secs must win over file"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // `stale_run_sweep_secs` resolution cascade (periodic stale-run sweep)
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_stale_run_sweep_secs_default_derives_from_sync_timeout() {
+        let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
+        assert_eq!(
+            resolved.stale_run_sweep_secs,
+            default_stale_run_sweep_secs(default_sync_timeout_secs())
+        );
+        assert_eq!(
+            resolved.stale_run_sweep_secs, 3900,
+            "max(3600 sync timeout, 1800 run ttl) + 300 margin"
+        );
+    }
+
+    /// The default tracks a raised `sync_timeout_secs` (a longer sync
+    /// launch legitimately keeps a Run's row idle for longer), and stays
+    /// pinned to the run TTL when the timeout is lowered below it.
+    #[test]
+    fn resolve_stale_run_sweep_secs_default_tracks_the_resolved_sync_timeout() {
+        let file = FileConfig {
+            sync_timeout_secs: Some(7200),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file).expect("resolve");
+        assert_eq!(resolved.stale_run_sweep_secs, 7500);
+
+        let cli = CliOverrides {
+            sync_timeout_secs: Some(60),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, FileConfig::default()).expect("resolve");
+        assert_eq!(
+            resolved.stale_run_sweep_secs, 2100,
+            "a short sync timeout must not shrink the threshold below the run TTL + margin"
+        );
+    }
+
+    #[test]
+    fn resolve_stale_run_sweep_secs_cli_wins_over_file() {
+        let cli = CliOverrides {
+            stale_run_sweep_secs: Some(600),
+            ..Default::default()
+        };
+        let file = FileConfig {
+            stale_run_sweep_secs: Some(1200),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).expect("resolve");
+        assert_eq!(resolved.stale_run_sweep_secs, 600);
+    }
+
+    #[test]
+    fn resolve_stale_run_sweep_secs_zero_is_kept_as_the_disable_switch() {
+        let file = FileConfig {
+            stale_run_sweep_secs: Some(0),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file).expect("resolve");
+        assert_eq!(
+            resolved.stale_run_sweep_secs, 0,
+            "an explicit 0 disables the sweep and must not fall through to the default"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // `engine_max_hold_ms` resolution cascade (EngineCfg.max_hold_ms)
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_engine_max_hold_ms_absent_leaves_the_engine_default() {
+        let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
+        assert_eq!(
+            resolved.engine_max_hold_ms, None,
+            "None keeps the engine's built-in max_hold_ms"
+        );
+    }
+
+    #[test]
+    fn resolve_engine_max_hold_ms_file_wins_over_default() {
+        let file = FileConfig {
+            engine_max_hold_ms: Some(200),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file).expect("resolve");
+        assert_eq!(resolved.engine_max_hold_ms, Some(200));
+    }
+
+    #[test]
+    fn resolve_engine_max_hold_ms_cli_wins_over_file() {
+        let cli = CliOverrides {
+            engine_max_hold_ms: Some(500),
+            ..Default::default()
+        };
+        let file = FileConfig {
+            engine_max_hold_ms: Some(200),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).expect("resolve");
+        assert_eq!(resolved.engine_max_hold_ms, Some(500));
+    }
+
+    #[test]
+    fn file_config_deserializes_the_new_keys() {
+        let toml_text = "stale_run_sweep_secs = 900\nengine_max_hold_ms = 200\n";
+        let cfg: FileConfig = toml::from_str(toml_text).expect("parse");
+        assert_eq!(cfg.stale_run_sweep_secs, Some(900));
+        assert_eq!(cfg.engine_max_hold_ms, Some(200));
     }
 
     // ──────────────────────────────────────────────────────────────────

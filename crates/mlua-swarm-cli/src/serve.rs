@@ -187,6 +187,23 @@ pub struct Args {
     /// config file's `sync_timeout_secs`; built-in default is 3600s (60 min).
     #[arg(long)]
     sync_timeout_secs: Option<u64>,
+    /// Idle threshold (seconds) for the periodic stale-run sweep. A Run
+    /// still `Running` whose row has not been touched for longer than
+    /// this has lost its driver (a dropped synchronous launch leaves no
+    /// finalizer behind), so the sweep marks it `Interrupted` and it
+    /// becomes resumable via `POST /v1/runs/:id/resume` without waiting
+    /// for a restart. `0` disables the sweep. Overrides the config
+    /// file's `stale_run_sweep_secs`; the built-in default is
+    /// `max(sync_timeout_secs, run ttl) + 300` (3900s out of the box).
+    #[arg(long)]
+    stale_run_sweep_secs: Option<u64>,
+    /// R4 lock-hold guard threshold (milliseconds) for the engine: how
+    /// long a single `Engine::with_state` closure may hold the state
+    /// lock before the engine reports a suspected long operation inside
+    /// the lock. Overrides the config file's `engine_max_hold_ms`; when
+    /// both are omitted the engine's built-in default (50ms) stands.
+    #[arg(long)]
+    engine_max_hold_ms: Option<u64>,
     /// Opt-out of the persist-by-default `TaskStore`/`RunStore` (issue #35
     /// ST1): restores the previous InMemory default. Has no effect when an
     /// explicit `--task-store-path`/`--run-store-path` (or the config
@@ -271,6 +288,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         default_agent_kind: args.default_agent_kind.clone(),
         token_secret: args.token_secret.clone(),
         sync_timeout_secs: args.sync_timeout_secs,
+        stale_run_sweep_secs: args.stale_run_sweep_secs,
+        engine_max_hold_ms: args.engine_max_hold_ms,
         check_policy: args
             .check_policy
             .as_ref()
@@ -284,14 +303,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .map(|s| parse_agent_kind_cli(s).unwrap_or_else(|e| panic!("mse serve: {e}")));
     eprintln!("mse serve: config loaded from {}", config_path.display());
 
-    let make_cfg = || {
-        let mut c = EngineCfg::default();
-        if let Some(hex_secret) = &cfg.token_secret {
-            c.token_secret = hex::decode(hex_secret).expect("token-secret must be hex");
-        }
-        c.check_policy = cfg.check_policy;
-        c
-    };
     // Engine stateless-executor refactor:
     // A single Engine instance is used (the old task / enhance axis split
     // guarded against bind-state races that dispatch_attempt_with's
@@ -301,7 +312,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // "operator_delegate") get wrapped into the SpawnerStack inside
     // TaskLaunchService.
     let engine = Engine::new_with_layers(
-        make_cfg(),
+        engine_cfg_from(&cfg),
         mlua_swarm_server::default_layer_registry_with(mlua_swarm_server::LayerOptions {
             long_hold_warn_ms: cfg.long_hold_warn_ms,
         }),
@@ -519,6 +530,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let shutdown_task_store = task_store.clone();
     let shutdown_run_store = run_store.clone();
 
+    // Same refcount-bump rationale for the periodic stale-run sweeper,
+    // which outlives the router assembly below and runs for the whole
+    // process lifetime.
+    let sweep_task_store = task_store.clone();
+    let sweep_run_store = run_store.clone();
+    let sweep_trace_store = run_trace_store.clone();
+
     // Router assembly (fixed combined mode): merges task, ws_operator_factory, and every enhance route.
     let mut app = mlua_swarm_server::build_router_full_with_legacy_worker_binding_policy(
         engine.clone(),
@@ -556,6 +574,37 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     ));
 
     let enhance_loop = tokio::spawn(enhance_app.clone().run_forever(Duration::from_millis(100)));
+
+    // Periodic stale-run sweeper (same spawn/abort wiring as the enhance
+    // loop). `stale_run_sweep_secs = 0` means no loop at all, so the
+    // disable switch costs nothing at runtime.
+    let stale_run_sweep_secs = cfg.stale_run_sweep_secs;
+    let stale_run_sweeper = if stale_run_sweep_secs == 0 {
+        eprintln!("mse serve: stale run sweep disabled (stale_run_sweep_secs = 0)");
+        None
+    } else {
+        eprintln!(
+            "mse serve: stale run sweep every {}s, idle threshold {stale_run_sweep_secs}s",
+            STALE_RUN_SWEEP_PERIOD.as_secs()
+        );
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(STALE_RUN_SWEEP_PERIOD);
+            // `interval`'s first tick completes immediately; consume it so
+            // the first sweep lands one period in, not at boot (the boot
+            // sweep has just run).
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                sweep_stale_running_runs(
+                    &sweep_task_store,
+                    &sweep_run_store,
+                    &sweep_trace_store,
+                    stale_run_sweep_secs,
+                )
+                .await;
+            }
+        }))
+    };
 
     let doctor_info = DoctorInfo {
         bind: cfg.bind.to_string(),
@@ -613,6 +662,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .await
         .expect("serve");
     enhance_loop.abort();
+    if let Some(sweeper) = stale_run_sweeper {
+        sweeper.abort();
+    }
     // B-4: mark any Run still `Running` after the drain `Interrupted`, so a
     // restart does not leave it stranded `Running` forever. Runs BEFORE the
     // isle drivers are drained below — it writes through the SQLite stores.
@@ -625,6 +677,150 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Build the [`EngineCfg`] the server runs with from the resolved config.
+///
+/// A free fn (rather than the closure it grew out of) so the config →
+/// engine mapping is unit-testable on its own: `token_secret` is decoded
+/// here, `check_policy` is carried through, and `engine_max_hold_ms`
+/// overrides the R4 lock-hold guard only when it is actually set — an
+/// absent key leaves `EngineCfg::default()`'s 50ms in place.
+fn engine_cfg_from(cfg: &mlua_swarm_server::config::ResolvedConfig) -> EngineCfg {
+    let mut c = EngineCfg::default();
+    if let Some(hex_secret) = &cfg.token_secret {
+        c.token_secret = hex::decode(hex_secret).expect("token-secret must be hex");
+    }
+    c.check_policy = cfg.check_policy;
+    if let Some(ms) = cfg.engine_max_hold_ms {
+        c.max_hold_ms = ms as u128;
+    }
+    c
+}
+
+/// How often the stale-run sweeper wakes up. Independent of the idle
+/// threshold it reaps at (`stale_run_sweep_secs`): the period only bounds
+/// how late a reap can be (threshold + one period), so a fixed minute is
+/// enough and keeps the loop off the config surface.
+const STALE_RUN_SWEEP_PERIOD: Duration = Duration::from_secs(60);
+
+/// Periodic stale-run sweep: mark every Run that is still `Running` but
+/// has not touched its row for longer than `threshold_secs` as
+/// `Interrupted`, so it becomes resumable via `POST /v1/runs/:id/resume`
+/// without waiting for a process restart.
+///
+/// This covers the one lifecycle hole the boot sweep
+/// ([`recover_interrupted_runs`]) and the shutdown drain
+/// ([`interrupt_running_on_shutdown`]) leave open: a driver future that is
+/// simply **dropped** mid-flight (the client of a synchronous launch
+/// disconnects, so the axum handler future — and the run driver inside it
+/// — is cancelled). Nothing runs on a drop: the panic guard is for
+/// unwinds, and the TTL timeout lives inside the very future that went
+/// away. Such a Run stays `Running` forever with no one left to advance
+/// it, which is exactly what `updated_at` reveals — every store write on
+/// the live path (`append_step_entry`, `set_result`, `update_status`,
+/// `try_transition`) bumps it, on both the InMemory and SQLite backends.
+///
+/// The status flip is a compare-and-set (`RunStore::try_transition`
+/// `Running -> Interrupted`) rather than the boot/shutdown path's direct
+/// `update_status`, because this sweep runs **concurrently with live
+/// traffic**: between `list_running` and the write, a run may have
+/// finalized on its own. Losing the CAS means someone else already moved
+/// the row, and the sweep leaves it alone instead of clobbering a terminal
+/// status. Every store error is logged and swallowed — a sweep tick must
+/// never take the server down.
+///
+/// `threshold_secs == 0` disables the sweep (the caller does not even
+/// spawn the loop; the guard here keeps the function itself honest).
+/// Returns the number of Runs this tick reaped, which is what the tests
+/// assert on.
+async fn sweep_stale_running_runs(
+    task_store: &std::sync::Arc<dyn mlua_swarm::store::task::TaskStore>,
+    run_store: &std::sync::Arc<dyn mlua_swarm::store::run::RunStore>,
+    run_trace_store: &std::sync::Arc<dyn mlua_swarm::store::trace::RunTraceStore>,
+    threshold_secs: u64,
+) -> usize {
+    if threshold_secs == 0 {
+        return 0;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let running = match run_store.list_running().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "stale run sweep: list_running failed");
+            return 0;
+        }
+    };
+    let mut reaped = 0;
+    for run in running {
+        // `saturating_sub` covers a row stamped in the future by a clock
+        // step: it reads as "idle 0s", never as a huge idle that would
+        // reap a live run.
+        let idle_secs = now.saturating_sub(run.updated_at);
+        if idle_secs <= threshold_secs {
+            continue;
+        }
+        match run_store
+            .try_transition(
+                &run.id,
+                mlua_swarm::store::run::RunStatus::Running,
+                mlua_swarm::store::run::RunStatus::Interrupted,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    run_id = %run.id,
+                    "stale run sweep: run left Running between the scan and the transition; skipped"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(run_id = %run.id, error = %e, "stale run sweep: try_transition failed");
+                continue;
+            }
+        }
+        // Won the CAS: stamp the same terminal shape the boot sweep and
+        // shutdown drain use, with a reason that names the actual cause.
+        let envelope = serde_json::json!({ "error": format!("orphaned: no driver progress for {idle_secs}s") });
+        if let Err(e) = run_store.set_result(&run.id, envelope).await {
+            tracing::warn!(run_id = %run.id, error = %e, "stale run sweep: set_result failed");
+        }
+        if let Err(e) = task_store
+            .update_status(
+                &run.task_id,
+                mlua_swarm::store::task::TaskRecordStatus::Interrupted,
+            )
+            .await
+        {
+            tracing::warn!(task_id = %run.task_id, error = %e, "stale run sweep: task update_status failed");
+        }
+        // The dropped driver never reached `finalize_run`, so the trace
+        // stream gets its terminal marker here (same shape as the panic
+        // guard's).
+        mlua_swarm::store::trace::TraceHandle::new(run.id.clone(), run_trace_store.clone())
+            .append(
+                mlua_swarm::store::trace::kind::RUN_FINISHED,
+                None,
+                None,
+                serde_json::json!({ "status": "interrupted", "reason": "stale run sweep" }),
+            )
+            .await;
+        tracing::info!(
+            run_id = %run.id,
+            task_id = %run.task_id,
+            idle_secs,
+            threshold_secs,
+            resume_url = %format!("POST /v1/runs/{}/resume", run.id),
+            "stale run sweep: marked an orphaned run Interrupted"
+        );
+        reaped += 1;
+    }
+    reaped
 }
 
 /// Boot-time recovery sweep (issue #35): any Run left `Running` from a
@@ -876,6 +1072,9 @@ mod tests {
     use mlua_swarm::store::replay::ReplayEntry;
     use mlua_swarm::store::run::{RunRecord, RunStatus};
     use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus};
+    use mlua_swarm::store::trace::{
+        kind as trace_kind, InMemoryRunTraceStore, RunTraceStore, TraceQuery,
+    };
     use mlua_swarm::types::{RunId, TaskId};
 
     #[tokio::test]
@@ -1131,5 +1330,224 @@ mod tests {
         assert_eq!(done_run.result_ref, None);
         let done_task = task_store.get(&done_task_id).await.unwrap();
         assert_eq!(done_task.status, TaskRecordStatus::Done);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Periodic stale-run sweep
+    // ──────────────────────────────────────────────────────────────────
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Seed one Task + one Run pair with an explicit run status and
+    /// `updated_at`, plus a launch-input snapshot so the resume
+    /// precondition (`input_json.is_some()`) is observable.
+    async fn seed_pair(
+        task_store: &Arc<dyn TaskStore>,
+        run_store: &Arc<dyn RunStore>,
+        key: &str,
+        status: RunStatus,
+        updated_at: u64,
+    ) -> (TaskId, RunId) {
+        let task_id = TaskId::parse(format!("T-{key}")).unwrap();
+        let run_id = RunId::parse(format!("R-{key}")).unwrap();
+        task_store
+            .create(TaskRecord {
+                id: task_id.clone(),
+                goal: "stale sweep fixture".into(),
+                blueprint_ref: json!({}),
+                input_ctx: json!({}),
+                task_input_spec: None,
+                status: TaskRecordStatus::Running,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: task_id.clone(),
+                status,
+                step_entries: vec![],
+                degradations: vec![],
+                operator_sid: None,
+                result_ref: None,
+                input_json: Some("{}".to_string()),
+                created_at: 1,
+                updated_at,
+            })
+            .await
+            .unwrap();
+        (task_id, run_id)
+    }
+
+    /// The sweep reaps a Run whose row has gone quiet past the threshold
+    /// (the dropped-driver orphan) and leaves a Run that is still making
+    /// progress alone. The reaped Run lands in exactly the state the
+    /// resume endpoint accepts: `Interrupted` + a launch-input snapshot.
+    #[tokio::test]
+    async fn stale_run_sweep_reaps_the_orphan_and_leaves_the_fresh_run_running() {
+        let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let trace_store: Arc<dyn RunTraceStore> = Arc::new(InMemoryRunTraceStore::new());
+
+        let now = now_secs();
+        let (stale_task_id, stale_run_id) = seed_pair(
+            &task_store,
+            &run_store,
+            "stale",
+            RunStatus::Running,
+            now - 1_000,
+        )
+        .await;
+        let (fresh_task_id, fresh_run_id) =
+            seed_pair(&task_store, &run_store, "fresh", RunStatus::Running, now).await;
+
+        let reaped = sweep_stale_running_runs(&task_store, &run_store, &trace_store, 100).await;
+        assert_eq!(reaped, 1, "only the idle run is reaped");
+
+        let stale_run = run_store.get(&stale_run_id).await.unwrap();
+        assert_eq!(stale_run.status, RunStatus::Interrupted);
+        let err = stale_run
+            .result_ref
+            .as_ref()
+            .and_then(|r| r.get("error"))
+            .and_then(|e| e.as_str())
+            .expect("terminal envelope carries an `error` string");
+        assert!(
+            err.starts_with("orphaned: no driver progress for"),
+            "reason names the actual cause: {err}"
+        );
+        assert!(
+            stale_run.input_json.is_some(),
+            "resume precondition: Interrupted + a launch-input snapshot"
+        );
+        assert_eq!(
+            task_store.get(&stale_task_id).await.unwrap().status,
+            TaskRecordStatus::Interrupted
+        );
+
+        // The trace stream gets the terminal marker the dropped driver
+        // never wrote.
+        let events = trace_store
+            .list(&stale_run_id, &TraceQuery::default())
+            .await
+            .expect("trace list");
+        let finished: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == trace_kind::RUN_FINISHED)
+            .collect();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].payload["status"], json!("interrupted"));
+
+        // Control: the run that is still progressing is untouched on
+        // every axis.
+        let fresh_run = run_store.get(&fresh_run_id).await.unwrap();
+        assert_eq!(fresh_run.status, RunStatus::Running);
+        assert_eq!(fresh_run.result_ref, None);
+        assert_eq!(
+            task_store.get(&fresh_task_id).await.unwrap().status,
+            TaskRecordStatus::Running
+        );
+        assert!(trace_store
+            .list(&fresh_run_id, &TraceQuery::default())
+            .await
+            .expect("trace list")
+            .is_empty());
+    }
+
+    /// `stale_run_sweep_secs = 0` is the disable switch: even a run idle
+    /// far past any plausible threshold stays `Running`.
+    #[tokio::test]
+    async fn stale_run_sweep_threshold_zero_is_a_no_op() {
+        let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let trace_store: Arc<dyn RunTraceStore> = Arc::new(InMemoryRunTraceStore::new());
+
+        let (_, run_id) = seed_pair(
+            &task_store,
+            &run_store,
+            "disabled",
+            RunStatus::Running,
+            now_secs() - 100_000,
+        )
+        .await;
+
+        let reaped = sweep_stale_running_runs(&task_store, &run_store, &trace_store, 0).await;
+        assert_eq!(reaped, 0);
+        assert_eq!(
+            run_store.get(&run_id).await.unwrap().status,
+            RunStatus::Running
+        );
+    }
+
+    /// The sweep can never overwrite a Run that reached a terminal status:
+    /// `list_running` excludes it, and the `Running -> Interrupted`
+    /// compare-and-set fails for it even when invoked directly (the race
+    /// where a run finalizes between the scan and the write).
+    #[tokio::test]
+    async fn stale_run_sweep_cas_never_clobbers_a_terminal_run() {
+        let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let trace_store: Arc<dyn RunTraceStore> = Arc::new(InMemoryRunTraceStore::new());
+
+        let (_, done_run_id) = seed_pair(
+            &task_store,
+            &run_store,
+            "already-done",
+            RunStatus::Done,
+            now_secs() - 100_000,
+        )
+        .await;
+        run_store
+            .set_result(&done_run_id, json!({"out": "finished on its own"}))
+            .await
+            .unwrap();
+
+        let reaped = sweep_stale_running_runs(&task_store, &run_store, &trace_store, 100).await;
+        assert_eq!(reaped, 0, "a terminal run is not a sweep candidate");
+
+        let done_run = run_store.get(&done_run_id).await.unwrap();
+        assert_eq!(done_run.status, RunStatus::Done);
+        assert_eq!(
+            done_run.result_ref,
+            Some(json!({"out": "finished on its own"})),
+            "the run's own terminal result survives the sweep"
+        );
+
+        // The guard itself: the transition the sweep would perform is
+        // rejected for a row that is no longer `Running`.
+        assert!(
+            !run_store
+                .try_transition(&done_run_id, RunStatus::Running, RunStatus::Interrupted)
+                .await
+                .unwrap(),
+            "Running -> Interrupted CAS must lose against a terminal status"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // `engine_max_hold_ms` → `EngineCfg.max_hold_ms`
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn engine_cfg_from_keeps_the_engine_default_max_hold_when_unset() {
+        let cfg = mlua_swarm_server::config::ResolvedConfig::default();
+        assert_eq!(cfg.engine_max_hold_ms, None);
+        assert_eq!(engine_cfg_from(&cfg).max_hold_ms, 50);
+    }
+
+    #[test]
+    fn engine_cfg_from_applies_the_configured_max_hold() {
+        let cfg = mlua_swarm_server::config::ResolvedConfig {
+            engine_max_hold_ms: Some(200),
+            ..Default::default()
+        };
+        assert_eq!(engine_cfg_from(&cfg).max_hold_ms, 200);
     }
 }

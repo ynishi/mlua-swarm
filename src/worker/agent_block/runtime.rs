@@ -215,6 +215,10 @@ struct WorkerResultCaptor {
     /// wire one (an `artifact` emit then degrades to a `tracing::warn!`
     /// rather than silently vanishing).
     sink: Option<Arc<dyn crate::worker::output::OutputSink>>,
+    /// The agent's Blueprint-declared model
+    /// ([`AgentBlockSettings::declared_model`]) — the fallback for
+    /// `stats.model` when the payload does not report one at runtime.
+    declared_model: Option<String>,
 }
 
 impl WorkerResultCaptor {
@@ -236,9 +240,14 @@ impl WorkerResultCaptor {
     /// return, whose `usage` (`{input_tokens, output_tokens,
     /// total_tokens}`, all turns summed) and `num_turns` used to be
     /// DROPPED here — the exact gap this recovers. `None` when the
-    /// payload carries neither (caller-script `worker_result` shapes).
-    /// The raw `usage` object also rides as `adapter_data` so
+    /// payload carries none of them (caller-script `worker_result`
+    /// shapes). The raw `usage` object also rides as `adapter_data` so
     /// provider-specific detail (cache tokens etc.) survives.
+    ///
+    /// A payload-level `"model"` string is the **runtime-observed** model
+    /// and is adopted verbatim; it outranks the Blueprint-declared
+    /// fallback applied in [`Handler::call`], because what actually
+    /// served the attempt beats what was asked for.
     fn extract_stats(payload: &Value) -> Option<crate::store::trace::WorkerStats> {
         let usage_raw = payload.get("usage");
         let usage = usage_raw.and_then(|u| {
@@ -260,12 +269,16 @@ impl WorkerResultCaptor {
             .get("num_turns")
             .and_then(|v| v.as_u64())
             .map(|n| n as u32);
-        if usage.is_none() && num_turns.is_none() {
+        let model = payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if usage.is_none() && num_turns.is_none() && model.is_none() {
             return None;
         }
         Some(crate::store::trace::WorkerStats {
             worker_kind: Some("agent_block".to_string()),
-            model: None,
+            model,
             usage,
             num_turns,
             adapter_data: usage_raw.cloned(),
@@ -330,7 +343,16 @@ impl Handler for WorkerResultCaptor {
         // Even when the SDK payload carries no usage (script-side
         // `worker_result` shapes), the boundary still knows its own
         // kind — surface it so `StepEntry.worker_kind` is never empty.
-        let wr = WorkerResult { value, ok, stats }.ensure_worker_kind("agent_block");
+        let mut wr = WorkerResult { value, ok, stats }.ensure_worker_kind("agent_block");
+        // `agent.run` returns no model, so without this the sidecar's
+        // `model` was always empty on this backend. Fall back to the
+        // Blueprint-declared `profile.model`, mirroring the subprocess
+        // backend's baked `{model}`. Precedence: runtime-observed
+        // (`extract_stats`) > declared > none — `get_or_insert_with`
+        // encodes exactly that (it is a no-op once a value is present).
+        if let (Some(declared), Some(stats)) = (self.declared_model.as_deref(), wr.stats.as_mut()) {
+            stats.model.get_or_insert_with(|| declared.to_string());
+        }
         if let Ok(mut guard) = self.tx.lock() {
             if let Some(tx) = guard.take() {
                 let _ = tx.send(wr);
@@ -421,6 +443,13 @@ struct AgentBlockSettings {
     /// body and frontmatter. `None` maps to `BlockConfig.context = None`
     /// for backwards compatibility with the old path.
     profile_context: Option<String>,
+    /// The agent.md frontmatter `model:` line (`profile.model`), baked at
+    /// compile time. Observational only — this backend does not select a
+    /// model with it (the SDK owns that); it is the declared fallback for
+    /// the per-step `stats.model` sidecar, so a step of an agent whose BP
+    /// names a model is attributable even though `agent.run` reports
+    /// none. Sibling of the subprocess backend's baked `{model}`.
+    declared_model: Option<String>,
 }
 
 /// One invocation's worth of an `agent-block-core` SDK call — the
@@ -438,6 +467,7 @@ async fn run_agent_block_worker(
     let captor: Arc<dyn Handler> = Arc::new(WorkerResultCaptor {
         tx: Mutex::new(Some(tx)),
         sink: inv.sink.clone(),
+        declared_model: settings.declared_model.clone(),
     });
 
     // GH #86: the task-context tier, read off the ONE in-process seam
@@ -770,12 +800,17 @@ impl crate::blueprint::compiler::SpawnerFactory for AgentBlockInProcessSpawnerFa
             None => Duration::from_secs(30),
         };
         let profile_context = agent_def.profile.as_ref().map(|p| p.system_prompt.clone());
+        // Same source the subprocess backend bakes its `{model}`
+        // placeholder from; here it only ever reaches the per-step stats
+        // sidecar (see `AgentBlockSettings::declared_model`).
+        let declared_model = agent_def.profile.as_ref().and_then(|p| p.model.clone());
 
         let settings = Arc::new(AgentBlockSettings {
             script,
             spec_project_root,
             mcp_rpc_timeout,
             profile_context,
+            declared_model,
         });
 
         // A plain `InProcSpawner` with this agent's single route. GH #86
@@ -949,6 +984,7 @@ mod tests {
         let captor = WorkerResultCaptor {
             tx: Mutex::new(Some(tx)),
             sink: None,
+            declared_model: None,
         };
         let payload = serde_json::json!({ "ok": true, "response": "hello" });
         let ack = captor
@@ -959,6 +995,86 @@ mod tests {
         let wr = rx.await.expect("recv");
         assert!(wr.ok);
         assert_eq!(wr.value, serde_json::json!("hello"));
+    }
+
+    // ─── declared model → per-step stats sidecar ─────────────────────────
+
+    /// Run one payload through a captor carrying `declared_model` and
+    /// return the resulting `stats.model`.
+    async fn captured_model(declared: Option<&str>, payload: Value) -> Option<String> {
+        let (tx, rx) = oneshot::channel();
+        let captor = WorkerResultCaptor {
+            tx: Mutex::new(Some(tx)),
+            sink: None,
+            declared_model: declared.map(str::to_string),
+        };
+        captor
+            .call("agent_result".into(), "evt-1".into(), payload, Value::Null)
+            .await
+            .expect("handler ack");
+        let wr = rx.await.expect("recv");
+        wr.stats
+            .expect("worker_kind alone guarantees a sidecar")
+            .model
+    }
+
+    /// `agent.run` reports no model, so the declared `profile.model` is
+    /// what lands in the sidecar — the gap that left `StepEntry.stats
+    /// .model` permanently `None` on this backend.
+    #[tokio::test]
+    async fn declared_model_lands_in_the_stats_sidecar() {
+        let payload = serde_json::json!({
+            "content": "done",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+            "num_turns": 2,
+        });
+        assert_eq!(
+            captured_model(Some("opus"), payload).await,
+            Some("opus".to_string())
+        );
+    }
+
+    /// The fallback does not depend on the usage rail: a caller-script
+    /// `worker_result` shape (no `usage`, no `num_turns`) still gets the
+    /// declared model, because `ensure_worker_kind` has already created
+    /// the sidecar.
+    #[tokio::test]
+    async fn declared_model_lands_even_without_usage_in_the_payload() {
+        let payload = serde_json::json!({ "ok": true, "response": "hello" });
+        assert_eq!(
+            captured_model(Some("sonnet"), payload).await,
+            Some("sonnet".to_string())
+        );
+    }
+
+    /// A runtime-reported `model` is what actually served the attempt, so
+    /// it outranks the declaration.
+    #[tokio::test]
+    async fn runtime_reported_model_wins_over_the_declaration() {
+        let payload = serde_json::json!({
+            "content": "done",
+            "model": "claude-runtime-1",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        });
+        assert_eq!(
+            captured_model(Some("opus"), payload).await,
+            Some("claude-runtime-1".to_string())
+        );
+
+        // …including when the payload carries nothing else the stats
+        // extractor keys on.
+        let payload = serde_json::json!({ "content": "done", "model": "claude-runtime-1" });
+        assert_eq!(
+            captured_model(Some("opus"), payload).await,
+            Some("claude-runtime-1".to_string())
+        );
+    }
+
+    /// No declaration and no runtime report = no attribution invented.
+    #[tokio::test]
+    async fn no_declared_model_leaves_the_sidecar_model_empty() {
+        let payload = serde_json::json!({ "ok": true, "response": "hello" });
+        assert_eq!(captured_model(None, payload).await, None);
     }
 
     #[tokio::test]
@@ -1228,6 +1344,7 @@ mod tests {
         let captor = WorkerResultCaptor {
             tx: Mutex::new(Some(tx)),
             sink: Some(sink.clone()),
+            declared_model: None,
         };
 
         captor
@@ -1285,6 +1402,7 @@ mod tests {
         let captor = WorkerResultCaptor {
             tx: Mutex::new(Some(tx)),
             sink: None,
+            declared_model: None,
         };
         let err = captor
             .call(

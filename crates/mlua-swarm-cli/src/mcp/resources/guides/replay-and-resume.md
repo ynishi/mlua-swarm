@@ -155,15 +155,61 @@ starts accepting HTTP traffic:
      fields `run_id`, `task_id`, `replayed_steps`, and
      `resume_url = "POST /v1/runs/<id>/resume"`. This is the
      "resumable" hint the attached operator watches for.
-   - `replayed_steps == 0` — emits at `tracing::debug!` level;
-     the Run is marked Interrupted but there is nothing to
-     replay against, so a resume would be equivalent to a
-     rekick.
+   - `replayed_steps == 0` — also emits at `tracing::info!`
+     level (an orphan must stay visible at the default log
+     level). A Run with a launch-input snapshot but no replay
+     entries is still resumable — the resume rebuilds it from
+     the snapshot; a Run with neither is reported as not
+     resumable.
 
 The sweep never re-dispatches on its own. An operator that has
 not yet attached would have its handle burn out while the Run
 waits for it, so the actual resume kick is the operator's
 responsibility (see the "Deferred" note below).
+
+## Stale run sweep
+
+The boot sweep only fires at process start, and the shutdown
+drain only when the server exits cleanly. Neither covers a run
+driver future that is simply **dropped** mid-flight — the client
+of a synchronous launch disconnects, the axum handler future is
+cancelled, and the driver inside it disappears. Nothing runs on a
+drop: the panic guard is for unwinds, and the TTL timeout lives
+inside the very future that went away. Such a Run stays `Running`
+with nobody left to advance it, and until the next restart it was
+not even resumable (resume only accepts `Interrupted`).
+
+`mse serve` therefore runs a periodic sweep alongside the server:
+
+1. Every 60s it walks `RunStore::list_running` and computes each
+   Run's idle time from `updated_at`. Every store write on the
+   live path (step-entry append, status update, result write)
+   bumps that column, so it tracks actual driver progress.
+2. A Run idle for longer than `stale_run_sweep_secs` is
+   transitioned `Running -> Interrupted` with a **compare-and-set**,
+   its `result_ref` set to
+   `{"error":"orphaned: no driver progress for <n>s"}`, its owning
+   Task marked `Interrupted`, and a `core.run_finished` event
+   (`{"status":"interrupted","reason":"stale run sweep"}`) appended
+   to the trace stream. The owning Run is then resumable through the
+   ordinary `POST /v1/runs/<id>/resume` endpoint — no restart
+   involved.
+3. Losing the compare-and-set means the Run left `Running` between
+   the scan and the write (it finalized on its own), so the sweep
+   leaves it untouched. A Run that reached a terminal status can
+   never be clobbered by the sweep.
+
+The threshold defaults to `max(sync_timeout_secs, run ttl) + 300`
+= 3900s out of the box: those two are the structural ceilings on
+how long a live Run can legitimately stay quiet, so anything past
+them plus a margin has no driver left. Set
+`stale_run_sweep_secs` (config file or `--stale-run-sweep-secs`)
+to tune it, or `0` to disable the sweep entirely. Worst-case
+detection latency is the threshold plus one 60s period.
+
+Every store error inside a sweep tick is logged and swallowed —
+a persistence hiccup must not take the server down — and the
+sweep, like the boot one, never re-dispatches on its own.
 
 ## Deferred pieces
 
@@ -196,3 +242,5 @@ out of scope of the initial land:
   server side.
 - `crates/mlua-swarm-cli/src/serve.rs::recover_interrupted_runs`
   — the boot-time sweep and the resumable-log emission point.
+- `crates/mlua-swarm-cli/src/serve.rs::sweep_stale_running_runs`
+  — the periodic stale-run sweep and its compare-and-set guard.

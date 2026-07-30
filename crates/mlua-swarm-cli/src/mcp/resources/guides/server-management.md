@@ -274,6 +274,19 @@ carries process-level knobs (working directory, `KeepAlive`,
 `ThrottleInterval`, log sinks) and does not need re-installing for a
 config-only change.
 
+Unknown keys in `config.toml` are a hard error (typo guard), so a
+key must not be added before the binary that understands it is
+installed — otherwise the daemon refuses to start. Order for a
+key introduced by a new release: upgrade the binary first, then
+add the key, then restart.
+
+### Recently added keys
+
+| Key | CLI flag | Default | Effect |
+|---|---|---|---|
+| `stale_run_sweep_secs` | `--stale-run-sweep-secs` | `max(sync_timeout_secs, run ttl) + 300` (3900s) | Idle threshold for the periodic stale-run sweep: a Run still `Running` whose row has been untouched for longer has lost its driver, and the sweep marks it `Interrupted` so it becomes resumable without a restart. `0` disables the sweep. See `mse://guides/replay-and-resume`. |
+| `engine_max_hold_ms` | `--engine-max-hold-ms` | `50` | Engine lock-hold guard threshold in milliseconds: how long a single state-lock operation may run before the engine reports a suspected long operation inside the lock. Raise it on a loaded host where the warning fires on healthy runs. |
+
 ## See also
 
 - `mse://guides/getting-started` — top-level entry point (serve /
