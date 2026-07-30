@@ -99,6 +99,12 @@ pub struct TaskApplicationInput {
     /// Operator registry ID — used on the path that hands the whole
     /// spawn off to an external Operator.
     pub operator_backend_id: Option<String>,
+    /// Run-scoped Operator session pin, threaded verbatim into
+    /// [`TaskLaunchInput::operator_pin`] — the session id (`S-<hex>`) this
+    /// launch binds its Spawn stream to, on any axis. `None` (the default
+    /// via [`Self::automate`]) keeps the logical-role resolution every
+    /// pre-pin caller has.
+    pub operator_pin: Option<String>,
     /// "Runtime Agent-level" tier (highest priority) of the `OperatorKind`
     /// cascade — per-agent override, keyed by `AgentDef.name`. Empty by
     /// default. See `crate::core::ctx::collapse_operator_kind` for the full tier
@@ -146,6 +152,7 @@ impl TaskApplicationInput {
             bridge_id: None,
             hook_id: None,
             operator_backend_id: None,
+            operator_pin: None,
             operator_kind_overrides: HashMap::new(),
             task_input: None,
             check_policy: None,
@@ -320,6 +327,7 @@ impl TaskApplication {
                 bridge_id: input.bridge_id,
                 hook_id: input.hook_id,
                 operator_backend_id: input.operator_backend_id,
+                operator_pin: input.operator_pin,
                 operator_kind_overrides: input.operator_kind_overrides,
                 init_ctx: input.init_ctx,
                 run_ctx,
@@ -502,6 +510,7 @@ mod tests {
             bridge_id: Some("br-x".into()),
             hook_id: Some("hk-y".into()),
             operator_backend_id: None,
+            operator_pin: None,
             operator_kind_overrides: HashMap::new(),
             task_input: None,
             check_policy: None,

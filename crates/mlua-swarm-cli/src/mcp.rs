@@ -2071,6 +2071,24 @@ struct SwarmRunReq {
     /// Operator id label. Default "mcp-run".
     #[serde(default)]
     operator_id: Option<String>,
+    /// Run-scoped Operator session pin (`S-<hex>`): the session this run's
+    /// Spawn frames are delivered to, regardless of which session currently
+    /// holds the Blueprint's logical `operator_ref` role. Sent as the
+    /// `operator_sid` field of `POST /v1/tasks`.
+    ///
+    /// Usually omitted: when this process holds exactly one live Operator
+    /// session (`mse_operator_join`) and the run targets the server that
+    /// session is joined to, that sid is pinned automatically — a driver's
+    /// runs come back to the driver without any extra argument. Zero or two
+    /// or more live sessions auto-pin nothing. Set the field explicitly to
+    /// pin a specific session (for example when this process holds several).
+    ///
+    /// Only the `{kind: "id"}` selector can carry a pin: it is the path that
+    /// launches on `mse serve`, where Operator sessions live. Pinning an
+    /// inline / file Blueprint (which runs inside this process, with no
+    /// Operator sessions of its own) is rejected rather than ignored.
+    #[serde(default)]
+    operator_sid: Option<String>,
     /// `main_ai` / `automate` / `composite` — the "Runtime Global" tier of
     /// the 4-tier `OperatorKind` cascade. Unspecified falls through to the
     /// BP-level tiers (`OperatorDef.kind` / `Blueprint.default_operator_kind`)
@@ -2184,6 +2202,27 @@ fn any_json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         "type": ["object", "array", "string", "number", "boolean", "null"],
         "description": "Arbitrary JSON value."
     })
+}
+
+/// Whether the auto-pin may apply: does a `swarm_run(kind = "id")` launch
+/// bound for `bind` target the same server this process's Operator sessions
+/// are joined to (`http_base`)?
+///
+/// An omitted `bind` means the default server, so it matches when
+/// `http_base` is that same default. A sid is only meaningful on the server
+/// that minted it — auto-pinning it at a different server would turn a
+/// launch that used to work into a `400`, so the pin is simply not applied
+/// there. An explicit `operator_sid` is never filtered this way: the caller
+/// named the session, and an unknown sid failing loudly is the point.
+///
+/// Pure and side-effect-free so the matching rule is unit-testable without a
+/// live session.
+fn auto_pin_targets_joined_server(http_base: &str, bind: Option<&str>) -> bool {
+    let target = format!(
+        "http://{}",
+        bind.unwrap_or(launchd::DEFAULT_BIND).trim_end_matches('/')
+    );
+    http_base.trim_end_matches('/') == target
 }
 
 /// Parse a wire-level kind string into `OperatorKind`. Shared by
@@ -2623,7 +2662,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Run a Blueprint via TaskApplication.handle. Blocking by default (returns run_id + final_ctx + bound_version on completion); pass `detach: true` for the asynchronous launch — returns `{run_id, task_id, status: \"running\"}` immediately, poll `swarm_status` for the result. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline)."
+        description = "Run a Blueprint via TaskApplication.handle. Blocking by default (returns run_id + final_ctx + bound_version on completion); pass `detach: true` for the asynchronous launch — returns `{run_id, task_id, status: \"running\"}` immediately, poll `swarm_status` for the result. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline). On the `{kind: \"id\"}` path the run is pinned to an Operator session: `operator_sid` when given, otherwise this process's sole live session (joined via mse_operator_join, and only when the run targets that session's server) — so with several drivers sharing one server, a run's Spawn frames come back to the driver that launched it instead of to whichever session currently holds the Blueprint's logical operator role."
     )]
     async fn swarm_run(
         &self,
@@ -2646,6 +2685,25 @@ impl MseServer {
         // Id kind: proxy POST /v1/tasks. Uses the server-side store; the
         // in-process store dedicated to Inline is not consulted.
         if let BlueprintSelector::Id { id, bind } = &selector {
+            // Run-scoped Operator pin: explicit param first; otherwise this
+            // process's sole live session, but only when the run targets the
+            // very server that session is joined to (a sid means nothing on
+            // another server, and auto-pinning one there would turn a
+            // working launch into a 400).
+            let operator_sid = match req.operator_sid {
+                Some(sid) => Some(sid),
+                None => match self.op_client.sole_live_sid().await {
+                    Some(sid)
+                        if auto_pin_targets_joined_server(
+                            self.op_client.http_base(),
+                            bind.as_deref(),
+                        ) =>
+                    {
+                        Some(sid)
+                    }
+                    _ => None,
+                },
+            };
             return self
                 .swarm_run_via_http(
                     run_id,
@@ -2658,8 +2716,25 @@ impl MseServer {
                     req.operator_kind_overrides,
                     detach,
                     req.ttl_secs,
+                    operator_sid,
                 )
                 .await;
+        }
+
+        // Inline / File run inside this process, whose engine has no
+        // Operator session registry at all — a pin here could never be
+        // honored. Say so instead of accepting the argument and quietly
+        // running unpinned: a caller that asked for a specific session must
+        // not be told "done" by a path that cannot deliver there.
+        if req.operator_sid.is_some() {
+            return Err(McpError::invalid_params(
+                "operator_sid pins a run to an Operator session on `mse serve`, so it only \
+                 applies to the {kind: \"id\"} selector; an inline / file Blueprint runs \
+                 inside this mcp process, which holds no Operator sessions. Register the \
+                 Blueprint on the server and launch it by id to use the pin."
+                    .to_string(),
+                None,
+            ));
         }
 
         // Minted here (rather than just before `run_store.create` below) so
@@ -2757,6 +2832,9 @@ impl MseServer {
             bridge_id: None,
             hook_id: None,
             operator_backend_id: None,
+            // The in-process path has no Operator session registry to pin
+            // to (an explicit `operator_sid` was rejected above).
+            operator_pin: None,
             operator_kind_overrides,
             task_input: None,
             // Local MCP run path does not expose a check_policy override;
@@ -2957,6 +3035,7 @@ impl MseServer {
         operator_kind_overrides: Option<HashMap<String, String>>,
         detach: bool,
         ttl_override: Option<u64>,
+        operator_sid: Option<String>,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut inner = self.state.write().await;
@@ -3018,6 +3097,14 @@ impl MseServer {
         }
         if !operator_obj.is_empty() {
             payload.insert("operator".into(), JsonValue::Object(operator_obj));
+        }
+        // Run-scoped Operator pin (explicit param or this process's sole
+        // live session): the server binds the whole Spawn stream of this run
+        // to that session instead of resolving the Blueprint's logical role
+        // through whichever session happens to hold it. Absent field = the
+        // pre-pin wire body, byte-for-byte.
+        if let Some(sid) = operator_sid {
+            payload.insert("operator_sid".into(), JsonValue::String(sid));
         }
 
         let client = match reqwest::Client::builder()
@@ -4815,6 +4902,7 @@ mod tests {
             init_ctx: None,
             timeout_secs: Some(5),
             operator_id: None,
+            operator_sid: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -4876,6 +4964,7 @@ mod tests {
             init_ctx: Some(serde_json::json!({"in": "hello"})),
             timeout_secs: Some(10),
             operator_id: None,
+            operator_sid: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -4910,6 +4999,7 @@ mod tests {
             init_ctx: Some(serde_json::json!({"in": "hello"})),
             timeout_secs: Some(10),
             operator_id: None,
+            operator_sid: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: Some(true),
@@ -4954,6 +5044,7 @@ mod tests {
             init_ctx: Some(serde_json::json!({"in": "hello"})),
             timeout_secs: Some(10),
             operator_id: None,
+            operator_sid: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -5000,6 +5091,7 @@ mod tests {
             init_ctx: Some(serde_json::json!({"in": "hello"})),
             timeout_secs: Some(10),
             operator_id: None,
+            operator_sid: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -5023,6 +5115,7 @@ mod tests {
             init_ctx: Some(serde_json::json!({"in": "hi"})),
             timeout_secs: Some(10),
             operator_id: None,
+            operator_sid: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -5051,6 +5144,7 @@ mod tests {
             init_ctx: Some(serde_json::json!({"in": "hi"})),
             timeout_secs: Some(10),
             operator_id: None,
+            operator_sid: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -5061,6 +5155,68 @@ mod tests {
         let text = extract_text_payload(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(parsed["status"], "done", "payload: {text}");
+    }
+
+    /// The run-scoped pin only means something on the server-backed path.
+    /// An inline Blueprint runs inside this process, which holds no
+    /// Operator sessions — accepting the argument and running unpinned
+    /// would tell the caller "done" on a route that could never deliver
+    /// where they asked.
+    #[tokio::test]
+    async fn swarm_run_rejects_an_operator_sid_on_the_inline_path() {
+        let server = MseServer::new();
+        let bp_json = serde_json::to_value(identity_blueprint()).expect("serialize");
+        let input: BlueprintInput = serde_json::from_value(bp_json).expect("bare parse");
+        let req = SwarmRunReq {
+            blueprint: input,
+            init_ctx: Some(serde_json::json!({"in": "hi"})),
+            timeout_secs: Some(10),
+            operator_id: None,
+            operator_sid: Some("S-somewhere".to_string()),
+            operator_kind: None,
+            operator_kind_overrides: None,
+            detach: None,
+            ttl_secs: None,
+        };
+        let err = server
+            .swarm_run(Parameters(req))
+            .await
+            .expect_err("an inline run must not silently ignore the pin");
+        let message = err.to_string();
+        assert!(
+            message.contains("operator_sid"),
+            "the error must name the rejected param: {message}"
+        );
+        assert!(
+            message.contains("id"),
+            "the error must point at the selector that does support it: {message}"
+        );
+    }
+
+    /// Auto-pin only applies when the launch targets the server this
+    /// process's sessions are joined to — a sid means nothing elsewhere.
+    #[test]
+    fn auto_pin_matches_only_the_joined_server() {
+        assert!(
+            auto_pin_targets_joined_server("http://127.0.0.1:7777", None),
+            "an omitted bind means the default server"
+        );
+        assert!(auto_pin_targets_joined_server(
+            "http://127.0.0.1:7777",
+            Some("127.0.0.1:7777")
+        ));
+        assert!(
+            auto_pin_targets_joined_server("http://127.0.0.1:7777/", Some("127.0.0.1:7777")),
+            "a trailing slash on the joined base must not defeat the match"
+        );
+        assert!(
+            !auto_pin_targets_joined_server("http://127.0.0.1:7777", Some("127.0.0.1:9999")),
+            "another server never inherits this process's sid"
+        );
+        assert!(
+            !auto_pin_targets_joined_server("http://elsewhere:7777", None),
+            "the default bind is not this process's server here"
+        );
     }
 
     /// File hygiene: `..` parent-dir components are rejected.
@@ -5906,6 +6062,7 @@ mod tests {
                 init_ctx: None,
                 timeout_secs: Some(5),
                 operator_id: None,
+                operator_sid: None,
                 operator_kind: None,
                 operator_kind_overrides: None,
                 detach: None,
@@ -5944,6 +6101,7 @@ mod tests {
                 init_ctx: None,
                 timeout_secs: Some(5),
                 operator_id: None,
+                operator_sid: None,
                 operator_kind: None,
                 operator_kind_overrides: None,
                 detach: None,

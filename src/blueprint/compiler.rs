@@ -554,7 +554,7 @@ impl Compiler {
     /// metadata.
     pub fn compile(&self, bp: &Blueprint) -> Result<CompiledBlueprint, CompileError> {
         let bound_agents = resolve_bound_agents(bp)?;
-        self.compile_bound(bp, &bound_agents)
+        self.compile_bound_pinned(bp, &bound_agents, None)
     }
 
     /// Compile with an already-resolved immutable binding snapshot. Resume
@@ -566,11 +566,38 @@ impl Compiler {
         bp: &Blueprint,
         bound_agents: &[BoundAgent],
     ) -> Result<CompiledBlueprint, CompileError> {
-        let effective = materialize_bound_blueprint(bp, bound_agents);
-        self.compile_resolved(&effective)
+        self.compile_bound_pinned(bp, bound_agents, None)
     }
 
-    fn compile_resolved(&self, bp: &Blueprint) -> Result<CompiledBlueprint, CompileError> {
+    /// [`Self::compile_bound`] plus a launch-scoped Operator session pin.
+    ///
+    /// `operator_pin` is the session id (`S-<hex>`) this launch is bound to.
+    /// When `Some`, every `kind = Operator` agent is compiled against that
+    /// session instead of whichever session currently holds the agent's
+    /// `spec.operator_ref` role — the Blueprint keeps naming the logical
+    /// role, and which session it means becomes a launch-time fact. The pin
+    /// travels as a compile-synthesized build hint (same mechanism as the
+    /// Subprocess template hint, see [`resolve_subprocess_template_hint`]);
+    /// `spec.operator_ref` itself is never rewritten, so design-time
+    /// validation and the `OperatorDef.kind` cascade keep reading the
+    /// declared role.
+    ///
+    /// `None` reproduces [`Self::compile_bound`] byte-for-byte.
+    pub fn compile_bound_pinned(
+        &self,
+        bp: &Blueprint,
+        bound_agents: &[BoundAgent],
+        operator_pin: Option<&str>,
+    ) -> Result<CompiledBlueprint, CompileError> {
+        let effective = materialize_bound_blueprint(bp, bound_agents);
+        self.compile_resolved(&effective, operator_pin)
+    }
+
+    fn compile_resolved(
+        &self,
+        bp: &Blueprint,
+        operator_pin: Option<&str>,
+    ) -> Result<CompiledBlueprint, CompileError> {
         let mut routes: HashMap<String, Arc<dyn SpawnerAdapter>> = HashMap::new();
         let mut seen: HashMap<String, ()> = HashMap::new();
         // GH #50: `AgentDef.name` → declared `VerdictContract`, collected
@@ -698,7 +725,26 @@ impl Compiler {
             } else {
                 None
             };
-            let spawner = factory.build(ad, subprocess_hint.as_ref().or(hint))?;
+            // Run-scoped Operator pin: an `Operator` agent compiled under a
+            // launch-time session pin carries it in as a synthesized hint
+            // (sibling of the Subprocess template hint above). The pin is
+            // merged INTO the author-declared `hints.per_agent` entry rather
+            // than replacing it, so a Blueprint that already hints this agent
+            // keeps every key it declared. Unpinned launches synthesize
+            // nothing and the historical hint is passed through untouched.
+            let operator_pin_hint = match operator_pin {
+                Some(pin) if ad.kind == AgentKind::Operator => {
+                    Some(merge_operator_pin_hint(hint, pin, &ad.name)?)
+                }
+                _ => None,
+            };
+            let spawner = factory.build(
+                ad,
+                operator_pin_hint
+                    .as_ref()
+                    .or(subprocess_hint.as_ref())
+                    .or(hint),
+            )?;
             routes.insert(ad.name.clone(), spawner);
         }
 
@@ -1613,6 +1659,42 @@ fn resolve_subprocess_template_hint(
     })))
 }
 
+/// Hint key carrying the launch-scoped Operator session pin (`S-<hex>`),
+/// synthesized by [`Compiler::compile_bound_pinned`] and consumed by
+/// [`OperatorSpawnerFactory::build`].
+pub const OPERATOR_SID_PIN_HINT_KEY: &str = "operator_sid_pin";
+
+/// Merge the run-scoped Operator session pin into an agent's declared build
+/// hint. An absent hint becomes a fresh one-key object; a declared object
+/// hint is cloned and gains the pin key (declared keys survive). A declared
+/// non-object hint is a Blueprint authoring error here — merging would have
+/// to drop it silently, and a dropped hint is exactly the kind of quiet
+/// substitution the pin exists to remove.
+fn merge_operator_pin_hint(
+    hint: Option<&Value>,
+    pin: &str,
+    agent: &str,
+) -> Result<Value, CompileError> {
+    let mut object = match hint {
+        None => serde_json::Map::new(),
+        Some(Value::Object(map)) => map.clone(),
+        Some(other) => {
+            return Err(CompileError::InvalidSpec {
+                name: agent.to_string(),
+                msg: format!(
+                    "hints.per_agent['{agent}'] must be a JSON object to carry the \
+                     run-scoped operator pin (got {other})"
+                ),
+            });
+        }
+    };
+    object.insert(
+        OPERATOR_SID_PIN_HINT_KEY.to_string(),
+        Value::String(pin.to_string()),
+    );
+    Ok(Value::Object(object))
+}
+
 impl SubprocessProcessSpawnerFactory {
     /// GH #83 — the EmbedAgent template build path (see the struct doc).
     /// Returns the concrete [`ProcessSpawner`] so unit tests can inspect
@@ -2311,6 +2393,17 @@ impl crate::worker::Worker for RustFnWorker {
 /// session axis is overriding the agent axis. Consistent usage means
 /// picking one axis per use case.
 ///
+/// # Run-scoped session pin
+///
+/// `spec.operator_ref` names a logical role, and a role's holder is
+/// process-global state that another driver's session can own. When the
+/// launch pins a session ([`Compiler::compile_bound_pinned`]), the pin
+/// arrives as the [`OPERATOR_SID_PIN_HINT_KEY`] build hint and becomes the
+/// lookup key for this factory — the Blueprint still declares the role, the
+/// launch decides which session it means for this run. A pin that resolves
+/// to no registered backend fails the compile; there is deliberately no
+/// fallback to the role's current holder.
+///
 /// Interior mutability is provided by an `Arc<RwLock>`. Even after the
 /// factory has been stored as `Arc<dyn SpawnerFactory>` in
 /// `SpawnerRegistry`, a caller holding an `Arc` clone can still add
@@ -2370,7 +2463,7 @@ impl SpawnerFactory for OperatorSpawnerFactory {
     fn build(
         &self,
         agent_def: &AgentDef,
-        _hint: Option<&Value>,
+        hint: Option<&Value>,
     ) -> Result<Arc<dyn SpawnerAdapter>, CompileError> {
         let agent_name = &agent_def.name;
         let spec = &agent_def.spec;
@@ -2388,11 +2481,21 @@ impl SpawnerFactory for OperatorSpawnerFactory {
             .get("operator_ref")
             .and_then(|v| v.as_str())
             .ok_or_else(|| invalid("operator spec: 'operator_ref' (string) required".into()))?;
+        // Run-scoped pin (see `Compiler::compile_bound_pinned`): the launch
+        // named the session this run routes to, so the lookup key is that
+        // sid, not the role's current global holder. A pin that resolves to
+        // nothing fails the launch loudly — falling back to the role here
+        // would silently hand the run to the very session the pin exists to
+        // avoid.
+        let pin = hint
+            .and_then(|h| h.get(OPERATOR_SID_PIN_HINT_KEY))
+            .and_then(|v| v.as_str());
+        let lookup_key = pin.unwrap_or(op_ref);
         let operators = self
             .operators
             .read()
             .expect("OperatorSpawnerFactory.operators RwLock poisoned");
-        let op = operators.get(op_ref).cloned().ok_or_else(|| {
+        let op = operators.get(lookup_key).cloned().ok_or_else(|| {
             let mut names: Vec<String> = operators.keys().cloned().collect();
             names.sort();
             let names_list = if names.is_empty() {
@@ -2400,11 +2503,24 @@ impl SpawnerFactory for OperatorSpawnerFactory {
             } else {
                 names.join(", ")
             };
-            invalid(format!(
-                "operator_ref '{op_ref}' not registered in factory. \
-                 Registered sids: [{names_list}]. \
-                 Hint: call mse_operator_join(roles=[...]) to mint the sid first."
-            ))
+            match pin {
+                Some(pin) => invalid(format!(
+                    "run-scoped operator pin '{pin}' (declared operator_ref '{op_ref}') \
+                     is not registered in factory. \
+                     Registered ids: [{names_list}]. \
+                     The launch pinned this run to that session; resolving \
+                     '{op_ref}' through whichever session currently holds the \
+                     role would send this run's Spawn frames somewhere the \
+                     caller did not ask for, so the launch fails instead. \
+                     Hint: the pinned session must be joined (and still live) \
+                     before launching."
+                )),
+                None => invalid(format!(
+                    "operator_ref '{op_ref}' not registered in factory. \
+                     Registered sids: [{names_list}]. \
+                     Hint: call mse_operator_join(roles=[...]) to mint the sid first."
+                )),
+            }
         })?;
         drop(operators);
 
@@ -3012,6 +3128,380 @@ mod audit_agent_validation_tests {
             compiler.compile(&bp).is_ok(),
             "an audits[].agent that names a declared AgentDef must compile"
         );
+    }
+}
+
+// ─── run-scoped Operator session pin ──────────────────────────────────────
+//
+// `spec.operator_ref` names a logical role whose holder is process-global
+// state; a launch may pin the session it actually belongs to. These tests
+// cover both halves: the compiler synthesizing the pin hint for exactly the
+// `kind = Operator` agents, and the factory resolving (or loudly failing)
+// against the pinned id instead of the role.
+#[cfg(test)]
+mod operator_run_pin_tests {
+    use super::*;
+    use crate::core::ctx::Ctx;
+    use crate::types::CapToken;
+    use crate::worker::adapter::{WorkerError, WorkerResult};
+    use std::sync::Mutex;
+
+    /// Shared `(agent, hint)` log the recording factories append to.
+    type Seen = Arc<Mutex<Vec<(String, Option<Value>)>>>;
+
+    /// Records every `(agent, hint)` pair the compiler hands it, so a test
+    /// can assert on the hint an agent was built with — the pin's whole
+    /// effect at this layer.
+    struct RecordingOperatorFactory {
+        seen: Seen,
+    }
+
+    impl SpawnerFactory for RecordingOperatorFactory {
+        fn build(
+            &self,
+            agent_def: &AgentDef,
+            hint: Option<&Value>,
+        ) -> Result<Arc<dyn SpawnerAdapter>, CompileError> {
+            self.seen
+                .lock()
+                .expect("RecordingOperatorFactory.seen poisoned")
+                .push((agent_def.name.clone(), hint.cloned()));
+            let mut spawner: InProcSpawner<LuaWorker> = InProcSpawner::<LuaWorker>::typed();
+            let worker: WorkerFn = Arc::new(|_inv| {
+                Box::pin(async move {
+                    Ok(WorkerResult {
+                        value: Value::Null,
+                        ok: true,
+                        stats: None,
+                    })
+                })
+            });
+            spawner.registry.insert(agent_def.name.clone(), worker);
+            Ok(Arc::new(spawner))
+        }
+    }
+
+    impl SpawnerFactoryKind for RecordingOperatorFactory {
+        const KIND: AgentKind = AgentKind::Operator;
+        type Worker = crate::operator::OperatorWorker;
+    }
+
+    /// Same recorder on a non-Operator kind, to prove the pin does not
+    /// leak onto agents it has no business touching.
+    struct RecordingLuaFactory {
+        seen: Seen,
+    }
+
+    impl SpawnerFactory for RecordingLuaFactory {
+        fn build(
+            &self,
+            agent_def: &AgentDef,
+            hint: Option<&Value>,
+        ) -> Result<Arc<dyn SpawnerAdapter>, CompileError> {
+            self.seen
+                .lock()
+                .expect("RecordingLuaFactory.seen poisoned")
+                .push((agent_def.name.clone(), hint.cloned()));
+            let mut spawner: InProcSpawner<LuaWorker> = InProcSpawner::<LuaWorker>::typed();
+            let worker: WorkerFn = Arc::new(|_inv| {
+                Box::pin(async move {
+                    Ok(WorkerResult {
+                        value: Value::Null,
+                        ok: true,
+                        stats: None,
+                    })
+                })
+            });
+            spawner.registry.insert(agent_def.name.clone(), worker);
+            Ok(Arc::new(spawner))
+        }
+    }
+
+    impl SpawnerFactoryKind for RecordingLuaFactory {
+        const KIND: AgentKind = AgentKind::Lua;
+        type Worker = LuaWorker;
+    }
+
+    fn recording_compiler() -> (Compiler, Seen, Seen) {
+        let operator_seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let lua_seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = SpawnerRegistry::new();
+        registry.register::<RecordingOperatorFactory>(Arc::new(RecordingOperatorFactory {
+            seen: operator_seen.clone(),
+        }));
+        registry.register::<RecordingLuaFactory>(Arc::new(RecordingLuaFactory {
+            seen: lua_seen.clone(),
+        }));
+        (Compiler::new(registry), operator_seen, lua_seen)
+    }
+
+    /// Two agents (one Operator on role `main-ai`, one Lua) plus an
+    /// author-declared `hints.per_agent` entry on the Operator one, so the
+    /// merge behaviour is observable.
+    fn bp_with_operator_and_lua_agents() -> Blueprint {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": crate::blueprint::current_schema_version(),
+            "id": "operator-pin-ut",
+            "flow": {
+                "kind": "step",
+                "ref": "planner",
+                "in": { "op": "path", "at": "$.input" },
+                "out": { "op": "path", "at": "$.output" }
+            },
+            "agents": [
+                {
+                    "name": "planner",
+                    "kind": "operator",
+                    "spec": { "operator_ref": "main-ai" }
+                },
+                {
+                    "name": "scorer",
+                    "kind": "lua",
+                    "spec": { "source": "return { value = 1, ok = true }" }
+                }
+            ],
+            "operators": [{ "name": "main-ai" }],
+            "hints": { "per_agent": { "planner": { "authored": "keep-me" } } },
+            "strategy": { "strict_refs": false }
+        }))
+        .expect("test Blueprint literal")
+    }
+
+    fn hint_for(seen: &Seen, agent: &str) -> Option<Value> {
+        seen.lock()
+            .expect("seen poisoned")
+            .iter()
+            .find(|(name, _)| name == agent)
+            .map(|(_, hint)| hint.clone())
+            .expect("agent was never built")
+    }
+
+    /// Test 1: a pinned compile reaches the Operator factory with the sid,
+    /// merged into (not over) the author's declared hint.
+    #[test]
+    fn pinned_compile_hands_the_operator_factory_the_pinned_sid() {
+        let (compiler, operator_seen, _lua_seen) = recording_compiler();
+        let bp = bp_with_operator_and_lua_agents();
+        let bound = resolve_bound_agents(&bp).expect("resolve bound agents");
+        compiler
+            .compile_bound_pinned(&bp, &bound, Some("S-pinned"))
+            .expect("pinned compile");
+
+        let hint = hint_for(&operator_seen, "planner").expect("planner hint");
+        assert_eq!(
+            hint.get(OPERATOR_SID_PIN_HINT_KEY),
+            Some(&Value::String("S-pinned".to_string())),
+            "the pin must reach the factory as a build hint: {hint}"
+        );
+        assert_eq!(
+            hint.get("authored"),
+            Some(&Value::String("keep-me".to_string())),
+            "merging the pin must not drop the author's declared hint: {hint}"
+        );
+    }
+
+    /// Test 3 (regression lock): an unpinned compile synthesizes nothing —
+    /// the factory sees exactly the authored hint, and an agent with no
+    /// authored hint still sees `None`.
+    #[test]
+    fn unpinned_compile_passes_the_authored_hint_through_untouched() {
+        let (compiler, operator_seen, lua_seen) = recording_compiler();
+        let bp = bp_with_operator_and_lua_agents();
+        let bound = resolve_bound_agents(&bp).expect("resolve bound agents");
+        compiler
+            .compile_bound(&bp, &bound)
+            .expect("unpinned compile");
+
+        assert_eq!(
+            hint_for(&operator_seen, "planner"),
+            Some(serde_json::json!({ "authored": "keep-me" })),
+            "an unpinned compile must hand over the authored hint verbatim"
+        );
+        assert_eq!(
+            hint_for(&lua_seen, "scorer"),
+            None,
+            "an agent with no authored hint must still be built with None"
+        );
+    }
+
+    /// The pin is an Operator-axis fact: a Lua (or any non-Operator) agent
+    /// in the same pinned Blueprint is built exactly as it would be
+    /// unpinned.
+    #[test]
+    fn pin_does_not_leak_onto_non_operator_agents() {
+        let (compiler, _operator_seen, lua_seen) = recording_compiler();
+        let bp = bp_with_operator_and_lua_agents();
+        let bound = resolve_bound_agents(&bp).expect("resolve bound agents");
+        compiler
+            .compile_bound_pinned(&bp, &bound, Some("S-pinned"))
+            .expect("pinned compile");
+
+        assert_eq!(
+            hint_for(&lua_seen, "scorer"),
+            None,
+            "a non-Operator agent must not receive the operator pin hint"
+        );
+    }
+
+    /// A declared hint that is not a JSON object cannot carry the pin.
+    /// Dropping it silently is the kind of quiet substitution this feature
+    /// exists to remove, so the compile fails instead.
+    #[test]
+    fn non_object_authored_hint_fails_the_pinned_compile() {
+        let (compiler, _operator_seen, _lua_seen) = recording_compiler();
+        let mut bp = bp_with_operator_and_lua_agents();
+        bp.hints
+            .per_agent
+            .insert("planner".to_string(), Value::String("not-an-object".into()));
+        let bound = resolve_bound_agents(&bp).expect("resolve bound agents");
+        match compiler.compile_bound_pinned(&bp, &bound, Some("S-pinned")) {
+            Err(CompileError::InvalidSpec { name, msg }) => {
+                assert_eq!(name, "planner");
+                assert!(
+                    msg.contains("run-scoped operator pin"),
+                    "message must explain why the hint blocks the pin: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidSpec, got a different CompileError: {other}"),
+            Ok(_) => panic!("expected the non-object hint to fail the pinned compile"),
+        }
+        // Unpinned, the same Blueprint is none of the compiler's business.
+        assert!(
+            compiler.compile_bound(&bp, &bound).is_ok(),
+            "an unpinned compile must keep accepting whatever hint shape the author declared"
+        );
+    }
+
+    // ── factory-level resolution ─────────────────────────────────────────
+
+    /// Backend stub whose `requires_worker_binding` doubles as an identity
+    /// marker: the two registrations below disagree on it, so which one the
+    /// factory picked is visible in `build`'s outcome alone.
+    struct StubOperator {
+        requires_binding: bool,
+    }
+
+    #[async_trait]
+    impl Operator for StubOperator {
+        async fn execute(
+            &self,
+            _ctx: &Ctx,
+            _system: Option<String>,
+            _prompt: Value,
+            _worker: Option<WorkerBinding>,
+            _worker_token: CapToken,
+        ) -> Result<WorkerResult, WorkerError> {
+            Ok(WorkerResult {
+                value: Value::Null,
+                ok: true,
+                stats: None,
+            })
+        }
+
+        fn requires_worker_binding(&self) -> bool {
+            self.requires_binding
+        }
+    }
+
+    fn operator_agent() -> AgentDef {
+        AgentDef {
+            name: "planner".to_string(),
+            kind: AgentKind::Operator,
+            spec: serde_json::json!({ "operator_ref": "main-ai" }),
+            profile: None,
+            meta: None,
+            runner: None,
+            runner_ref: None,
+            verdict: None,
+        }
+    }
+
+    fn pin_hint(sid: &str) -> Value {
+        serde_json::json!({ OPERATOR_SID_PIN_HINT_KEY: sid })
+    }
+
+    /// Test 1 (factory half): with the role held by one backend and the pin
+    /// naming another, the pinned one is what gets baked — even though the
+    /// agent keeps declaring the role.
+    #[test]
+    fn pin_resolves_the_pinned_session_not_the_role_holder() {
+        let factory = OperatorSpawnerFactory::new();
+        // The role's current holder would reject this agent (it requires a
+        // worker_binding the agent does not declare); the pinned session
+        // would accept it. Building successfully therefore proves the
+        // pinned backend answered.
+        factory.register_operator(
+            "main-ai",
+            Arc::new(StubOperator {
+                requires_binding: true,
+            }) as Arc<dyn Operator>,
+        );
+        factory.register_operator(
+            "S-pinned",
+            Arc::new(StubOperator {
+                requires_binding: false,
+            }) as Arc<dyn Operator>,
+        );
+        assert!(
+            factory
+                .build(&operator_agent(), Some(&pin_hint("S-pinned")))
+                .is_ok(),
+            "the pinned session must resolve the spawner, not the role's holder"
+        );
+        // And the mirror image: unpinned, the role's holder answers and
+        // rejects it.
+        assert!(
+            factory.build(&operator_agent(), None).is_err(),
+            "without a pin the role's holder must still be the resolution"
+        );
+    }
+
+    /// Test 2: a pin naming no registered session fails the build loudly,
+    /// naming both the pin and the role it did NOT fall back to.
+    #[test]
+    fn pin_miss_fails_loud_and_never_falls_back_to_the_role() {
+        let factory = OperatorSpawnerFactory::new();
+        factory.register_operator(
+            "main-ai",
+            Arc::new(StubOperator {
+                requires_binding: false,
+            }) as Arc<dyn Operator>,
+        );
+        match factory.build(&operator_agent(), Some(&pin_hint("S-gone"))) {
+            Err(CompileError::InvalidSpec { name, msg }) => {
+                assert_eq!(name, "planner");
+                assert!(msg.contains("S-gone"), "message must name the pin: {msg}");
+                assert!(
+                    msg.contains("main-ai"),
+                    "message must name the declared role it refused to fall back to: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidSpec, got a different CompileError: {other}"),
+            Ok(_) => panic!(
+                "a pin naming no live session must fail the launch, not silently resolve the role"
+            ),
+        }
+    }
+
+    /// Test 3 (factory half): with no pin hint the lookup and its error
+    /// message are the pre-pin ones.
+    #[test]
+    fn unpinned_build_keeps_the_historical_role_lookup_and_message() {
+        let factory = OperatorSpawnerFactory::new();
+        match factory.build(&operator_agent(), None) {
+            Err(CompileError::InvalidSpec { msg, .. }) => {
+                assert!(
+                    msg.contains("operator_ref 'main-ai' not registered in factory"),
+                    "unpinned message must stay the historical one: {msg}"
+                );
+                assert!(
+                    !msg.contains("run-scoped operator pin"),
+                    "an unpinned failure must not mention the pin: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidSpec, got a different CompileError: {other}"),
+            Ok(_) => panic!("an unregistered role must still fail"),
+        }
     }
 }
 

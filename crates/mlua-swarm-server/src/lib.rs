@@ -818,6 +818,19 @@ pub struct TaskLaunchRequest {
     /// (unchanged precondition, same as the existing `operator_backend_id`
     /// field).
     ///
+    /// The field also pins the **AgentSpec axis** (the per-agent
+    /// `spec.operator_ref` route every Blueprint with `kind = Operator`
+    /// agents uses, whether or not it declares the delegate layer):
+    /// `TaskApplicationInput.operator_pin` carries the sid down to the
+    /// compiler, which resolves those agents against the pinned session
+    /// instead of the role's current process-global holder, and to the
+    /// binding provider, which attests their manifests through the same
+    /// session. Blueprints keep declaring the logical role; which session
+    /// that role means for this run becomes a launch-time fact, recorded on
+    /// `RunRecord.operator_sid`. A pin naming no live session fails the
+    /// launch — there is no fallback to the role, because that fallback is
+    /// exactly how a run ends up on another driver's session.
+    ///
     /// When unset, behavior is unchanged: whatever
     /// `operator.operator_backend_id` / BP-level `operator_ref` alias
     /// resolution already does still applies.
@@ -1194,6 +1207,12 @@ async fn run_flow_form(
         bridge_id: op_req.senior_bridge_id,
         hook_id: op_req.spawn_hook_id,
         operator_backend_id: op_req.operator_backend_id,
+        // Axis-independent half of `operator_sid` (see its doc on
+        // `TaskLaunchRequest`): the same sid binds this launch's AgentSpec
+        // axis — Operator agents compile against the pinned session and
+        // their manifests are attested through it — while the field above
+        // keeps feeding the opt-in delegate layer unchanged.
+        operator_pin: req.operator_sid.clone(),
         operator_kind_overrides,
         task_input: task_input_spec,
         // The request-body top-level `check_policy` (tier 1)

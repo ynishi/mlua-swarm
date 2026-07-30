@@ -737,6 +737,11 @@ Rules that fall out of this:
    non-strict mode the mismatch is not a pre-Spawn gate — the agent binds
    `DeclarationOnly`, and the missing role instead surfaces when the Spawn's
    own routing finds no session claiming it.
+   A **run-scoped pin** (§ Two drivers, one role) changes only the third
+   site: the launch names the session, so the run resolves against that sid
+   instead of the role's current holder. The BP-side pair
+   (`OperatorDef.name` == `spec.operator_ref`) is unaffected, and the
+   mint's `roles[]` becomes optional on pinned runs.
 3. **`kind: MainAi` is the *type*, not the *name*.** It says "when an
    agent references this role, dispatch via the WS thin-path". Multiple
    `OperatorDef`s can have `kind: MainAi` under different names.
@@ -775,6 +780,20 @@ restart (which also dropped every OTHER live session):
   Same trust tier as `mlua_swarm_server_shutdown` (no Bearer — admin
   observability + recovery for stale-session drift). MCP counterpart:
   `mse_operator_leave_by_role(role)`.
+  Teardown fails every spawn parked on the session, and a role name is
+  process-global — so the holder may be a working session rather than the
+  stale one you meant. When at least one `Running` run is pinned to the
+  holder, the route refuses with `409` and lists them:
+  ```json
+  {
+    "error": "session is driving in-flight runs; ...",
+    "role": "main-ai",
+    "sid": "S-...",
+    "active_runs": ["R-..."]
+  }
+  ```
+  Repeat with `?force=true` to tear down anyway — the escape hatch for a
+  genuinely wedged session whose runs will never finish.
 
 The pre-#81 `DELETE /v1/operators/:sid` (Bearer required) is unchanged
 and remains the correct path for a session's own driver to leave
@@ -898,6 +917,106 @@ side: the reference `mse_pending_wait` loop pops one frame at a time
 (`operator_client.rs::pending_wait`), so if you want a single Operator
 to drive many concurrent spawns you need to fan out that pop loop
 yourself.
+
+### Two drivers, one role: run-scoped session pins
+
+Splitting the role per lane (above) works when the lanes are part of one
+design. It does not cover the other common shape: **two independent
+drivers running the same Blueprint against one `mse serve`**. Both want
+`main-ai`, and a role is a process-global claim — so without a pin:
+
+- the second driver's `POST /v1/operators` is a `409`, and if it takes
+  the role instead, the first driver's next launch compiles against
+  *its* session — Spawn frames leave for the wrong process, silently;
+- the usual recovery, `DELETE /v1/operators/by-role/main-ai`, fails
+  every spawn parked on whoever holds it, including runs that were
+  perfectly healthy.
+
+The fix is a launch-time fact rather than a naming scheme: **the
+Blueprint declares the logical role; the launch declares which session
+that role means for this run.**
+
+```
+Blueprint (design-time)         Launch (per run)              Run
+────────────────────────        ─────────────────────         ──────────────
+operators:                      POST /v1/tasks
+  - name: "main-ai"               { blueprint: {...},
+agents:                             operator_sid: "S-aaa" }   RunRecord
+  - spec:                                  │                    .operator_sid
+      operator_ref: "main-ai"              ▼                    = "S-aaa"
+                                  every kind=Operator agent
+                                  compiles against S-aaa,
+                                  manifests attest through it
+```
+
+`operator_sid` is accepted by `POST /v1/tasks` and `POST
+/v1/tasks/:id/runs`, validated against the live session registry at
+request time (an unknown sid is a `400`, before any Task/Run row is
+written), and recorded on `RunRecord.operator_sid`. It binds the run's
+whole Spawn stream:
+
+- **routing** — `kind = Operator` agents resolve to the pinned session at
+  compile time, not to whichever session currently holds
+  `spec.operator_ref`;
+- **attestation** — capability manifests resolve through the pinned
+  session too, so `strict_binding` Blueprints stay `Bound` under pinning;
+- **resume** — the pin travels in the run's launch snapshot, so
+  `POST /v1/runs/:id/resume` continues on the same session.
+
+A pin that names no live session **fails the launch**. There is
+deliberately no fallback to the role: falling back is how a run ends up
+on another driver's session in the first place, and it does so silently.
+
+Unpinned launches are untouched — same role lookup, same behaviour,
+byte for byte.
+
+#### Auto-pin from `mse mcp`
+
+A driver rarely has to name the sid. `swarm_run` on the
+`{kind: "id"}` selector pins:
+
+1. the `operator_sid` argument, when given;
+2. otherwise this mcp process's **sole** live Operator session (joined
+   via `mse_operator_join`), and only when the run targets the server
+   that session is joined to.
+
+Zero or several live sessions auto-pin nothing — with several, the
+process would have to guess, which is the failure the pin exists to
+prevent; name one explicitly there. Inline / file Blueprints run inside
+the mcp process, which holds no Operator sessions at all, so an explicit
+`operator_sid` on those selectors is rejected rather than ignored.
+
+So the everyday driver loop is unchanged: join, launch, `mse_pending_wait`
+— and the frames come back to the driver that launched, even with a
+second driver on the same server.
+
+#### `roles: []` is the canonical join under pinning
+
+Because a pinned run resolves by sid, a driver that always pins does not
+need the role claim at all:
+
+```
+mse_operator_join(roles={}, capability_manifest={...})  → sid=S-aaa
+```
+
+An empty `roles` never conflicts (nothing is claimed), so any number of
+drivers can join the same server for the same Blueprint. The Blueprint
+still declares `operators[].name` / `spec.operator_ref` — those are
+design-time symbols and unaffected. What the empty claim gives up is the
+*unpinned* path: with no session holding the role, an unpinned launch of
+that Blueprint has nothing to resolve and fails at compile time (loudly,
+naming the role and the registered ids). Claim the role when you want
+that fallback; leave it empty when every launch is pinned.
+
+#### Relationship to the delegate layer
+
+`operator_sid` keeps its original meaning for the opt-in
+`spawner_hints.layers = ["operator_delegate"]` path — it is that layer's
+session backend. The two axes do not interfere: where the delegate layer
+applies it bypasses the per-agent spawners entirely (see
+`OperatorSpawnerFactory`'s exclusivity note), and where it does not, the
+pin decides the AgentSpec axis underneath. One sid, both axes, same
+session.
 
 ## Responsibility summary
 

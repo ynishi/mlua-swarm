@@ -18,6 +18,11 @@ use tokio::sync::Mutex;
 pub struct OperatorSessionBindingProvider {
     operator_sessions: Arc<Mutex<HashMap<SessionId, Arc<OperatorSessionEntry>>>>,
     roles_to_sid: Arc<Mutex<HashMap<String, SessionId>>>,
+    /// Run-scoped session pin (`operator_sid` on the launch). `Some`
+    /// resolves manifests through this session and never consults
+    /// `roles_to_sid`; `None` is the process-global role lookup every
+    /// unpinned launch keeps using.
+    pinned_sid: Option<SessionId>,
 }
 
 impl OperatorSessionBindingProvider {
@@ -30,6 +35,28 @@ impl OperatorSessionBindingProvider {
         Self {
             operator_sessions,
             roles_to_sid,
+            pinned_sid: None,
+        }
+    }
+
+    /// Resolve the session this request attests through: the launch pin when
+    /// there is one, otherwise the session currently holding the request's
+    /// logical `target` role.
+    ///
+    /// The pinned arm reports `Unbound` (not an error) when the sid names no
+    /// live session — same tier as an unjoined role, and the launch's own
+    /// fail-loud line is the compiler's pinned spawner lookup, which rejects
+    /// the same condition outright.
+    async fn resolve_sid(&self, target: &str) -> Result<SessionId, String> {
+        match &self.pinned_sid {
+            Some(sid) => Ok(sid.clone()),
+            None => self
+                .roles_to_sid
+                .lock()
+                .await
+                .get(target)
+                .cloned()
+                .ok_or_else(|| format!("no Operator session owns binding target '{target}'")),
         }
     }
 
@@ -52,25 +79,34 @@ impl OperatorSessionBindingProvider {
         // DeclarationOnly and `strict_binding` decides whether they fail.
         // (a)/(b) would fail again at real spawn-time routing anyway, so the
         // binding stage does not pre-gate them.
-        let Some(sid) = self.roles_to_sid.lock().await.get(target).cloned() else {
-            return Ok(BindOutcome::Unbound {
-                agent: request.agent.clone(),
-                reason: format!("no Operator session owns binding target '{target}'"),
-            });
+        let sid = match self.resolve_sid(target).await {
+            Ok(sid) => sid,
+            Err(reason) => {
+                return Ok(BindOutcome::Unbound {
+                    agent: request.agent.clone(),
+                    reason,
+                });
+            }
+        };
+        // How this run reached that sid — a launch pin or the role map.
+        // Named in every `Unbound` reason below so a driver reading a
+        // degradation entry can tell "my pinned session is gone" from "the
+        // role has no holder".
+        let via = match &self.pinned_sid {
+            Some(_) => format!("run-scoped pin (declared binding target '{target}')"),
+            None => format!("binding target '{target}'"),
         };
         let Some(entry) = self.operator_sessions.lock().await.get(&sid).cloned() else {
             return Ok(BindOutcome::Unbound {
                 agent: request.agent.clone(),
-                reason: format!(
-                    "Operator session '{sid}' for binding target '{target}' disappeared"
-                ),
+                reason: format!("Operator session '{sid}' for {via} disappeared"),
             });
         };
         let Some(manifest) = entry.capability_manifest.as_ref() else {
             return Ok(BindOutcome::Unbound {
                 agent: request.agent.clone(),
                 reason: format!(
-                    "Operator session '{sid}' for binding target '{target}' supplied no capability_manifest"
+                    "Operator session '{sid}' for {via} supplied no capability_manifest"
                 ),
             });
         };
@@ -122,6 +158,20 @@ impl AgentBindingProvider for OperatorSessionBindingProvider {
             outcomes.push(outcome);
         }
         Ok(outcomes)
+    }
+
+    /// Launch-scoped clone pinned to `session_id`, sharing the same live
+    /// session / role maps. An id that does not parse as a `SessionId`
+    /// cannot name a live session, so it yields `None` and the launch keeps
+    /// the unpinned provider — the pin's fail-loud line is the compiler's
+    /// pinned spawner lookup, which rejects that same id there.
+    fn pinned_to_session(&self, session_id: &str) -> Option<Arc<dyn AgentBindingProvider>> {
+        let sid = SessionId::parse(session_id.to_string()).ok()?;
+        Some(Arc::new(Self {
+            operator_sessions: self.operator_sessions.clone(),
+            roles_to_sid: self.roles_to_sid.clone(),
+            pinned_sid: Some(sid),
+        }))
     }
 }
 
@@ -224,6 +274,106 @@ mod tests {
             }
             BindOutcome::Bound { .. } => panic!("expected Unbound when the role has not joined"),
         }
+    }
+
+    /// Two sessions, one role: the role is held by a session with no
+    /// manifest (another driver's, as far as this launch is concerned) while
+    /// the pinned session carries the manifest. The pinned provider must
+    /// attest through the pin — this is the strict_binding path staying
+    /// `Bound` under run-scoped pinning.
+    #[tokio::test]
+    async fn pinned_provider_attests_through_the_pin_not_the_role_holder() {
+        let manifest = AgentProviderManifest {
+            provider_id: "pinned-session".to_string(),
+            provider_revision: None,
+            capabilities: vec![AgentProviderCapability {
+                launch_variant: Some("mse-coder".to_string()),
+                resolved_model: Some("claude-sonnet-4".to_string()),
+                effective_tools: vec!["Read".to_string()],
+                capability_snapshot_digest: None,
+            }],
+        };
+        let role_holder_sid = SessionId::new();
+        let pinned_sid = SessionId::new();
+        let role_holder = Arc::new(OperatorSessionEntry {
+            sid: role_holder_sid.clone(),
+            token: "token".to_string(),
+            roles: vec!["main-ai".to_string()],
+            capability_manifest: None,
+            joined_at_secs: 0,
+            ws_session: Mutex::new(None),
+        });
+        let pinned = Arc::new(OperatorSessionEntry {
+            sid: pinned_sid.clone(),
+            token: "token".to_string(),
+            roles: Vec::new(),
+            capability_manifest: Some(manifest),
+            joined_at_secs: 0,
+            ws_session: Mutex::new(None),
+        });
+        let sessions = Arc::new(Mutex::new(HashMap::from([
+            (role_holder_sid.clone(), role_holder),
+            (pinned_sid.clone(), pinned),
+        ])));
+        let roles = Arc::new(Mutex::new(HashMap::from([(
+            "main-ai".to_string(),
+            role_holder_sid,
+        )])));
+        let provider = OperatorSessionBindingProvider::new(sessions, roles);
+
+        // Unpinned, the role's holder answers — and it has nothing to attest.
+        let outcomes = provider.bind(&[request()]).await.unwrap();
+        assert!(
+            matches!(&outcomes[0], BindOutcome::Unbound { .. }),
+            "the role's holder supplied no manifest, so the unpinned bind is Unbound"
+        );
+
+        // Pinned, the pinned session's manifest resolves the receipt. The
+        // agent keeps declaring the same logical role throughout.
+        let pinned_provider = provider
+            .pinned_to_session(pinned_sid.as_str())
+            .expect("a live sid must yield a pinned provider");
+        let outcomes = pinned_provider.bind(&[request()]).await.unwrap();
+        let receipt = expect_bound(&outcomes[0]);
+        assert_eq!(receipt.provider_id, "pinned-session");
+        assert_eq!(receipt.effective_tools, ["Read"]);
+    }
+
+    /// A pin naming no live session reports `Unbound` (the launch's loud
+    /// failure is the compiler's pinned spawner lookup), and the reason says
+    /// the pin — not the role — is what went missing.
+    #[tokio::test]
+    async fn pin_to_a_dead_session_reports_unbound_naming_the_pin() {
+        let provider = provider(None).await;
+        let gone = SessionId::new();
+        let pinned = provider
+            .pinned_to_session(gone.as_str())
+            .expect("pinned provider");
+        let outcomes = pinned.bind(&[request()]).await.unwrap();
+        match &outcomes[0] {
+            BindOutcome::Unbound { reason, .. } => {
+                assert!(
+                    reason.contains("run-scoped pin"),
+                    "reason must attribute the gap to the pin: {reason}"
+                );
+                assert!(
+                    reason.contains(gone.as_str()),
+                    "reason must name the pinned sid: {reason}"
+                );
+            }
+            BindOutcome::Bound { .. } => panic!("a pin to a dead session cannot be Bound"),
+        }
+    }
+
+    /// An id that is not a `SessionId` at all cannot name a live session:
+    /// no pinned provider is produced, so the launch keeps the unpinned one
+    /// and fails loudly at the compiler instead.
+    #[test]
+    fn unparseable_pin_yields_no_pinned_provider() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let roles = Arc::new(Mutex::new(HashMap::new()));
+        let provider = OperatorSessionBindingProvider::new(sessions, roles);
+        assert!(provider.pinned_to_session("not-a-session-id").is_none());
     }
 
     #[tokio::test]

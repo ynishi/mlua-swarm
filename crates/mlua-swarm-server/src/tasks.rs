@@ -97,6 +97,11 @@ pub(crate) struct RunLaunchSnapshot {
     bridge_id: Option<String>,
     hook_id: Option<String>,
     operator_backend_id: Option<String>,
+    /// Run-scoped Operator session pin. `#[serde(default)]` so a Run
+    /// snapshotted before the field existed still decodes (it resumes
+    /// unpinned, exactly as it launched).
+    #[serde(default)]
+    operator_pin: Option<String>,
     #[serde(default)]
     operator_kind_overrides: HashMap<String, OperatorKind>,
     task_input: Option<TaskInputSpec>,
@@ -117,6 +122,7 @@ impl RunLaunchSnapshot {
             bridge_id: input.bridge_id.clone(),
             hook_id: input.hook_id.clone(),
             operator_backend_id: input.operator_backend_id.clone(),
+            operator_pin: input.operator_pin.clone(),
             operator_kind_overrides: input.operator_kind_overrides.clone(),
             task_input: input.task_input.clone(),
             check_policy: input.check_policy,
@@ -135,6 +141,7 @@ impl RunLaunchSnapshot {
             bridge_id: self.bridge_id,
             hook_id: self.hook_id,
             operator_backend_id: self.operator_backend_id,
+            operator_pin: self.operator_pin,
             operator_kind_overrides: self.operator_kind_overrides,
             task_input: self.task_input,
             check_policy: self.check_policy,
@@ -573,6 +580,11 @@ pub async fn task_rekick(
         bridge_id: None,
         hook_id: None,
         operator_backend_id,
+        // Same value, second axis: the sid also binds this rekick's
+        // AgentSpec-axis Operator agents (and their manifest attestation) to
+        // that session, so a rekick lands on the session the caller named
+        // rather than on whichever session currently holds the role.
+        operator_pin: req.operator_sid.clone(),
         operator_kind_overrides: HashMap::new(),
         task_input: task_input_spec,
         // This legacy `POST /v1/tasks/:id/runs`-style path does not carry a
@@ -2925,6 +2937,109 @@ mod tests {
             Some("S-live-op".to_string()),
             "the pinned operator_sid must be persisted verbatim on the RunRecord"
         );
+    }
+
+    /// A pinned rekick feeds BOTH axes from the one `operator_sid`: the
+    /// delegate layer's session backend (unchanged behaviour) and the new
+    /// run-scoped pin the compiler / binding provider read. The launch
+    /// snapshot is where a resumed Run picks the pin back up, so that is
+    /// what the assertion reads.
+    #[tokio::test]
+    async fn rekick_pin_reaches_both_axes_and_survives_in_the_launch_snapshot() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req("pinned rekick snapshot goal")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        let (_status, rekicked) = task_rekick(
+            State(state.clone()),
+            Path(posted.task_id.to_string()),
+            Some(Json(RunKickRequest {
+                init_ctx_override: None,
+                task_input_override: None,
+                timeout_secs: None,
+                detach: false,
+                operator_sid: Some("S-live-op".to_string()),
+            })),
+        )
+        .await
+        .expect("task_rekick with a registered operator_sid");
+
+        let run = state
+            .run_store
+            .get(&rekicked.0.run_id)
+            .await
+            .expect("run get");
+        let snapshot: Value = serde_json::from_str(
+            run.input_json
+                .as_deref()
+                .expect("a rekicked Run persists its launch snapshot"),
+        )
+        .expect("snapshot json");
+        assert_eq!(
+            snapshot["operator_backend_id"],
+            serde_json::json!("S-live-op"),
+            "the delegate axis keeps receiving the sid exactly as before: {snapshot}"
+        );
+        assert_eq!(
+            snapshot["operator_pin"],
+            serde_json::json!("S-live-op"),
+            "the same sid must also pin the AgentSpec axis: {snapshot}"
+        );
+    }
+
+    /// An unpinned launch leaves both fields absent — the pre-pin snapshot
+    /// shape, byte-for-byte.
+    #[tokio::test]
+    async fn unpinned_launch_snapshot_carries_neither_axis() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req("unpinned snapshot goal")),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+        let run = state.run_store.get(&posted.run_id).await.expect("run get");
+        let snapshot: Value =
+            serde_json::from_str(run.input_json.as_deref().expect("launch snapshot"))
+                .expect("snapshot json");
+        assert_eq!(snapshot["operator_backend_id"], Value::Null);
+        assert_eq!(snapshot["operator_pin"], Value::Null);
+        assert_eq!(
+            run.operator_sid, None,
+            "an unpinned launch records no session on the Run"
+        );
+    }
+
+    /// A snapshot written before the pin field existed still decodes, and
+    /// resumes unpinned.
+    #[test]
+    fn pre_pin_launch_snapshot_still_decodes() {
+        let snapshot = serde_json::json!({
+            "blueprint": { "kind": "inline", "value": identity_blueprint() },
+            "operator_id": "http-run",
+            "role": "operator",
+            "ttl": { "secs": 60, "nanos": 0 },
+            "init_ctx": {},
+            "operator_kind": null,
+            "bridge_id": null,
+            "hook_id": null,
+            "operator_backend_id": null,
+            "task_input": null,
+            "check_policy": null,
+        });
+        let decoded: RunLaunchSnapshot =
+            serde_json::from_value(snapshot).expect("a pre-pin snapshot must still decode");
+        assert!(decoded.into_input().operator_pin.is_none());
     }
 
     #[tokio::test]

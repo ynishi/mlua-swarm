@@ -43,6 +43,26 @@ pub trait AgentBindingProvider: Send + Sync {
         &self,
         requests: &[BindRequest],
     ) -> Result<Vec<BindOutcome>, BindingProviderError>;
+
+    /// Launch-scoped variant of this provider, resolved against one pinned
+    /// execution session id instead of whatever session currently holds the
+    /// request's logical `binding_target`.
+    ///
+    /// A launch may pin the execution session it routes to (the server's
+    /// `operator_sid` launch field). Two drivers sharing one process claim
+    /// the same logical role over time, so "the role's current holder" and
+    /// "the session this launch is bound to" are different facts — this hook
+    /// lets a provider resolve manifests through the second one.
+    ///
+    /// The default returns `None`: a provider with no session concept (the
+    /// manifest reference provider, an embed-mode adapter) is unaffected and
+    /// the caller keeps using the unpinned provider, byte-for-byte.
+    fn pinned_to_session(
+        &self,
+        _session_id: &str,
+    ) -> Option<std::sync::Arc<dyn AgentBindingProvider>> {
+        None
+    }
 }
 
 /// Reference provider backed by an execution-environment capability manifest.

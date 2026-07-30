@@ -664,6 +664,29 @@ pub struct TaskLaunchInput {
     /// `Composite` — bypasses `inner.spawn` and calls
     /// `operator.execute`.
     pub operator_backend_id: Option<String>,
+    /// Run-scoped Operator session pin — the session id (`S-<hex>`) this
+    /// launch binds its whole Spawn stream to, independent of which axis
+    /// carries the spawn.
+    ///
+    /// A Blueprint's `spec.operator_ref` names a logical role; the role's
+    /// holder is process-global, so with two drivers on one process "the
+    /// role" and "the session this launch belongs to" are different facts.
+    /// `Some(sid)` makes the second one authoritative for this launch: the
+    /// binding provider attests through the pinned session
+    /// ([`crate::binding::AgentBindingProvider::pinned_to_session`]) and the
+    /// compiler resolves every `kind = Operator` agent against it
+    /// ([`Compiler::compile_bound_pinned`]). A pin naming no live session
+    /// fails the launch rather than falling back to the role.
+    ///
+    /// `None` (the default via [`Self::automate`]) leaves both resolutions
+    /// exactly as they were — role lookup, byte-for-byte.
+    ///
+    /// Orthogonal to [`Self::operator_backend_id`]: that field is the
+    /// opt-in `operator_delegate` layer's session-wide backend, which
+    /// bypasses the per-agent spawners entirely when a Blueprint declares
+    /// the layer. A launch may carry both; the delegate layer keeps winning
+    /// where it applies, and the pin decides the AgentSpec axis underneath.
+    pub operator_pin: Option<String>,
     /// "Runtime Agent-level" tier (highest priority) of the `OperatorKind`
     /// cascade — per-agent override, keyed by `AgentDef.name`. Empty by
     /// default (no override for any agent). See
@@ -739,6 +762,7 @@ impl TaskLaunchInput {
             bridge_id: None,
             hook_id: None,
             operator_backend_id: None,
+            operator_pin: None,
             operator_kind_overrides: HashMap::new(),
             init_ctx,
             task_input: None,
@@ -845,10 +869,22 @@ impl TaskLaunchService {
         // `LayerRegistry` resolution + `SpawnerStack` wrapping) is
         // concentrated inside `service::linker::link` — Service
         // scatter is intentionally prevented.
+        // A pinned launch attests through the pinned session instead of the
+        // logical role's current holder, when the injected provider knows
+        // how to do that (`pinned_to_session` defaults to `None`, so an
+        // unpinned launch — and any provider without a session concept —
+        // keeps using `self.binding_provider` unchanged).
+        let pinned_binding_provider: Option<Arc<dyn AgentBindingProvider>> = input
+            .operator_pin
+            .as_deref()
+            .and_then(|pin| self.binding_provider.as_ref()?.pinned_to_session(pin));
+        let binding_provider = pinned_binding_provider
+            .as_deref()
+            .or(self.binding_provider.as_deref());
         let (bound_agents, snapshot_origin) = load_or_resolve_bound_agents(
             &input.blueprint,
             input.run_ctx.as_ref(),
-            self.binding_provider.as_deref(),
+            binding_provider,
             self.legacy_worker_binding_policy,
         )
         .await?;
@@ -873,9 +909,11 @@ impl TaskLaunchService {
             });
         }
         input.blueprint = materialize_bound_blueprint(&input.blueprint, &bound_agents);
-        let compiled = self
-            .compiler
-            .compile_bound(&input.blueprint, &bound_agents)?;
+        let compiled = self.compiler.compile_bound_pinned(
+            &input.blueprint,
+            &bound_agents,
+            input.operator_pin.as_deref(),
+        )?;
         // GH #50 (Subtask 2 follow-up): merge this Blueprint's compiled
         // `AgentDef.verdict` contracts into the engine's runtime registry —
         // see `Engine::register_verdict_contracts`'s doc for the additive

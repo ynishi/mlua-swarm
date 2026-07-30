@@ -344,6 +344,27 @@ impl OperatorClientState {
         }
     }
 
+    /// HTTP root every session in this process is joined to (`MSE_BASE_URL`
+    /// / the built-in default). A launch that targets a different server
+    /// cannot be auto-pinned to a session minted here — the sid means
+    /// nothing over there.
+    pub fn http_base(&self) -> &str {
+        &self.http_base
+    }
+
+    /// The sid of this process's **only** live Operator session, or `None`
+    /// when it holds zero or more than one.
+    ///
+    /// This is the auto-pin source: with exactly one session there is no
+    /// ambiguity about which one a launch from this process belongs to, so
+    /// the launch can pin it without the driver naming it. Zero (nothing to
+    /// pin) and two-or-more (the process would have to guess) both stay
+    /// unpinned — guessing is what the pin exists to prevent.
+    pub async fn sole_live_sid(&self) -> Option<String> {
+        let sessions = self.sessions.lock().await;
+        sole_sid(sessions.keys().map(String::as_str))
+    }
+
     async fn get_entry(&self, sid: &str) -> Result<Arc<SessionEntry>, ClientError> {
         self.sessions
             .lock()
@@ -593,6 +614,17 @@ impl OperatorClientState {
     }
 }
 
+/// The auto-pin rule of [`OperatorClientState::sole_live_sid`], split out
+/// so it is unit-testable without a live WebSocket: exactly one live
+/// session yields its sid, zero or many yield `None`.
+fn sole_sid<'a>(mut sids: impl Iterator<Item = &'a str>) -> Option<String> {
+    let first = sids.next()?;
+    match sids.next() {
+        None => Some(first.to_string()),
+        Some(_) => None,
+    }
+}
+
 /// Best-effort rollback for the two-step join protocol. Once POST minted a
 /// role-owning session, any failure before the WebSocket becomes usable must
 /// release that session with the same bearer token or it becomes an orphan
@@ -712,6 +744,37 @@ mod tests {
         let text = r#"{"type":"spawn","req_id":"r5","task_id":"ST-1","agent":"a","attempt":1,"capability_token":"tok","worker_handle":"wh-abc","directive":"do it"}"#;
         let frame = parse_server_frame(text).expect("should parse");
         assert_eq!(frame.payload["worker_handle"], "wh-abc");
+    }
+
+    // ─── auto-pin source (sole live session) ─────────────────────────────
+
+    #[test]
+    fn sole_sid_returns_the_only_session() {
+        assert_eq!(
+            sole_sid(["S-only"].into_iter()),
+            Some("S-only".to_string()),
+            "one live session is unambiguous — that is the auto-pin"
+        );
+    }
+
+    #[test]
+    fn sole_sid_declines_zero_and_many() {
+        assert_eq!(
+            sole_sid([].into_iter()),
+            None,
+            "no live session leaves nothing to pin"
+        );
+        assert_eq!(
+            sole_sid(["S-a", "S-b"].into_iter()),
+            None,
+            "with several live sessions the process would have to guess, which is \
+             exactly what the pin exists to prevent"
+        );
+    }
+
+    #[tokio::test]
+    async fn sole_live_sid_is_none_before_any_join() {
+        assert_eq!(OperatorClientState::new().sole_live_sid().await, None);
     }
 
     // ─── worker route capture (issue: wrapper Bash removal follow-up) ────

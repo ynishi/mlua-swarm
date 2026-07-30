@@ -539,9 +539,25 @@ pub async fn operators_list(State(state): State<AppState>) -> Response {
 /// `404` when no session holds the role, `204` on successful teardown. The
 /// response body on `204` is empty (`teardown_operator_session` performs
 /// the same cleanup as `operators_delete`).
+///
+/// # In-flight protection (`409` unless `?force=true`)
+///
+/// A role name is process-global, so "the session holding `main-ai`" may
+/// well be another driver's live session rather than the stale one the
+/// caller meant to clear — and teardown fails every parked spawn on it
+/// ([`teardown_operator_session`]'s `fail_pending`). When the holding sid is
+/// pinned by at least one `Running` Run (`RunRecord.operator_sid`), this
+/// route refuses with `409` and lists those run ids, so the recovery habit
+/// cannot take a working run down as collateral. `?force=true` performs the
+/// teardown anyway — the escape hatch for a genuinely wedged session whose
+/// runs will never finish.
+///
+/// The check reads through [`crate::AppState::run_store`]; a store read
+/// failure is itself a `409` (refuse rather than tear down blind).
 pub async fn operators_delete_by_role(
     State(state): State<AppState>,
     Path(role): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<OperatorsDeleteByRoleQuery>,
 ) -> Response {
     let sid = {
         let map = state.roles_to_sid.lock().await;
@@ -582,8 +598,75 @@ pub async fn operators_delete_by_role(
                 .into_response();
         }
     };
+    if !query.force {
+        match active_runs_for_sid(&state, &sid).await {
+            Ok(active_runs) if !active_runs.is_empty() => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "session is driving in-flight runs; \
+                                  tearing it down would fail their parked spawns",
+                        "role": role,
+                        "sid": sid,
+                        "active_runs": active_runs,
+                        "hint": "wait for the runs to finish, or repeat with ?force=true \
+                                 to tear the session down anyway",
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // Unknown occupancy is not "no occupancy": refusing keeps a
+                // store outage from turning this recovery route into a
+                // silent killer of someone else's runs. `?force=true` still
+                // gets through.
+                tracing::warn!(%role, %sid, %error, "operators_delete_by_role: run occupancy check failed");
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": format!(
+                            "cannot verify whether this session is driving in-flight runs: {error}"
+                        ),
+                        "role": role,
+                        "sid": sid,
+                        "hint": "retry, or repeat with ?force=true to tear the session down \
+                                 without the check",
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
     teardown_operator_session(&state, &sid, &entry).await;
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Query string of `DELETE /v1/operators/by-role/:role`.
+#[derive(Debug, Deserialize, Default)]
+pub struct OperatorsDeleteByRoleQuery {
+    /// Tear the session down even while it is driving `Running` runs.
+    /// `false` (the default, and the shape every pre-guard caller sends)
+    /// refuses with `409` in that case.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Ids of the `Running` runs pinned to `sid` (`RunRecord.operator_sid`),
+/// ascending by `created_at` so the response order is stable. Empty means
+/// the session drives nothing right now.
+async fn active_runs_for_sid(state: &AppState, sid: &SessionId) -> Result<Vec<String>, String> {
+    let mut running = state
+        .run_store
+        .list_running()
+        .await
+        .map_err(|e| e.to_string())?;
+    running.sort_by_key(|record| record.created_at);
+    Ok(running
+        .into_iter()
+        .filter(|record| record.operator_sid.as_deref() == Some(sid.as_str()))
+        .map(|record| record.id.to_string())
+        .collect())
 }
 
 // ─── GET /v1/operators/:sid (Bearer required) ───────────────────────────────
@@ -715,5 +798,186 @@ mod tests {
         let req: OperatorsCreateReq =
             serde_json::from_value(serde_json::json!({ "roles": [] })).unwrap();
         assert!(req.capability_manifest.is_none());
+    }
+
+    // ── by-role teardown: in-flight protection ───────────────────────────
+
+    mod by_role_in_flight {
+        use super::*;
+        use mlua_swarm::core::config::EngineCfg;
+        use mlua_swarm::core::engine::Engine;
+        use mlua_swarm::store::output::InMemoryOutputStore;
+        use mlua_swarm::store::run::{InMemoryRunStore, RunRecord, RunStatus};
+        use mlua_swarm::store::task::InMemoryTaskStore;
+        use mlua_swarm::RunId;
+        use mlua_swarm::TaskId;
+        use std::collections::HashMap;
+
+        fn test_state() -> AppState {
+            let engine =
+                Engine::new_with_layers(EngineCfg::default(), crate::default_layer_registry());
+            let compiler = mlua_swarm::Compiler::new(crate::default_registry());
+            let launch = Arc::new(mlua_swarm::TaskLaunchService::new(engine.clone(), compiler));
+            AppState {
+                engine,
+                sessions: Arc::new(Mutex::new(crate::SessionStore::default())),
+                task_app: Arc::new(mlua_swarm::TaskApplication::new_inline_only(launch)),
+                ws_operator_factory: None,
+                data_store: Arc::new(InMemoryOutputStore::new()),
+                operator_sessions: Arc::new(Mutex::new(HashMap::new())),
+                roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
+                task_store: Arc::new(InMemoryTaskStore::new()),
+                run_store: Arc::new(InMemoryRunStore::new()),
+                replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
+                run_trace_store: Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
+                base_url: None,
+                sync_timeout_secs: 300,
+            }
+        }
+
+        /// Seed one live session holding `role` (no WS attached — teardown
+        /// and the guard both work off the login record).
+        async fn seed_session(state: &AppState, role: &str) -> SessionId {
+            let sid = SessionId::new();
+            let entry = Arc::new(OperatorSessionEntry {
+                sid: sid.clone(),
+                token: "token".to_string(),
+                roles: vec![role.to_string()],
+                capability_manifest: None,
+                joined_at_secs: 0,
+                ws_session: Mutex::new(None),
+            });
+            state
+                .operator_sessions
+                .lock()
+                .await
+                .insert(sid.clone(), entry);
+            state
+                .roles_to_sid
+                .lock()
+                .await
+                .insert(role.to_string(), sid.clone());
+            sid
+        }
+
+        async fn seed_run(state: &AppState, sid: Option<&SessionId>, status: RunStatus) -> RunId {
+            let run_id = RunId::new();
+            state
+                .run_store
+                .create(RunRecord {
+                    id: run_id.clone(),
+                    task_id: TaskId::new(),
+                    status,
+                    step_entries: Vec::new(),
+                    degradations: Vec::new(),
+                    operator_sid: sid.map(|s| s.to_string()),
+                    result_ref: None,
+                    input_json: None,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .await
+                .expect("seed run");
+            run_id
+        }
+
+        async fn body_json(response: Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            serde_json::from_slice(&bytes).expect("json body")
+        }
+
+        async fn session_is_live(state: &AppState, sid: &SessionId) -> bool {
+            state.operator_sessions.lock().await.contains_key(sid)
+        }
+
+        /// No run pins the holder: the recovery route behaves exactly as it
+        /// did before the guard.
+        #[tokio::test]
+        async fn idle_holder_is_still_torn_down() {
+            let state = test_state();
+            let sid = seed_session(&state, "main-ai").await;
+            // A Running run belonging to a DIFFERENT session must not
+            // protect this one.
+            let other = SessionId::new();
+            seed_run(&state, Some(&other), RunStatus::Running).await;
+            // ...and a finished run of this session must not either.
+            seed_run(&state, Some(&sid), RunStatus::Done).await;
+
+            let response = operators_delete_by_role(
+                State(state.clone()),
+                Path("main-ai".to_string()),
+                axum::extract::Query(OperatorsDeleteByRoleQuery::default()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(!session_is_live(&state, &sid).await);
+        }
+
+        /// The holder is driving a Running run: refuse, and say which runs
+        /// would have been failed.
+        #[tokio::test]
+        async fn holder_driving_a_running_run_is_refused_with_its_run_ids() {
+            let state = test_state();
+            let sid = seed_session(&state, "main-ai").await;
+            let run_id = seed_run(&state, Some(&sid), RunStatus::Running).await;
+
+            let response = operators_delete_by_role(
+                State(state.clone()),
+                Path("main-ai".to_string()),
+                axum::extract::Query(OperatorsDeleteByRoleQuery::default()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = body_json(response).await;
+            assert_eq!(
+                body["active_runs"],
+                serde_json::json!([run_id.to_string()]),
+                "the 409 must name the in-flight runs: {body}"
+            );
+            assert!(
+                session_is_live(&state, &sid).await,
+                "a refused teardown must leave the session (and its parked spawns) alone"
+            );
+            // The role stays claimed — a refused recovery changes nothing.
+            assert_eq!(
+                state.roles_to_sid.lock().await.get("main-ai"),
+                Some(&sid),
+                "a refused teardown must not release the role"
+            );
+        }
+
+        /// `?force=true` is the escape hatch for a wedged session whose runs
+        /// will never finish.
+        #[tokio::test]
+        async fn force_tears_down_despite_in_flight_runs() {
+            let state = test_state();
+            let sid = seed_session(&state, "main-ai").await;
+            seed_run(&state, Some(&sid), RunStatus::Running).await;
+
+            let response = operators_delete_by_role(
+                State(state.clone()),
+                Path("main-ai".to_string()),
+                axum::extract::Query(OperatorsDeleteByRoleQuery { force: true }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(!session_is_live(&state, &sid).await);
+        }
+
+        /// Unknown role keeps its pre-guard `404` (the guard runs after the
+        /// lookup, not before it).
+        #[tokio::test]
+        async fn unknown_role_still_404s() {
+            let state = test_state();
+            let response = operators_delete_by_role(
+                State(state),
+                Path("nobody-holds-this".to_string()),
+                axum::extract::Query(OperatorsDeleteByRoleQuery::default()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 }
