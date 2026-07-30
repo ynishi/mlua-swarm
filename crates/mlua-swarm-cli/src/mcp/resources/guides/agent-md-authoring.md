@@ -121,6 +121,14 @@ the file *and* re-emitting the full body inline):
   rejects the sentinel with `400`. Path guards apply either way (absolute
   path, under `work_dir`, ≤ 2 MiB).
 
+Either form can additionally be declared as JSON on the Blueprint side
+(`submit_format: "json"`, see `mse://guides/worker-io-contract` §
+Structured final bodies), which makes the server parse the final body so
+downstream nodes can address fields inside it. When a step is declared
+that way, the agent's Output format section must commit to emitting JSON
+and nothing else — no prose preamble, no fenced code block, no trailing
+commentary; an unparseable body is rejected with `422`.
+
 **Self-report convention.** If the agent uses a tool outside the set its
 prompt intends, or falls back to another tool after a failure, it should
 report that via `POST /v1/worker/degradation` (`{tool, error, fallback,

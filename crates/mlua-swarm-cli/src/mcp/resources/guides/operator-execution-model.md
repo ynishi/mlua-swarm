@@ -165,6 +165,28 @@ inline bodies; only sentinel bodies now require the opt-in.
 For the agent-side (agent.md) contract around choosing inline vs
 sentinel, see `mse://guides/agent-md-authoring` § Output contract.
 
+### `submit_format` opt-in for structured final bodies
+
+A sibling opt-in on the same tiers: `submit_format: "json"` makes the
+server parse a step's **final** submit body and fold the parsed value
+into the flow ctx, so a downstream `fanout` `items` or `branch` cond can
+address fields inside it (`$.<step>.lanes`) instead of receiving one
+opaque string.
+
+| Tier | Declaration |
+|---|---|
+| Step | `Step.in.$step_meta.inline = {"submit_format": "json", ...}` |
+| Agent | `AgentMeta.ctx = {"submit_format": "json", ...}` |
+| BP-global | `Blueprint.default_agent_ctx = {"submit_format": "json", ...}` |
+
+Default-deny like the sentinel opt-in: an undeclared step folds its body
+as a string, unchanged. A declared step whose body does not parse is
+rejected with `422`; any value other than `"json"` falls back to the
+string fold with a warning. Staged parts are unaffected. The full rules
+(including how it composes with the `@file:` sentinel and with verdict
+contracts) live in `mse://guides/worker-io-contract` § Structured final
+bodies.
+
 ### Step projection naming (GH #23): `AgentMeta.projection_name`
 
 A dispatched Step's OUTPUT used to be addressable under two independent

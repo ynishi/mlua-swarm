@@ -61,6 +61,16 @@ inside the body (`Step.ref` is a static string on the wire, so it cannot
 be computed from the item) — that is the shape `mse bp new fanout`
 scaffolds.
 
+**Feeding `items` from a worker's output.** A submit body is raw text, so
+a planner step's OUTPUT folds as one string and `items = $.planner.lanes`
+raises `PathNotFound` — the array is inside a string, not in the ctx.
+Declare `submit_format: "json"` on that planner's meta channel
+(`AgentMeta.ctx` / `Blueprint.default_agent_ctx` / `$step_meta`) to have
+the server parse its final body and fold the structured value instead;
+undeclared steps keep the string fold, and a declared step whose body
+does not parse is rejected with `422`. See
+`mse://guides/worker-io-contract` § Structured final bodies.
+
 **What `$.results` contains.** Under `join = "all"`, one element per
 item, each element the lane's *final ctx object* — not the step's
 output. The step output sits inside it, under whatever path that step's

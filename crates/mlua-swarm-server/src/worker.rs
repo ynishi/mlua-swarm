@@ -354,6 +354,30 @@ const FILE_SENTINEL_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// declaration.
 const FILE_SENTINEL_ALLOW_KEY: &str = "allow_file_submit";
 
+/// `AgentContextView.extra` key that opts a step's FINAL submit body into
+/// server-side JSON parsing. Declared through the same GH #21 meta
+/// channels as [`FILE_SENTINEL_ALLOW_KEY`] (`Blueprint.metas` /
+/// `AgentMeta.ctx` / step-level `$step_meta`) and folded into the view at
+/// spawn time by `AgentContextMiddleware`.
+///
+/// Default-deny: absent (the overwhelming majority of steps) folds the
+/// body as `Value::String`, byte-for-byte the pre-existing behavior. The
+/// only recognized value is the string [`SUBMIT_FORMAT_JSON`]; see
+/// [`resolve_submit_value`] for what a declared step gets instead.
+const SUBMIT_FORMAT_KEY: &str = "submit_format";
+
+/// The one recognized [`SUBMIT_FORMAT_KEY`] value: parse the final submit
+/// body as JSON and fold the parsed [`Value`] into the flow ctx, so a
+/// downstream node can address fields inside it (`$.<step>.lanes`, a
+/// `fanout` `items` expression, a `branch` cond) instead of receiving one
+/// opaque string.
+const SUBMIT_FORMAT_JSON: &str = "json";
+
+/// How many leading characters of an unparseable body the `422` echoes
+/// back, so the failure is diagnosable from the HTTP response alone
+/// without dumping a multi-KB payload into the error message.
+const SUBMIT_FORMAT_PREVIEW_CHARS: usize = 80;
+
 /// Resolves the `@file:<abs-path>` sentinel (GH #42) when present at the
 /// start of `body_str`. When absent, returns `body_str` unchanged — this
 /// is the byte-for-byte compatible path for all pre-#42 workers.
@@ -482,6 +506,75 @@ async fn resolve_file_sentinel(
     Ok(String::from_utf8_lossy(&bytes).trim_end().to_string())
 }
 
+/// Resolves the final submit body into the [`Value`] folded into the flow
+/// ctx, honoring the [`SUBMIT_FORMAT_KEY`] opt-in.
+///
+/// Called by [`worker_submit`] AFTER [`resolve_file_sentinel`], so a
+/// declared step may combine both: the sentinel resolves the file first
+/// and the parse then applies to the file's contents, exactly as if the
+/// same bytes had been posted inline.
+///
+/// Outcomes:
+///
+/// - No `AgentContextView` for `(task_id, attempt)`, or no
+///   [`SUBMIT_FORMAT_KEY`] in `view.extra` → `Value::String(body_str)`,
+///   the pre-existing fold, unchanged down to the byte.
+/// - `submit_format: "json"` and the body parses → the parsed [`Value`]
+///   (object, array, or any other JSON value).
+/// - `submit_format: "json"` and the body does NOT parse → `422`
+///   (declared-strict, the same posture as the verdict contract: a
+///   declared output contract the worker breaks is rejected rather than
+///   silently degraded). The message names the agent and echoes the
+///   first [`SUBMIT_FORMAT_PREVIEW_CHARS`] characters of the body.
+/// - Any other declared value (`"yaml"`, `true`, a typo) → the body folds
+///   as `Value::String` and a `tracing::warn!` records the unrecognized
+///   declaration. An unknown value is not a client error: the strict lane
+///   belongs to the recognized format, and a future kind-agnostic output
+///   contract is the place to type this key.
+///
+/// The verdict contract is deliberately NOT consulted here — the
+/// completion-time check lives inside
+/// `Engine::submit_worker_result_trusted` and runs on the value this
+/// function returns, so an undeclared agent's bare token reaches it as
+/// the same `Value::String` as before.
+async fn resolve_submit_value(
+    state: &AppState,
+    task_id: &StepId,
+    attempt: u32,
+    body_str: String,
+) -> Result<Value, ApiError> {
+    let declared = state
+        .engine
+        .agent_context_for(task_id, attempt)
+        .await
+        .and_then(|view| {
+            view.extra
+                .get(SUBMIT_FORMAT_KEY)
+                .cloned()
+                .map(|declared| (view.agent, declared))
+        });
+    let Some((agent, declared)) = declared else {
+        return Ok(Value::String(body_str));
+    };
+    if declared.as_str() != Some(SUBMIT_FORMAT_JSON) {
+        tracing::warn!(
+            agent = %agent,
+            declared = %declared,
+            "unknown `{SUBMIT_FORMAT_KEY}` value; folding the body as a string \
+             (the only recognized value is {SUBMIT_FORMAT_JSON:?})"
+        );
+        return Ok(Value::String(body_str));
+    }
+    serde_json::from_str::<Value>(&body_str).map_err(|e| {
+        let preview: String = body_str.chars().take(SUBMIT_FORMAT_PREVIEW_CHARS).collect();
+        ApiError::unprocessable(format!(
+            "submit_format violation: agent {agent:?} declared \
+             `{SUBMIT_FORMAT_KEY}: {SUBMIT_FORMAT_JSON:?}`, but the submitted body is \
+             not valid JSON: {e} (body starts with: {preview:?})"
+        ))
+    })
+}
+
 /// GH #50 (Subtask 2) — submit-time verdict contract gate, shared by
 /// [`worker_submit`] (`channel = Body`) and [`worker_artifact`]
 /// (`channel = Part`, only when `name == "verdict"`). Enforcement Point 2
@@ -567,9 +660,18 @@ fn map_completion_result<T>(result: Result<T, EngineError>, context: &str) -> Re
 /// `allow_file_submit: true` (GH #43, default-deny — see
 /// [`FILE_SENTINEL_ALLOW_KEY`]).
 ///
+/// **`submit_format: "json"` opt-in**: a step whose meta channel declares
+/// [`SUBMIT_FORMAT_KEY`] as `"json"` gets its final body parsed into a
+/// structured [`Value`] before it is folded into the flow ctx, so a
+/// downstream `fanout` / `branch` can address fields inside it. Applied
+/// after sentinel resolution (so the two combine), declared-strict
+/// (unparseable → `422`), default-deny for every undeclared step — see
+/// [`resolve_submit_value`].
+///
 /// Behavior:
 /// - `task_id` is auto-looked-up server-side from the token (already bound to the `CapToken`).
-/// - Body raw bytes go as-is into `Value::String` for `submit_output` + `post_result`.
+/// - Body raw bytes go as-is into `Value::String` for `submit_output` + `post_result`
+///   (unless the step declared `submit_format: "json"`, above).
 /// - `ok=true` fixed (= the submit endpoint is success-path only). For the error
 ///   path, use `/v1/worker/result` with an explicit `ok=false`.
 #[derive(Debug, Deserialize, Default)]
@@ -704,7 +806,14 @@ pub async fn worker_submit(
     // call is needed here; `check_verdict_contract` remains in use by
     // `worker_artifact`'s staging-time `name == "verdict"` early
     // validation, unchanged.
-    let value = Value::String(body_str);
+    //
+    // `submit_format: "json"` opt-in: a step that declared it on its meta
+    // channel folds a parsed `Value` instead of the raw string; every
+    // other step keeps the `Value::String(body_str)` fold byte-for-byte
+    // (see `resolve_submit_value`). The verdict-contract check still runs
+    // downstream (inside the engine) on whatever value this produces, so
+    // an undeclared gate agent's bare token is compared exactly as before.
+    let value = resolve_submit_value(&state, &task_id, attempt, body_str).await?;
 
     // GH #76 HTTP wire: resolve the `(ok, verdict)` query-param pair into the
     // `SubmitOutcome` the engine call takes. The handle path = trusted
@@ -3012,6 +3121,414 @@ mod tests {
             .expect_err("non-true opt-in value must reject sentinel");
             assert_eq!(err.status, StatusCode::BAD_REQUEST, "value: {allow:?}");
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // `submit_format: "json"` — opt-in structured final submit. Default
+    // (undeclared) folds `Value::String` exactly as before; a declared
+    // step folds the parsed value and is rejected with `422` when its
+    // body does not parse.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Seeds an `agent_ctx` entry carrying the agent name plus, when
+    /// `submit_format` is `Some`, that value under [`SUBMIT_FORMAT_KEY`]
+    /// in `view.extra` — the shape `AgentContextMiddleware` folds from
+    /// the Blueprint meta channels at spawn time. `work_dir`, when given,
+    /// also enables the `@file:` sentinel (`allow_file_submit: true`), so
+    /// one helper covers the sentinel + parse combination.
+    async fn seed_submit_format(
+        state: &AppState,
+        task_id: &StepId,
+        attempt: u32,
+        agent: &str,
+        submit_format: Option<Value>,
+        work_dir: Option<&str>,
+    ) {
+        let tid = task_id.clone();
+        let agent = agent.to_string();
+        let work_dir = work_dir.map(|w| w.to_string());
+        state
+            .engine
+            .with_state("test.seed_submit_format", move |s| {
+                let mut entry = mlua_swarm::core::state::AgentCtxEntry::default();
+                entry.view.agent = agent;
+                if let Some(w) = work_dir {
+                    entry.view.work_dir = Some(w);
+                    entry
+                        .view
+                        .extra
+                        .insert(FILE_SENTINEL_ALLOW_KEY.to_string(), Value::Bool(true));
+                }
+                if let Some(v) = submit_format {
+                    entry.view.extra.insert(SUBMIT_FORMAT_KEY.to_string(), v);
+                }
+                s.agent_ctx.insert((tid, attempt), entry);
+            })
+            .await
+            .expect("seed_submit_format");
+    }
+
+    /// Reads back the `Final` event's value from the in-memory
+    /// `output_store` tail `submit_worker_result_trusted` writes to.
+    async fn final_value(state: &AppState, task_id: &StepId, attempt: u32) -> Option<Value> {
+        let tid = task_id.clone();
+        state
+            .engine
+            .with_state("test.inspect_output_store", move |s| {
+                s.output_store.get(&(tid.clone(), attempt)).and_then(|evs| {
+                    evs.iter().find_map(|ev| match ev {
+                        OutputEvent::Final {
+                            content: ContentRef::Inline { value },
+                            ..
+                        } => Some(value.clone()),
+                        _ => None,
+                    })
+                })
+            })
+            .await
+            .expect("with_state")
+    }
+
+    /// Default-deny regression lock: a step with a materialized view but
+    /// NO `submit_format` declaration folds its body as a string even
+    /// when that body happens to be valid JSON. The server never sniffs
+    /// the payload — parsing is declaration-driven only.
+    #[tokio::test]
+    async fn worker_submit_without_submit_format_folds_json_looking_body_as_string() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+        seed_submit_format(&state, &task_id, 1, "planner", None, None).await;
+
+        let body = r#"{"lanes":["a","b"]}"#;
+        let status = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
+            axum::body::Bytes::from(body),
+        )
+        .await
+        .expect("undeclared submit must succeed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        assert_eq!(
+            final_value(&state, &task_id, 1).await,
+            Some(Value::String(body.to_string())),
+            "an undeclared step must keep the raw-string fold",
+        );
+    }
+
+    /// `submit_format: "json"` + a parseable body → the folded value is
+    /// the structured JSON, so a downstream path (`$.<step>.lanes`)
+    /// resolves instead of hitting one opaque string.
+    #[tokio::test]
+    async fn worker_submit_declared_json_folds_structured_value() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+        seed_submit_format(
+            &state,
+            &task_id,
+            1,
+            "planner",
+            Some(Value::String(SUBMIT_FORMAT_JSON.to_string())),
+            None,
+        )
+        .await;
+
+        let status = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
+            axum::body::Bytes::from(r#"{"lanes":["auth","billing"],"verdict":"PASS"}"#),
+        )
+        .await
+        .expect("declared JSON submit must succeed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let value = final_value(&state, &task_id, 1)
+            .await
+            .expect("Final event present");
+        assert_eq!(
+            value,
+            json!({"lanes": ["auth", "billing"], "verdict": "PASS"})
+        );
+        // The whole point of the opt-in: fields are addressable.
+        assert_eq!(value["lanes"], json!(["auth", "billing"]));
+        assert_eq!(value["verdict"], json!("PASS"));
+    }
+
+    /// Declared-strict: a declared step whose body does not parse is
+    /// rejected with `422` (naming the agent and echoing the body head),
+    /// and nothing reaches the flow ctx.
+    #[tokio::test]
+    async fn worker_submit_declared_json_rejects_unparseable_body_with_422() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+        seed_submit_format(
+            &state,
+            &task_id,
+            1,
+            "planner",
+            Some(Value::String(SUBMIT_FORMAT_JSON.to_string())),
+            None,
+        )
+        .await;
+
+        let err = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
+            axum::body::Bytes::from("DONE — 3 lanes planned, see the report above"),
+        )
+        .await
+        .expect_err("a declared step must not fold an unparseable body");
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            err.message.contains("planner") && err.message.contains("DONE"),
+            "the rejection must name the agent and echo the body head, got: {}",
+            err.message
+        );
+        assert_eq!(
+            final_value(&state, &task_id, 1).await,
+            None,
+            "a rejected submit must not reach the output tail",
+        );
+    }
+
+    /// The `@file:` sentinel and the parse compose: the file is resolved
+    /// first, then its contents are parsed, so a large structured payload
+    /// can take the file lane without losing its shape.
+    #[tokio::test]
+    async fn worker_submit_declared_json_parses_file_sentinel_contents() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let work_dir = tmp.path().to_path_buf();
+        seed_submit_format(
+            &state,
+            &task_id,
+            1,
+            "planner",
+            Some(Value::String(SUBMIT_FORMAT_JSON.to_string())),
+            Some(work_dir.to_str().expect("work_dir utf-8")),
+        )
+        .await;
+
+        let payload_path = work_dir.join("plan.json");
+        tokio::fs::write(&payload_path, "{\"lanes\": [\"auth\", \"billing\"]}\n")
+            .await
+            .expect("write payload");
+        let body = format!(
+            "@file:{}",
+            payload_path.to_str().expect("payload path utf-8")
+        );
+
+        let status = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
+            axum::body::Bytes::from(body),
+        )
+        .await
+        .expect("sentinel + declared JSON submit must succeed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        assert_eq!(
+            final_value(&state, &task_id, 1).await,
+            Some(json!({"lanes": ["auth", "billing"]})),
+        );
+    }
+
+    /// An unrecognized declared value is not a client error: the body
+    /// folds as a string (the default lane) and the server warns. Locks
+    /// the fallback so a typo degrades visibly instead of 422-ing a
+    /// worker that did nothing wrong.
+    #[tokio::test]
+    async fn worker_submit_unknown_submit_format_falls_back_to_string() {
+        for declared in [
+            Value::String("yaml".to_string()),
+            Value::Bool(true),
+            Value::Number(1.into()),
+        ] {
+            let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+            let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+            let state = test_state(data_store, run_store);
+            let task_id = StepId::new();
+            let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+            seed_submit_format(&state, &task_id, 1, "planner", Some(declared.clone()), None).await;
+
+            let status = worker_submit(
+                State(state.clone()),
+                bearer_headers(&handle),
+                Query(SubmitQuery {
+                    ok: None,
+                    verdict: None,
+                }),
+                axum::body::Bytes::from(r#"{"lanes":["a"]}"#),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("unknown value must not reject ({declared}): {e:?}"));
+            assert_eq!(status, StatusCode::NO_CONTENT);
+
+            assert_eq!(
+                final_value(&state, &task_id, 1).await,
+                Some(Value::String(r#"{"lanes":["a"]}"#.to_string())),
+                "unknown value {declared} must keep the string fold",
+            );
+        }
+    }
+
+    /// Order lock: the verdict contract still sees the pre-parse string
+    /// for an undeclared gate agent — a `channel: "body"` contract keeps
+    /// accepting its bare token and keeps rejecting a non-member value,
+    /// byte-for-byte as before the opt-in existed.
+    #[tokio::test]
+    async fn worker_submit_verdict_contract_unchanged_without_submit_format() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        state.engine.register_verdict_contracts(HashMap::from([(
+            "gate".to_string(),
+            body_verdict_contract(&["PASS", "BLOCKED"]),
+        )]));
+
+        // Member value: accepted, folded as the same bare string.
+        let accepted = StepId::new();
+        let handle = seed_task_with_handle(&state, &accepted, "gate", 1, None).await;
+        seed_submit_format(&state, &accepted, 1, "gate", None, None).await;
+        let status = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
+            axum::body::Bytes::from("BLOCKED"),
+        )
+        .await
+        .expect("a declared verdict value must still pass");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            final_value(&state, &accepted, 1).await,
+            Some(Value::String("BLOCKED".to_string())),
+        );
+
+        // Non-member value: still the pre-existing 422 from the contract,
+        // not a submit_format error.
+        let rejected = StepId::new();
+        let handle = seed_task_with_handle(&state, &rejected, "gate", 1, None).await;
+        seed_submit_format(&state, &rejected, 1, "gate", None, None).await;
+        let err = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
+            axum::body::Bytes::from("UNKNOWN"),
+        )
+        .await
+        .expect_err("a non-member verdict value must still be rejected");
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            err.message.contains("verdict contract violation"),
+            "the verdict contract must own this rejection, got: {}",
+            err.message
+        );
+    }
+
+    /// End-to-end of the motivating shape: a planner declares
+    /// `submit_format: "json"`, submits `{"lanes": [...]}`, and a `fanout`
+    /// whose `items` is `$.<step>.lanes` dispatches one lane per element.
+    /// Before the opt-in the same submit folded as a string and the
+    /// `items` path could not be resolved at all.
+    #[tokio::test]
+    async fn declared_json_submit_feeds_a_fanout_items_path() {
+        use mlua_flow_ir::{EvalError, Expr, JoinMode, Node as FlowNode};
+
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+        seed_submit_format(
+            &state,
+            &task_id,
+            1,
+            "planner",
+            Some(Value::String(SUBMIT_FORMAT_JSON.to_string())),
+            None,
+        )
+        .await;
+
+        worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
+            axum::body::Bytes::from(r#"{"lanes":["auth","billing","search"]}"#),
+        )
+        .await
+        .expect("declared JSON submit must succeed");
+        let planner_out = final_value(&state, &task_id, 1)
+            .await
+            .expect("Final event present");
+
+        // The step's OUTPUT as the BP chain would see it, under `$.planner`.
+        let path = |s: &str| Expr::Path {
+            at: s.parse().expect("literal test path"),
+        };
+        let flow = FlowNode::Fanout {
+            items: path("$.planner.lanes"),
+            bind: path("$.item"),
+            body: Box::new(FlowNode::Step {
+                ref_: "check".to_string(),
+                in_: path("$.item"),
+                out: path("$.branch_out"),
+            }),
+            join: JoinMode::All,
+            out: path("$.results"),
+        };
+        let dispatcher = |_ref: &str, input: Value| -> Result<Value, EvalError> { Ok(input) };
+        let final_ctx = mlua_flow_ir::eval(&flow, json!({ "planner": planner_out }), &dispatcher)
+            .expect("fanout over the parsed submit must evaluate");
+
+        let lanes: Vec<&Value> = final_ctx["results"]
+            .as_array()
+            .expect("results is an array")
+            .iter()
+            .map(|lane_ctx| &lane_ctx["branch_out"])
+            .collect();
+        assert_eq!(
+            lanes,
+            vec![&json!("auth"), &json!("billing"), &json!("search")]
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────
