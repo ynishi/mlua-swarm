@@ -90,9 +90,9 @@ verdict gating.
 
 ### `fanout` — N parallel checkers + aggregate (GH #82)
 
-`F.fanout` shape: N independent checker agents dispatch in parallel,
-their branch results collect into `$.results` (`join = "all"`), and a
-fixed `aggregate` stage consumes that array. This is the shape
+`F.fanout` shape: N independent checker agents, one dispatch per lane,
+their lane results collecting into `$.results` (`join = "all"`), and a
+fixed `aggregate` stage consuming that array. This is the shape
 `bp_dsl` used to require `F.raw()` for; GH #82 added the 7th (and
 final) Node builder to `flow_dsl` so the whole flow.ir Node grammar
 is now reachable from the DSL.
@@ -120,14 +120,44 @@ seed every checker under `d` when starting a run:
 swarm_run(blueprint = ..., init_ctx = { d = { lint = "...", test = "...", build = "..." } })
 ```
 
+**Lane arithmetic — why the body is a branch cascade.** A fanout `body`
+runs once *per item*, whole. A body listing all N checkers in a `seq`
+would therefore run every checker for every item: N x N dispatches. The
+`--stages` list means N *different* agents, one per lane, and
+`Step.ref` is a static string on the wire — so per-item agent selection
+is a `branch` on the bound `$.item`. That is what the template renders:
+N checkers produce N-1 nested branches, each lane dispatches exactly one
+step, and the last checker is the terminal `else` (the item set is
+closed — it is the literal array the template emits alongside the
+fanout). `--stages solo` degenerates to a bare `F.step` body.
+
+```lua
+body = F.branch({
+  cond     = F.p("$.item"):eq("lint"),
+  on_true  = F.step({ agent = "lint", input = F.p("$.d.lint"), out = F.p("$.branch_out") }),
+  on_false = F.branch({
+    cond     = F.p("$.item"):eq("test"),
+    on_true  = F.step({ agent = "test", input = F.p("$.d.test"), out = F.p("$.branch_out") }),
+    -- Closed item set: the last checker is the fallthrough.
+    on_false = F.step({ agent = "build", input = F.p("$.d.build"), out = F.p("$.branch_out") }),
+  }),
+}),
+```
+
 The rendered flow uses `F.fanout{items, bind, body, join, out}` with
-`join = "all"` (every branch runs, results collect in order). To
+`join = "all"` (every lane runs, results collect in order). To
 short-circuit on the first success, first settlement, or gather
 per-item status without raising, switch `join` to `"any"` /
 `"race"` / `"all_settled"` respectively — the runtime already
 supports all four modes; see `mse://guides/blueprint-authoring`
-§ "Flow node kinds" for the semantics of each. Live sample:
-`mse://blueprints/samples/10-fanout`.
+§ "Flow node kinds" for the semantics of each, and § "Fanout lanes,
+`$.results`, and the aggregate gate" for what `$.results` actually
+holds and why the `aggregate` stage is the only way to gate on it.
+
+Live sample: `mse://blueprints/samples/10-fanout` — the *homogeneous*
+variant of this shape (one agent fanned out over an item array, no
+branch cascade), which is what you want when every lane runs the same
+checker over a different payload.
 
 ## Rendered shape guarantees
 

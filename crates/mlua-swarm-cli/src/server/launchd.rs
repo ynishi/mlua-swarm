@@ -871,6 +871,34 @@ com.mse.server = {
         assert!(rendered.contains("/Users/alice/.cargo/bin/mse"));
         assert!(rendered.contains("/Users/alice/.mse/config.toml"));
         assert!(rendered.contains("/Users/alice/projects/mlua-swarm"));
+        // The daemon's own install dir is on the daemon's PATH.
+        assert!(
+            rendered.contains("<string>/Users/alice/.cargo/bin:/usr/local/bin:"),
+            "cargo-bin dir must be substituted into EnvironmentVariables.PATH"
+        );
+    }
+
+    /// An in-process `agent_block` worker's `spec.mcp_servers[].command`
+    /// is spawned as a child of the server process, so it resolves
+    /// against this PATH and nothing else. `--cargo-bin` names the
+    /// directory the operator chose to install into — the most specific
+    /// match available — so it goes first.
+    #[test]
+    fn render_puts_cargo_bin_first_on_path() {
+        let rendered = render(
+            Path::new("/Users/alice"),
+            Path::new("/opt/mse/bin"),
+            Path::new("/Users/alice/projects/mlua-swarm"),
+        )
+        .expect("render succeeds");
+        let path_line = rendered
+            .lines()
+            .find(|l| l.contains("/opt/mse/bin:"))
+            .expect("PATH entry must carry the substituted cargo-bin dir");
+        assert!(
+            path_line.trim().starts_with("<string>/opt/mse/bin:"),
+            "cargo-bin dir must come first on PATH: {path_line}"
+        );
     }
 
     #[test]

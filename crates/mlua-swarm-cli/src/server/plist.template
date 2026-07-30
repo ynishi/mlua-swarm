@@ -35,7 +35,13 @@
   Notes:
     - binary path / config path / WorkingDirectory must be absolute
       (launchd does not resolve relative paths or tildes).
-    - EnvironmentVariables.PATH may need tweaking for your environment.
+    - EnvironmentVariables.PATH is the daemon's whole search path, and an
+      in-process agent_block worker's `spec.mcp_servers[].command` is
+      spawned as a child of that daemon — so a bare command name resolves
+      against this list, not against your login shell's PATH. {{CARGO_BIN}}
+      comes first (the daemon's own install dir). Anything installed
+      elsewhere: give an absolute `command`, or add its directory here and
+      `launchctl kickstart -k gui/$(id -u)/com.mse.server`.
 -->
 <dict>
     <key>Label</key>
@@ -52,7 +58,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <string>{{CARGO_BIN}}:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
 
     <key>WorkingDirectory</key>

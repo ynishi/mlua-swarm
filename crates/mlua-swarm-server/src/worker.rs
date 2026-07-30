@@ -815,7 +815,12 @@ pub async fn worker_artifact(
 }
 
 /// Body for `POST /v1/worker/degradation` (GH #32).
-#[derive(Debug, Deserialize)]
+///
+/// The persisted shape is [`DegradationEntry`], not this struct: the
+/// server injects `step_ref` / `attempt` / `at` on the way in. `JsonSchema`
+/// is derived because this body is hand-authored by worker harness
+/// implementors, who read it from `mse://api/http-endpoints`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DegradationBody {
     /// The tool (or capability) the worker attempted to use.
     pub tool: String,
@@ -951,7 +956,14 @@ pub async fn worker_degradation(
 /// Request body for `POST /v1/worker/stats` — a worker's self-reported
 /// per-attempt stats (per-step run stats, operator axis). Every field
 /// optional; an all-empty body is accepted and dropped.
-#[derive(Debug, Deserialize)]
+///
+/// Field-for-field the wire twin of [`mlua_swarm::store::trace::WorkerStats`],
+/// which is what the handler converts it into; the one difference is this
+/// body's `worker_kind` default of `"operator"`. The property sets are
+/// drift-locked by `stats_body_schema_matches_worker_stats_property_set`.
+/// `JsonSchema` is derived because this body is hand-authored by worker
+/// harness implementors, who read it from `mse://api/http-endpoints`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct StatsBody {
     /// Worker kind label. Defaults to `"operator"` — this endpoint's
     /// primary caller is the WS-operator / SubAgent axis, whose spawn
@@ -1369,6 +1381,33 @@ mod tests {
         assert!(
             err.contains("pass") && err.contains("blocked") && err.contains("skip"),
             "err should enumerate the valid tier set: {err}"
+        );
+    }
+
+    /// Drift lock: [`StatsBody`] is the wire twin of
+    /// [`mlua_swarm::store::trace::WorkerStats`] — the handler builds one
+    /// from the other field by field. A field added to either side alone
+    /// silently drops that field from `POST /v1/worker/stats` (or publishes
+    /// one the endpoint cannot accept), so the two property sets are
+    /// asserted equal rather than left to review.
+    #[test]
+    fn stats_body_schema_matches_worker_stats_property_set() {
+        fn property_names<T: schemars::JsonSchema>() -> std::collections::BTreeSet<String> {
+            let schema = serde_json::to_value(schemars::schema_for!(T))
+                .expect("schema must serialize as JSON");
+            schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .expect("schema must expose a properties object")
+                .keys()
+                .cloned()
+                .collect()
+        }
+
+        assert_eq!(
+            property_names::<StatsBody>(),
+            property_names::<mlua_swarm::store::trace::WorkerStats>(),
+            "StatsBody and WorkerStats must expose the same property set"
         );
     }
 

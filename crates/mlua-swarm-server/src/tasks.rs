@@ -1347,7 +1347,10 @@ pub async fn runs_list(
 }
 
 /// Response body for `GET /v1/runs/:id/steps`.
-#[derive(Debug, Serialize)]
+///
+/// `JsonSchema` is derived so `mse://api/http-endpoints` can publish the
+/// per-step stats surface without restating [`StepEntry`]'s field list.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct RunStepsResponse {
     /// The Run the steps belong to.
     pub run_id: String,

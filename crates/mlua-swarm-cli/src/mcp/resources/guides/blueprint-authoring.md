@@ -45,6 +45,82 @@ Every node is tagged with a `kind` discriminator:
 
 `out` / `at` / `counter` must always be `path` exprs (write targets).
 
+### Fanout lanes, `$.results`, and the aggregate gate
+
+`fanout` is the one node whose result is not readable the way it looks.
+Read this before writing a flow that branches on a fanout's outcome.
+
+**A lane is a disjoint ctx.** `body` runs once per item against a *copy*
+of the parent ctx plus the `bind` write. Lane writes never reach the
+parent ctx and never reach each other; only `out` crosses back.
+
+**Dispatch arithmetic.** `body` runs once per item, whole. K steps in
+the body and N items is K x N dispatches, not K. The canonical body is
+one step. Per-item *agent* selection needs a `branch` on the bound item
+inside the body (`Step.ref` is a static string on the wire, so it cannot
+be computed from the item) — that is the shape `mse bp new fanout`
+scaffolds.
+
+**What `$.results` contains.** Under `join = "all"`, one element per
+item, each element the lane's *final ctx object* — not the step's
+output. The step output sits inside it, under whatever path that step's
+`out` named. So with `out = $.branch_out` in the lane, the value you
+want is `$.results[i].branch_out`, not `$.results[i]`. Under
+`all_settled` that same object is nested one deeper, under `.value`,
+beside a `status`.
+
+**You cannot index it.** flow.ir paths have exactly one segment kind, a
+string key. The supported grammar is `$`, `$.a.b`, and `$["a.b"]` for
+keys containing a dot — there is no array-index segment:
+
+- `$.results[0]` is a **parse error**: the Blueprint is rejected on
+  deserialize (`mse bp build`, `POST /v1/blueprints/:id`), not at run time.
+- `$.results.0` parses as the string key `"0"` and raises `PathNotFound`
+  at eval — a string key never indexes an array.
+
+**No quantifier either.** No cond op ranges over an array: there is no
+`any` / `all` / wildcard. `in` is not an escape hatch — it compares
+*whole elements* structurally, and an element here is a full lane ctx
+object, so it cannot express "some lane returned BLOCKED". `len` gives
+you the lane count and nothing about the lanes.
+
+**Therefore the aggregate step is the gate.** Hand `$.results` to one
+agent and let it collapse the array into a scalar you *can* compare:
+
+```jsonc
+{"kind": "fanout", "items": {"op":"path","at":"$.d.targets"},
+ "bind": {"op":"path","at":"$.item"}, "join": "all",
+ "out": {"op":"path","at":"$.results"},
+ "body": {"kind":"step","ref":"check",
+          "in": {"op":"path","at":"$.item"},
+          "out": {"op":"path","at":"$.branch_out"}}},
+{"kind": "step", "ref": "aggregate",
+ "in": {"op":"path","at":"$.results"},
+ "out": {"op":"path","at":"$.aggregate"}},
+{"kind": "branch",
+ "cond": {"op":"eq","lhs":{"op":"path","at":"$.aggregate.verdict"},
+          "rhs":{"op":"lit","value":"PASS"}},
+ "then": {"...": "on pass"}, "else": {"...": "on block"}}
+```
+
+Give the aggregate agent a verdict contract so the gate compares a
+scalar the engine already validated:
+
+```jsonc
+{ "name": "aggregate", "verdict": { "channel": "part", "values": ["PASS", "BLOCKED"] } }
+```
+
+See § Returning verdicts to drive BP flow below for the two channels, and
+`mse://blueprints/samples/10-fanout` for a runnable version of this
+shape.
+
+**The one non-agent option.** `call_extern` (see § Expr ops) can fold
+`$.results` in a host-registered pure function — the only way to reduce
+the array without dispatching an agent. It is host-dependent: it works
+only when the embedding host wired an externs registry
+(`TaskLaunchService::with_externs`), so a Blueprint using it is not
+portable to a plain `mse serve`.
+
 ## Worker output: `out` vs named parts (GH #36)
 
 A `step` node's OUTPUT is normally a single JSON value — the worker's
@@ -525,6 +601,12 @@ Every expr is tagged with an `op` discriminator:
 | `in`     | `needle`, `haystack`       | `true` if `needle` equals any element of the `haystack` array.          |
 | `call_extern` | `ref`, `args` (array) | Invoke a host-registered pure function (`Externs` registry) with the evaluated `args`. Unregistered `ref` raises. Value-shape only — no side effects, no flow control. |
 
+No op quantifies over an array — there is no `any` / `all` / wildcard,
+and `in` compares whole elements structurally. Gating on a collection
+(a `fanout`'s `out`, most commonly) goes through a step that reduces it
+to a scalar first: see § Fanout lanes, `$.results`, and the aggregate
+gate.
+
 `call_extern` requires the host to register an externs registry
 (`TaskLaunchService::with_externs`); without one every `call_extern`
 raises an extern error.
@@ -720,6 +802,26 @@ Two modes, selected by whether `spec.script_path` is present:
   ]
 }
 ```
+
+**`mcp_servers[].command` resolution.** The MCP server process is spawned
+as a child of the **`mse serve` process**, so a bare command name is
+looked up on that process's `PATH` — not your shell's. Under `mse serve`
+started from a login shell that is usually the same thing. Under the
+`mse server install` LaunchAgent it is not: launchd gives the daemon the
+fixed `EnvironmentVariables.PATH` from
+`~/Library/LaunchAgents/com.mse.server.plist`, which lists the
+`--cargo-bin` directory plus the standard system dirs and nothing else.
+For anything installed elsewhere, give an absolute path:
+
+```jsonc
+{ "name": "docs", "command": "<your-mcp-binary>", "args": [] }                  // bare: must be on the daemon's PATH
+{ "name": "docs", "command": "/opt/homebrew/bin/<your-mcp-binary>", "args": [] } // absolute: always resolves
+```
+
+The alternative is to extend `EnvironmentVariables.PATH` in that plist
+and reload the job (`launchctl kickstart -k gui/$(id -u)/com.mse.server`).
+A command that fails to resolve surfaces at MCP-connect time, not at
+Blueprint compile time.
 
 **Input.** Three Lua globals, all per-task and none via the server process
 env:

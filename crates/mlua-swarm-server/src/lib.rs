@@ -107,10 +107,11 @@ pub use operator_ws::{
 pub use projection::{McpQueryAdapter, ProjectionSource, StepList, StepPathQuery, StepSummary};
 pub use tasks::{
     RunBindingDifference, RunBindingExplainEntry, RunBindingStatus, RunBindingsExplainResponse,
-    RunKickRequest, RunKickResponse, RunResumeResponse, TaskDetailResponse,
+    RunKickRequest, RunKickResponse, RunResumeResponse, RunStepsResponse, TaskDetailResponse,
 };
 pub use worker::{
-    worker_artifact, worker_prompt, worker_result, ArtifactQuery, PromptQuery, WorkerResultReq,
+    worker_artifact, worker_prompt, worker_result, ArtifactQuery, DegradationBody, PromptQuery,
+    StatsBody, WorkerResultReq,
 };
 
 use axum::{

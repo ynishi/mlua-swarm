@@ -56,7 +56,7 @@
 //! | `mse://blueprints/samples/07-dsl-pipeline`   | Sample `.bp.lua` — bp_dsl verdict-gated pipeline.   |
 //! | `mse://blueprints/samples/08-bundled-refs`   | Sample `.bp.lua` — `$agent_md` refs into the bundled `samples/agents/` dir (include cascade). |
 //! | `mse://blueprints/samples/09-skip-on-example`| Sample `.bp.lua` — GH #76 DSL sugar `skip_on` DSL sugar (Skip tier). |
-//! | `mse://blueprints/samples/10-fanout`         | Sample `.bp.lua` — GH #82 `F.fanout` (parallel branch dispatch + aggregate) — the shape `bp_dsl` used to require `F.raw()`. |
+//! | `mse://blueprints/samples/10-fanout`         | Sample `.bp.lua` — GH #82 `F.fanout`: one agent fanned out over an item array (one dispatch per item) + aggregate. |
 //! | `mse://guides/subprocess-backends`           | GH #83 SubprocessDef CLI invocation templates (EmbedAgent): closed placeholder set, output normalization, Runner::Subprocess binding. |
 //! | `mse://blueprints/samples/11-subprocess-embed` | GH #83 sample — two headless workers on different SubprocessDef templates, neutral binaries only. |
 //! | `mse://guides/skip-tier-and-skip-on`         | Skip tier semantics + `skip_on = { ... }` DSL surface + `bp_doctor` `skip_on_lint` family + error surface (GH #76). |
@@ -138,7 +138,7 @@ const SAMPLE_08_BUNDLED_REFS_BODY: &str =
     include_str!("./resources/samples/08-bundled-refs.bp.lua");
 const SAMPLE_09_SKIP_ON_EXAMPLE_BODY: &str =
     include_str!("./resources/samples/bp/skip-on-example.bp.lua");
-const SAMPLE_10_FANOUT_BODY: &str = include_str!("./resources/samples/09-fanout.bp.lua");
+const SAMPLE_10_FANOUT_BODY: &str = include_str!("./resources/samples/10-fanout.bp.lua");
 const SAMPLE_11_SUBPROCESS_EMBED_BODY: &str =
     include_str!("./resources/samples/11-subprocess-embed.json");
 
@@ -314,8 +314,8 @@ pub const RESOURCES: &[ResourceEntry] = &[
     },
     ResourceEntry {
         uri: "mse://blueprints/samples/10-fanout",
-        title: "Sample .bp.lua — parallel branch dispatch + aggregate (F.fanout, GH #82)",
-        description: "GH #82: three independent checkers (lint / test / build) dispatched in parallel via `F.fanout` (join = \"all\"); an aggregate stage consumes the collected `$.results` array. Demonstrates the `F.fanout` builder — flow.ir's 7th Node kind, previously reachable only via `F.raw()`. Full semantics: `mse://guides/blueprint-authoring` § \"Flow node kinds\"; scaffold recipe: `mse://guides/bp-dsl-templates`.",
+        title: "Sample .bp.lua — fanout over an item array + aggregate (F.fanout, GH #82)",
+        description: "GH #82: one `check` agent fanned out over the `$.d.targets` array via `F.fanout` (join = \"all\") — the body holds exactly one step, because it runs once per item — with an aggregate stage consuming the collected `$.results`. Demonstrates the `F.fanout` builder (flow.ir's 7th Node kind, previously reachable only via `F.raw()`) and the bound `$.item`. Heterogeneous lanes (one agent per lane, selected by branching on `$.item`) are what `mse bp new fanout` scaffolds: `mse://guides/bp-dsl-templates`. Lane semantics and how to gate on `$.results`: `mse://guides/blueprint-authoring`.",
         mime_type: "text/x-lua",
         body: ResourceBody::Static(SAMPLE_10_FANOUT_BODY),
     },
@@ -350,7 +350,7 @@ pub const RESOURCES: &[ResourceEntry] = &[
     ResourceEntry {
         uri: "mse://api/http-endpoints",
         title: "HTTP endpoint wire-body JSON Schemas",
-        description: "Live schemars-generated request/response JSON Schemas for /v1/blueprints, /v1/tasks, and /v1/tasks/:id/runs, keyed by endpoint. A separate resource from mse://api/blueprint-schema (issue #19).",
+        description: "Live schemars-generated request/response JSON Schemas for the /v1/blueprints, /v1/tasks, /v1/runs (including the per-step stats trace), and /v1/worker families, keyed by endpoint. A separate resource from mse://api/blueprint-schema (issue #19).",
         mime_type: "application/json",
         body: ResourceBody::HttpEndpoints,
     },
@@ -388,7 +388,10 @@ pub fn blueprint_schema_value() -> Result<serde_json::Value, serde_json::Error> 
 /// /v1/blueprints/:id`) point at `mse://api/blueprint-schema` by URI
 /// instead of duplicating that schema here — the two resources stay
 /// separate documents (see the module doc / `must_not_simplify #1` /
-/// `#6`). Thin endpoints (`doctor` / `healthz`) are out of scope here;
+/// `#6`). `GET /v1/runs` uses the same idiom in prose: its body is an
+/// array of the `GET /v1/runs/:id` response, so it carries a `$comment`
+/// naming its query params rather than a second copy of `RunRecord`'s
+/// `$defs`. Thin endpoints (`doctor` / `healthz`) are out of scope here;
 /// adding one later is one more map entry.
 pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Error> {
     let task_launch_request_schema = schemars::schema_for!(mlua_swarm_server::TaskLaunchRequest);
@@ -406,6 +409,14 @@ pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Er
     let run_bindings_response = serde_json::to_value(&run_bindings_response_schema)?;
     let worker_payload_schema = schemars::schema_for!(mlua_swarm::WorkerPayload);
     let worker_payload = serde_json::to_value(&worker_payload_schema)?;
+    let run_record_schema = schemars::schema_for!(mlua_swarm::store::run::RunRecord);
+    let run_record = serde_json::to_value(&run_record_schema)?;
+    let run_steps_response_schema = schemars::schema_for!(mlua_swarm_server::RunStepsResponse);
+    let run_steps_response = serde_json::to_value(&run_steps_response_schema)?;
+    let stats_body_schema = schemars::schema_for!(mlua_swarm_server::StatsBody);
+    let stats_body = serde_json::to_value(&stats_body_schema)?;
+    let degradation_body_schema = schemars::schema_for!(mlua_swarm_server::DegradationBody);
+    let degradation_body = serde_json::to_value(&degradation_body_schema)?;
 
     Ok(serde_json::json!({
         "endpoints": {
@@ -436,6 +447,25 @@ pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Er
             "GET /v1/worker/prompt": {
                 "$comment": "Worker self-fetch. Query: `task_id=<StepId>`. Auth: `Authorization: Bearer <worker_handle>` (short handle from the Spawn frame, or full capability_token). Response body = WorkerPayload; `context` carries the AgentContextView (GH #20 Contract C) when AgentContextMiddleware was layered; exactly one of `system` / `system_ref` is populated when a system_prompt was baked (GH #31).",
                 "response": worker_payload,
+            },
+            "GET /v1/runs/:id": {
+                "$comment": "One persisted Run. `step_entries[]` is the per-step stats trace, appended once per dispatched step at outcome time and write-once thereafter (in-flight visibility belongs to `GET /v1/runs/:id/trace`). `input_json` is the opaque launch snapshot — its shape is not part of this contract, do not read fields out of it.",
+                "response": run_record,
+            },
+            "GET /v1/runs/:id/steps": {
+                "$comment": "The same StepEntry rows `GET /v1/runs/:id` embeds, split out as a sub-resource so a stats poller does not drag the full RunRecord (launch snapshot included) on every poll.",
+                "response": run_steps_response,
+            },
+            "GET /v1/runs": {
+                "$comment": "Filtered Run collection, newest-first. Query: `task_id` / `status` (pending|running|done|failed|interrupted) / `limit` / `offset`, all optional. Response body is {\"runs\": [<the GET /v1/runs/:id response>, ...]} — the element schema is not restated here.",
+            },
+            "POST /v1/worker/stats": {
+                "$comment": "Worker self-reported per-attempt stats. Auth: `Authorization: Bearer <worker_handle>` (short handle from the Spawn frame, or full capability_token). `worker_kind` defaults to \"operator\". Every field is optional and an all-empty body is accepted and dropped. Call it BEFORE the attempt's final `POST /v1/worker/submit`: the dispatcher folds the recorded stats into the step's StepEntry at outcome time, so stats arriving after that fold never reach the Run record. 204 on success; 410 once the addressed Run is terminal. `mse_worker_submit` has no `stats` param — this endpoint is the only route.",
+                "request": stats_body,
+            },
+            "POST /v1/worker/degradation": {
+                "$comment": "Worker-reported tool degradation (GH #32). Same Bearer forms as POST /v1/worker/stats. The server injects `step_ref` / `attempt` / `at`; the persisted shape is a DegradationEntry on `RunRecord.degradations`, readable via GET /v1/runs/:id. 204 on success; 410 once the addressed Run is terminal. Also reachable via `mse_worker_submit`'s `degradations` array.",
+                "request": degradation_body,
             },
         },
     }))
@@ -571,6 +601,11 @@ mod tests {
             "POST /v1/tasks/:id/runs",
             "GET /v1/runs/:id/bindings",
             "GET /v1/worker/prompt",
+            "GET /v1/runs/:id",
+            "GET /v1/runs/:id/steps",
+            "GET /v1/runs",
+            "POST /v1/worker/stats",
+            "POST /v1/worker/degradation",
         ] {
             assert!(
                 endpoints.contains_key(key),
@@ -618,6 +653,87 @@ mod tests {
             endpoints["POST /v1/blueprints/:id"]["request"]["schema_ref"],
             serde_json::json!("mse://api/blueprint-schema")
         );
+    }
+
+    /// The run-read family and the two worker report routes are the only
+    /// published description of the per-step stats surface — `POST
+    /// /v1/worker/stats` in particular has no MCP-tool equivalent
+    /// (`mse_worker_submit` carries `degradations` but no `stats`), so a
+    /// worker harness author discovers it here or not at all.
+    #[test]
+    fn http_endpoints_resource_publishes_the_run_stats_surface() {
+        let entry = find_by_uri("mse://api/http-endpoints").expect("resource must exist");
+        let body = body_for(entry).expect("http-endpoints resource body generation must succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("body must be valid JSON");
+        let endpoints = &parsed["endpoints"];
+
+        // GET /v1/runs/:id carries the whole RunRecord ...
+        let run_response = &endpoints["GET /v1/runs/:id"]["response"];
+        let run_props = run_response
+            .get("properties")
+            .expect("GET /v1/runs/:id response must expose properties");
+        for field in ["step_entries", "degradations", "result_ref", "status"] {
+            assert!(
+                run_props.get(field).is_some(),
+                "RunRecord schema must expose {field}: {run_response}"
+            );
+        }
+        // ... including StepEntry's stats block under `$defs` (schemars 1
+        // emits `$defs`, not the draft-07 `definitions` — same convention
+        // the mcp-tools resource asserts against).
+        let step_entry_props = run_response
+            .get("$defs")
+            .and_then(|d| d.get("StepEntry"))
+            .and_then(|s| s.get("properties"))
+            .expect("RunRecord schema must define StepEntry under $defs");
+        for field in [
+            "usage",
+            "duration_ms",
+            "worker_kind",
+            "model",
+            "num_turns",
+            "adapter_data",
+        ] {
+            assert!(
+                step_entry_props.get(field).is_some(),
+                "StepEntry schema must expose the stats field {field}: {step_entry_props}"
+            );
+        }
+
+        // GET /v1/runs/:id/steps publishes the same rows standalone.
+        assert!(
+            endpoints["GET /v1/runs/:id/steps"]["response"]["properties"]
+                .get("steps")
+                .is_some(),
+            "RunStepsResponse schema must expose steps"
+        );
+        // GET /v1/runs is a cross-ref entry: prose only, no duplicated
+        // RunRecord $defs.
+        assert!(
+            endpoints["GET /v1/runs"].get("response").is_none(),
+            "GET /v1/runs must stay a cross-ref entry"
+        );
+
+        // POST /v1/worker/stats is a typed request body.
+        let stats_props = endpoints["POST /v1/worker/stats"]["request"]
+            .get("properties")
+            .expect("POST /v1/worker/stats request must expose properties");
+        for field in ["usage", "num_turns", "worker_kind", "model"] {
+            assert!(
+                stats_props.get(field).is_some(),
+                "StatsBody schema must expose {field}: {stats_props}"
+            );
+        }
+        let degradation_props = endpoints["POST /v1/worker/degradation"]["request"]
+            .get("properties")
+            .expect("POST /v1/worker/degradation request must expose properties");
+        for field in ["tool", "error", "fallback"] {
+            assert!(
+                degradation_props.get(field).is_some(),
+                "DegradationBody schema must expose {field}: {degradation_props}"
+            );
+        }
     }
 
     #[test]
@@ -778,6 +894,43 @@ mod tests {
                 panic!("{uri}: does not build via dsl::build_bp_from_script: {e}")
             });
         }
+    }
+
+    /// GH #82: the bundled fanout sample must dispatch exactly one step
+    /// per item. The `body` of a `fanout` runs once per element, so a
+    /// `seq` of N steps there is N x N dispatches — a defect invisible in
+    /// the sample's prose and in every schema-level check, which is why
+    /// the built node shape is asserted directly. `bind` being read by
+    /// the step's `in` is the other half: a sample that binds `$.item`
+    /// and never reads it teaches the wrong shape.
+    #[test]
+    fn bundled_sample_fanout_dispatches_one_step_per_lane() {
+        let uri = "mse://blueprints/samples/10-fanout";
+        let entry = find_by_uri(uri).unwrap_or_else(|| panic!("sample must exist: {uri}"));
+        let body = body_for(entry).expect("sample body must generate");
+        let value = mlua_swarm_cli::dsl::build_bp_from_script(&body)
+            .unwrap_or_else(|e| panic!("{uri}: does not build via dsl::build_bp_from_script: {e}"));
+
+        let fanout = value["flow"]["children"]
+            .as_array()
+            .expect("flow must be a seq")
+            .iter()
+            .find(|node| node["kind"] == "fanout")
+            .unwrap_or_else(|| panic!("{uri}: sample must contain a fanout node"));
+        assert_eq!(
+            fanout["body"]["kind"], "step",
+            "{uri}: the fanout body must be a single step (it runs once per item): {}",
+            fanout["body"]
+        );
+        assert_eq!(
+            fanout["body"]["in"],
+            serde_json::json!({"op": "path", "at": "$.item"}),
+            "{uri}: the lane step must read the bound item"
+        );
+        assert_eq!(
+            fanout["bind"],
+            serde_json::json!({"op": "path", "at": "$.item"})
+        );
     }
 
     /// GH #76 DSL sugar: the bundled skip_on sample must additionally parse

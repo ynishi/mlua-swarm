@@ -38,6 +38,12 @@ already-loaded job is booted out and re-bootstrapped cleanly. Flags:
 (default: `$CARGO_BIN` env, else `$HOME/.cargo/bin`);
 `--project-root <dir>` overrides `WorkingDirectory` (default: `$PWD`).
 
+That `--cargo-bin` directory is also prepended to the daemon's
+`EnvironmentVariables.PATH`, which is what an in-process `agent_block`
+worker's `spec.mcp_servers[].command` resolves against (the MCP server
+is a child of the daemon, not of your shell) — see
+`mse://guides/blueprint-authoring` § In-process agents.
+
 ```
 mse server install
 mse server install --cargo-bin ~/.cargo/bin --project-root ~/projects/mlua-swarm
@@ -276,5 +282,6 @@ config-only change.
   family (`mlua_swarm_server_*` is one of them).
 - `mse://api/mcp-tools` — live JSON Schemas for each MCP tool's
   request body, including the seven `mlua_swarm_server_*` tools.
-- `mse://api/http-endpoints` — HTTP wire-body JSON Schemas (`GET
-  /v1/healthz` is what `mse server status` probes under the hood).
+- `mse://api/http-endpoints` — HTTP wire-body JSON Schemas for the
+  `/v1/blueprints`, `/v1/tasks`, `/v1/runs`, and `/v1/worker` families
+  (`GET /v1/healthz` is what `mse server status` probes under the hood).

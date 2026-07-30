@@ -696,6 +696,51 @@ fn render_verdict_template(
     out
 }
 
+/// Render the `fanout` template's lane body: the Lua expression that
+/// dispatches exactly one step for the lane whose bound `$.item` is
+/// being evaluated.
+///
+/// `head` + `tail` is the checker list split so the non-empty
+/// precondition is carried by the signature rather than by a panic. One
+/// checker renders a bare `F.step` (a `Step` is a `Node`, so it is a
+/// legal `fanout` body on its own); N checkers render N-1 nested
+/// `F.branch` nodes comparing `$.item` against each name, with the last
+/// checker as the terminal `else` — flow.ir's `Branch.else` is not
+/// optional, and the item set is closed by construction (it is the
+/// literal array this template emits alongside the fanout).
+///
+/// `indent` is the leading whitespace of the line the expression starts
+/// on; nested lines extend it. The returned string carries no trailing
+/// comma or newline — the caller places it.
+fn render_fanout_lane_body(head: &str, tail: &[String], indent: &str) -> String {
+    let step = |checker: &str| {
+        format!(
+            "F.step({{ agent = \"{checker}\", input = F.p(\"$.d.{checker}\"), out = F.p(\"$.branch_out\") }})"
+        )
+    };
+    let Some((next, rest)) = tail.split_first() else {
+        return step(head);
+    };
+    let inner = format!("{indent}  ");
+    // The innermost `else` is a bare step, not another branch: flag it
+    // in the generated source so an author extending the item list
+    // knows the fallthrough is deliberate.
+    let fallthrough_note = if rest.is_empty() {
+        format!("{inner}-- Closed item set: the last checker is the fallthrough.\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "F.branch({{\n\
+         {inner}cond     = F.p(\"$.item\"):eq(\"{head}\"),\n\
+         {inner}on_true  = {on_true},\n\
+         {fallthrough_note}{inner}on_false = {on_false},\n\
+         {indent}}})",
+        on_true = step(head),
+        on_false = render_fanout_lane_body(next, rest, &inner),
+    )
+}
+
 /// GH #82: `mse bp new fanout` — parallel branch dispatch + aggregate.
 /// Emits a `flow_dsl` shape that used to require `F.raw()`:
 /// `F.seq{ assign(items), fanout(items -> N checkers -> results), aggregate step }`.
@@ -705,6 +750,16 @@ fn render_verdict_template(
 /// and the aggregate — is a plain operator with the standard
 /// `ws_operator` Runner shape the other templates use, so the emitted
 /// script round-trips through the same compile-lint path.
+///
+/// **Lane arithmetic.** The fanout `body` runs once per item, so a body
+/// holding K steps dispatches K x N times. `--stages lint,test,build`
+/// means three *different* checkers, one per lane — which is a per-item
+/// agent selection, and `Node::Step.ref` is a static string on the wire.
+/// So the body is a branch cascade on the bound `$.item`
+/// ([`render_fanout_lane_body`]): N checkers render N-1 branches, each
+/// lane dispatches exactly one step, and the last checker is the
+/// terminal `else` (the item set is closed by construction — it is the
+/// literal array this template also emits).
 ///
 /// The `bind` expression the fanout uses (`$.d.<checker>`) is the same
 /// `$.d.<stage>` convention `pipeline` / `verdict` follow, so the
@@ -716,9 +771,11 @@ fn render_fanout_template(
     operator: &str,
     binding: &str,
 ) -> String {
-    let checkers: &[String] = if checkers.is_empty() {
-        // parse_stages returns empty only when `--stages ""` is passed
-        // literally; fall back to the same default the None arm uses.
+    // `split_first` carries the non-empty precondition the lane-body
+    // renderer needs: `parse_stages` returns empty only when `--stages ""`
+    // is passed literally, and that falls back to the same default the
+    // None arm uses.
+    let Some((first_checker, other_checkers)) = checkers.split_first() else {
         return render_fanout_template(
             name,
             &DEFAULT_FANOUT_STAGES
@@ -728,8 +785,6 @@ fn render_fanout_template(
             operator,
             binding,
         );
-    } else {
-        checkers
     };
     let aggregate = FANOUT_AGGREGATE_STAGE;
     let checker_list_lua = checkers
@@ -758,9 +813,18 @@ fn render_fanout_template(
         "--   swarm_run(blueprint = ..., init_ctx = {{ d = {{ {init_ctx_sample} }} }})\n"
     ));
     out.push_str("--\n");
-    out.push_str("-- The fanout `join = \"all\"` gathers every branch's final ctx into an\n");
+    out.push_str("-- The fanout `body` runs ONCE PER ITEM, so it holds exactly one\n");
+    out.push_str("-- dispatch per lane: a branch cascade on the bound `$.item` picks\n");
+    out.push_str("-- that lane's checker. (A `seq` of every checker in the body would\n");
+    out.push_str("-- run all of them for every item — N checkers x N items.)\n");
+    out.push_str("--\n");
+    out.push_str("-- The fanout `join = \"all\"` gathers every lane's final ctx into an\n");
     out.push_str("-- ordered array at `$.results`; the aggregate stage reads that\n");
-    out.push_str("-- array and produces the final decision.\n");
+    out.push_str("-- array and produces the final decision. `$.results` cannot be\n");
+    out.push_str("-- indexed from a path expr, so the aggregate step is also how a\n");
+    out.push_str("-- downstream gate reads this result — see\n");
+    out.push_str("-- `mse://guides/blueprint-authoring` § \"Fanout lanes, `$.results`,\n");
+    out.push_str("-- and the aggregate gate\".\n");
     out.push_str("--\n");
     out.push_str("-- See `mse://guides/blueprint-authoring` § \"Flow node kinds\" for\n");
     out.push_str("-- the four `join` modes (`all` / `any` / `race` / `all_settled`)\n");
@@ -773,26 +837,19 @@ fn render_fanout_template(
     out.push_str(&format!(
         "  F.assign({{ at = F.p(\"$.checkers\"), value = F.lit({{ {checker_list_lua} }}) }}),\n"
     ));
-    // The fanout's `body` dispatches ONE step per element; the element
-    // (a checker's name) binds under `$.item`, and each branch reads
-    // its own input from `$.d.<checker_name>` — resolved statically at
-    // scaffold time so every branch dispatches its own operator agent.
+    // The fanout's `body` runs once per element, so it dispatches ONE
+    // step per lane: the element (a checker's name) binds under
+    // `$.item`, and the branch cascade selects that lane's checker,
+    // which reads its own `$.d.<checker_name>` slot.
     out.push_str("  F.fanout({\n");
     out.push_str("    items = F.p(\"$.checkers\"),\n");
     out.push_str("    bind  = F.p(\"$.item\"),\n");
     out.push_str("    join  = \"all\",\n");
     out.push_str("    out   = F.p(\"$.results\"),\n");
-    // Bodies dispatched in parallel: one step per checker, each reading
-    // its own `$.d.<checker>` slot. seq-of-1 keeps the body a Node
-    // rather than a bare Step, matching the branch shape flow.ir
-    // expects.
-    out.push_str("    body  = F.seq({\n");
-    for checker in checkers {
-        out.push_str(&format!(
-            "      F.step({{ agent = \"{checker}\", input = F.p(\"$.d.{checker}\"), out = F.p(\"$.branch_out\") }}),\n"
-        ));
-    }
-    out.push_str("    }),\n");
+    out.push_str(&format!(
+        "    body  = {},\n",
+        render_fanout_lane_body(first_checker, other_checkers, "    ")
+    ));
     out.push_str("  }),\n");
     out.push_str(&format!(
         "  F.step({{ agent = \"{aggregate}\", input = F.p(\"$.results\"), out = F.p(\"$.{aggregate}\") }}),\n"
@@ -1522,6 +1579,100 @@ mod tests {
             rendered.contains("mse://guides/bp-dsl-templates"),
             "fanout header must link to the guide covering the convention"
         );
+    }
+
+    /// The scaffold's whole point is one dispatch per lane. A `seq` body
+    /// holding every checker renders identical text at the substring
+    /// level (same agent names, same `$.d.<checker>` reads, same agent
+    /// count) while dispatching N x N steps at run time, so the shape is
+    /// asserted on the built wire JSON, not on the rendered source.
+    #[test]
+    fn fanout_template_dispatches_one_step_per_lane() {
+        let rendered = render_template_by_kind(
+            "fanout",
+            "lane-arithmetic",
+            Some("lint,test,build"),
+            None,
+            None,
+            None,
+        )
+        .expect("render must succeed with 3 stages");
+        let bp = dsl::build_bp_from_script(&rendered).expect("rendered scaffold must build");
+        let body = &bp["flow"]["children"][1]["body"];
+
+        // 3 checkers => 2 nested branches, terminal else = the last step.
+        let outer_cond = &body["cond"];
+        assert_eq!(body["kind"], "branch", "lane body must be a branch: {body}");
+        assert_eq!(
+            outer_cond,
+            &serde_json::json!({
+                "op": "eq",
+                "lhs": {"op": "path", "at": "$.item"},
+                "rhs": {"op": "lit", "value": "lint"},
+            }),
+            "each lane is selected by comparing the bound $.item"
+        );
+        assert_eq!(body["then"]["kind"], "step");
+        assert_eq!(body["then"]["ref"], "lint");
+
+        let inner = &body["else"];
+        assert_eq!(inner["kind"], "branch", "cascade depth must be 2: {inner}");
+        assert_eq!(
+            inner["cond"]["rhs"],
+            serde_json::json!({"op": "lit", "value": "test"})
+        );
+        assert_eq!(inner["then"]["ref"], "test");
+        assert_eq!(
+            inner["else"]["kind"], "step",
+            "the last checker is the terminal else, not another branch"
+        );
+        assert_eq!(inner["else"]["ref"], "build");
+
+        // Exactly one step runs per item: 3 step nodes, 2 branch nodes,
+        // no `seq` inside the fanout body.
+        let rendered_body = serde_json::to_string(body).expect("body serializes");
+        assert_eq!(
+            rendered_body.matches("\"kind\":\"step\"").count(),
+            3,
+            "one step per lane: {rendered_body}"
+        );
+        assert_eq!(
+            rendered_body.matches("\"kind\":\"branch\"").count(),
+            2,
+            "N checkers => N-1 branches: {rendered_body}"
+        );
+        assert!(
+            !rendered_body.contains("\"kind\":\"seq\""),
+            "a seq body would run every checker for every item: {rendered_body}"
+        );
+    }
+
+    /// `N == 1` degenerates: nothing to select between, so the body is a
+    /// bare `F.step` (a `Step` is a legal `Node`, so no seq-of-1 wrapper
+    /// is needed).
+    #[test]
+    fn fanout_template_single_stage_emits_a_bare_step_body() {
+        let rendered =
+            render_template_by_kind("fanout", "solo-fanout", Some("solo"), None, None, None)
+                .expect("render must succeed with a single stage");
+        let bp = dsl::build_bp_from_script(&rendered).expect("rendered scaffold must build");
+        let body = &bp["flow"]["children"][1]["body"];
+        assert_eq!(body["kind"], "step", "single lane needs no branch: {body}");
+        assert_eq!(body["ref"], "solo");
+        assert_eq!(
+            body["in"],
+            serde_json::json!({"op": "path", "at": "$.d.solo"})
+        );
+
+        // 1 checker + aggregate = 2 operator agents on the one operator.
+        let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
+        assert!(matches!(
+            report,
+            LintReport::Ok {
+                agents: 2,
+                operators: 1
+            }
+        ));
     }
 
     #[test]

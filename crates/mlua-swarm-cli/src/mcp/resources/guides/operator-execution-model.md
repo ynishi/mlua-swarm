@@ -590,6 +590,52 @@ each entry carrying its own `step_ref` for locality — and surface via
 non-empty runs, so an operator or MainAI can spot a degraded run without
 walking the full run record.
 
+## Worker stats reporting
+
+The same asymmetry the degradation channel closes exists for *cost*: an
+in-process or subprocess worker reports its own token usage at its fold
+site, but a WS-operator SubAgent's spawn path has no such site — nothing
+in the three hops above knows what the attempt cost. `POST
+/v1/worker/stats` is that boundary's self-report, a sibling of the
+degradation channel on the same observational plane (it never touches
+step OUTPUT, so `$.<step>` is unaffected).
+
+**There is only one entry point.** `mse_worker_submit` carries a
+`degradations` array but has **no `stats` param** — direct HTTP is the
+whole surface:
+
+```jsonc
+// POST <base_url>/v1/worker/stats
+// Authorization: Bearer <worker_handle>   (or the full capability_token)
+// Content-Type: application/json
+{
+  "worker_kind": "operator",              // optional, defaults to "operator"
+  "model": "<the model that served the attempt>",
+  "usage": { "input_tokens": 1200, "output_tokens": 340, "total_tokens": 1540 },
+  "num_turns": 3,
+  "adapter_data": { "…": "free-form, size-capped, never interpreted" }
+}
+```
+
+Every field is optional; an all-empty body is accepted and dropped. The
+response is `204`, or `410 Gone` once the addressed Run is terminal (the
+same guard the submit / artifact / degradation routes apply).
+
+**Call it before the attempt's final submit.** The engine holds the
+reported stats per `(task_id, attempt)`, and the dispatcher drains them
+at outcome time — the moment the dispatch settles, which is what the
+final `mse_worker_submit` triggers. Stats that arrive after that fold are
+never folded into this attempt's record. Re-reporting within one attempt
+is last-write-wins, so a worker that learns its usage incrementally can
+just POST again before finishing.
+
+Reported stats land on the attempt's `StepEntry` — `worker_kind`,
+`model`, `usage`, `num_turns`, `adapter_data`, beside the
+dispatcher-measured `started_at_ms` / `completed_at_ms` / `duration_ms` —
+and surface on both `GET /v1/runs/:id` (inside `step_entries`) and
+`GET /v1/runs/:id/steps`. Wire schemas for all three:
+`mse://api/http-endpoints`.
+
 Runner capability resolution has a separate Run-scoped explain surface:
 `GET /v1/runs/:id/bindings`. Each entry returns the pinned declaration as
 `requested`, the Core-validated provider attestation as `effective`, and a
