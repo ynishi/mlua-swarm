@@ -15,6 +15,19 @@ local F = require("flow_dsl")
 
 local M = {}
 
+-- Authoring-time warnings accumulated across every `M.pipeline` call in
+-- one script run. The Rust host drains them via
+-- `M.take_authoring_warnings()` after the script returns (a fresh VM per
+-- build means no cross-script leakage).
+M._authoring_warnings = {}
+
+--- Return the accumulated authoring warnings and clear the buffer.
+function M.take_authoring_warnings()
+  local out = M._authoring_warnings
+  M._authoring_warnings = {}
+  return out
+end
+
 --- `B.bp{ id=, agents=, flow=, ... }` — the whole Blueprint table.
 --- bp_dsl does not gate-keep field names: anything beyond `id` / `flow`
 --- (e.g. `agents`, `operators`, `strategy`, `metadata`) passes through
@@ -214,6 +227,13 @@ end
 ---     use it. Default is `gate_default = "explicit"` (the new,
 ---     bug-fixed behavior).
 ---
+--- A pipeline that declares pipeline-level `halt_on` but has no stage
+--- opting in at all compiles to a flow that can never halt. That state is
+--- reported (never an `error()`) as an authoring warning: one line pushed
+--- into `M._authoring_warnings`, drained by the Rust host via
+--- `M.take_authoring_warnings()` and surfaced as `dsl warn:` on the CLI /
+--- `authoring_warnings` in the `bp_build` MCP response.
+---
 --- `gate = false` overrides all four (opts out even with retry / stage
 --- halt_on / auto cascade). When set the stage's step spliced directly
 --- into the enclosing `seq` with no `branch`, and the rest of the
@@ -296,6 +316,28 @@ function M.pipeline(spec)
     )
   end
 
+  -- bafe47d4: opt-in gate decision for one stage record. Order matters —
+  -- `gate = false` must win against every other opt-in signal (retry /
+  -- stage halt_on / auto cascade), and `gate = true` must beat the
+  -- default-off / auto-cascade split so an author can force a gate in a
+  -- pipeline that otherwise wouldn't emit one. Shared by the per-stage
+  -- build below and the pipeline-wide dead-halt lint.
+  local function stage_wants_gate(rec)
+    if rec.gate == false then
+      return false
+    elseif rec.gate == true then
+      return true
+    elseif rec.retry ~= nil then
+      return true
+    elseif rec.halt_on ~= nil then
+      return true
+    elseif gate_default == "auto" and #halt_on > 0 then
+      return true
+    else
+      return false
+    end
+  end
+
   local stages = {}
   for i, rec in ipairs(spec) do
     stages[i] = rec
@@ -313,6 +355,35 @@ function M.pipeline(spec)
     register_out(rec)
     if rec.retry ~= nil then
       register_out(rec.retry.fix)
+    end
+  end
+
+  -- Dead-halt lint (issue: opt-in flip drift, sibling of bp_doctor's
+  -- verdict_contract_never_read). Pipeline-level `halt_on` with zero
+  -- gate-emitting stages compiles to a flow that can never halt — the
+  -- halt machinery is decorative. `done` is deliberately NOT part of the
+  -- trigger (without gates the final assign still runs unconditionally),
+  -- and an explicit `halted_at` alone is not flagged either (it is a
+  -- target path, not halt intent).
+  if #halt_on > 0 then
+    local any_gate = false
+    local stage_ids = {}
+    for i, rec in ipairs(stages) do
+      stage_ids[i] = tostring(rec.id)
+      if stage_wants_gate(rec) then
+        any_gate = true
+      end
+    end
+    if not any_gate then
+      M._authoring_warnings[#M._authoring_warnings + 1] = "B.pipeline stages ["
+        .. table.concat(stage_ids, ", ")
+        .. "]: halt_on = {"
+        .. table.concat(halt_on, ", ")
+        .. "} is declared at the pipeline level but no stage emits a verdict"
+        .. " gate — gates are opt-in since bafe47d4, so this pipeline can"
+        .. " never halt. Add gate = true (or a stage-level halt_on / retry)"
+        .. " to at least one stage, or set gate_default = \"auto\" to restore"
+        .. " the pre-flip cascade for this source."
     end
   end
 
@@ -377,25 +448,8 @@ function M.pipeline(spec)
       children = body_children
     end
 
-    -- bafe47d4: opt-in gate decision. Order matters — `gate = false`
-    -- must win against every other opt-in signal (retry / stage
-    -- halt_on / auto cascade), and `gate = true` must beat the
-    -- default-off / auto-cascade split so an author can force a gate
-    -- in a pipeline that otherwise wouldn't emit one.
-    local wants_gate
-    if rec.gate == false then
-      wants_gate = false
-    elseif rec.gate == true then
-      wants_gate = true
-    elseif rec.retry ~= nil then
-      wants_gate = true
-    elseif rec.halt_on ~= nil then
-      wants_gate = true
-    elseif gate_default == "auto" and #halt_on > 0 then
-      wants_gate = true
-    else
-      wants_gate = false
-    end
+    -- bafe47d4: opt-in gate decision (see `stage_wants_gate` above).
+    local wants_gate = stage_wants_gate(rec)
 
     if not wants_gate then
       children[#children + 1] = rest

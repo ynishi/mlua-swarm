@@ -171,8 +171,14 @@ pub async fn run(args: BpArgs) -> Result<()> {
 async fn run_build(args: BuildArgs) -> Result<()> {
     let script = std::fs::read_to_string(&args.script)
         .with_context(|| format!("reading {}", args.script.display()))?;
-    let bp_value = dsl::build_bp_from_script(&script)
+    let (bp_value, dsl_warnings) = dsl::build_bp_from_script_with_warnings(&script)
         .with_context(|| format!("building Blueprint from {}", args.script.display()))?;
+
+    // Authoring-time (bp_dsl-level) warnings — report-only, printed before
+    // the compile-lint verdict so the two layers stay visually distinct.
+    for w in &dsl_warnings {
+        eprintln!("dsl warn: {w}");
+    }
 
     match compile_lint(&bp_value, &args.script, &args.include) {
         Ok(LintReport::Ok { agents, operators }) => {
@@ -256,18 +262,34 @@ async fn run_build(args: BuildArgs) -> Result<()> {
 /// bp lint: ERROR (…, compile lint failed)  → always non-zero
 /// ```
 ///
+/// Authoring-time `bp_dsl` warnings (e.g. the `B.pipeline` dead-halt lint)
+/// are printed first as `dsl warn: <line>` and are also promoted to a
+/// non-zero exit by `--strict`.
+///
 /// Precedent: `cargo check`, `tsc --noEmit`, `eslint`, `ruff check`.
 /// `--strict` mirrors `mypy --strict` / `cargo clippy -- -D warnings`
 /// (promote WARN to non-zero exit for CI use).
 fn run_lint(args: LintArgs) -> Result<()> {
     let script = std::fs::read_to_string(&args.script)
         .with_context(|| format!("reading {}", args.script.display()))?;
-    let bp_value = dsl::build_bp_from_script(&script)
+    let (bp_value, dsl_warnings) = dsl::build_bp_from_script_with_warnings(&script)
         .with_context(|| format!("building Blueprint from {}", args.script.display()))?;
+
+    // Authoring-time (bp_dsl-level) warnings — report-only, printed before
+    // the compile-lint verdict so the two layers stay visually distinct.
+    for w in &dsl_warnings {
+        eprintln!("dsl warn: {w}");
+    }
+    // `--strict` treats a dsl warning like a compile-lint WARN: everything
+    // is still printed, but the exit code is non-zero for CI use.
+    let strict_dsl_warn = args.strict && !dsl_warnings.is_empty();
 
     match compile_lint(&bp_value, &args.script, &args.include) {
         Ok(LintReport::Ok { agents, operators }) => {
             eprintln!("bp lint: OK ({agents} agent(s), {operators} operator(s) checked)");
+            if strict_dsl_warn {
+                return Err(anyhow!("bp lint: --strict, exiting non-zero on WARN"));
+            }
             Ok(())
         }
         Ok(LintReport::Warn {

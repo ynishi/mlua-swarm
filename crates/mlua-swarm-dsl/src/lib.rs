@@ -97,6 +97,17 @@ pub fn preload(lua: &mlua::Lua) -> mlua::Result<()> {
 /// object as a post-pass (`replace_empty_object_markers`) over the
 /// converted value.
 pub fn build_bp_from_script(script: &str) -> anyhow::Result<serde_json::Value> {
+    Ok(build_bp_from_script_with_warnings(script)?.0)
+}
+
+/// Like [`build_bp_from_script`], but also drains the authoring-time
+/// warnings `bp_dsl.lua` accumulated during the run (currently the
+/// B.pipeline dead-halt lint: pipeline-level `halt_on` with zero
+/// gate-emitting stages). Best-effort: a script that never
+/// `require`s `bp_dsl` yields an empty list.
+pub fn build_bp_from_script_with_warnings(
+    script: &str,
+) -> anyhow::Result<(serde_json::Value, Vec<String>)> {
     use mlua::LuaSerdeExt;
 
     // `mlua::Error` wraps a boxed `dyn std::error::Error` without a
@@ -114,7 +125,31 @@ pub fn build_bp_from_script(script: &str) -> anyhow::Result<serde_json::Value> {
         .from_value_with(result, options)
         .map_err(|e| anyhow::anyhow!("lua value -> json conversion failed: {e}"))?;
     replace_empty_object_markers(&mut value);
-    Ok(value)
+    let warnings = drain_authoring_warnings(&lua);
+    Ok((value, warnings))
+}
+
+/// Best-effort drain of `bp_dsl`'s authoring-warning buffer from the VM the
+/// script just ran in: `package.loaded["bp_dsl"].take_authoring_warnings()`.
+/// A script that never required the module (or any unexpected shape) yields
+/// an empty list — a reporting-only lint must never fail a build.
+fn drain_authoring_warnings(lua: &mlua::Lua) -> Vec<String> {
+    let drained: mlua::Result<Vec<String>> = (|| {
+        let package: mlua::Table = lua.globals().get("package")?;
+        let loaded: mlua::Table = package.get("loaded")?;
+        let module: mlua::Value = loaded.get("bp_dsl")?;
+        let mlua::Value::Table(module) = module else {
+            return Ok(Vec::new());
+        };
+        let take: mlua::Function = module.get("take_authoring_warnings")?;
+        let list: mlua::Table = take.call(())?;
+        let mut out = Vec::new();
+        for entry in list.sequence_values::<String>() {
+            out.push(entry?);
+        }
+        Ok(out)
+    })();
+    drained.unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -361,6 +396,153 @@ mod tests {
         )
         .expect("baseline pipeline must build");
         assert_eq!(with_empty, baseline, "skip_on = {{}} must be a no-op");
+    }
+
+    /// Build `script` and return only the authoring warnings it produced.
+    fn warnings_for(script: &str) -> Vec<String> {
+        build_bp_from_script_with_warnings(script)
+            .expect("script must build")
+            .1
+    }
+
+    /// The dead-halt lint: pipeline-level `halt_on` with zero
+    /// gate-emitting stages compiles to a flow that can never halt, so
+    /// one WARN line is emitted naming the stages and the halt values.
+    #[test]
+    fn dead_halt_lint_warns_when_pipeline_halt_on_has_no_gating_stage() {
+        let warnings = warnings_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "review" { agent = "mock-review" },
+              halt_on = { "BLOCKED" },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one dead-halt WARN: {warnings:?}"
+        );
+        let w = &warnings[0];
+        assert!(w.contains("can never halt"), "{w}");
+        assert!(w.contains("review"), "must name the stage id: {w}");
+        assert!(w.contains("BLOCKED"), "must name the halt values: {w}");
+    }
+
+    /// `gate = true` on any stage is an explicit opt-in — the pipeline can
+    /// halt, so the lint stays silent.
+    #[test]
+    fn dead_halt_lint_silent_when_a_stage_opts_in_with_gate_true() {
+        let warnings = warnings_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "review" { agent = "mock-review", gate = true },
+              halt_on = { "BLOCKED" },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        );
+        assert!(warnings.is_empty(), "gate = true opts in: {warnings:?}");
+    }
+
+    /// `gate_default = "auto"` restores the pre-flip cascade, so every
+    /// stage gates and the lint stays silent.
+    #[test]
+    fn dead_halt_lint_silent_under_gate_default_auto() {
+        let warnings = warnings_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "review" { agent = "mock-review" },
+              halt_on = { "BLOCKED" },
+              halted_at = "$.halted_at",
+              gate_default = "auto",
+            })
+            "#,
+        );
+        assert!(
+            warnings.is_empty(),
+            "auto cascade gates every stage: {warnings:?}"
+        );
+    }
+
+    /// `retry` implies a gate (the retry loop reads verdict and the
+    /// post-retry gate is emitted), so the lint stays silent.
+    #[test]
+    fn dead_halt_lint_silent_when_a_stage_declares_retry() {
+        let warnings = warnings_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "review" {
+                agent = "mock-review",
+                retry = { max = 1, fix = B.stage "fix" { agent = "f" } },
+              },
+              halt_on = { "BLOCKED" },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        );
+        assert!(warnings.is_empty(), "retry implies a gate: {warnings:?}");
+    }
+
+    /// An explicit `halted_at` alone is a target path, not halt intent —
+    /// deliberately outside the trigger.
+    #[test]
+    fn dead_halt_lint_silent_for_halted_at_without_halt_on() {
+        let warnings = warnings_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "review" { agent = "mock-review" },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        );
+        assert!(
+            warnings.is_empty(),
+            "halted_at alone is not halt intent: {warnings:?}"
+        );
+    }
+
+    /// `done` is deliberately outside the trigger too: without gates the
+    /// final assign still runs unconditionally, so nothing is dead.
+    #[test]
+    fn dead_halt_lint_silent_for_done_without_halt_on() {
+        let warnings = warnings_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "review" { agent = "mock-review" },
+              done = "$.done",
+            })
+            "#,
+        );
+        assert!(
+            warnings.is_empty(),
+            "done without halt_on is not a dead halt: {warnings:?}"
+        );
+    }
+
+    /// The legacy entry point keeps building a warning-triggering script:
+    /// the lint is report-only, warnings are simply dropped.
+    #[test]
+    fn build_bp_from_script_still_builds_a_dead_halt_pipeline() {
+        let out = build_bp_from_script(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "review" { agent = "mock-review" },
+              halt_on = { "BLOCKED" },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        )
+        .expect("dead-halt pipeline must still build");
+        assert_eq!(out["kind"], serde_json::json!("seq"));
     }
 
     #[test]

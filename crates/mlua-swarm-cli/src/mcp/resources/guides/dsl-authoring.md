@@ -159,6 +159,16 @@ Opt-in rules (any one triggers gate emission on that stage):
   sources; new authoring should stay on `"explicit"` (the default) and
   opt in per stage.
 
+A pipeline that declares pipeline-level `halt_on` but has **no** stage
+opting in is flagged at build time as an authoring warning: the halt
+machinery is decorative and that pipeline can never halt. The warning shows
+up as `dsl warn: ...` on `mse bp build` / `mse bp lint` (and as
+`authoring_warnings` in the `bp_build` MCP response) — report-only, never a
+build failure. The fix is `gate = true` (or a stage-level `halt_on` /
+`retry`) on at least one stage, or `gate_default = "auto"` to restore the
+pre-flip cascade for that source. `halted_at` / `done` alone do not trigger
+it — only a pipeline-level `halt_on` with zero gating stages does.
+
 `gate = false` on a stage record overrides every opt-in signal — its
 `step` Node splices directly into the enclosing `seq`, and the rest of
 the pipeline continues unconditionally (not nested under an `else`).

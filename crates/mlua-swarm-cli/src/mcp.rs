@@ -3341,7 +3341,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Build a `.bp.lua` authoring-DSL script into canonical Blueprint JSON and (by default) register it with the running `mse serve` — the MCP twin of the `mse bp build --register` CLI, so a Blueprint can go from Lua script to registered without shelling out. Pipeline: run the script in an embedded Lua VM (`require(\"flow_dsl\")` / `require(\"bp_dsl\")`), best-effort compile-lint the result through the real Compiler (includes the GH #50 verdict-contract lints; reported as `lint: \"skipped: ...\"` — never silently — when `$file`/`$agent_md` refs cannot be resolved relative to the script's own directory, since the server resolves those itself against its `--blueprint-ref-base` at register time), then POST the built JSON to `/v1/blueprints/:id`. The server never runs Lua — JSON stays the canonical wire format; the DSL is an authoring frontend (GH #52). Failures return `status: \"error\"` with a `stage` field (read | build | lint | write_out | register) so an authoring loop can fix the script and re-call. GH #62 Axis B.1: on `stage: \"lint\"` failures whose Compiler message matches a known lint kind (worker-binding-missing / verdict-value-not-in-contract / halted-at-missing), the response also carries `fix_hint: {kind, reason, patch_suggestion, docs_ref}` — a Clippy-style structured recovery hint the caller can render. `fix_hint` is `null` on lint failures without a canonical fix recipe (never a wrong-but-confident hint). Pass `register=false` for a build+lint-only dry run; the dry run (and any lint error) includes the built JSON as `blueprint` for inspection, while a successful register returns `json_bytes` instead (read it back via bp-family read tools or the emitted `out` file)."
+        description = "Build a `.bp.lua` authoring-DSL script into canonical Blueprint JSON and (by default) register it with the running `mse serve` — the MCP twin of the `mse bp build --register` CLI, so a Blueprint can go from Lua script to registered without shelling out. Pipeline: run the script in an embedded Lua VM (`require(\"flow_dsl\")` / `require(\"bp_dsl\")`), best-effort compile-lint the result through the real Compiler (includes the GH #50 verdict-contract lints; reported as `lint: \"skipped: ...\"` — never silently — when `$file`/`$agent_md` refs cannot be resolved relative to the script's own directory, since the server resolves those itself against its `--blueprint-ref-base` at register time), then POST the built JSON to `/v1/blueprints/:id`. The server never runs Lua — JSON stays the canonical wire format; the DSL is an authoring frontend (GH #52). Failures return `status: \"error\"` with a `stage` field (read | build | lint | write_out | register) so an authoring loop can fix the script and re-call. GH #62 Axis B.1: on `stage: \"lint\"` failures whose Compiler message matches a known lint kind (worker-binding-missing / verdict-value-not-in-contract / halted-at-missing), the response also carries `fix_hint: {kind, reason, patch_suggestion, docs_ref}` — a Clippy-style structured recovery hint the caller can render. `fix_hint` is `null` on lint failures without a canonical fix recipe (never a wrong-but-confident hint). Pass `register=false` for a build+lint-only dry run; the dry run (and any lint error) includes the built JSON as `blueprint` for inspection, while a successful register returns `json_bytes` instead (read it back via bp-family read tools or the emitted `out` file). Every successful build also returns authoring_warnings — bp_dsl-level lint lines (e.g. the B.pipeline dead-halt check: pipeline-level halt_on with zero gate-emitting stages), additive and report-only."
     )]
     async fn bp_build(
         &self,
@@ -3359,17 +3359,18 @@ impl MseServer {
                 }))
             }
         };
-        let bp_value = match mlua_swarm_cli::dsl::build_bp_from_script(&script) {
-            Ok(v) => v,
-            Err(e) => {
-                return json_result(&serde_json::json!({
-                    "status": "error",
-                    "stage": "build",
-                    "script_path": req.script_path,
-                    "error": format!("{e:#}"),
-                }))
-            }
-        };
+        let (bp_value, authoring_warnings) =
+            match mlua_swarm_cli::dsl::build_bp_from_script_with_warnings(&script) {
+                Ok(v) => v,
+                Err(e) => {
+                    return json_result(&serde_json::json!({
+                        "status": "error",
+                        "stage": "build",
+                        "script_path": req.script_path,
+                        "error": format!("{e:#}"),
+                    }))
+                }
+            };
         let lint = match crate::bp::compile_lint(&bp_value, &script_path, &[]) {
             Ok(crate::bp::LintReport::Ok { agents, operators }) => {
                 format!("ok ({agents} agent(s), {operators} operator(s) checked)")
@@ -3394,6 +3395,7 @@ impl MseServer {
                         "script_path": req.script_path,
                         "error": format!("strict_embed: {reason}"),
                         "warnings": warnings,
+                        "authoring_warnings": authoring_warnings,
                         "fix_hint": serde_json::Value::Null,
                         "blueprint": bp_value,
                     }));
@@ -3441,6 +3443,7 @@ impl MseServer {
                     "error": msg,
                     "fix_hint": fix_hint,
                     "diagnostic": diagnostic_json,
+                    "authoring_warnings": authoring_warnings,
                     "blueprint": bp_value,
                 }));
             }
@@ -3458,6 +3461,7 @@ impl MseServer {
                     "stage": "write_out",
                     "bp_id": bp_id,
                     "lint": lint,
+                    "authoring_warnings": authoring_warnings,
                     "out": out,
                     "error": e.to_string(),
                 }));
@@ -3468,6 +3472,7 @@ impl MseServer {
                 "status": "built",
                 "bp_id": bp_id,
                 "lint": lint,
+                "authoring_warnings": authoring_warnings,
                 "out": req.out,
                 "blueprint": bp_value,
             }));
@@ -3482,6 +3487,7 @@ impl MseServer {
                     "status": "registered",
                     "bp_id": bp_id,
                     "lint": lint,
+                    "authoring_warnings": authoring_warnings,
                     "out": req.out,
                     "url": outcome.url,
                     "http_status": outcome.http_status,
