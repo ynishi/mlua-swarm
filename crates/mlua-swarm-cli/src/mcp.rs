@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use futures_util::FutureExt;
 use mlua_swarm::application::{BlueprintRef, TaskApplication, TaskApplicationInput};
 use mlua_swarm::blueprint::store::{BlueprintStore, InMemoryBlueprintStore};
 use mlua_swarm::blueprint::{resolve_bound_agents, Blueprint, RunnerResolutionSource};
@@ -184,6 +185,91 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Render a caught panic payload as a human-readable string (sibling of the
+/// server crate's helper of the same name).
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Panic guard for the in-process (stdio MCP) run driver — the local
+/// counterpart of the server crate's `tasks::catch_run_panic`.
+///
+/// A panic inside the driver would otherwise unwind the detached task (the
+/// `tokio::time::timeout` ceiling with it) or the tool call itself, leaving
+/// the local `RunRecord` / `RunHandle` stuck at `Running` with `swarm_status`
+/// polling forever. Here the panic is caught and the Run is terminated:
+/// `RunStore` gets `Interrupted` (guarded by
+/// [`RunStore::try_transition`] so a Run that already finalized keeps its
+/// verdict) plus a structured `{"error": ...}` result, and the local
+/// `RunHandle` gets `Failed` — the stdio adapter's status enum has no
+/// `Interrupted` variant, and inventing one would change the tool's wire
+/// contract.
+///
+/// Relies on unwinding: a future `[profile.release] panic = "abort"` would
+/// make this a no-op.
+async fn catch_in_process_run_panic<T, F>(
+    state: &Arc<RwLock<Inner>>,
+    run_store: &Arc<dyn RunStore>,
+    run_id: &str,
+    run_id_typed: &RunId,
+    site: &str,
+    fut: F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = T>,
+{
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(value) => Ok(value),
+        Err(payload) => {
+            let message = panic_payload_to_string(payload);
+            tracing::error!(
+                run_id,
+                site,
+                payload = %message,
+                "in-process run driver panicked — marking the Run Interrupted"
+            );
+            match run_store
+                .try_transition(
+                    run_id_typed,
+                    StoreRunStatus::Running,
+                    StoreRunStatus::Interrupted,
+                )
+                .await
+            {
+                Ok(true) => {
+                    let envelope = serde_json::json!({
+                        "error": format!("run driver panicked at {site}: {message}"),
+                    });
+                    let _ = run_store.set_result(run_id_typed, envelope).await;
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        run_id,
+                        site,
+                        "in-process run driver panicked, but the Run is no longer `Running` — leaving its terminal status untouched"
+                    );
+                    return Err(message);
+                }
+                Err(e) => {
+                    tracing::warn!(run_id, error = %e, "panic guard: run try_transition failed");
+                    return Err(message);
+                }
+            }
+            let mut inner = state.write().await;
+            if let Some(h) = inner.runs.get_mut(run_id) {
+                h.status = RunStatus::Failed;
+            }
+            Err(message)
+        }
+    }
 }
 
 /// Maps `operator_client::ClientError` to an `McpError` for tool responses.
@@ -2891,23 +2977,39 @@ impl MseServer {
             let run_id_bg = run_id.clone();
             let run_id_typed_bg = run_id_typed.clone();
             let run_store_bg = run_store.clone();
+            // Panic guard — see `catch_in_process_run_panic`.
+            let guard_state = self.state.clone();
+            let guard_run_id = run_id.clone();
+            let guard_run_id_typed = run_id_typed.clone();
+            let guard_run_store = run_store.clone();
             tokio::spawn(async move {
-                let result =
-                    tokio::time::timeout(ttl, task_app.handle_with_run(input, run_ctx)).await;
-                let (status, store_status, final_ctx) = match result {
-                    Ok(Ok(out)) => (RunStatus::Done, StoreRunStatus::Done, Some(out.final_ctx)),
-                    Ok(Err(_)) | Err(_) => (RunStatus::Failed, StoreRunStatus::Failed, None),
+                let driver = async move {
+                    let result =
+                        tokio::time::timeout(ttl, task_app.handle_with_run(input, run_ctx)).await;
+                    let (status, store_status, final_ctx) = match result {
+                        Ok(Ok(out)) => (RunStatus::Done, StoreRunStatus::Done, Some(out.final_ctx)),
+                        Ok(Err(_)) | Err(_) => (RunStatus::Failed, StoreRunStatus::Failed, None),
+                    };
+                    let _ = run_store_bg
+                        .update_status(&run_id_typed_bg, store_status)
+                        .await;
+                    if let Some(fc) = final_ctx {
+                        let _ = run_store_bg.set_result(&run_id_typed_bg, fc).await;
+                    }
+                    let mut inner = state_bg.write().await;
+                    if let Some(h) = inner.runs.get_mut(&run_id_bg) {
+                        h.status = status;
+                    }
                 };
-                let _ = run_store_bg
-                    .update_status(&run_id_typed_bg, store_status)
-                    .await;
-                if let Some(fc) = final_ctx {
-                    let _ = run_store_bg.set_result(&run_id_typed_bg, fc).await;
-                }
-                let mut inner = state_bg.write().await;
-                if let Some(h) = inner.runs.get_mut(&run_id_bg) {
-                    h.status = status;
-                }
+                let _ = catch_in_process_run_panic(
+                    &guard_state,
+                    &guard_run_store,
+                    &guard_run_id,
+                    &guard_run_id_typed,
+                    "mcp.launch.detach",
+                    driver,
+                )
+                .await;
             });
             return json_result(&serde_json::json!({
                 "run_id": run_id,
@@ -2918,7 +3020,31 @@ impl MseServer {
         }
 
         let exec = task_app.handle_with_run(input, run_ctx);
-        let result = tokio::time::timeout(ttl, exec).await;
+        // Panic guard — see `catch_in_process_run_panic`. A panicking driver
+        // yields a structured `failed` tool response instead of unwinding the
+        // tool call and leaving the Run pinned at `running`.
+        let result = match catch_in_process_run_panic(
+            &self.state,
+            &run_store,
+            &run_id,
+            &run_id_typed,
+            "mcp.launch.sync",
+            tokio::time::timeout(ttl, exec),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => {
+                return json_result(&serde_json::json!({
+                    "run_id": run_id,
+                    "task_id": task_id_typed,
+                    "status": "failed",
+                    "error": format!(
+                        "run driver panicked: {message}; the run was marked Interrupted"
+                    ),
+                }));
+            }
+        };
 
         // Post-action store snapshot. Inline mode does not write to the
         // store, so head=None / history_len=0 is the default; once the Id

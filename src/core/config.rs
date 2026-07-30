@@ -22,8 +22,11 @@ pub struct EngineCfg {
     /// attempt `n` is `backoff_ms_step * (n + 1)`.
     pub backoff_ms_step: u64,
     /// R4 guard threshold: if a single `with_state` closure holds the lock
-    /// longer than this (ms), `with_state` panics — a signal that a long
-    /// operation leaked inside the lock in violation of the R3 discipline.
+    /// longer than this (ms), `with_state` reports a long operation having
+    /// leaked inside the lock in violation of the R3 discipline — it panics
+    /// in debug builds (`debug_assertions`), and emits a `tracing::warn!`
+    /// with `op` / `elapsed_ms` / `max_hold_ms` and continues in release
+    /// builds.
     pub max_hold_ms: u128,
     /// HMAC secret used by `TokenSigner` to sign/verify `CapToken`s.
     ///

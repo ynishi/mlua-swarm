@@ -516,7 +516,9 @@ impl Engine {
 
     /// The closure is a **sync** `FnOnce` — you cannot pass an async
     /// closure, which enforces R3 at the type level. Exceeding `max_hold`
-    /// panics so that R4 violations surface immediately.
+    /// panics in debug builds so that R4 violations surface immediately;
+    /// release builds emit a `tracing::warn!` and continue, so a
+    /// load-dependent overrun never unwinds the caller's task.
     pub async fn with_state<F, R>(&self, op: &'static str, f: F) -> Result<R, EngineError>
     where
         F: FnOnce(&mut EngineState) -> R,
@@ -547,6 +549,17 @@ impl Engine {
         drop(guard);
 
         if elapsed_ms > cfg.max_hold_ms {
+            // R4 violation. In dev/test this is a hard failure so a long op
+            // inside the lock surfaces immediately; in release it must never
+            // take the caller's task down with it (a panic here kills the run
+            // driver future and strands the RunRecord in `Running`).
+            tracing::warn!(
+                op,
+                elapsed_ms = %elapsed_ms,
+                max_hold_ms = %cfg.max_hold_ms,
+                "with_state exceeded max hold — suspected R3 violation (long op inside lock)"
+            );
+            #[cfg(debug_assertions)]
             panic!(
                 "Engine.with_state('{op}') held {elapsed_ms}ms > max {}ms — suspected R3 violation (long op inside lock)",
                 cfg.max_hold_ms
@@ -3413,6 +3426,51 @@ mod check_policy_helper_tests {
             }
             other => panic!("expected CheckPolicyStrict, got {:?}", other),
         }
+    }
+}
+
+// ─── UT: R4 max-hold guard — panic in debug, warn + continue in release ─────
+#[cfg(test)]
+mod max_hold_guard_tests {
+    use super::*;
+
+    /// Debug builds keep the hard failure: an over-budget closure unwinds
+    /// with the historical message so an R3 violation is impossible to miss
+    /// in dev and test.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "suspected R3 violation")]
+    async fn with_state_over_max_hold_panics_in_debug() {
+        let engine = Engine::new(EngineCfg {
+            max_hold_ms: 0,
+            ..EngineCfg::default()
+        });
+        // `with_state` takes a sync `FnOnce`, so a blocking sleep is the
+        // only way to overrun the budget from inside the lock.
+        let _ = engine
+            .with_state("test.over_max_hold", |_s| {
+                std::thread::sleep(Duration::from_millis(5));
+            })
+            .await;
+    }
+
+    /// Release builds only warn: the call returns `Ok` and the caller's task
+    /// survives, which is what keeps a run driver future from being unwound
+    /// (and its RunRecord stranded in `Running`) by a load-dependent overrun.
+    #[cfg(not(debug_assertions))]
+    #[tokio::test]
+    async fn with_state_over_max_hold_warns_and_returns_in_release() {
+        let engine = Engine::new(EngineCfg {
+            max_hold_ms: 0,
+            ..EngineCfg::default()
+        });
+        let result = engine
+            .with_state("test.over_max_hold", |_s| {
+                std::thread::sleep(Duration::from_millis(5));
+                42u32
+            })
+            .await;
+        assert_eq!(result.expect("release build must not panic"), 42);
     }
 }
 

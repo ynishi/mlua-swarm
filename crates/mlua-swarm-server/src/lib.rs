@@ -1284,38 +1284,45 @@ async fn run_flow_form(
         let bg_state = state.clone();
         let bg_task_id = task_id.clone();
         let bg_run_id = run_id.clone();
+        // Panic guard (see `tasks::catch_run_panic`): without it a panic in
+        // the driver unwinds this whole spawned task — timeout combinator
+        // included — and strands the Run in `Running`.
+        let guard_state = state.clone();
+        let guard_task_id = task_id.clone();
+        let guard_run_id = run_id.clone();
         tokio::spawn(async move {
-            let outcome = match tokio::time::timeout(
-                Duration::from_secs(ttl_secs),
-                bg_state.task_app.handle_with_run(input, Some(run_ctx)),
-            )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(_elapsed) => {
-                    let reason = json!({
-                        "error": format!("detached run exceeded {ttl_secs}s ttl ceiling"),
-                    });
-                    if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
-                        tracing::warn!(%bg_run_id, error = %e, "run_flow_form: detached ttl set_result failed");
-                    }
-                    if let Err(e) = bg_state
-                        .run_store
-                        .update_status(&bg_run_id, RunStatus::Failed)
-                        .await
-                    {
-                        tracing::warn!(%bg_run_id, error = %e, "run_flow_form: detached ttl run update_status(Failed) failed");
-                    }
-                    if let Err(e) = bg_state
-                        .task_store
-                        .update_status(&bg_task_id, TaskRecordStatus::Failed)
-                        .await
-                    {
-                        tracing::warn!(%bg_task_id, error = %e, "run_flow_form: detached ttl task update_status(Failed) failed");
-                    }
-                    // This arm never reaches `finalize_run`, so the trace
-                    // stream gets its terminal marker here.
-                    mlua_swarm::store::trace::TraceHandle::new(
+            let driver = async move {
+                let outcome = match tokio::time::timeout(
+                    Duration::from_secs(ttl_secs),
+                    bg_state.task_app.handle_with_run(input, Some(run_ctx)),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_elapsed) => {
+                        let reason = json!({
+                            "error": format!("detached run exceeded {ttl_secs}s ttl ceiling"),
+                        });
+                        if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
+                            tracing::warn!(%bg_run_id, error = %e, "run_flow_form: detached ttl set_result failed");
+                        }
+                        if let Err(e) = bg_state
+                            .run_store
+                            .update_status(&bg_run_id, RunStatus::Failed)
+                            .await
+                        {
+                            tracing::warn!(%bg_run_id, error = %e, "run_flow_form: detached ttl run update_status(Failed) failed");
+                        }
+                        if let Err(e) = bg_state
+                            .task_store
+                            .update_status(&bg_task_id, TaskRecordStatus::Failed)
+                            .await
+                        {
+                            tracing::warn!(%bg_task_id, error = %e, "run_flow_form: detached ttl task update_status(Failed) failed");
+                        }
+                        // This arm never reaches `finalize_run`, so the trace
+                        // stream gets its terminal marker here.
+                        mlua_swarm::store::trace::TraceHandle::new(
                         bg_run_id.clone(),
                         bg_state.run_trace_store.clone(),
                     )
@@ -1326,12 +1333,21 @@ async fn run_flow_form(
                         json!({ "status": "failed", "reason": format!("ttl {ttl_secs}s exceeded") }),
                     )
                     .await;
-                    return;
-                }
+                        return;
+                    }
+                };
+                // `finalize_run` persists both the Ok and Err outcomes itself;
+                // the passthrough return value has no consumer here.
+                let _ = tasks::finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
             };
-            // `finalize_run` persists both the Ok and Err outcomes itself;
-            // the passthrough return value has no consumer here.
-            let _ = tasks::finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
+            let _ = tasks::catch_run_panic(
+                &guard_state,
+                &guard_task_id,
+                &guard_run_id,
+                "launch.detach",
+                driver,
+            )
+            .await;
         });
         return Ok(TaskLaunchReply(
             TaskLaunchResponse {
@@ -1352,12 +1368,29 @@ async fn run_flow_form(
     // flow eval — the flow is abandoned, not resumed (intended v1
     // semantics; stage-granularity resume is a coarser guarantee than
     // this handler makes, out of scope here).
-    let outcome = match tokio::time::timeout(
-        Duration::from_secs(sync_timeout_secs),
-        state.task_app.handle_with_run(input, Some(run_ctx)),
+    //
+    // Wrapped in the panic guard (`tasks::catch_run_panic`) so a panicking
+    // driver returns a structured 500 with a resumable `Interrupted` Run
+    // instead of propagating into the connection task and dropping the
+    // response mid-request.
+    let timed = tasks::catch_run_panic(
+        state,
+        &task_id,
+        &run_id,
+        "launch.sync",
+        tokio::time::timeout(
+            Duration::from_secs(sync_timeout_secs),
+            state.task_app.handle_with_run(input, Some(run_ctx)),
+        ),
     )
     .await
-    {
+    .map_err(|msg| {
+        ApiError::engine(format!(
+            "run driver panicked: {msg}; the run was marked Interrupted and can be resumed \
+             via POST /v1/runs/{run_id}/resume"
+        ))
+    })?;
+    let outcome = match timed {
         Ok(outcome) => outcome,
         Err(_elapsed) => {
             // Best effort: mark the Task/Run so they do not stay `Running`

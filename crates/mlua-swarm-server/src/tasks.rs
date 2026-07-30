@@ -39,6 +39,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use futures_util::FutureExt;
 use mlua_swarm::application::{
     BlueprintRef, TaskApplicationError, TaskApplicationInput, TaskApplicationOutput,
 };
@@ -58,6 +59,7 @@ use mlua_swarm::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -279,6 +281,125 @@ pub(crate) async fn finalize_run(
         )
         .await;
     outcome
+}
+
+/// Render a caught panic payload as a human-readable string. `panic!` with
+/// a literal yields `&'static str`, a formatted `panic!` yields `String`;
+/// anything else (a `panic_any` with a custom type) has no textual form, so
+/// it is reported by shape rather than dropped silently.
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Terminal-stamp a Run whose driver future panicked: `Interrupted` plus a
+/// structured `{"error": "run driver panicked at <site>: <payload>"}`
+/// result envelope — the same terminal shape the boot sweep and the
+/// shutdown drain stamp, so the Run stays resumable via
+/// `POST /v1/runs/:id/resume` (which only accepts `Interrupted`).
+///
+/// The status flip goes through [`RunStore::try_transition`], so a Run that
+/// already reached a terminal status is left alone: a panic raised *after*
+/// `finalize_run` persisted `Done` / `Failed` (for example inside the trace
+/// tail) must not rewrite that verdict.
+///
+/// Best-effort like [`finalize_run`]: every secondary store error is logged
+/// and swallowed — the panic itself is the primary signal, already logged by
+/// [`catch_run_panic`].
+pub(crate) async fn mark_run_interrupted_by_panic(
+    state: &AppState,
+    task_id: &TaskId,
+    run_id: &RunId,
+    site: &str,
+    payload: &str,
+) {
+    match state
+        .run_store
+        .try_transition(run_id, RunStatus::Running, RunStatus::Interrupted)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                %run_id,
+                site,
+                "run driver panicked, but the Run is no longer `Running` — leaving its terminal status untouched"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(%run_id, error = %e, "panic guard: run try_transition(Running -> Interrupted) failed");
+            return;
+        }
+    }
+
+    let envelope = json!({ "error": format!("run driver panicked at {site}: {payload}") });
+    if let Err(e) = state.run_store.set_result(run_id, envelope).await {
+        tracing::warn!(%run_id, error = %e, "panic guard: set_result failed");
+    }
+    if let Err(e) = state
+        .task_store
+        .update_status(task_id, TaskRecordStatus::Interrupted)
+        .await
+    {
+        tracing::warn!(%task_id, error = %e, "panic guard: task update_status(Interrupted) failed");
+    }
+    // This path never reaches `finalize_run`, so the trace stream gets its
+    // terminal marker here.
+    TraceHandle::new(run_id.clone(), state.run_trace_store.clone())
+        .append(
+            trace_kind::RUN_FINISHED,
+            None,
+            None,
+            json!({ "status": "interrupted", "reason": "driver panic" }),
+        )
+        .await;
+}
+
+/// Wrap a run driver future so a panic inside it terminates the Run instead
+/// of vanishing with the task.
+///
+/// Without this, a panic in a detached driver unwinds the whole spawned task
+/// — including the `tokio::time::timeout` combinator that wraps it, so the
+/// TTL ceiling never fires either — and the `RunRecord` is stranded in
+/// `Running` with no recovery path. On the synchronous paths the same panic
+/// propagates into the hyper connection task and drops the connection
+/// mid-request. Here the panic is caught, the Run is marked `Interrupted`
+/// via [`mark_run_interrupted_by_panic`], and the caller gets the payload
+/// string back to shape its own response.
+///
+/// Note this relies on unwinding: a future `[profile.release] panic =
+/// "abort"` would make the guard a no-op.
+pub(crate) async fn catch_run_panic<T, F>(
+    state: &AppState,
+    task_id: &TaskId,
+    run_id: &RunId,
+    site: &str,
+    fut: F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = T>,
+{
+    match AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(value) => Ok(value),
+        Err(payload) => {
+            let message = panic_payload_to_string(payload);
+            tracing::error!(
+                %task_id,
+                %run_id,
+                site,
+                payload = %message,
+                "run driver panicked — marking the Run Interrupted"
+            );
+            mark_run_interrupted_by_panic(state, task_id, run_id, site, &message).await;
+            Err(message)
+        }
+    }
 }
 
 /// Query params for `GET /v1/tasks`.
@@ -643,38 +764,43 @@ pub async fn task_rekick(
         let bg_state = state.clone();
         let bg_task_id = task_id.clone();
         let bg_run_id = run_id.clone();
+        // Panic guard — see `catch_run_panic`.
+        let guard_state = state.clone();
+        let guard_task_id = task_id.clone();
+        let guard_run_id = run_id.clone();
         tokio::spawn(async move {
-            let outcome = match tokio::time::timeout(
-                Duration::from_secs(ttl_secs),
-                bg_state.task_app.handle_with_run(input, Some(run_ctx)),
-            )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(_elapsed) => {
-                    let reason = serde_json::json!({
-                        "error": format!("detached rekick exceeded {ttl_secs}s ttl ceiling"),
-                    });
-                    if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
-                        tracing::warn!(%bg_run_id, error = %e, "task_rekick: detached ttl set_result failed");
-                    }
-                    if let Err(e) = bg_state
-                        .run_store
-                        .update_status(&bg_run_id, RunStatus::Failed)
-                        .await
-                    {
-                        tracing::warn!(%bg_run_id, error = %e, "task_rekick: detached ttl run update_status failed");
-                    }
-                    if let Err(e) = bg_state
-                        .task_store
-                        .update_status(&bg_task_id, TaskRecordStatus::Failed)
-                        .await
-                    {
-                        tracing::warn!(%bg_task_id, error = %e, "task_rekick: detached ttl task update_status failed");
-                    }
-                    // This arm never reaches `finalize_run`, so the trace
-                    // stream gets its terminal marker here.
-                    TraceHandle::new(bg_run_id.clone(), bg_state.run_trace_store.clone())
+            let driver = async move {
+                let outcome = match tokio::time::timeout(
+                    Duration::from_secs(ttl_secs),
+                    bg_state.task_app.handle_with_run(input, Some(run_ctx)),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_elapsed) => {
+                        let reason = serde_json::json!({
+                            "error": format!("detached rekick exceeded {ttl_secs}s ttl ceiling"),
+                        });
+                        if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
+                            tracing::warn!(%bg_run_id, error = %e, "task_rekick: detached ttl set_result failed");
+                        }
+                        if let Err(e) = bg_state
+                            .run_store
+                            .update_status(&bg_run_id, RunStatus::Failed)
+                            .await
+                        {
+                            tracing::warn!(%bg_run_id, error = %e, "task_rekick: detached ttl run update_status failed");
+                        }
+                        if let Err(e) = bg_state
+                            .task_store
+                            .update_status(&bg_task_id, TaskRecordStatus::Failed)
+                            .await
+                        {
+                            tracing::warn!(%bg_task_id, error = %e, "task_rekick: detached ttl task update_status failed");
+                        }
+                        // This arm never reaches `finalize_run`, so the trace
+                        // stream gets its terminal marker here.
+                        TraceHandle::new(bg_run_id.clone(), bg_state.run_trace_store.clone())
                         .append(
                             trace_kind::RUN_FINISHED,
                             None,
@@ -682,12 +808,21 @@ pub async fn task_rekick(
                             json!({ "status": "failed", "reason": format!("ttl {ttl_secs}s exceeded") }),
                         )
                         .await;
-                    return;
-                }
+                        return;
+                    }
+                };
+                // `finalize_run` persists both the Ok and Err outcomes itself;
+                // the passthrough return value has no consumer here.
+                let _ = finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
             };
-            // `finalize_run` persists both the Ok and Err outcomes itself;
-            // the passthrough return value has no consumer here.
-            let _ = finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
+            let _ = catch_run_panic(
+                &guard_state,
+                &guard_task_id,
+                &guard_run_id,
+                "rekick.detach",
+                driver,
+            )
+            .await;
         });
         return Ok((
             StatusCode::ACCEPTED,
@@ -704,12 +839,26 @@ pub async fn task_rekick(
     // blocks on. On expiry the timed-out future is dropped, cancelling the
     // in-process flow eval — the flow is abandoned, not resumed. Best
     // effort: mark the Run/Task so they do not stay `Running` forever.
-    let outcome = match tokio::time::timeout(
-        Duration::from_secs(sync_timeout_secs),
-        state.task_app.handle_with_run(input, Some(run_ctx)),
+    // Wrapped in the panic guard (`catch_run_panic`) — same rationale as the
+    // sync launch path in `crate::lib`.
+    let timed = catch_run_panic(
+        &state,
+        &task_id,
+        &run_id,
+        "rekick.sync",
+        tokio::time::timeout(
+            Duration::from_secs(sync_timeout_secs),
+            state.task_app.handle_with_run(input, Some(run_ctx)),
+        ),
     )
     .await
-    {
+    .map_err(|msg| {
+        ApiError::engine(format!(
+            "run driver panicked: {msg}; the run was marked Interrupted and can be resumed \
+             via POST /v1/runs/{run_id}/resume"
+        ))
+    })?;
+    let outcome = match timed {
         Ok(outcome) => outcome,
         Err(_elapsed) => {
             let reason = serde_json::json!({
@@ -902,40 +1051,54 @@ pub async fn run_resume(
     let bg_state = state.clone();
     let bg_task_id = task_id.clone();
     let bg_run_id = run_id.clone();
+    // Panic guard — see `catch_run_panic`.
+    let guard_state = state.clone();
+    let guard_task_id = task_id.clone();
+    let guard_run_id = run_id.clone();
     tokio::spawn(async move {
-        let outcome = match tokio::time::timeout(
-            Duration::from_secs(ttl_secs),
-            bg_state.task_app.handle_with_run(input, Some(run_ctx)),
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(_elapsed) => {
-                let reason = serde_json::json!({
-                    "error": format!("resumed run exceeded {ttl_secs}s ttl ceiling"),
-                });
-                if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
-                    tracing::warn!(%bg_run_id, error = %e, "run_resume: ttl set_result failed");
+        let driver = async move {
+            let outcome = match tokio::time::timeout(
+                Duration::from_secs(ttl_secs),
+                bg_state.task_app.handle_with_run(input, Some(run_ctx)),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_elapsed) => {
+                    let reason = serde_json::json!({
+                        "error": format!("resumed run exceeded {ttl_secs}s ttl ceiling"),
+                    });
+                    if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
+                        tracing::warn!(%bg_run_id, error = %e, "run_resume: ttl set_result failed");
+                    }
+                    if let Err(e) = bg_state
+                        .run_store
+                        .update_status(&bg_run_id, RunStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_run_id, error = %e, "run_resume: ttl run update_status failed");
+                    }
+                    if let Err(e) = bg_state
+                        .task_store
+                        .update_status(&bg_task_id, TaskRecordStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_task_id, error = %e, "run_resume: ttl task update_status failed");
+                    }
+                    return;
                 }
-                if let Err(e) = bg_state
-                    .run_store
-                    .update_status(&bg_run_id, RunStatus::Failed)
-                    .await
-                {
-                    tracing::warn!(%bg_run_id, error = %e, "run_resume: ttl run update_status failed");
-                }
-                if let Err(e) = bg_state
-                    .task_store
-                    .update_status(&bg_task_id, TaskRecordStatus::Failed)
-                    .await
-                {
-                    tracing::warn!(%bg_task_id, error = %e, "run_resume: ttl task update_status failed");
-                }
-                return;
-            }
+            };
+            // `finalize_run` persists both the Ok and Err outcomes itself.
+            let _ = finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
         };
-        // `finalize_run` persists both the Ok and Err outcomes itself.
-        let _ = finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
+        let _ = catch_run_panic(
+            &guard_state,
+            &guard_task_id,
+            &guard_run_id,
+            "resume.detach",
+            driver,
+        )
+        .await;
     });
 
     Ok((
@@ -1234,39 +1397,53 @@ pub async fn run_rerun_from(
     let bg_state = state.clone();
     let bg_task_id = task_id.clone();
     let bg_run_id = run_id.clone();
+    // Panic guard — see `catch_run_panic`.
+    let guard_state = state.clone();
+    let guard_task_id = task_id.clone();
+    let guard_run_id = run_id.clone();
     tokio::spawn(async move {
-        let outcome = match tokio::time::timeout(
-            Duration::from_secs(ttl_secs),
-            bg_state.task_app.handle_with_run(input, Some(run_ctx)),
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(_elapsed) => {
-                let reason = serde_json::json!({
-                    "error": format!("rerun-from run exceeded {ttl_secs}s ttl ceiling"),
-                });
-                if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
-                    tracing::warn!(%bg_run_id, error = %e, "run_rerun_from: ttl set_result failed");
+        let driver = async move {
+            let outcome = match tokio::time::timeout(
+                Duration::from_secs(ttl_secs),
+                bg_state.task_app.handle_with_run(input, Some(run_ctx)),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_elapsed) => {
+                    let reason = serde_json::json!({
+                        "error": format!("rerun-from run exceeded {ttl_secs}s ttl ceiling"),
+                    });
+                    if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
+                        tracing::warn!(%bg_run_id, error = %e, "run_rerun_from: ttl set_result failed");
+                    }
+                    if let Err(e) = bg_state
+                        .run_store
+                        .update_status(&bg_run_id, RunStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_run_id, error = %e, "run_rerun_from: ttl run update_status failed");
+                    }
+                    if let Err(e) = bg_state
+                        .task_store
+                        .update_status(&bg_task_id, TaskRecordStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_task_id, error = %e, "run_rerun_from: ttl task update_status failed");
+                    }
+                    return;
                 }
-                if let Err(e) = bg_state
-                    .run_store
-                    .update_status(&bg_run_id, RunStatus::Failed)
-                    .await
-                {
-                    tracing::warn!(%bg_run_id, error = %e, "run_rerun_from: ttl run update_status failed");
-                }
-                if let Err(e) = bg_state
-                    .task_store
-                    .update_status(&bg_task_id, TaskRecordStatus::Failed)
-                    .await
-                {
-                    tracing::warn!(%bg_task_id, error = %e, "run_rerun_from: ttl task update_status failed");
-                }
-                return;
-            }
+            };
+            let _ = finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
         };
-        let _ = finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome).await;
+        let _ = catch_run_panic(
+            &guard_state,
+            &guard_task_id,
+            &guard_run_id,
+            "rerun_from.detach",
+            driver,
+        )
+        .await;
     });
 
     Ok((
@@ -2269,6 +2446,181 @@ mod tests {
             1,
             "the 400 must fire before a second Run is minted"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Run driver panic guard (`catch_run_panic`)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Seeds a `Running` Task + Run pair directly in the stores — the panic
+    /// guard operates on an already-dispatched Run, so these tests do not
+    /// need a real dispatch to reach it.
+    async fn seed_running_run(state: &AppState) -> (TaskId, RunId) {
+        let now = now_secs();
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        state
+            .task_store
+            .create(TaskRecord {
+                id: task_id.clone(),
+                goal: "panic guard goal".into(),
+                blueprint_ref: json!({}),
+                input_ctx: json!({}),
+                task_input_spec: None,
+                status: TaskRecordStatus::Running,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("task create");
+        state
+            .run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: task_id.clone(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                result_ref: None,
+                input_json: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("run create");
+        (task_id, run_id)
+    }
+
+    async fn run_finished_events(state: &AppState, run_id: &RunId) -> Vec<TraceEvent> {
+        state
+            .run_trace_store
+            .list(run_id, &TraceQuery::default())
+            .await
+            .expect("trace list")
+            .into_iter()
+            .filter(|e| e.kind == trace_kind::RUN_FINISHED)
+            .collect()
+    }
+
+    /// A panicking driver terminates its Run instead of stranding it: the
+    /// Run goes `Interrupted` (resumable) with a structured reason naming
+    /// the site and carrying the panic payload, the Task follows, and the
+    /// trace stream gets exactly one terminal marker.
+    #[tokio::test]
+    async fn panicking_driver_marks_run_interrupted() {
+        let state = test_state();
+        let (task_id, run_id) = seed_running_run(&state).await;
+
+        let outcome: Result<(), String> =
+            catch_run_panic(&state, &task_id, &run_id, "test.detach", async {
+                panic!("boom");
+            })
+            .await;
+        let message = outcome.expect_err("a panicking driver must report the panic to its caller");
+        assert!(
+            message.contains("boom"),
+            "the panic payload must survive as the caller-visible message: {message}"
+        );
+
+        let rec = state.run_store.get(&run_id).await.expect("run get");
+        assert_eq!(
+            rec.status,
+            RunStatus::Interrupted,
+            "a panicked Run must be resumable, not left Running or marked Failed"
+        );
+        let reason = rec
+            .result_ref
+            .as_ref()
+            .and_then(|v| v.get("error"))
+            .and_then(Value::as_str)
+            .expect("a structured {\"error\": ...} envelope");
+        assert!(
+            reason.contains("boom") && reason.contains("test.detach"),
+            "the reason must name both the panic payload and the site: {reason}"
+        );
+
+        let task = state.task_store.get(&task_id).await.expect("task get");
+        assert_eq!(task.status, TaskRecordStatus::Interrupted);
+
+        let finished = run_finished_events(&state, &run_id).await;
+        assert_eq!(finished.len(), 1, "expected one terminal trace marker");
+        assert_eq!(
+            finished[0].payload.get("status").and_then(Value::as_str),
+            Some("interrupted")
+        );
+        assert_eq!(
+            finished[0].payload.get("reason").and_then(Value::as_str),
+            Some("driver panic")
+        );
+    }
+
+    /// The guard is compare-and-set: a panic raised after the Run already
+    /// finalized (say inside the trace tail that follows `finalize_run`)
+    /// must not rewrite the terminal verdict or its result.
+    #[tokio::test]
+    async fn panic_guard_does_not_clobber_a_finalized_run() {
+        let state = test_state();
+        let (task_id, run_id) = seed_running_run(&state).await;
+        state
+            .run_store
+            .set_result(&run_id, json!({"kept": true}))
+            .await
+            .expect("set_result");
+        state
+            .run_store
+            .update_status(&run_id, RunStatus::Done)
+            .await
+            .expect("update_status");
+
+        let outcome: Result<(), String> =
+            catch_run_panic(&state, &task_id, &run_id, "test.detach", async {
+                panic!("late boom");
+            })
+            .await;
+        assert!(
+            outcome.is_err(),
+            "the panic is still reported to the caller"
+        );
+
+        let rec = state.run_store.get(&run_id).await.expect("run get");
+        assert_eq!(rec.status, RunStatus::Done, "the CAS must have refused");
+        assert_eq!(rec.result_ref, Some(json!({"kept": true})));
+        let finished = run_finished_events(&state, &run_id).await;
+        assert!(
+            finished.is_empty(),
+            "a refused CAS must not append a second terminal marker: {finished:?}"
+        );
+    }
+
+    /// The synchronous launch/rekick shape: the driver is wrapped
+    /// `timeout(..)`-and-all, so a panic surfaces as an `Err` the handler
+    /// maps to a `500` (`ApiError::engine`) — instead of unwinding into the
+    /// connection task and dropping the response — while the Run is left
+    /// `Interrupted` and therefore resumable.
+    #[tokio::test]
+    async fn sync_panic_returns_err_and_interrupts_run() {
+        let state = test_state();
+        let (task_id, run_id) = seed_running_run(&state).await;
+
+        let timed = catch_run_panic(
+            &state,
+            &task_id,
+            &run_id,
+            "launch.sync",
+            tokio::time::timeout(Duration::from_secs(30), async {
+                panic!("sync boom");
+            }),
+        )
+        .await;
+        let message = timed.expect_err("the sync path must observe the panic as an Err");
+        assert!(message.contains("sync boom"), "payload lost: {message}");
+
+        let err = ApiError::engine(format!("run driver panicked: {message}"));
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let rec = state.run_store.get(&run_id).await.expect("run get");
+        assert_eq!(rec.status, RunStatus::Interrupted);
     }
 
     #[tokio::test]
