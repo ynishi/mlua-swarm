@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/ynishi/mlua-swarm/compare/v0.19.0...v0.20.0) - 2026-07-30
+
+### Added
+
+- *(step-naming,mcp)* drop ambiguous nesting-root aliases and close the worker stats gap
+- *(serve,worker)* stale-run sweeper, agent_block declared model, engine max_hold_ms config
+- *(operator)* run-scoped operator pin — launch binds the spawn route to a session
+- *(bp_dsl)* fanout stages in B.pipeline
+- *(bp_dsl)* warn when B.pipeline halt_on has no gating stage
+- *(worker)* opt-in structured JSON submit via `submit_format` meta
+
+### Fixed
+
+- *(engine)* downgrade the R4 max-hold guard to a warning in release builds
+- correct fanout lane semantics, publish the run-stats endpoints, and fix the LaunchAgent PATH
+- *(bp)* scaffold fanout lanes write $.lane.<checker> instead of a shared $.branch_out
+
 ## [0.19.0](https://github.com/ynishi/mlua-swarm/compare/v0.18.0...v0.19.0) - 2026-07-30
 
 ### Added
