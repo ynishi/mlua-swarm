@@ -206,6 +206,93 @@ spliced in directly if `gate=false`). `counter` is optional; when omitted
 the loop counter path defaults to `"$.{stage_id}_n"`. The `fix` stage record
 goes through the same default in/out wiring as any other stage.
 
+### Fanout stages
+
+`fanout = { ... }` on a stage record (mutually exclusive with `agent`)
+expands that stage's slot into an `F.fanout` node instead of a `step`, so a
+pipeline that needs parallel lanes no longer has to drop out of `B.pipeline`
+into a hand-built `F.seq{F.fanout{...}}`. Read
+`mse://guides/blueprint-authoring` § "Fanout lanes, `$.results`, and the
+aggregate gate" first — the lane semantics it describes are unchanged; this
+is authoring sugar over exactly that node.
+
+Two shapes. **Heterogeneous** (one agent per lane) — the lanes are named,
+`items` is the literal lane-name array, and the body is a branch cascade on
+the bound item:
+
+```lua
+local flow = B.pipeline({
+  B.stage "plan" { agent = "planner" },
+  B.stage "gates" {
+    fanout = { lanes = {
+      { lane = "danger",  agent = "gate-danger" },
+      { lane = "leak",    agent = "gate-leak" },
+      { lane = "hygiene", agent = "gate-hygiene" },
+    } },
+  },
+  B.stage "aggregate" { agent = "aggregate", input = B.from "gates", gate = true },
+  halt_on = { "BLOCKED" }, halted_at = "$.halted_at", done = "$.gates_ok",
+})
+-- gates: items = lit["danger","leak","hygiene"], out = $.gates
+--        lane danger: in = $.d.danger, out = $.lane.danger  (and so on)
+```
+
+**Homogeneous** (one agent over N items) — `items` comes from the stage's
+own resolved `input`, and the lane body is a single step reading the bound
+item:
+
+```lua
+local flow = B.pipeline({
+  B.stage "targets"   { fanout = { agent = "check" } },  -- items = $.d.targets
+  B.stage "aggregate" { agent = "aggregate", input = B.from "targets", gate = true },
+  halt_on = { "BLOCKED" }, halted_at = "$.halted_at", done = "$.done",
+})
+```
+
+Feeding `items` from a previous stage's output works through the ordinary
+wiring — `chain = true` (or an explicit `input = B.from "planner"`) makes the
+planner's `out` the item source — but that planner must declare
+`submit_format: "json"` on its meta channel, or its output folds as one
+string and `items` raises `PathNotFound` (see
+`mse://guides/blueprint-authoring` § Fanout lanes).
+
+`fanout` fields:
+
+| field | default | meaning |
+|---|---|---|
+| `agent` | — | homogeneous shape: one agent, one dispatch per item. Mutually exclusive with `lanes` |
+| `lanes` | — | heterogeneous shape: an **ordered array** of lane-name strings (lane name = agent name) or `{ lane=, agent=, input=, out= }` tables. A keyed table is an error — `pairs` order is undefined, so the lane order would be non-deterministic |
+| `items` | homogeneous: the stage's resolved `input`; heterogeneous: the literal lane-name array | an Expr (`F.p"$.d.targets"`), a `B.from "stage"` reference, or a raw Lua value (auto-`lit` — so a bare string here is a *literal*, unlike a stage's `input`) |
+| `bind` | `"$.item"` | the write target each item is bound to inside its lane ctx |
+| `join` | `"all"` | `all` / `any` / `race` / `all_settled`; anything else is an error |
+| `lane_out` (homogeneous) | `"$.branch_out"` | the lane body step's `out` |
+| a lane's `input` (heterogeneous) | `$.d.{lane}` | accepts a path string or `B.from` |
+| a lane's `out` (heterogeneous) | `$.lane.{lane}` | nested under a shared root so N lanes land on N distinct addresses |
+
+How the other stage options compose:
+
+- **`out`** is unchanged (`$.{stage_id}` by default), so the aggregate stage
+  reads the join result with `input = B.from "{stage_id}"` or `chain = true`.
+  A single lane needs no cascade — the body is the bare step.
+- **`skip_on`** and **`chain`** work exactly as they do on an ordinary
+  stage; the skip guard wraps the whole fanout node.
+- **A verdict gate on the fanout stage itself** (`gate = true` or a
+  stage-level `halt_on`) is emitted as written but reported as an authoring
+  warning: the stage's `out` holds the *join result*, not one agent's
+  verdict, so the gate can never fire. The gate belongs on the aggregate
+  stage that reduces the join result to a scalar verdict. For the same
+  reason `gate_default = "auto"` skips fanout stages — if no other stage
+  opts in, the dead-halt warning above is the correct report.
+- **`retry`** on a fanout stage is an `error()`: the loop cond would compare
+  that same join result, and a `retry.fix` step has no lane ctx to write
+  back into. Put the retry on the aggregate stage.
+
+What the sugar deliberately does not cover: per-lane retry or per-lane gates
+(flow.ir has no wire shape for either), nested fanout, and any short-hand for
+the aggregate stage — the aggregate is an ordinary stage on purpose, because
+which per-lane path it reads (`$.lane.{lane}` / `$.branch_out`, one level
+deeper under `all_settled`) is the author's contract with that agent.
+
 ### `B.from`
 
 `B.from "stage_id"` is an unresolved reference to another stage's `out`

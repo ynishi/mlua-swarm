@@ -84,7 +84,11 @@ end
 --- the body runs unchanged. `skip_on` may coexist with `halt_on` /
 --- `retry` / `gate` — the skip guard nests OUTSIDE the retry loop but
 --- INSIDE the enclosing gate/rest chain so a skipped stage does not
---- prevent later stages from running.
+--- prevent later stages from running. `fanout = { ... }` replaces `agent`
+--- (the two are mutually exclusive) and expands the stage's slot into an
+--- `F.fanout` node instead of a `step` — see `B.pipeline`'s
+--- "## Fanout stages" section for the sub-record's fields and how the
+--- other stage options compose with it.
 function M.stage(id)
   return function(t)
     t.id = id
@@ -180,6 +184,263 @@ local function build_step(rec, outs, chain_default)
   })
 end
 
+-- ── Fanout stages ───────────────────────────────────────────────────────
+
+-- The `join` modes flow.ir's `fanout` node accepts (see
+-- `mse://guides/blueprint-authoring` § "Flow node kinds"). The list keeps a
+-- stable order for the error message; the set is the membership check.
+local FANOUT_JOIN_MODE_LIST = { "all", "any", "race", "all_settled" }
+local FANOUT_JOIN_MODES = {}
+for _, mode in ipairs(FANOUT_JOIN_MODE_LIST) do
+  FANOUT_JOIN_MODES[mode] = true
+end
+
+-- The default write target each item is bound to inside a lane's own ctx.
+local DEFAULT_BIND_PATH = "$.item"
+
+-- The default `join` mode: every lane runs, results gather into an array.
+local DEFAULT_JOIN = "all"
+
+-- The lane body's default `out` for the homogeneous shape (one agent, N
+-- items) — the depth-1 path the bundled `mse://blueprints/samples/10-fanout`
+-- uses. Only one agent writes it, so the single address is unambiguous.
+local DEFAULT_LANE_OUT_PATH = "$.branch_out"
+
+-- The lane body's default `out` for ONE heterogeneous lane. Nested under a
+-- shared `$.lane` root so the N lanes land on N distinct addresses: lanes
+-- are disjoint ctx copies, so N lanes sharing one depth-1 path would be an
+-- alias the reader cannot tell apart in the joined result.
+local function default_lane_out_path(lane_name)
+  return "$.lane." .. lane_name
+end
+
+-- Normalize `fanout.lanes` into an ordered array of
+-- `{ lane =, agent =, input =, out = }` records. Accepts a bare string
+-- shorthand (lane name and agent name are the same) or the full table form.
+-- Rejects a keyed table: `pairs` order is undefined, so a map would emit a
+-- non-deterministic lane order (and therefore non-deterministic JSON).
+local function normalize_lanes(stage_id, lanes)
+  local where = 'bp_dsl: stage "' .. tostring(stage_id) .. '": '
+  if type(lanes) ~= "table" then
+    error(where .. "fanout.lanes must be an ordered array, got " .. type(lanes), 0)
+  end
+  local n = #lanes
+  local count = 0
+  for _ in pairs(lanes) do
+    count = count + 1
+  end
+  if count == 0 then
+    error(
+      where
+        .. "fanout.lanes is empty — declare at least one lane, or use"
+        .. " fanout.agent for the homogeneous (one agent, N items) shape.",
+      0
+    )
+  end
+  if n ~= count then
+    error(
+      where
+        .. 'fanout.lanes must be an ordered array ({ "danger", { lane ='
+        .. ' "leak", agent = "gate-leak" } }), not a keyed table — `pairs`'
+        .. " order is undefined, so a keyed table would emit a"
+        .. " non-deterministic lane order.",
+      0
+    )
+  end
+  local out = {}
+  for i = 1, n do
+    local raw = lanes[i]
+    if type(raw) == "string" then
+      out[i] = { lane = raw, agent = raw }
+    elseif type(raw) == "table" then
+      local name = raw.lane or raw.agent
+      if name == nil then
+        error(
+          where
+            .. "fanout.lanes["
+            .. i
+            .. "] needs a `lane` name or an `agent` (a bare string is"
+            .. " shorthand for both).",
+          0
+        )
+      end
+      out[i] = {
+        lane = name,
+        agent = raw.agent or name,
+        input = raw.input,
+        out = raw.out,
+      }
+    else
+      error(
+        where
+          .. "fanout.lanes["
+          .. i
+          .. "] must be a lane-name string or a { lane =, agent =, input =,"
+          .. " out = } table, got "
+          .. type(raw),
+        0
+      )
+    end
+  end
+  return out
+end
+
+-- Hard validation of one stage record's `fanout` sub-record, run before any
+-- Node is built so a malformed record fails loud instead of emitting a
+-- half-formed fanout. Caches the normalized lane list on the record
+-- (`_fanout_lanes`, same convention as `_out`) for the build pass.
+local function validate_fanout(rec)
+  local fo = rec.fanout
+  if fo == nil then
+    return
+  end
+  local where = 'bp_dsl: stage "' .. tostring(rec.id) .. '": '
+  if type(fo) ~= "table" then
+    error(where .. "fanout must be a table, got " .. type(fo), 0)
+  end
+  if rec.agent ~= nil then
+    error(
+      where
+        .. "`agent` and `fanout` are mutually exclusive — a fanout stage"
+        .. " names its agent inside the fanout record (fanout.agent for one"
+        .. " agent over N items, fanout.lanes for one agent per lane).",
+      0
+    )
+  end
+  if rec.retry ~= nil then
+    error(
+      where
+        .. "`retry` is not supported on a fanout stage — the retry loop's"
+        .. " cond reads `<out>.parts[\"verdict\"]`, but a fanout's `out`"
+        .. " holds the join result rather than one agent's verdict, and a"
+        .. " `retry.fix` step has no lane ctx to write back into. Put the"
+        .. " retry on the aggregate stage that reduces this stage's `out`"
+        .. " to a scalar verdict.",
+      0
+    )
+  end
+  if fo.agent ~= nil and fo.lanes ~= nil then
+    error(
+      where
+        .. "fanout.agent and fanout.lanes are mutually exclusive — agent is"
+        .. " the homogeneous shape (one agent over N items), lanes is the"
+        .. " heterogeneous shape (one agent per lane).",
+      0
+    )
+  end
+  if fo.agent == nil and fo.lanes == nil then
+    error(
+      where
+        .. "fanout needs either agent = \"<name>\" (one agent over N items)"
+        .. " or lanes = { ... } (one agent per lane).",
+      0
+    )
+  end
+  local join = fo.join or DEFAULT_JOIN
+  if not FANOUT_JOIN_MODES[join] then
+    error(
+      where
+        .. "fanout.join must be one of "
+        .. table.concat(FANOUT_JOIN_MODE_LIST, " / ")
+        .. ", got "
+        .. tostring(join),
+      0
+    )
+  end
+  if fo.lanes ~= nil then
+    rec._fanout_lanes = normalize_lanes(rec.id, fo.lanes)
+  end
+end
+
+-- Resolve a `fanout.items` field to an Expr. A `B.from "stage"` placeholder
+-- becomes a `path` Expr against that stage's `out` — the case that must NOT
+-- collapse into a `lit` (a literal placeholder table would emit the
+-- unresolved record as data). Everything else follows flow_dsl's usual
+-- Expr-or-raw-value convention (`F.p"$.x"` stays a path, a raw Lua value
+-- auto-`lit`s), and `nil` means "no explicit items" so the caller applies
+-- its own default.
+local function resolve_items(items, outs)
+  if is_placeholder(items) then
+    local target = outs[items.stage_id]
+    if target == nil then
+      error(
+        'bp_dsl: B.from("' .. tostring(items.stage_id) .. '") references an undefined stage',
+        0
+      )
+    end
+    return F.p(target)
+  end
+  return items
+end
+
+-- Build the heterogeneous lane body: a branch cascade on the bound item,
+-- one lane per arm, the last lane the terminal `else` (the item set is
+-- closed by construction — it is the literal lane-name array this stage
+-- also emits as `items`). A single lane degenerates to a bare step. Each
+-- lane's `input` goes through the ordinary stage-input resolution
+-- (`$.d.<lane>` by default, `B.from` accepted), and its `out` defaults to
+-- `$.lane.<lane>`.
+local function build_lane_body(lanes, idx, bind_path, outs)
+  local lane = lanes[idx]
+  local step = F.step({
+    agent = lane.agent,
+    input = F.p(resolve_input_path(lane.input, lane.lane, outs, nil)),
+    out = F.p(lane.out or default_lane_out_path(lane.lane)),
+  })
+  if idx >= #lanes then
+    return step
+  end
+  return F.branch({
+    cond = F.p(bind_path):eq(lane.lane),
+    on_true = step,
+    on_false = build_lane_body(lanes, idx + 1, bind_path, outs),
+  })
+end
+
+-- Build the `fanout` Node for one stage record — `build_step`'s sibling for
+-- a stage that declares `fanout = { ... }`. The stage's `out` is unchanged
+-- (`$.<stage_id>` by default), so a downstream aggregate stage reads the
+-- join result via `B.from "<stage_id>"` or `chain = true` exactly as it
+-- would read an ordinary stage's output.
+local function build_fanout(rec, outs, chain_default)
+  local fo = rec.fanout
+  local bind_path = fo.bind or DEFAULT_BIND_PATH
+  local items = resolve_items(fo.items, outs)
+  local body
+  if rec._fanout_lanes ~= nil then
+    local lanes = rec._fanout_lanes
+    body = build_lane_body(lanes, 1, bind_path, outs)
+    if items == nil then
+      -- Heterogeneous default: the literal lane-name array the cascade
+      -- branches on.
+      local names = {}
+      for i, lane in ipairs(lanes) do
+        names[i] = lane.lane
+      end
+      items = F.lit(names)
+    end
+  else
+    body = F.step({
+      agent = fo.agent,
+      input = F.p(bind_path),
+      out = F.p(fo.lane_out or DEFAULT_LANE_OUT_PATH),
+    })
+    if items == nil then
+      -- Homogeneous default: the stage's own resolved `input` is where the
+      -- item array comes from (so the R1 `$.d.<id>` default, `chain`, and an
+      -- explicit `input` / `B.from` all carry over unchanged).
+      items = F.p(resolve_input_path(rec.input, rec.id, outs, chain_default))
+    end
+  end
+  return F.fanout({
+    items = items,
+    bind = F.p(bind_path),
+    join = fo.join or DEFAULT_JOIN,
+    out = F.p(rec._out),
+    body = body,
+  })
+end
+
 --- `B.pipeline{ stage..., halt_on={"BLOCKED"}, halted_at="$.halted_at",
 --- done="$.xxx" }` — the default-wiring authoring sugar. Positional
 --- entries are stage records (`B.stage "id" {...}`); `halt_on` /
@@ -270,6 +531,48 @@ end
 --- stages) before any Node is assembled, so forward references work; an
 --- unresolved reference is an `error()`.
 ---
+--- ## Fanout stages
+---
+--- `fanout = { ... }` on a stage record (mutually exclusive with `agent`)
+--- expands that stage's slot into an `F.fanout` Node instead of a `step`,
+--- so a pipeline needing parallel lanes no longer has to drop out of
+--- `B.pipeline` into a hand-built `F.seq{F.fanout{...}}`. Two shapes:
+---
+---   - homogeneous — `fanout = { agent = "check" }`: one agent dispatched
+---     once per item. `items` defaults to the stage's own resolved `input`
+---     (`$.d.{stage_id}`, or the `chain` / explicit / `B.from` override),
+---     and the lane body is one `step` reading the bound item and writing
+---     `lane_out` (default `"$.branch_out"`).
+---   - heterogeneous — `fanout = { lanes = { "danger", { lane = "leak",
+---     agent = "gate-leak" } } }`: one agent per lane. `lanes` must be an
+---     ORDERED array (a keyed table is an `error()`: `pairs` order is
+---     undefined, so the emitted lane order would be non-deterministic);
+---     each entry is a lane-name string (lane name = agent name) or a
+---     `{ lane=, agent=, input=, out= }` table. `items` defaults to the
+---     literal lane-name array, and the body is a branch cascade on the
+---     bound item — one arm per lane, the last lane the terminal `else`.
+---     A lane's `input` defaults to `$.d.{lane}` (and accepts `B.from`);
+---     its `out` defaults to `$.lane.{lane}`.
+---
+--- Other `fanout` fields: `bind` (default `"$.item"`), `join` (default
+--- `"all"`; `all` / `any` / `race` / `all_settled`, anything else is an
+--- `error()`), and `items` — an explicit `items` accepts an Expr
+--- (`F.p"$.d.targets"`), a `B.from "stage"` placeholder (resolved to that
+--- stage's `out` path), or a raw Lua value (auto-`lit`, so a bare string is
+--- a literal, NOT a path — unlike a stage's `input`).
+---
+--- Composition with the other stage options: the stage's `out` is
+--- unchanged (`$.{stage_id}` by default), so the aggregate stage reads the
+--- join result via `B.from "{stage_id}"` or `chain = true`; `skip_on` and
+--- `chain` work unchanged; a verdict gate (`gate = true` or a stage-level
+--- `halt_on`) emits verbatim but is reported as an authoring warning — the
+--- gate belongs on the aggregate stage that reduces the join result to a
+--- scalar verdict, since a fanout's `out` is the join result and not one
+--- agent's verdict; `gate_default = "auto"` skips fanout stages for the
+--- same reason; and `retry` on a fanout stage is an `error()` (the loop
+--- cond would compare that same join result, and `retry.fix` has no lane
+--- ctx to write back into).
+---
 --- ## `skip_on` (GH #76 DSL sugar)
 ---
 --- `skip_on = { "SKIP", "NOT_APPLICABLE", ... }` on a stage record wraps
@@ -331,7 +634,10 @@ function M.pipeline(spec)
       return true
     elseif rec.halt_on ~= nil then
       return true
-    elseif gate_default == "auto" and #halt_on > 0 then
+    elseif gate_default == "auto" and #halt_on > 0 and rec.fanout == nil then
+      -- A fanout stage is outside the auto cascade: the cascade's gate cond
+      -- reads a single agent's verdict, which a join result is not (see the
+      -- fanout × gate lint below). Explicit opt-in still wins above.
       return true
     else
       return false
@@ -341,6 +647,13 @@ function M.pipeline(spec)
   local stages = {}
   for i, rec in ipairs(spec) do
     stages[i] = rec
+  end
+
+  -- Pass 0: hard validation of every `fanout` stage record (mutually
+  -- exclusive fields, join mode, lane shape). Runs before anything is
+  -- registered or built so a malformed record fails loud.
+  for _, rec in ipairs(stages) do
+    validate_fanout(rec)
   end
 
   -- Pass 1: resolve every stage's (and retry fix stage's) `out` path
@@ -365,15 +678,38 @@ function M.pipeline(spec)
   -- trigger (without gates the final assign still runs unconditionally),
   -- and an explicit `halted_at` alone is not flagged either (it is a
   -- target path, not halt intent).
-  if #halt_on > 0 then
-    local any_gate = false
-    local stage_ids = {}
-    for i, rec in ipairs(stages) do
-      stage_ids[i] = tostring(rec.id)
-      if stage_wants_gate(rec) then
-        any_gate = true
-      end
+  --
+  -- The same walk carries the fanout × verdict-gate lint: a gate on a
+  -- fanout stage compares the stage's `out` — the join result — against the
+  -- halt values, so it can never see a single agent's verdict. That is
+  -- reported, never an `error()`: the gate is still emitted exactly as
+  -- written (same posture as the dead-halt lint).
+  local any_gate = false
+  local stage_ids = {}
+  for i, rec in ipairs(stages) do
+    stage_ids[i] = tostring(rec.id)
+    local wants_gate = stage_wants_gate(rec)
+    if wants_gate then
+      any_gate = true
     end
+    if wants_gate and rec.fanout ~= nil then
+      M._authoring_warnings[#M._authoring_warnings + 1] = 'B.pipeline stage "'
+        .. tostring(rec.id)
+        .. '": a verdict gate on a fanout stage compares '
+        .. tostring(rec._out)
+        .. '.parts["verdict"], but '
+        .. tostring(rec._out)
+        .. " holds the fanout's join result — not one agent's verdict — so"
+        .. " the gate can never fire. Put the gate on the aggregate stage"
+        .. ' that reads this one (B.stage "aggregate" { agent = ..., input ='
+        .. ' B.from "'
+        .. tostring(rec.id)
+        .. '", gate = true }) and reduces the join result to a scalar'
+        .. " verdict. The gate is emitted as written."
+    end
+  end
+
+  if #halt_on > 0 then
     if not any_gate then
       M._authoring_warnings[#M._authoring_warnings + 1] = "B.pipeline stages ["
         .. table.concat(stage_ids, ", ")
@@ -400,7 +736,12 @@ function M.pipeline(spec)
     if chain and idx >= 2 then
       chain_default = stages[idx - 1]._out
     end
-    local step_node = build_step(rec, outs, chain_default)
+    local step_node
+    if rec.fanout ~= nil then
+      step_node = build_fanout(rec, outs, chain_default)
+    else
+      step_node = build_step(rec, outs, chain_default)
+    end
     local rest = build_from(idx + 1, rest_else)
 
     -- GH #76 DSL sugar: `skip_on` wraps the stage's OWN body (step + optional

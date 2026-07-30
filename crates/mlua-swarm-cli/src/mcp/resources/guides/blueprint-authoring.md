@@ -131,6 +131,13 @@ only when the embedding host wired an externs registry
 (`TaskLaunchService::with_externs`), so a Blueprint using it is not
 portable to a plain `mse serve`.
 
+**Writing this shape in the Lua DSL.** `bp_dsl`'s `B.stage "id" { fanout =
+{...} }` emits exactly the node described here — items / bind / join / out
+defaults, the one-step homogeneous body or the heterogeneous branch cascade
+— while the aggregate stage stays an ordinary stage carrying the gate. The
+semantics above are unchanged by the sugar; see
+`mse://guides/dsl-authoring` § Fanout stages.
+
 ## Worker output: `out` vs named parts (GH #36)
 
 A `step` node's OUTPUT is normally a single JSON value — the worker's

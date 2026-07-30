@@ -545,6 +545,219 @@ mod tests {
         assert_eq!(out["kind"], serde_json::json!("seq"));
     }
 
+    /// A verdict gate on a fanout stage compares the join result rather
+    /// than one agent's verdict, so it can never fire — one WARN line names
+    /// the stage and points at the aggregate stage. Report-only: the gate
+    /// is still emitted exactly as written.
+    #[test]
+    fn fanout_stage_with_a_verdict_gate_warns_and_still_emits_the_gate() {
+        let (value, warnings) = build_bp_from_script_with_warnings(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "gates" {
+                fanout = { lanes = { "danger", "leak" } },
+                gate = true,
+              },
+              halt_on = { "BLOCKED" },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        )
+        .expect("gate-on-fanout must still build");
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one fanout-gate WARN: {warnings:?}"
+        );
+        let w = &warnings[0];
+        assert!(w.contains("gates"), "must name the stage id: {w}");
+        assert!(w.contains("fanout stage"), "{w}");
+        assert!(
+            w.contains("aggregate"),
+            "must point at the aggregate-stage fix: {w}"
+        );
+
+        // The gate itself is untouched: seq{fanout, branch}.
+        let children = value["children"].as_array().expect("seq children");
+        assert_eq!(children[0]["kind"], serde_json::json!("fanout"));
+        assert_eq!(children[1]["kind"], serde_json::json!("branch"));
+    }
+
+    /// A stage-level `halt_on` is the same opt-in, so it warns the same way.
+    #[test]
+    fn fanout_stage_with_a_stage_level_halt_on_warns_too() {
+        let warnings = warnings_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "gates" {
+                fanout = { agent = "check" },
+                halt_on = { "BLOCKED" },
+              },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        );
+        assert_eq!(warnings.len(), 1, "stage halt_on opts in: {warnings:?}");
+        assert!(warnings[0].contains("gates"), "{:?}", warnings);
+    }
+
+    /// A fanout stage is outside the `gate_default = "auto"` cascade, so it
+    /// gets no gate and no fanout-gate WARN of its own — and with no other
+    /// stage opting in, the pipeline-level `halt_on` is correctly reported
+    /// as a dead halt instead.
+    #[test]
+    fn fanout_stage_is_outside_the_auto_cascade_and_reports_a_dead_halt() {
+        let (value, warnings) = build_bp_from_script_with_warnings(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "gates" { fanout = { agent = "check" } },
+              halt_on = { "BLOCKED" },
+              halted_at = "$.halted_at",
+              gate_default = "auto",
+            })
+            "#,
+        )
+        .expect("auto cascade + fanout must build");
+
+        assert_eq!(warnings.len(), 1, "only the dead-halt WARN: {warnings:?}");
+        assert!(
+            warnings[0].contains("can never halt"),
+            "the dead-halt lint is the correct report here: {}",
+            warnings[0]
+        );
+
+        let children = value["children"].as_array().expect("seq children");
+        assert_eq!(children[0]["kind"], serde_json::json!("fanout"));
+        assert_ne!(
+            children[1]["kind"],
+            serde_json::json!("branch"),
+            "the auto cascade must not gate a fanout stage: {value}"
+        );
+    }
+
+    /// Build `script` and return the error message it raised.
+    fn error_for(script: &str) -> String {
+        build_bp_from_script(script)
+            .expect_err("script must fail to build")
+            .to_string()
+    }
+
+    /// `retry` on a fanout stage is rejected outright: the loop cond would
+    /// compare the join result against a verdict, and `retry.fix` has no
+    /// lane ctx to write back into.
+    #[test]
+    fn retry_on_a_fanout_stage_errors() {
+        let message = error_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "gates" {
+                fanout = { agent = "check" },
+                retry = { max = 1, fix = B.stage "fix" { agent = "f" } },
+              },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        );
+        assert!(message.contains("retry"), "{message}");
+        assert!(message.contains("gates"), "must name the stage: {message}");
+    }
+
+    /// `agent` and `fanout` on the same stage record are mutually exclusive.
+    #[test]
+    fn agent_alongside_fanout_errors() {
+        let message = error_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "gates" { agent = "check", fanout = { agent = "check" } },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        );
+        assert!(message.contains("mutually exclusive"), "{message}");
+    }
+
+    /// A fanout record needs exactly one of `agent` / `lanes`.
+    #[test]
+    fn fanout_without_agent_or_lanes_errors() {
+        let message = error_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "gates" { fanout = { join = "all" } },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        );
+        assert!(
+            message.contains("fanout.agent") || message.contains("agent ="),
+            "{message}"
+        );
+        assert!(message.contains("lanes"), "{message}");
+    }
+
+    /// An unknown `join` mode fails loud — typo protection, same posture as
+    /// `gate_default`.
+    #[test]
+    fn unknown_fanout_join_mode_errors() {
+        let message = error_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "gates" { fanout = { agent = "check", join = "first" } },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        );
+        assert!(message.contains("join"), "{message}");
+        assert!(
+            message.contains("first"),
+            "must echo the bad value: {message}"
+        );
+        assert!(
+            message.contains("all_settled"),
+            "must list the modes: {message}"
+        );
+    }
+
+    /// `lanes` must be an ordered array: a keyed table has undefined `pairs`
+    /// order, which would emit a non-deterministic lane order.
+    #[test]
+    fn keyed_lanes_table_errors() {
+        let message = error_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "gates" {
+                fanout = { lanes = { danger = "gate-danger", leak = "gate-leak" } },
+              },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        );
+        assert!(message.contains("ordered array"), "{message}");
+    }
+
+    /// An empty `lanes` list is an error too (the fanout would have no body).
+    #[test]
+    fn empty_lanes_list_errors() {
+        let message = error_for(
+            r#"
+            local B = require("bp_dsl")
+            return B.pipeline({
+              B.stage "gates" { fanout = { lanes = {} } },
+              halted_at = "$.halted_at",
+            })
+            "#,
+        );
+        assert!(message.contains("empty"), "{message}");
+    }
+
     #[test]
     fn empty_object_marker_replacement_does_not_misfire_on_ordinary_data() {
         // A field that legitimately reuses the marker key name for
