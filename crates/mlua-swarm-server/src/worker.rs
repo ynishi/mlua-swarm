@@ -354,24 +354,38 @@ const FILE_SENTINEL_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// declaration.
 const FILE_SENTINEL_ALLOW_KEY: &str = "allow_file_submit";
 
-/// `AgentContextView.extra` key that opts a step's FINAL submit body into
-/// server-side JSON parsing. Declared through the same GH #21 meta
-/// channels as [`FILE_SENTINEL_ALLOW_KEY`] (`Blueprint.metas` /
-/// `AgentMeta.ctx` / step-level `$step_meta`) and folded into the view at
-/// spawn time by `AgentContextMiddleware`.
+/// `AgentContextView.extra` key carrying a step's declared submit format.
+/// Declared through the same GH #21 meta channels as
+/// [`FILE_SENTINEL_ALLOW_KEY`] (`Blueprint.metas` / `AgentMeta.ctx` /
+/// step-level `$step_meta`) and folded into the view at spawn time by
+/// `AgentContextMiddleware`. Same string as the engine-side fold's key
+/// (`mlua_swarm::core::engine::SUBMIT_FORMAT_KEY`) — this route and the
+/// fold are the two halves of one contract.
 ///
-/// Default-deny: absent (the overwhelming majority of steps) folds the
-/// body as `Value::String`, byte-for-byte the pre-existing behavior. The
-/// only recognized value is the string [`SUBMIT_FORMAT_JSON`]; see
-/// [`resolve_submit_value`] for what a declared step gets instead.
-const SUBMIT_FORMAT_KEY: &str = "submit_format";
+/// Absent (the overwhelming majority of steps): this route stages the
+/// body as `Value::String`, byte-for-byte — the engine's Final-pull fold
+/// then applies the default LENIENT container parse (a body that parses
+/// as a JSON object / array folds structured into the flow ctx; scalars
+/// and prose stay strings — see `mlua_swarm::core::engine::FoldParse`).
+/// The recognized values are [`SUBMIT_FORMAT_JSON`] (strict parse-or-422
+/// here at submit time) and [`SUBMIT_FORMAT_TEXT`] (fold-side opt-out);
+/// see [`resolve_submit_value`].
+const SUBMIT_FORMAT_KEY: &str = mlua_swarm::core::engine::SUBMIT_FORMAT_KEY;
 
-/// The one recognized [`SUBMIT_FORMAT_KEY`] value: parse the final submit
-/// body as JSON and fold the parsed [`Value`] into the flow ctx, so a
-/// downstream node can address fields inside it (`$.<step>.lanes`, a
-/// `fanout` `items` expression, a `branch` cond) instead of receiving one
-/// opaque string.
+/// Strict [`SUBMIT_FORMAT_KEY`] value: parse the final submit body as
+/// JSON — any JSON value, scalars included, unlike the fold's
+/// containers-only lenient default — and fold the parsed [`Value`], with
+/// an unparseable body rejected `422` at submit time. The opt-in for "the
+/// worker PROMISES JSON" (fail loud, retry-able) rather than "parse it if
+/// it happens to be JSON".
 const SUBMIT_FORMAT_JSON: &str = "json";
+
+/// Opt-out [`SUBMIT_FORMAT_KEY`] value: the body stages as a string here
+/// AND the engine-side fold skips its lenient container parse for the
+/// step (final body and staged parts alike), so a JSON-container-looking
+/// text reaches the flow ctx as raw text
+/// (`mlua_swarm::core::engine::SUBMIT_FORMAT_TEXT`).
+const SUBMIT_FORMAT_TEXT: &str = mlua_swarm::core::engine::SUBMIT_FORMAT_TEXT;
 
 /// How many leading characters of an unparseable body the `422` echoes
 /// back, so the failure is diagnosable from the HTTP response alone
@@ -518,18 +532,24 @@ async fn resolve_file_sentinel(
 ///
 /// - No `AgentContextView` for `(task_id, attempt)`, or no
 ///   [`SUBMIT_FORMAT_KEY`] in `view.extra` → `Value::String(body_str)`,
-///   the pre-existing fold, unchanged down to the byte.
+///   staged unchanged down to the byte. (The engine's Final-pull fold
+///   later applies its default lenient container parse to this string —
+///   see [`SUBMIT_FORMAT_KEY`]'s doc; this route itself never sniffs.)
 /// - `submit_format: "json"` and the body parses → the parsed [`Value`]
-///   (object, array, or any other JSON value).
+///   (object, array, or any other JSON value — scalars included, unlike
+///   the fold's containers-only lenient default).
 /// - `submit_format: "json"` and the body does NOT parse → `422`
 ///   (declared-strict, the same posture as the verdict contract: a
 ///   declared output contract the worker breaks is rejected rather than
 ///   silently degraded). The message names the agent and echoes the
 ///   first [`SUBMIT_FORMAT_PREVIEW_CHARS`] characters of the body.
+/// - `submit_format: "text"` → `Value::String(body_str)`, no warn. The
+///   declaration's real effect lives in the engine fold
+///   (`FoldParse::Raw`); here it is simply a recognized no-op.
 /// - Any other declared value (`"yaml"`, `true`, a typo) → the body folds
 ///   as `Value::String` and a `tracing::warn!` records the unrecognized
 ///   declaration. An unknown value is not a client error: the strict lane
-///   belongs to the recognized format, and a future kind-agnostic output
+///   belongs to the recognized formats, and a future kind-agnostic output
 ///   contract is the place to type this key.
 ///
 /// The verdict contract is deliberately NOT consulted here — the
@@ -556,23 +576,26 @@ async fn resolve_submit_value(
     let Some((agent, declared)) = declared else {
         return Ok(Value::String(body_str));
     };
-    if declared.as_str() != Some(SUBMIT_FORMAT_JSON) {
-        tracing::warn!(
-            agent = %agent,
-            declared = %declared,
-            "unknown `{SUBMIT_FORMAT_KEY}` value; folding the body as a string \
-             (the only recognized value is {SUBMIT_FORMAT_JSON:?})"
-        );
-        return Ok(Value::String(body_str));
+    match declared.as_str() {
+        Some(SUBMIT_FORMAT_JSON) => serde_json::from_str::<Value>(&body_str).map_err(|e| {
+            let preview: String = body_str.chars().take(SUBMIT_FORMAT_PREVIEW_CHARS).collect();
+            ApiError::unprocessable(format!(
+                "submit_format violation: agent {agent:?} declared \
+                     `{SUBMIT_FORMAT_KEY}: {SUBMIT_FORMAT_JSON:?}`, but the submitted body is \
+                     not valid JSON: {e} (body starts with: {preview:?})"
+            ))
+        }),
+        Some(SUBMIT_FORMAT_TEXT) => Ok(Value::String(body_str)),
+        _ => {
+            tracing::warn!(
+                agent = %agent,
+                declared = %declared,
+                "unknown `{SUBMIT_FORMAT_KEY}` value; folding the body as a string \
+                 (recognized values: {SUBMIT_FORMAT_JSON:?}, {SUBMIT_FORMAT_TEXT:?})"
+            );
+            Ok(Value::String(body_str))
+        }
     }
-    serde_json::from_str::<Value>(&body_str).map_err(|e| {
-        let preview: String = body_str.chars().take(SUBMIT_FORMAT_PREVIEW_CHARS).collect();
-        ApiError::unprocessable(format!(
-            "submit_format violation: agent {agent:?} declared \
-             `{SUBMIT_FORMAT_KEY}: {SUBMIT_FORMAT_JSON:?}`, but the submitted body is \
-             not valid JSON: {e} (body starts with: {preview:?})"
-        ))
-    })
 }
 
 /// GH #50 (Subtask 2) — submit-time verdict contract gate, shared by
@@ -807,12 +830,14 @@ pub async fn worker_submit(
     // `worker_artifact`'s staging-time `name == "verdict"` early
     // validation, unchanged.
     //
-    // `submit_format: "json"` opt-in: a step that declared it on its meta
-    // channel folds a parsed `Value` instead of the raw string; every
-    // other step keeps the `Value::String(body_str)` fold byte-for-byte
-    // (see `resolve_submit_value`). The verdict-contract check still runs
+    // `submit_format` handling: `"json"` (strict) parses here or 422s;
+    // `"text"` and undeclared stage the raw string byte-for-byte (see
+    // `resolve_submit_value`) — for undeclared steps the engine's
+    // Final-pull fold later applies its default lenient container parse
+    // (`FoldParse::Lenient`). The verdict-contract check still runs
     // downstream (inside the engine) on whatever value this produces, so
-    // an undeclared gate agent's bare token is compared exactly as before.
+    // an undeclared gate agent's bare token is compared exactly as before
+    // (a bare token is scalar, never touched by the lenient fold).
     let value = resolve_submit_value(&state, &task_id, attempt, body_str).await?;
 
     // GH #76 HTTP wire: resolve the `(ok, verdict)` query-param pair into the
@@ -863,7 +888,13 @@ pub struct ArtifactQuery {
 /// - `name` is required and non-empty; missing or blank → 400.
 /// - Body raw bytes go as-is into `Value::String` (same trailing-whitespace
 ///   trim as `worker_submit`) and are staged via
-///   [`mlua_swarm::core::engine::Engine::stage_worker_artifact_trusted`].
+///   [`mlua_swarm::core::engine::Engine::stage_worker_artifact_trusted`] —
+///   which is also what `materialize_part` writes, so the part FILE is
+///   always the submitted bytes verbatim. The engine's Final-pull fold
+///   applies its default lenient container parse to the part's ctx value
+///   (a JSON object / array part becomes addressable, e.g.
+///   `$.<step>.parts["plan-meta.json"].lanes`); `submit_format: "text"`
+///   on the step opts its parts (and body) out of that parse.
 /// - Staging the same `name` twice within one attempt: last write wins (the
 ///   Final-pull fold walks the tail in event order — see its doc).
 pub async fn worker_artifact(
@@ -3124,10 +3155,12 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // `submit_format: "json"` — opt-in structured final submit. Default
-    // (undeclared) folds `Value::String` exactly as before; a declared
-    // step folds the parsed value and is rejected with `422` when its
-    // body does not parse.
+    // `submit_format` — the submit-route half of the contract. Default
+    // (undeclared) STAGES `Value::String` exactly as before (the lenient
+    // container parse is the engine fold's job, not this route's);
+    // `"json"` parses here (any JSON value) and rejects `422` when the
+    // body does not parse; `"text"` is a recognized no-op here whose
+    // effect lives in the engine fold (`FoldParse::Raw`).
     // ──────────────────────────────────────────────────────────────────
 
     /// Seeds an `agent_ctx` entry carrying the agent name plus, when
@@ -3189,12 +3222,16 @@ mod tests {
             .expect("with_state")
     }
 
-    /// Default-deny regression lock: a step with a materialized view but
-    /// NO `submit_format` declaration folds its body as a string even
-    /// when that body happens to be valid JSON. The server never sniffs
-    /// the payload — parsing is declaration-driven only.
+    /// Route-level regression lock: a step with a materialized view but
+    /// NO `submit_format` declaration STAGES its body as a string even
+    /// when that body happens to be valid JSON — this route never sniffs
+    /// the payload. (The default lenient container parse happens later,
+    /// at the engine's Final-pull fold — `FoldParse::Lenient`, tested in
+    /// `mlua_swarm::core::engine` — which is exactly why the staged bytes
+    /// here must stay raw: they are what `materialize_final_submission` /
+    /// `materialize_part` and the verdict-contract checks see.)
     #[tokio::test]
-    async fn worker_submit_without_submit_format_folds_json_looking_body_as_string() {
+    async fn worker_submit_without_submit_format_stages_json_looking_body_as_string() {
         let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
         let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
         let state = test_state(data_store, run_store);
@@ -3400,6 +3437,49 @@ mod tests {
                 "unknown value {declared} must keep the string fold",
             );
         }
+    }
+
+    /// `submit_format: "text"` is a recognized value at this route: the
+    /// body stages as a string (like undeclared), succeeds, and is NOT
+    /// the unknown-value warn path. Its real effect — opting the step's
+    /// fold out of the lenient container parse — is the engine fold's
+    /// job (`FoldParse::Raw`, tested in `mlua_swarm::core::engine`).
+    #[tokio::test]
+    async fn worker_submit_declared_text_stages_string() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store);
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+        seed_submit_format(
+            &state,
+            &task_id,
+            1,
+            "planner",
+            Some(Value::String("text".to_string())),
+            None,
+        )
+        .await;
+
+        let body = r#"{"lanes":["a","b"]}"#;
+        let status = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
+            axum::body::Bytes::from(body),
+        )
+        .await
+        .expect("text-declared submit must succeed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        assert_eq!(
+            final_value(&state, &task_id, 1).await,
+            Some(Value::String(body.to_string())),
+            "a text-declared step must stage the raw string",
+        );
     }
 
     /// Order lock: the verdict contract still sees the pre-parse string

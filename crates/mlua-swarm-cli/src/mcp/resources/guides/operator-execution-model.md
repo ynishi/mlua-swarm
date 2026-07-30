@@ -165,13 +165,14 @@ inline bodies; only sentinel bodies now require the opt-in.
 For the agent-side (agent.md) contract around choosing inline vs
 sentinel, see `mse://guides/agent-md-authoring` § Output contract.
 
-### `submit_format` opt-in for structured final bodies
+### `submit_format` and the structured fold
 
-A sibling opt-in on the same tiers: `submit_format: "json"` makes the
-server parse a step's **final** submit body and fold the parsed value
-into the flow ctx, so a downstream `fanout` `items` or `branch` cond can
-address fields inside it (`$.<step>.lanes`) instead of receiving one
-opaque string.
+A sibling key on the same tiers. By default a final body or staged part
+whose bytes parse as a JSON **object or array** already folds structured
+into the flow ctx (lenient, containers only — scalars and prose stay
+strings), so a downstream `fanout` `items` or `branch` cond can address
+fields inside it (`$.<step>.lanes`) with no declaration.
+`submit_format` adjusts that default per step:
 
 | Tier | Declaration |
 |---|---|
@@ -179,13 +180,13 @@ opaque string.
 | Agent | `AgentMeta.ctx = {"submit_format": "json", ...}` |
 | BP-global | `Blueprint.default_agent_ctx = {"submit_format": "json", ...}` |
 
-Default-deny like the sentinel opt-in: an undeclared step folds its body
-as a string, unchanged. A declared step whose body does not parse is
-rejected with `422`; any value other than `"json"` falls back to the
-string fold with a warning. Staged parts are unaffected. The full rules
-(including how it composes with the `@file:` sentinel and with verdict
-contracts) live in `mse://guides/worker-io-contract` § Structured final
-bodies.
+`"json"` is the strict form (body only): an unparseable final body is
+rejected with `422` instead of degrading to a string. `"text"` opts the
+step's fold out of the lenient parse entirely (body and parts). Any
+other value falls back to the default with a warning. The full rules
+(scalar handling, `@file:` composition, verdict contracts, verbatim part
+files) live in `mse://guides/worker-io-contract` § Structured worker
+output.
 
 ### Step projection naming (GH #23): `AgentMeta.projection_name`
 

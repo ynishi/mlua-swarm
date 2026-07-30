@@ -61,15 +61,19 @@ inside the body (`Step.ref` is a static string on the wire, so it cannot
 be computed from the item) — that is the shape `mse bp new fanout`
 scaffolds.
 
-**Feeding `items` from a worker's output.** A submit body is raw text, so
-a planner step's OUTPUT folds as one string and `items = $.planner.lanes`
-raises `PathNotFound` — the array is inside a string, not in the ctx.
-Declare `submit_format: "json"` on that planner's meta channel
-(`AgentMeta.ctx` / `Blueprint.default_agent_ctx` / `$step_meta`) to have
-the server parse its final body and fold the structured value instead;
-undeclared steps keep the string fold, and a declared step whose body
-does not parse is rejected with `422`. See
-`mse://guides/worker-io-contract` § Structured final bodies.
+**Feeding `items` from a worker's output.** A final body (or staged
+part) whose bytes are a JSON object / array folds structured into the
+ctx by default, so `items = $.planner.lanes` — or
+`items = $.planner.parts["plan-meta.json"].lanes` when the planner
+stages the JSON as a part — resolves with no declaration, as long as the
+worker actually emits a JSON container there. To make that a *contract*
+rather than a best effort, declare `submit_format: "json"` on the
+planner's meta channel (`AgentMeta.ctx` / `Blueprint.default_agent_ctx`
+/ `$step_meta`): an unparseable final body is then rejected with `422`
+instead of silently folding as a string and raising `PathNotFound` at
+the fanout. Note the `{out, parts}` wrap: once a step stages any part,
+its body moves to `$.<step>.out.lanes`. See
+`mse://guides/worker-io-contract` § Structured worker output.
 
 **What `$.results` contains.** Under `join = "all"`, one element per
 item, each element the lane's *final ctx object* — not the step's

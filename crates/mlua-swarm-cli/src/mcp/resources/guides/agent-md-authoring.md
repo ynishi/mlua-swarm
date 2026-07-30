@@ -121,13 +121,15 @@ the file *and* re-emitting the full body inline):
   rejects the sentinel with `400`. Path guards apply either way (absolute
   path, under `work_dir`, ≤ 2 MiB).
 
-Either form can additionally be declared as JSON on the Blueprint side
-(`submit_format: "json"`, see `mse://guides/worker-io-contract` §
-Structured final bodies), which makes the server parse the final body so
-downstream nodes can address fields inside it. When a step is declared
-that way, the agent's Output format section must commit to emitting JSON
-and nothing else — no prose preamble, no fenced code block, no trailing
-commentary; an unparseable body is rejected with `422`.
+Either form folds structured into the flow ctx automatically when the
+body is a JSON object / array (the default lenient fold — see
+`mse://guides/worker-io-contract` § Structured worker output), so an
+agent that means to hand structured data downstream should emit the bare
+JSON with no prose preamble, no fenced code block, and no trailing
+commentary — any wrapping makes the bytes unparseable and the output
+degrades to one opaque string. A step additionally declared
+`submit_format: "json"` on the Blueprint side turns that from a best
+effort into a contract: an unparseable body is rejected with `422`.
 
 **Self-report convention.** If the agent uses a tool outside the set its
 prompt intends, or falls back to another tool after a failure, it should

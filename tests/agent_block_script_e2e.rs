@@ -242,6 +242,69 @@ bus.emit("worker_result", { ok = true, response = "report" })
     );
 }
 
+/// Lenient fold, end-to-end through the real dispatch: a Lua STRING body
+/// / part whose bytes are a JSON container folds structured into the flow
+/// ctx with NO declaration — `$.<step>.out.lanes` and
+/// `$.<step>.parts["plan-meta.json"].lanes` become addressable. Scalar
+/// content (the bare verdict token) stays a string: the containers-only
+/// rule (`FoldParse::Lenient` in `mlua_swarm::core::engine`).
+#[tokio::test]
+async fn script_mode_json_container_string_bodies_fold_structured() {
+    let (script, dir) = write_script(
+        "lenient-fold",
+        r#"
+bus.emit("artifact", { name = "plan-meta.json", content = '{"lanes":[{"id":1},{"id":2}]}' })
+bus.emit("artifact", { name = "verdict", content = "PASS" })
+bus.emit("worker_result", { ok = true, response = '{"lanes":["a","b"]}' })
+"#,
+    );
+    let bp = script_agent_bp("gh-lenient-fold", &script, &dir, Value::Null);
+    let out = service()
+        .launch(launch_input(bp, json!({})))
+        .await
+        .expect("launch must complete");
+    assert_eq!(
+        out.final_ctx["danger_result"],
+        json!({
+            "out": {"lanes": ["a", "b"]},
+            "parts": {
+                "plan-meta.json": {"lanes": [{"id": 1}, {"id": 2}]},
+                "verdict": "PASS",
+            },
+        }),
+        "JSON-container strings fold structured with no declaration; the \
+         scalar verdict token stays a string"
+    );
+}
+
+/// `submit_format: "text"` declared on the agent's meta channel
+/// (`AgentMeta.ctx`) opts the step's fold out of the lenient parse: the
+/// same JSON-container strings reach the flow ctx as raw text.
+#[tokio::test]
+async fn script_mode_text_declared_step_keeps_container_strings_raw() {
+    let (script, dir) = write_script(
+        "text-optout",
+        r#"
+bus.emit("artifact", { name = "data.json", content = '{"k":1}' })
+bus.emit("worker_result", { ok = true, response = '{"lanes":["a","b"]}' })
+"#,
+    );
+    let mut bp = script_agent_bp("gh-text-optout", &script, &dir, Value::Null);
+    bp["agents"][0]["meta"] = json!({"ctx": {"submit_format": "text"}});
+    let out = service()
+        .launch(launch_input(bp, json!({})))
+        .await
+        .expect("launch must complete");
+    assert_eq!(
+        out.final_ctx["danger_result"],
+        json!({
+            "out": r#"{"lanes":["a","b"]}"#,
+            "parts": {"data.json": r#"{"k":1}"#},
+        }),
+        "a text-declared step folds every string as itself"
+    );
+}
+
 /// A step that stages nothing keeps the plain body — the pre-GH-#36
 /// shape. Registering in-process part names must not start wrapping
 /// every in-process step in `{out, parts}`.

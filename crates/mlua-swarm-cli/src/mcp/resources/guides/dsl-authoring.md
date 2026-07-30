@@ -251,9 +251,11 @@ local flow = B.pipeline({
 
 Feeding `items` from a previous stage's output works through the ordinary
 wiring — `chain = true` (or an explicit `input = B.from "planner"`) makes the
-planner's `out` the item source — but that planner must declare
-`submit_format: "json"` on its meta channel, or its output folds as one
-string and `items` raises `PathNotFound` (see
+planner's `out` the item source. A planner that emits a JSON object /
+array body folds structured by default, so `items` resolves with no
+declaration; declare `submit_format: "json"` on its meta channel to make
+that a strict contract (unparseable body → `422` at submit instead of a
+`PathNotFound` at the fanout — see
 `mse://guides/blueprint-authoring` § Fanout lanes).
 
 `fanout` fields:

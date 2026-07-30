@@ -156,6 +156,73 @@ fn content_ref_to_comparable_string(content: crate::worker::output::ContentRef) 
     }
 }
 
+/// `AgentContextView.extra` key carrying a step's declared submit format.
+/// Declared through the GH #21 meta channels (`Blueprint.metas` /
+/// `AgentMeta.ctx` / step-level `$step_meta`) and folded into the view at
+/// spawn time by `AgentContextMiddleware`. Read in two places: the HTTP
+/// submit lane (`mlua-swarm-server`'s `resolve_submit_value`, where
+/// `"json"` means strict parse-or-422) and [`Engine::fold_parse_mode_for`]
+/// (where [`SUBMIT_FORMAT_TEXT`] opts the step's fold out of the default
+/// lenient container parse — see [`FoldParse`]).
+pub const SUBMIT_FORMAT_KEY: &str = "submit_format";
+
+/// The [`SUBMIT_FORMAT_KEY`] value that opts a step's fold out of lenient
+/// container parsing ([`FoldParse::Raw`]): every string the worker
+/// submitted — final body and staged parts alike — folds into the flow
+/// ctx as itself, even when its bytes would parse as a JSON object or
+/// array.
+pub const SUBMIT_FORMAT_TEXT: &str = "text";
+
+/// How [`fold_final_and_parts`] treats `Value::String` content when
+/// assembling the BP-chain value — the fold half of the
+/// [`SUBMIT_FORMAT_KEY`] contract.
+///
+/// `Lenient` is the default for every step: a string whose bytes parse as
+/// a JSON **object or array** folds as the parsed structure, so a
+/// downstream node can address fields inside it (`$.<step>.lanes`, a
+/// `fanout` `items` expression, a `branch` cond) with no declaration —
+/// uniformly across the HTTP submit, artifact staging, and in-process
+/// lanes, because they all meet here. Scalar JSON (`true`, `42`,
+/// `"quoted"`, `null`) deliberately stays a string: a scalar has no
+/// addressable interior, so parsing it buys no path capability while
+/// silently changing `Eq` conds and verdict comparisons for any declared
+/// token that happens to be valid JSON. A step that wants full-JSON
+/// semantics (scalars included) declares `submit_format: "json"` and gets
+/// the strict submit-time parse instead; a step that needs a
+/// JSON-container-looking body folded as a raw string declares
+/// `submit_format: "text"` (`Raw`: no parsing at all).
+///
+/// Parsing at the fold — not at staging — is also what keeps materialized
+/// part files verbatim: `Engine::stage_worker_artifact_trusted` /
+/// `materialize_part` still see the submitted `Value::String` bytes, and
+/// so do the verdict-contract checks (staging-time and completion-time),
+/// which all run before the fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldParse {
+    /// Default: fold a JSON-container string as its parsed structure.
+    Lenient,
+    /// `submit_format: "text"` opt-out: fold every string as itself.
+    Raw,
+}
+
+/// The `Lenient` half of [`FoldParse`]: parse a `Value::String` whose
+/// bytes lead with `{` / `[` AND parse as JSON; pass every other value
+/// through untouched. The leading-byte check keeps large prose bodies (a
+/// `plan.md` part, an operator completion notice) from paying a parse
+/// that could only fail, and is what scopes the parse to containers — a
+/// scalar body never enters `from_str` at all.
+fn lenient_fold_value(v: Value) -> Value {
+    let Value::String(s) = v else { return v };
+    let trimmed = s.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return Value::String(s);
+    }
+    match serde_json::from_str::<Value>(&s) {
+        Ok(parsed) => parsed,
+        Err(_) => Value::String(s),
+    }
+}
+
 /// [`Engine::dispatch_attempt_with`]'s Final-pull assembly (GH #36 ST1:
 /// named multi-part worker output), factored out as a pure function of the
 /// output-event tail so it is unit-testable without a live `Engine` /
@@ -182,21 +249,33 @@ fn content_ref_to_comparable_string(content: crate::worker::output::ContentRef) 
 ///
 /// `None` when `tail` carries no `Final` at all (the caller's pre-existing
 /// "no Final in output_tail" error path).
+///
+/// `mode` applies [`lenient_fold_value`] to the final value AND every
+/// folded part when `Lenient` (the default resolved by
+/// [`Engine::fold_parse_mode_for`]); `Raw` reproduces the pre-fold-parse
+/// behavior byte-for-byte. A value that is already structured (a strict
+/// `submit_format: "json"` body parsed at submit time, an in-process Lua
+/// table) passes through either way.
 fn fold_final_and_parts(
     tail: &[crate::worker::output::OutputEvent],
     staged_names: &[String],
+    mode: FoldParse,
 ) -> Option<(Value, bool)> {
+    let fold = |v: Value| match mode {
+        FoldParse::Lenient => lenient_fold_value(v),
+        FoldParse::Raw => v,
+    };
     let (final_content, ok) = tail.iter().rev().find_map(|ev| match ev {
         crate::worker::output::OutputEvent::Final { content, ok } => Some((content.clone(), *ok)),
         _ => None,
     })?;
-    let final_value = content_ref_to_value(final_content);
+    let final_value = fold(content_ref_to_value(final_content));
 
     let mut parts = serde_json::Map::new();
     for ev in tail {
         if let crate::worker::output::OutputEvent::Artifact { name, content } = ev {
             if staged_names.iter().any(|staged| staged == name) {
-                parts.insert(name.clone(), content_ref_to_value(content.clone()));
+                parts.insert(name.clone(), fold(content_ref_to_value(content.clone())));
             }
         }
     }
@@ -1587,7 +1666,8 @@ impl Engine {
             Ok(()) => {
                 let tail = self.output_tail(&task_id, attempt).await;
                 let staged_names = self.worker_artifact_names_for(&task_id, attempt).await;
-                fold_final_and_parts(&tail, &staged_names)
+                let mode = self.fold_parse_mode_for(&task_id, attempt).await;
+                fold_final_and_parts(&tail, &staged_names, mode)
                     .ok_or_else(|| "no Final in output_tail".to_string())
             }
             Err(msg) => Err(msg),
@@ -1827,7 +1907,8 @@ impl Engine {
                 Ok(()) => {
                     let tail = self.output_tail(&task_id, attempt).await;
                     let staged_names = self.worker_artifact_names_for(&task_id, attempt).await;
-                    fold_final_and_parts(&tail, &staged_names)
+                    let mode = self.fold_parse_mode_for(&task_id, attempt).await;
+                    fold_final_and_parts(&tail, &staged_names, mode)
                         .ok_or_else(|| "no Final in output_tail".to_string())
                 }
                 Err(msg) => Err(msg),
@@ -2389,6 +2470,25 @@ impl Engine {
         .await
         .ok()
         .flatten()
+    }
+
+    /// Resolves the [`FoldParse`] mode for `(task_id, attempt)` from the
+    /// step's `AgentContextView.extra[`[`SUBMIT_FORMAT_KEY`]`]`:
+    /// [`SUBMIT_FORMAT_TEXT`] opts the step's fold out of lenient
+    /// container parsing; everything else — absent (the overwhelming
+    /// majority of steps), `"json"` (whose strict parse already happened
+    /// at submit time, so the fold sees a structured value it passes
+    /// through), or an unrecognized value — folds `Lenient`.
+    async fn fold_parse_mode_for(&self, task_id: &StepId, attempt: u32) -> FoldParse {
+        match self.agent_context_for(task_id, attempt).await {
+            Some(view)
+                if view.extra.get(SUBMIT_FORMAT_KEY).and_then(|v| v.as_str())
+                    == Some(SUBMIT_FORMAT_TEXT) =>
+            {
+                FoldParse::Raw
+            }
+            _ => FoldParse::Lenient,
+        }
     }
 
     /// Read the current attempt number for a task (server-side lookup, no
@@ -5125,7 +5225,8 @@ mod named_multi_part_worker_output_tests {
             final_ev(serde_json::json!("final text"), true),
         ];
         let staged = names(&["summary", "diff"]);
-        let (value, ok) = fold_final_and_parts(&tail, &staged).expect("Final present");
+        let (value, ok) =
+            fold_final_and_parts(&tail, &staged, FoldParse::Lenient).expect("Final present");
         assert!(ok);
         assert_eq!(
             value,
@@ -5146,7 +5247,8 @@ mod named_multi_part_worker_output_tests {
     #[test]
     fn fold_final_and_parts_with_no_parts_returns_plain_final_value() {
         let tail = vec![final_ev(serde_json::json!("plain value"), true)];
-        let (value, ok) = fold_final_and_parts(&tail, &[]).expect("Final present");
+        let (value, ok) =
+            fold_final_and_parts(&tail, &[], FoldParse::Lenient).expect("Final present");
         assert!(ok);
         assert_eq!(value, serde_json::json!("plain value"));
     }
@@ -5162,7 +5264,8 @@ mod named_multi_part_worker_output_tests {
             final_ev(serde_json::json!("f"), true),
         ];
         let staged = names(&["a"]);
-        let (value, _ok) = fold_final_and_parts(&tail, &staged).expect("Final present");
+        let (value, _ok) =
+            fold_final_and_parts(&tail, &staged, FoldParse::Lenient).expect("Final present");
         assert_eq!(
             value,
             serde_json::json!({"out": "f", "parts": {"a": "second"}})
@@ -5176,7 +5279,7 @@ mod named_multi_part_worker_output_tests {
     fn fold_final_and_parts_returns_none_when_no_final_present() {
         let tail = vec![artifact("a", serde_json::json!("v"))];
         let staged = names(&["a"]);
-        assert!(fold_final_and_parts(&tail, &staged).is_none());
+        assert!(fold_final_and_parts(&tail, &staged, FoldParse::Lenient).is_none());
     }
 
     /// An `Artifact` on the tail whose name is NOT in `staged_names` (e.g.
@@ -5194,7 +5297,8 @@ mod named_multi_part_worker_output_tests {
         ];
         // `staged_names` empty: the worker itself never staged anything —
         // the audit sidecar Artifact must be ignored.
-        let (value, ok) = fold_final_and_parts(&tail, &[]).expect("Final present");
+        let (value, ok) =
+            fold_final_and_parts(&tail, &[], FoldParse::Lenient).expect("Final present");
         assert!(ok);
         assert_eq!(value, serde_json::json!({"echoed": "hi"}));
     }
@@ -5209,10 +5313,171 @@ mod named_multi_part_worker_output_tests {
             final_ev(serde_json::json!("f"), true),
         ];
         let staged = names(&["summary"]);
-        let (value, _ok) = fold_final_and_parts(&tail, &staged).expect("Final present");
+        let (value, _ok) =
+            fold_final_and_parts(&tail, &staged, FoldParse::Lenient).expect("Final present");
         assert_eq!(
             value,
             serde_json::json!({"out": "f", "parts": {"summary": "s"}})
+        );
+    }
+
+    /// Lenient fold: a `Value::String` final body / staged part whose
+    /// bytes parse as a JSON **container** folds structured with NO
+    /// declaration — the default that makes `$.<step>.lanes` /
+    /// `$.<step>.parts["plan-meta.json"].lanes` addressable across all
+    /// three lanes (they all meet at this fold).
+    #[test]
+    fn lenient_fold_parses_container_strings_in_final_and_parts() {
+        let tail = vec![
+            artifact(
+                "plan-meta.json",
+                Value::String(r#"{"lanes":[{"id":1},{"id":2}]}"#.to_string()),
+            ),
+            final_ev(Value::String(r#"{"lanes":["a","b"]}"#.to_string()), true),
+        ];
+        let staged = names(&["plan-meta.json"]);
+        let (value, ok) =
+            fold_final_and_parts(&tail, &staged, FoldParse::Lenient).expect("Final present");
+        assert!(ok);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "out": {"lanes": ["a", "b"]},
+                "parts": {"plan-meta.json": {"lanes": [{"id": 1}, {"id": 2}]}},
+            })
+        );
+    }
+
+    /// Containers-only lock: scalar JSON (`true` / `42` / a quoted
+    /// string / `null`), bare verdict tokens, and container-lookalikes
+    /// that do not parse ALL keep folding as strings under `Lenient` — a
+    /// scalar has no addressable interior, and parsing it would silently
+    /// change `Eq` conds / verdict comparisons for tokens that happen to
+    /// be valid JSON.
+    #[test]
+    fn lenient_fold_keeps_scalar_json_and_non_json_strings() {
+        let tail = vec![
+            artifact("verdict", Value::String("PASS".to_string())),
+            artifact("bool", Value::String("true".to_string())),
+            artifact("num", Value::String("42".to_string())),
+            artifact("quoted", Value::String("\"quoted\"".to_string())),
+            artifact("null", Value::String("null".to_string())),
+            artifact("broken", Value::String("{not json".to_string())),
+            final_ev(Value::String("PASS".to_string()), true),
+        ];
+        let staged = names(&["verdict", "bool", "num", "quoted", "null", "broken"]);
+        let (value, _ok) =
+            fold_final_and_parts(&tail, &staged, FoldParse::Lenient).expect("Final present");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "out": "PASS",
+                "parts": {
+                    "verdict": "PASS",
+                    "bool": "true",
+                    "num": "42",
+                    "quoted": "\"quoted\"",
+                    "null": "null",
+                    "broken": "{not json",
+                },
+            })
+        );
+    }
+
+    /// `submit_format: "text"` opt-out (`FoldParse::Raw`): a
+    /// JSON-container string folds as itself — the escape hatch for a
+    /// step that needs the raw text of a JSON-looking body.
+    #[test]
+    fn raw_mode_keeps_container_strings_unparsed() {
+        let tail = vec![
+            artifact("data.json", Value::String(r#"{"k":1}"#.to_string())),
+            final_ev(Value::String(r#"["a","b"]"#.to_string()), true),
+        ];
+        let staged = names(&["data.json"]);
+        let (value, _ok) =
+            fold_final_and_parts(&tail, &staged, FoldParse::Raw).expect("Final present");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "out": r#"["a","b"]"#,
+                "parts": {"data.json": r#"{"k":1}"#},
+            })
+        );
+    }
+
+    /// Leading-whitespace container strings still parse under `Lenient`
+    /// (`trim_start` before the leading-byte check), and already
+    /// structured values (a strict `"json"` body parsed at submit time,
+    /// an in-process Lua table) pass through both modes untouched.
+    #[test]
+    fn lenient_fold_trims_leading_whitespace_and_passes_structured_through() {
+        let tail = vec![
+            artifact("structured", serde_json::json!({"already": true})),
+            final_ev(Value::String("  \n {\"k\": 1}".to_string()), true),
+        ];
+        let staged = names(&["structured"]);
+        let (value, _ok) =
+            fold_final_and_parts(&tail, &staged, FoldParse::Lenient).expect("Final present");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "out": {"k": 1},
+                "parts": {"structured": {"already": true}},
+            })
+        );
+    }
+
+    /// `fold_parse_mode_for`: `submit_format: "text"` in the step's
+    /// `AgentContextView.extra` resolves `Raw`; absent view, absent key,
+    /// `"json"`, and unrecognized values all resolve `Lenient` (the
+    /// default).
+    #[tokio::test]
+    async fn fold_parse_mode_for_resolves_text_to_raw_and_everything_else_to_lenient() {
+        let engine = Engine::new(EngineCfg::default());
+        let task_id = StepId::new();
+
+        // No agent_ctx entry at all → Lenient.
+        assert_eq!(
+            engine.fold_parse_mode_for(&task_id, 1).await,
+            FoldParse::Lenient
+        );
+
+        let seed = |declared: Option<Value>| {
+            let engine = engine.clone();
+            let task_id = task_id.clone();
+            async move {
+                engine
+                    .with_state("test.seed_submit_format", move |s| {
+                        let mut entry = crate::core::state::AgentCtxEntry::default();
+                        if let Some(v) = declared {
+                            entry.view.extra.insert(SUBMIT_FORMAT_KEY.to_string(), v);
+                        }
+                        s.agent_ctx.insert((task_id, 1), entry);
+                    })
+                    .await
+                    .expect("seed agent_ctx");
+            }
+        };
+
+        seed(None).await;
+        assert_eq!(
+            engine.fold_parse_mode_for(&task_id, 1).await,
+            FoldParse::Lenient
+        );
+        seed(Some(Value::String("json".to_string()))).await;
+        assert_eq!(
+            engine.fold_parse_mode_for(&task_id, 1).await,
+            FoldParse::Lenient
+        );
+        seed(Some(Value::String("yaml".to_string()))).await;
+        assert_eq!(
+            engine.fold_parse_mode_for(&task_id, 1).await,
+            FoldParse::Lenient
+        );
+        seed(Some(Value::String(SUBMIT_FORMAT_TEXT.to_string()))).await;
+        assert_eq!(
+            engine.fold_parse_mode_for(&task_id, 1).await,
+            FoldParse::Raw
         );
     }
 

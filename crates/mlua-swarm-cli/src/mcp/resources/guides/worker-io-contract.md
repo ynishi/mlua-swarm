@@ -59,22 +59,46 @@ So the exit is pinned to tool calls that remove every degree of freedom:
   wins).
 - Large or file-shaped content can use the `@file:<abs-path>` sentinel
   body, resolved server-side.
-- A body that is meant to be structured data rather than prose can be
-  parsed server-side instead of folded as a string — see § Structured
-  final bodies below.
+- A body or part whose bytes are a JSON object / array folds into the
+  flow ctx as the parsed structure by default — see § Structured worker
+  output below.
 
 Staging never completes the attempt; the final `submit` does. At
 final-pull the server folds staged parts into
 `{"out": <final>, "parts": {<name>: <value>, ...}}` for the Blueprint
 flow (`$.parts["plan.md"]` addressing).
 
-## Structured final bodies: `submit_format: "json"`
+## Structured worker output: the fold and `submit_format`
 
-The submit body is raw text, so a step's OUTPUT is a single string by
-default — a downstream `fanout` `items` or `branch` cond cannot reach
-inside it. A Blueprint opts one step out of that by declaring
-`submit_format: "json"` on the same meta channels the `@file:` opt-in
-uses:
+The submit body and every staged part travel as raw text. What the
+Blueprint flow sees is decided at the **fold** (the final-pull that
+assembles the step's ctx value), in one of three modes:
+
+- **Default — lenient, containers only.** A final body or staged part
+  whose bytes parse as a JSON **object or array** folds as the parsed
+  structure, with no declaration, uniformly across the HTTP and
+  in-process lanes. `$.<step>.lanes`, a fanout
+  `items = $.<step>.parts["plan-meta.json"].lanes`, and a branch cond
+  all resolve into it. Scalar JSON (`true`, `42`, `"quoted"`, `null`)
+  and prose stay strings: a scalar has no addressable interior, and
+  parsing it would silently change `Eq` conds and verdict comparisons
+  for tokens that happen to be valid JSON. Anything that fails to parse
+  also stays a string — a JSON-looking prose body degrades to exactly
+  the old behavior.
+- **`submit_format: "json"` — strict, body only.** The step *promises*
+  JSON: the server parses the final body at submit time (any JSON
+  value, scalars included) and rejects an unparseable body with `422`
+  (the message names the agent and echoes the start of the body) so
+  the contract fails loud instead of folding a malformed string.
+  Deliberately body-only — a planner whose body is `plan-meta.json`
+  still stages markdown parts (`plan.md`), which must not 422.
+- **`submit_format: "text"` — opt-out.** Every string the step submits
+  — body and parts alike — folds as itself, even when its bytes are a
+  JSON container. The escape hatch for a step whose downstream wants
+  the raw text of JSON-looking output.
+
+`submit_format` is declared on the same meta channels the `@file:`
+opt-in uses:
 
 | Tier | Declaration |
 |---|---|
@@ -82,29 +106,23 @@ uses:
 | Agent | `AgentMeta.ctx = {"submit_format": "json", ...}` |
 | BP-global | `Blueprint.default_agent_ctx = {"submit_format": "json", ...}` |
 
-The server parses that step's final body and folds the parsed value, so
-`$.<step>.lanes` resolves and a fanout can take
-`{"op": "path", "at": "$.<step>.lanes"}` as its `items`.
+Notes that hold in every mode:
 
-What the declaration commits you to:
-
-- **Default-deny.** Without it the body folds as a string, byte for
-  byte as before — the server never sniffs a JSON-looking body.
-- **Declared-strict.** A declared step whose body does not parse is
-  rejected with `422` (the message names the agent and echoes the start
-  of the body) and the attempt records no OUTPUT. Declare it only for
-  an agent whose prompt commits to emitting JSON and nothing else.
-- **Unknown values fall back.** Any value other than `"json"` folds the
-  body as a string and logs a warning, so a typo degrades visibly
-  rather than failing the run.
+- **Unknown values fall back.** Any value other than `"json"` / `"text"`
+  logs a warning and behaves like the default, so a typo degrades
+  visibly rather than failing the run.
 - **It composes with `@file:`.** The sentinel resolves the file first
-  and the parse runs on its contents, so a large structured payload can
-  take the file lane without losing its shape.
-- **Verdict contracts are unaffected.** A `channel: "body"` contract
-  still compares the submitted body; a bare-token gate agent declares no
-  `submit_format` and behaves exactly as before.
-- **Parts stay strings.** The parse applies to the final body only —
-  a staged part (`?name=<name>`) is always folded raw.
+  and the mode applies to its contents, exactly as if the same bytes
+  had been posted inline.
+- **Verdict contracts are unaffected.** Both verdict checks compare the
+  submitted string *before* the fold, and a bare verdict token is a
+  scalar the lenient fold never touches.
+- **Part FILES are always verbatim.** The lenient parse applies to the
+  ctx fold only; the materialized part file keeps the submitted bytes
+  (see § Files are the server's job).
+- **The subprocess lane differs on scalars.** `kind: subprocess` parses
+  its stdout as any JSON value (scalars included) at its own boundary —
+  a pre-existing contract this fold does not change.
 
 ## Files are the server's job (the Adapter half)
 
@@ -141,7 +159,7 @@ with the transport removed:
 | task context | `WorkerPayload.context` (the `AgentContextView`) | `WorkerInvocation.context` — the same view, same middleware, same policy filtering |
 | final OUT | `POST /v1/worker/submit` | the worker's return value (`agent_block`: `bus.emit(<any kind>, ...)`, first emit wins) |
 | named part | `POST /v1/worker/artifact?name=<name>` | `agent_block`: `bus.emit("artifact", {name = ..., content = ...})` |
-| structured final OUT | raw text unless the step declares `submit_format: "json"` (above) | the return value is already a JSON value — nothing to declare |
+| structured final OUT | JSON-container bodies fold structured by default (§ Structured worker output) | a Lua table is already structured; a Lua STRING of a JSON container folds structured at the same fold |
 
 Staged parts fold identically on both lanes: stage at least one and the
 step's value becomes `{"out": <final>, "parts": {<name>: <value>}}`, so a
