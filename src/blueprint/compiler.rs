@@ -778,6 +778,14 @@ impl Compiler {
         // same family as the other Blueprint validation checks above); a
         // soft undeclared/undeclared collision is logged and compilation
         // proceeds (pre-GH-#23 union-rule behavior preserved).
+        //
+        // Only STRONG claims (a `Step.ref`, a declared `projection_name`,
+        // or an `out` that is exactly `$.T`) reach either path. Steps
+        // sharing a nesting root (`$.r.a` / `$.r.b`) claim it weakly, and
+        // a contested weak claim is dropped inside `from_blueprint` at
+        // `debug!` level — so the ordinary "several lanes under one root"
+        // Blueprint no longer warns on every compile. See
+        // `StepNaming`'s struct doc for the full ladder + boundary table.
         let (step_naming, step_naming_warnings) = StepNaming::from_blueprint(bp)?;
         for warning in &step_naming_warnings {
             tracing::warn!(

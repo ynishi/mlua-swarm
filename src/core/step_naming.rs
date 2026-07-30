@@ -51,11 +51,14 @@ pub struct StepNameEntry {
     /// flow.ir `Step.ref` (the data-plane producer name) unchanged.
     pub canonical: String,
     /// Every name this step should ALSO resolve under: always includes the
-    /// `Step.ref`, and — when the Step's `out` is a `Path` expr — the
-    /// top-level segment of that path (the pre-GH-#23 `result_ref`-derived
-    /// name). A bare `Step.ref` that happens to equal its own `out` top
-    /// segment collapses to a single-element set; this is not a
-    /// collision (see [`StepNaming::from_blueprint`]'s doc).
+    /// `Step.ref`, plus — when the Step's `out` is a `Path` expr — that
+    /// path's top-level segment (the pre-GH-#23 `result_ref`-derived
+    /// name), subject to the strong/weak claim ladder in
+    /// [`StepNaming::from_blueprint`]'s doc: a top segment claimed from a
+    /// NESTED `out` (`$.r.a`) is a WEAK claim and is absent here whenever
+    /// another step claims the same name. A bare `Step.ref` that happens
+    /// to equal its own `out` top segment collapses to a single-element
+    /// set; this is not a collision.
     pub aliases: BTreeSet<String>,
 }
 
@@ -117,16 +120,45 @@ pub struct StepNamingError {
 ///   → `"plan"`, `"$.a.b"` → `"a"`; a non-`Path` `out` contributes
 ///   nothing — best-effort, mirroring `blueprint::compiler`'s existing
 ///   static-walk convention of skipping what can't be inspected
-///   structurally).
+///   structurally), minus any WEAK claim another step contests (below).
 ///
-/// Every name (`canonical` + every alias) is checked for cross-step
-/// collisions. A clash where either side declared `projection_name` is a
-/// hard [`StepNamingError`] (registration is rejected outright). A clash
-/// between two undeclared steps is a soft [`StepNamingWarning`]: the
-/// pre-GH-#23 union rule's "data-plane wins" precedence is preserved by
-/// letting the step whose OWN `ref` equals the contested name own it in
-/// [`Self::resolve`] — an alias derived merely from another step's `out`
-/// segment never displaces it.
+/// # Strong and weak claims
+///
+/// Not every name a step could claim is claimed with the same strength:
+///
+/// - **strong claim** — the `Step.ref`, the declared `projection_name`,
+///   and an `out` that is exactly `$.T` (depth 1, so the step OWNS the
+///   whole `T` subtree).
+/// - **weak claim** — the top segment `T` of an `out` writing UNDER it
+///   (`$.T.x…`, depth ≥ 2). The step owns a lane inside `T`, not `T`.
+///
+/// A weak claim registers only when no other step claims that name at
+/// all. The moment a second step claims it — strongly or weakly — every
+/// weak claim on the name is dropped (silently, at `tracing::debug!`
+/// level: a shared nesting root is ordinary Blueprint shape, not a
+/// defect). The name then resolves to whichever step claims it strongly,
+/// or to nothing when the contest was weak-vs-weak. That deliberate miss
+/// replaces the pre-existing behavior of handing out one arbitrary lane's
+/// output under the shared root's name.
+///
+/// Every strong claim (`canonical` + every strongly-claimed alias) is
+/// checked for cross-step collisions. A clash where either side declared
+/// `projection_name` is a hard [`StepNamingError`] (registration is
+/// rejected outright). A clash between two undeclared steps is a soft
+/// [`StepNamingWarning`]: the pre-GH-#23 union rule's "data-plane wins"
+/// precedence is preserved by letting the step whose OWN `ref` equals the
+/// contested name own it in [`Self::resolve`] — an alias derived merely
+/// from another step's `out` segment never displaces it.
+///
+/// The resulting boundaries:
+///
+/// | Blueprint shape | result |
+/// |---|---|
+/// | `$.r.a` / `$.r.b` / … written by different steps (a shared nesting root) | `"r"` is nobody's alias; no warning. Each lane is addressed by its own ref / `projection_name` |
+/// | two steps whose `out` is the identical `$.r` | soft warning + data-plane priority (a genuine ambiguity) |
+/// | `ref: "r"` on one step, `$.r.x` on another | the weak claim yields: no warning, `resolve("r")` is the `"r"` step |
+/// | `projection_name: "r"` on one step, `$.r.x` on another | the weak claim yields: compiles (no hard error) |
+/// | `$.r.a` written by exactly one step | `"r"` stays that step's alias (unchanged) |
 #[derive(Debug, Clone, Default)]
 pub struct StepNaming {
     by_ref: BTreeMap<String, String>,
@@ -166,8 +198,10 @@ impl StepNaming {
     pub fn from_blueprint(
         bp: &Blueprint,
     ) -> Result<(StepNaming, Vec<StepNamingWarning>), StepNamingError> {
-        // 1. Static walk: collect every Step occurrence's (ref, out-top-segment).
-        let mut occurrences: Vec<(String, Option<String>)> = Vec::new();
+        // 1. Static walk: collect every Step occurrence's
+        //    (ref, out-top-segment + whether that `out` was NESTED under
+        //    the segment).
+        let mut occurrences: Vec<(String, Option<(String, bool)>)> = Vec::new();
         collect_steps(&bp.flow, &mut occurrences);
 
         // 2. Group by ref — a `Step.ref` may recur (e.g. inside a Loop
@@ -175,9 +209,10 @@ impl StepNaming {
         //    twice); the same agent always resolves to the same
         //    canonical name, so all of its occurrences fold into one
         //    entry, and every `out`-top segment seen across occurrences
-        //    is unioned into its alias set.
+        //    is unioned into its claim set. Contests are therefore only
+        //    ever evaluated BETWEEN distinct refs.
         let mut order: Vec<String> = Vec::new();
-        let mut out_tops: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut out_tops: BTreeMap<String, BTreeSet<(String, bool)>> = BTreeMap::new();
         for (ref_, top) in occurrences {
             let tops = out_tops.entry(ref_.clone()).or_default();
             if let Some(top) = top {
@@ -198,20 +233,81 @@ impl StepNaming {
             })
             .collect();
 
-        let mut naming = StepNaming::default();
-        let mut warnings = Vec::new();
-        // name -> (owning ref, declared?) — tracks current ownership so a
-        // later occurrence can detect + (for soft clashes) re-arbitrate.
-        let mut claims: BTreeMap<String, (String, bool)> = BTreeMap::new();
-
+        // 4. Split each ref's claims into the strong set (its `ref`, its
+        //    canonical name, and every `out` that is exactly `$.T`) and
+        //    the weak set (top segments of NESTED `out`s, `$.T.x…` — the
+        //    step owns a lane inside `T`, not `T` itself). See the struct
+        //    doc's "Strong and weak claims".
+        let mut plans: Vec<StepClaims> = Vec::with_capacity(order.len());
         for ref_ in &order {
             let is_declared = declared.contains_key(ref_.as_str());
             let canonical = declared
                 .get(ref_.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| ref_.clone());
-            let mut aliases: BTreeSet<String> = out_tops.remove(ref_).unwrap_or_default();
-            aliases.insert(ref_.clone());
+            let mut strong_aliases: BTreeSet<String> = BTreeSet::new();
+            strong_aliases.insert(ref_.clone());
+            let mut weak_aliases: BTreeSet<String> = BTreeSet::new();
+            for (top, nested) in out_tops.remove(ref_).unwrap_or_default() {
+                if nested {
+                    weak_aliases.insert(top);
+                } else {
+                    strong_aliases.insert(top);
+                }
+            }
+            // A name this ref ALSO claims strongly is not weak for it.
+            weak_aliases.retain(|n| n != &canonical && !strong_aliases.contains(n));
+            plans.push(StepClaims {
+                ref_: ref_.clone(),
+                canonical,
+                is_declared,
+                strong_aliases,
+                weak_aliases,
+            });
+        }
+
+        // 5. Count claimants per name (each ref counted at most once per
+        //    name) so a weak claim can tell "nobody else wants this" from
+        //    "contested".
+        let mut claimants: BTreeMap<&str, usize> = BTreeMap::new();
+        for plan in &plans {
+            for name in plan.claimed_strong().chain(plan.weak_aliases.iter()) {
+                *claimants.entry(name.as_str()).or_default() += 1;
+            }
+        }
+
+        let mut naming = StepNaming::default();
+        let mut warnings = Vec::new();
+        // name -> (owning ref, declared?) — tracks current ownership so a
+        // later occurrence can detect + (for soft clashes) re-arbitrate.
+        let mut claims: BTreeMap<String, (String, bool)> = BTreeMap::new();
+
+        for plan in &plans {
+            let StepClaims {
+                ref_,
+                canonical,
+                is_declared,
+                strong_aliases,
+                weak_aliases,
+            } = plan;
+            let (is_declared, canonical) = (*is_declared, canonical.clone());
+
+            // Weak claims survive only uncontested; a contested one is
+            // dropped without a warning (a shared nesting root is
+            // ordinary Blueprint shape). `debug!` keeps it observable.
+            let mut aliases: BTreeSet<String> = strong_aliases.clone();
+            for name in weak_aliases {
+                if claimants.get(name.as_str()).copied().unwrap_or(0) > 1 {
+                    tracing::debug!(
+                        name = %name,
+                        step_ref = %ref_,
+                        "StepNaming: dropping a contested weak (nesting-root) alias claim; \
+                         address this step by its ref or projection_name instead"
+                    );
+                    continue;
+                }
+                aliases.insert(name.clone());
+            }
 
             let mut claimed: BTreeSet<String> = aliases.clone();
             claimed.insert(canonical.clone());
@@ -261,6 +357,32 @@ impl StepNaming {
     }
 }
 
+/// One distinct `Step.ref`'s claim ladder, as folded from every
+/// occurrence of that ref in the flow — the intermediate
+/// [`StepNaming::from_blueprint`] builds before arbitrating contests (see
+/// the [`StepNaming`] struct doc's "Strong and weak claims").
+struct StepClaims {
+    ref_: String,
+    canonical: String,
+    is_declared: bool,
+    /// `{Step.ref}` ∪ every depth-1 `out` top segment (`$.T`).
+    strong_aliases: BTreeSet<String>,
+    /// Top segments of nested `out`s (`$.T.x…`), minus anything this ref
+    /// already claims strongly.
+    weak_aliases: BTreeSet<String>,
+}
+
+impl StepClaims {
+    /// Every name this ref claims strongly, each yielded once
+    /// (`canonical` frequently IS the ref, i.e. already in
+    /// `strong_aliases`).
+    fn claimed_strong(&self) -> impl Iterator<Item = &String> {
+        self.strong_aliases.iter().chain(
+            std::iter::once(&self.canonical).filter(|c| !self.strong_aliases.contains(c.as_str())),
+        )
+    }
+}
+
 fn collision_reason(other_declared: bool, is_declared: bool) -> String {
     match (other_declared, is_declared) {
         (true, true) => "both sides declare projection_name".to_string(),
@@ -274,15 +396,15 @@ fn collision_reason(other_declared: bool, is_declared: bool) -> String {
 
 /// Walk the flow `Node` (same recursion shape as
 /// `blueprint::compiler::collect_refs` / `collect_step_meta_refs`) and
-/// collect every `Step`'s `(ref, out-top-segment)`.
-fn collect_steps(node: &Node, out: &mut Vec<(String, Option<String>)>) {
+/// collect every `Step`'s `(ref, out-alias)`.
+fn collect_steps(node: &Node, out: &mut Vec<(String, Option<(String, bool)>)>) {
     match node {
         Node::Step {
             ref_,
             out: out_expr,
             ..
         } => {
-            out.push((ref_.clone(), out_top_segment(out_expr)));
+            out.push((ref_.clone(), out_alias(out_expr)));
         }
         Node::Seq { children } => {
             for child in children {
@@ -303,15 +425,17 @@ fn collect_steps(node: &Node, out: &mut Vec<(String, Option<String>)>) {
     }
 }
 
-/// Extract the top-level segment of a `Step.out` `Path` expr
-/// (`"$.plan"` → `"plan"`, `"$.a.b"` → `"a"`). Any other `Expr` shape (or
-/// an empty path) contributes no alias — best-effort, mirroring
-/// `blueprint::compiler`'s existing static-walk convention of skipping
-/// what can't be inspected structurally (flow.ir's own `write_path`
-/// requires `Step.out` to be a `Path` expr at eval time regardless, so a
-/// non-`Path` `out` is already a runtime error there — this walk just
-/// never invents an alias for it statically).
-fn out_top_segment(expr: &Expr) -> Option<String> {
+/// Extract the top-level segment of a `Step.out` `Path` expr together
+/// with whether the path writes UNDER that segment rather than to it:
+/// `"$.plan"` → `("plan", false)` (a strong claim on `plan`), `"$.a.b"` →
+/// `("a", true)` (a weak claim on `a` — the step owns the `b` lane, not
+/// `a`). Any other `Expr` shape (or an empty path) contributes no alias —
+/// best-effort, mirroring `blueprint::compiler`'s existing static-walk
+/// convention of skipping what can't be inspected structurally (flow.ir's
+/// own `write_path` requires `Step.out` to be a `Path` expr at eval time
+/// regardless, so a non-`Path` `out` is already a runtime error there —
+/// this walk just never invents an alias for it statically).
+fn out_alias(expr: &Expr) -> Option<(String, bool)> {
     let Expr::Path { at } = expr else {
         return None;
     };
@@ -319,10 +443,9 @@ fn out_top_segment(expr: &Expr) -> Option<String> {
     let trimmed = rendered
         .strip_prefix("$.")
         .or_else(|| rendered.strip_prefix('$'))?;
-    trimmed
-        .split('.')
-        .find(|s| !s.is_empty())
-        .map(str::to_string)
+    let mut segments = trimmed.split('.').filter(|s| !s.is_empty());
+    let top = segments.next()?.to_string();
+    Some((top, segments.next().is_some()))
 }
 
 #[cfg(test)]
@@ -548,6 +671,123 @@ mod tests {
         assert_eq!(naming.resolve("planner"), Some("plan-out"));
         assert_eq!(naming.resolve("plan"), Some("plan-out"));
         assert_eq!(naming.resolve("does-not-exist"), None);
+    }
+
+    /// The shape this claim ladder exists for: several lanes writing
+    /// under one shared nesting root (`$.r.a` / `$.r.b` / `$.r.c`). Every
+    /// claim on `"r"` is weak and contested, so `"r"` becomes nobody's
+    /// alias — no warning is emitted (this is ordinary Blueprint shape),
+    /// `resolve("r")` misses explicitly instead of handing out one
+    /// arbitrary lane, and each lane stays addressable by its own ref.
+    #[test]
+    fn shared_nesting_root_is_claimed_by_nobody_and_warns_nowhere() {
+        let flow = Node::Seq {
+            children: vec![
+                step("lane-a", "$.r.a"),
+                step("lane-b", "$.r.b"),
+                step("lane-c", "$.r.c"),
+            ],
+        };
+        let bp = bp(
+            flow,
+            vec![
+                agent("lane-a", None),
+                agent("lane-b", None),
+                agent("lane-c", None),
+            ],
+        );
+        let (naming, warnings) = StepNaming::from_blueprint(&bp).expect("no collision");
+        assert!(
+            warnings.is_empty(),
+            "a shared nesting root is not an ambiguity: {warnings:?}"
+        );
+        assert_eq!(naming.resolve("r"), None);
+        for ref_ in ["lane-a", "lane-b", "lane-c"] {
+            let entry = naming
+                .entries()
+                .find(|e| e.canonical == ref_)
+                .expect("entry present");
+            assert_eq!(
+                entry.aliases,
+                BTreeSet::from([ref_.to_string()]),
+                "{ref_} must keep its own ref and drop the contested root"
+            );
+            assert_eq!(naming.resolve(ref_), Some(ref_));
+        }
+    }
+
+    /// The genuine ambiguity the weak-claim rule must NOT swallow: two
+    /// steps writing the identical depth-1 path both claim `"r"` strongly,
+    /// so the pre-existing soft warning + data-plane priority stands.
+    #[test]
+    fn two_steps_writing_the_identical_root_still_warn() {
+        let flow = Node::Seq {
+            children: vec![step("first", "$.r"), step("second", "$.r")],
+        };
+        let bp = bp(flow, vec![agent("first", None), agent("second", None)]);
+        let (naming, warnings) = StepNaming::from_blueprint(&bp).expect("soft collision is Ok");
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert_eq!(warnings[0].name, "r");
+        // Neither step's own ref is "r", so the first-seen owner is kept.
+        assert_eq!(naming.resolve("r"), Some("first"));
+    }
+
+    /// A step whose ref IS the nesting root claims it strongly; the
+    /// nesting sibling's weak claim yields, so no warning fires and
+    /// `resolve` keeps pointing at the `ref: "r"` step.
+    #[test]
+    fn strong_ref_claim_beats_a_nesting_sibling_without_warning() {
+        let flow = Node::Seq {
+            children: vec![step("r", "$.r_out"), step("lane", "$.r.x")],
+        };
+        let bp = bp(flow, vec![agent("r", None), agent("lane", None)]);
+        let (naming, warnings) = StepNaming::from_blueprint(&bp).expect("no collision");
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(naming.resolve("r"), Some("r"));
+        let lane = naming
+            .entries()
+            .find(|e| e.canonical == "lane")
+            .expect("entry present");
+        assert_eq!(lane.aliases, BTreeSet::from(["lane".to_string()]));
+    }
+
+    /// The hard-error case the ladder dissolves: a DECLARED
+    /// `projection_name` against a nesting sibling's weak claim used to
+    /// reject the compile outright. The weak claim now yields instead.
+    #[test]
+    fn declared_name_against_a_nesting_sibling_compiles() {
+        let flow = Node::Seq {
+            children: vec![step("declarer", "$.declarer_out"), step("lane", "$.r.x")],
+        };
+        let bp = bp(
+            flow,
+            vec![agent("declarer", Some("r")), agent("lane", None)],
+        );
+        let (naming, warnings) =
+            StepNaming::from_blueprint(&bp).expect("a yielding weak claim must not hard-error");
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(naming.resolve("r"), Some("r"));
+        assert_eq!(naming.canonical_of_producer("declarer"), Some("r"));
+    }
+
+    /// Backward compat: an uncontested nesting root is still that step's
+    /// alias — dropping weak claims is a contest rule, not a blanket
+    /// demotion of nested `out` paths.
+    #[test]
+    fn uncontested_nesting_root_stays_an_alias() {
+        let flow = step("only", "$.r.a");
+        let bp = bp(flow, vec![agent("only", None)]);
+        let (naming, warnings) = StepNaming::from_blueprint(&bp).expect("no collision");
+        assert!(warnings.is_empty());
+        let entry = naming
+            .entries()
+            .find(|e| e.canonical == "only")
+            .expect("entry present");
+        assert_eq!(
+            entry.aliases,
+            BTreeSet::from(["only".to_string(), "r".to_string()])
+        );
+        assert_eq!(naming.resolve("r"), Some("only"));
     }
 
     #[test]

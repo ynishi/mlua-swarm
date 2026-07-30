@@ -460,7 +460,7 @@ pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Er
                 "$comment": "Filtered Run collection, newest-first. Query: `task_id` / `status` (pending|running|done|failed|interrupted) / `limit` / `offset`, all optional. Response body is {\"runs\": [<the GET /v1/runs/:id response>, ...]} — the element schema is not restated here.",
             },
             "POST /v1/worker/stats": {
-                "$comment": "Worker self-reported per-attempt stats. Auth: `Authorization: Bearer <worker_handle>` (short handle from the Spawn frame, or full capability_token). `worker_kind` defaults to \"operator\". Every field is optional and an all-empty body is accepted and dropped. Call it BEFORE the attempt's final `POST /v1/worker/submit`: the dispatcher folds the recorded stats into the step's StepEntry at outcome time, so stats arriving after that fold never reach the Run record. 204 on success; 410 once the addressed Run is terminal. `mse_worker_submit` has no `stats` param — this endpoint is the only route.",
+                "$comment": "Worker self-reported per-attempt stats. Auth: `Authorization: Bearer <worker_handle>` (short handle from the Spawn frame, or full capability_token). `worker_kind` defaults to \"operator\". Every field is optional and an all-empty body is accepted and dropped. Call it BEFORE the attempt's final `POST /v1/worker/submit`: the dispatcher folds the recorded stats into the step's StepEntry at outcome time, so stats arriving after that fold never reach the Run record. 204 on success; 410 once the addressed Run is terminal. Also reachable via `mse_worker_submit`'s `stats` object, which POSTs here before its own submit; aggregate a run's reports with the `swarm_run_stats` tool.",
                 "request": stats_body,
             },
             "POST /v1/worker/degradation": {
@@ -656,10 +656,11 @@ mod tests {
     }
 
     /// The run-read family and the two worker report routes are the only
-    /// published description of the per-step stats surface — `POST
-    /// /v1/worker/stats` in particular has no MCP-tool equivalent
-    /// (`mse_worker_submit` carries `degradations` but no `stats`), so a
-    /// worker harness author discovers it here or not at all.
+    /// published description of the per-step stats WIRE surface: `POST
+    /// /v1/worker/stats` is reachable from a tool (`mse_worker_submit`'s
+    /// `stats` object) but its body shape and the fold-ordering rule are
+    /// documented here, so a worker harness author calling the route
+    /// directly discovers them here or not at all.
     #[test]
     fn http_endpoints_resource_publishes_the_run_stats_surface() {
         let entry = find_by_uri("mse://api/http-endpoints").expect("resource must exist");

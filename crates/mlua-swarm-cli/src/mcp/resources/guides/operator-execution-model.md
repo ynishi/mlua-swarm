@@ -225,6 +225,31 @@ collapse that union into one name declared up front, on the Agent tier:
   collision case) with a `tracing::warn!`, resolving data-plane-first —
   unchanged from before.
 
+**Steps sharing a nesting root claim it weakly.** Writing one lane each
+under a common root (`"out": "$.review.style"` / `"$.review.perf"` / …)
+is ordinary Blueprint shape, not an ambiguity, so those steps do not
+compete for the root name `review`. A name claimed only as the top
+segment of a path written *underneath* it is a **weak** claim; the
+`Step.ref`, a declared `projection_name`, and an `out` that is exactly
+`$.review` are **strong** claims. A weak claim registers only while
+nobody else claims that name — the moment a second step claims it,
+strongly or weakly, every weak claim on it is dropped:
+
+| Blueprint shape | result |
+|---|---|
+| `$.r.a` / `$.r.b` / … written by different steps (a shared nesting root) | `"r"` is nobody's alias; no warning. Address each lane by its own ref / `projection_name` |
+| two steps whose `out` is the identical `$.r` | warning + data-plane priority, as before (a genuine ambiguity) |
+| `ref: "r"` on one step, `$.r.x` on another | the weak claim yields: no warning, `"r"` still resolves to the `"r"` step |
+| `projection_name: "r"` on one step, `$.r.x` on another | the weak claim yields: compiles (this used to be a hard error) |
+| `$.r.a` written by exactly one step | `"r"` stays that step's alias, unchanged |
+
+A dropped root name resolves to nothing rather than to some lane: a
+`ContextPolicy.steps: ["review"]` filter or a REST `.../steps/review`
+lookup against a *shared* root now misses explicitly instead of silently
+returning whichever lane happened to be registered first. Name the lane
+you mean (its `Step.ref`, or a `projection_name`) — a root with a single
+writer is unaffected.
+
 See `crate::core::step_naming`'s module doc for the full addressing-space
 design this table backs.
 
@@ -622,22 +647,40 @@ in the three hops above knows what the attempt cost. `POST
 degradation channel on the same observational plane (it never touches
 step OUTPUT, so `$.<step>` is unaffected).
 
-**There is only one entry point.** `mse_worker_submit` carries a
-`degradations` array but has **no `stats` param** — direct HTTP is the
-whole surface:
+There are two entry points, exactly as for degradations:
 
-```jsonc
-// POST <base_url>/v1/worker/stats
-// Authorization: Bearer <worker_handle>   (or the full capability_token)
-// Content-Type: application/json
-{
-  "worker_kind": "operator",              // optional, defaults to "operator"
-  "model": "<the model that served the attempt>",
-  "usage": { "input_tokens": 1200, "output_tokens": 340, "total_tokens": 1540 },
-  "num_turns": 3,
-  "adapter_data": { "…": "free-form, size-capped, never interpreted" }
-}
-```
+- **Direct HTTP** — `POST <base_url>/v1/worker/stats` with
+  `Authorization: Bearer <worker_handle>` (or the full
+  `capability_token`) and `Content-Type: application/json`:
+
+  ```jsonc
+  {
+    "worker_kind": "operator",              // optional, defaults to "operator"
+    "model": "<the model that served the attempt>",
+    "usage": { "input_tokens": 1200, "output_tokens": 340, "total_tokens": 1540 },
+    "num_turns": 3,
+    "adapter_data": { "…": "free-form, size-capped, never interpreted" }
+  }
+  ```
+
+- **`mse_worker_submit`'s `stats` object** (`mse://guides/mcp-tool-reference`)
+  — the same body, passed alongside the submit that ends the attempt:
+
+  ```jsonc
+  {
+    "worker_handle": "wh-...",
+    "body": "<the actual result>",
+    "stats": {
+      "model": "<the model that served the attempt>",
+      "usage": { "input_tokens": 1200, "output_tokens": 340, "total_tokens": 1540 },
+      "num_turns": 3
+    }
+  }
+  ```
+
+  It is POSTed to `/v1/worker/stats` after any `degradations` entries and
+  before the call's own submit body lands — the ordering the fold below
+  requires. An omitted `stats` field POSTs nothing.
 
 Every field is optional; an all-empty body is accepted and dropped. The
 response is `204`, or `410 Gone` once the addressed Run is terminal (the
@@ -656,7 +699,12 @@ Reported stats land on the attempt's `StepEntry` — `worker_kind`,
 dispatcher-measured `started_at_ms` / `completed_at_ms` / `duration_ms` —
 and surface on both `GET /v1/runs/:id` (inside `step_entries`) and
 `GET /v1/runs/:id/steps`. Wire schemas for all three:
-`mse://api/http-endpoints`.
+`mse://api/http-endpoints`. The `swarm_run_stats` tool folds that trace
+into per-step rows, whole-run `totals`, and a per-model breakdown for one
+`run_id`, without needing the run to have been launched by the calling
+process. Because reporting is per-boundary and optional, its
+`steps_with_stats` / `steps_total` pair is the honest coverage figure —
+read the totals against it rather than as a run's full cost.
 
 Runner capability resolution has a separate Run-scoped explain surface:
 `GET /v1/runs/:id/bindings`. Each entry returns the pinned declaration as

@@ -16,7 +16,7 @@ mod resources;
 // plist path / launchd state-parsing literals (Crux #1).
 use crate::server::launchd;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +28,7 @@ use mlua_swarm::blueprint::{resolve_bound_agents, Blueprint, RunnerResolutionSou
 use mlua_swarm::store::run::{
     InMemoryRunStore, RunContext, RunRecord, RunStatus as StoreRunStatus, RunStore,
 };
+use mlua_swarm::store::trace::TokenUsage;
 use mlua_swarm::types::{RunId, StepId, TaskId};
 use mlua_swarm::{
     binding_requests, Compiler, Engine, EngineCfg, OperatorKind, Role, TaskLaunchService,
@@ -147,6 +148,158 @@ async fn fetch_run_via_http(bind: &str, run_id: &str) -> Option<JsonValue> {
         return None;
     }
     resp.json::<JsonValue>().await.ok()
+}
+
+/// Why a `GET /v1/runs/:id` fetch failed, for the callers that must tell
+/// "no such run" (a caller mistake) from "could not ask" (a transport
+/// fault) — the distinction [`fetch_run_via_http`] deliberately discards.
+#[derive(Debug)]
+enum RunFetchError {
+    /// The server answered `404`: no Run with that id.
+    NotFound,
+    /// Client build / send / non-JSON body / any other non-2xx status.
+    Transport(String),
+}
+
+/// Status-preserving `GET /v1/runs/:id`, the read path behind
+/// [`MseServer::swarm_run_stats`]. Same route as [`fetch_run_via_http`],
+/// opposite error contract: nothing is swallowed, so an unknown run id
+/// surfaces as `invalid_params` and an unreachable server as
+/// `internal_error` instead of both becoming an empty report.
+async fn fetch_run_strict(bind: &str, run_id: &str) -> Result<JsonValue, RunFetchError> {
+    let url = format!("http://{bind}/v1/runs/{run_id}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| RunFetchError::Transport(format!("client build: {e}")))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| RunFetchError::Transport(format!("GET {url}: {e}")))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(RunFetchError::NotFound);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(RunFetchError::Transport(format!(
+            "GET {url}: HTTP {} — {body}",
+            status.as_u16()
+        )));
+    }
+    resp.json::<JsonValue>()
+        .await
+        .map_err(|e| RunFetchError::Transport(format!("GET {url}: decode: {e}")))
+}
+
+/// Fold a Run's `step_entries` into the per-step / per-model / whole-run
+/// cost view [`MseServer::swarm_run_stats`] returns. Pure (no I/O, no
+/// clock) so the aggregation rules are unit-testable against literal
+/// entries.
+///
+/// The rules, all of which have to tolerate a partially-reported run —
+/// stats are optional at every worker boundary, and absence must never
+/// look like zero cost:
+///
+/// - `steps[]` mirrors the input order, one row per entry, carrying only
+///   the cost-relevant fields (`step_ref` / `status` / `attempt` /
+///   `duration_ms` / `worker_kind` / `model` / `usage`). A field the
+///   entry does not carry is omitted from the row rather than nulled.
+/// - `totals.input_tokens` / `output_tokens` / `total_tokens` sum only
+///   the entries that carry a `usage` object; `steps_with_stats` counts
+///   exactly those, against `steps_total` for every entry — so a reader
+///   can see how much of the run the totals actually cover.
+/// - `totals.duration_ms_sum` sums every entry's dispatcher-measured
+///   `duration_ms` (independent of worker self-reporting). It is a sum of
+///   per-step durations, NOT the run's wall-clock time: steps that ran
+///   concurrently (a `Fanout`) are counted in full, each.
+/// - `by_model` groups by the self-reported `model`; an entry without one
+///   contributes to the totals but to no model bucket.
+fn aggregate_run_stats(step_entries: &[JsonValue]) -> JsonValue {
+    let mut steps: Vec<JsonValue> = Vec::with_capacity(step_entries.len());
+    let (mut input, mut output, mut total) = (0u64, 0u64, 0u64);
+    let mut duration_sum = 0u64;
+    let mut with_stats = 0usize;
+    // BTreeMap: a stable (model-sorted) key order in the JSON object.
+    let mut by_model: BTreeMap<String, (u64, u64, u64, u64)> = BTreeMap::new();
+
+    for entry in step_entries {
+        let mut row = serde_json::Map::new();
+        for field in [
+            "step_ref",
+            "status",
+            "attempt",
+            "duration_ms",
+            "worker_kind",
+            "model",
+            "usage",
+        ] {
+            if let Some(v) = entry.get(field) {
+                if !v.is_null() {
+                    row.insert(field.to_string(), v.clone());
+                }
+            }
+        }
+        steps.push(JsonValue::Object(row));
+
+        let usage = entry.get("usage").and_then(|u| u.as_object());
+        let read = |key: &str| -> u64 {
+            usage
+                .and_then(|u| u.get(key))
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0)
+        };
+        let (e_in, e_out, e_total) = (
+            read("input_tokens"),
+            read("output_tokens"),
+            read("total_tokens"),
+        );
+        if usage.is_some() {
+            with_stats += 1;
+            input += e_in;
+            output += e_out;
+            total += e_total;
+        }
+        if let Some(ms) = entry.get("duration_ms").and_then(JsonValue::as_u64) {
+            duration_sum += ms;
+        }
+        if let Some(model) = entry.get("model").and_then(JsonValue::as_str) {
+            let bucket = by_model.entry(model.to_string()).or_insert((0, 0, 0, 0));
+            bucket.0 += 1;
+            bucket.1 += e_in;
+            bucket.2 += e_out;
+            bucket.3 += e_total;
+        }
+    }
+
+    let by_model: serde_json::Map<String, JsonValue> = by_model
+        .into_iter()
+        .map(|(model, (steps, i, o, t))| {
+            (
+                model,
+                serde_json::json!({
+                    "steps": steps,
+                    "input_tokens": i,
+                    "output_tokens": o,
+                    "total_tokens": t,
+                }),
+            )
+        })
+        .collect();
+
+    serde_json::json!({
+        "steps": steps,
+        "totals": {
+            "input_tokens": input,
+            "output_tokens": output,
+            "total_tokens": total,
+            "duration_ms_sum": duration_sum,
+            "steps_with_stats": with_stats,
+            "steps_total": step_entries.len(),
+        },
+        "by_model": JsonValue::Object(by_model),
+    })
 }
 
 /// Best-effort `GET /v1/runs/:id/trace?latest=50` — the server-side
@@ -2081,6 +2234,18 @@ struct WorkerSubmitReq {
     /// the invariant). Omitted (`None`) = unchanged pre-#32 behavior.
     #[serde(default)]
     degradations: Option<Vec<DegradationInput>>,
+    /// Optional self-reported per-attempt stats (token usage / model /
+    /// turns). POSTed to `/v1/worker/stats` BEFORE this call's own
+    /// submit/artifact POST, so the dispatcher's outcome fold picks them
+    /// up — a WS-operator SubAgent has no in-process fold site of its
+    /// own, and this is that boundary's only way to report cost without
+    /// a raw HTTP call. Observational: never folded into step OUTPUT.
+    /// Report on the FINAL (plain, no-`name`) submit; stats sent on an
+    /// earlier artifact-staging call are kept per `(task_id, attempt)`
+    /// and overwritten by a later report (last write wins). Omitted
+    /// (`None`) = no stats POST at all.
+    #[serde(default)]
+    stats: Option<StatsInput>,
 }
 
 /// Client-facing shape for one worker-reported degradation entry (GH #32) —
@@ -2101,6 +2266,38 @@ struct DegradationInput {
     /// Optional free-form context from the worker.
     #[serde(default)]
     note: Option<String>,
+}
+
+/// Client-facing shape for a worker's self-reported per-attempt stats —
+/// mirrors the wire body `mlua-swarm-server`'s `POST /v1/worker/stats`
+/// endpoint expects (`crates/mlua-swarm-server/src/worker.rs`'s
+/// `StatsBody`), which is itself the wire twin of
+/// [`mlua_swarm::store::trace::WorkerStats`]. Every field is optional and
+/// an all-empty body is accepted server-side (and dropped), matching
+/// `DegradationInput`'s "the worker only supplies what it observed"
+/// convention. `usage` reuses the engine's own [`TokenUsage`] type rather
+/// than restating its three counters, so the client shape cannot drift
+/// from what the fold stores.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct StatsInput {
+    /// Worker kind label. Server-side default is `"operator"`.
+    #[serde(default)]
+    worker_kind: Option<String>,
+    /// The model that served the attempt.
+    #[serde(default)]
+    model: Option<String>,
+    /// Normalized token usage (`input_tokens` / `output_tokens` /
+    /// `total_tokens`).
+    #[serde(default)]
+    usage: Option<TokenUsage>,
+    /// Number of LLM turns the attempt ran.
+    #[serde(default)]
+    num_turns: Option<u32>,
+    /// Free-form worker-specific detail (size-capped on fold, never
+    /// interpreted by the engine).
+    #[serde(default)]
+    #[schemars(schema_with = "any_object_schema")]
+    adapter_data: Option<JsonValue>,
 }
 
 /// Builds the `/v1/worker/submit` or `/v1/worker/artifact?name=<name>`
@@ -2136,6 +2333,16 @@ fn worker_submit_endpoint_url(base_url: &str, name: Option<&str>) -> Result<reqw
 fn worker_degradation_endpoint_url(base_url: &str) -> Result<reqwest::Url, String> {
     let base = base_url.trim_end_matches('/');
     reqwest::Url::parse(&format!("{base}/v1/worker/degradation")).map_err(|e| e.to_string())
+}
+
+// convention-token-ok: mse_worker_submit is a mlua-swarm public MCP tool name.
+/// Builds the `/v1/worker/stats` endpoint URL for
+/// [`MseServer::mse_worker_submit`]'s pre-submit stats POST. Same shape
+/// and error contract as [`worker_degradation_endpoint_url`] — trailing
+/// slash trimmed, no query params, pure and unit-testable.
+fn worker_stats_endpoint_url(base_url: &str) -> Result<reqwest::Url, String> {
+    let base = base_url.trim_end_matches('/');
+    reqwest::Url::parse(&format!("{base}/v1/worker/stats")).map_err(|e| e.to_string())
 }
 
 // ---- tool param schemas ----
@@ -2363,6 +2570,20 @@ struct SwarmStatusReq {
     /// local `RunHandle` never observed is no longer reported as stale
     /// `running`. The HTTP fetch is guarded by a short timeout and its
     /// failure is silent: the tool falls back to the local run store.
+    #[serde(default)]
+    bind: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SwarmRunStatsReq {
+    /// The run to report on (`R-<hex>`). Read over HTTP from the server's
+    /// own run store, so any run that server knows about works — this
+    /// process does not need a local `RunHandle` for it (unlike
+    /// `swarm_status`), and a run launched by a different driver session
+    /// is reachable by id alone.
+    run_id: String,
+    /// `mse serve` bind address holding the run (default
+    /// `127.0.0.1:7777`).
     #[serde(default)]
     bind: Option<String>,
 }
@@ -2645,7 +2866,7 @@ impl MseServer {
 
     // convention-token-ok: mse_pending_wait is a mlua-swarm public MCP tool name.
     #[tool(
-        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Normally `worker_handle` + `body` are the ONLY required params — base_url auto-resolves from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass it explicitly to override (or when the Bearer is a full capability_token). Optional ok=false marks the attempt failed (flow.ir Try catch path); mutually exclusive with `name`. Optional `name` (GH #36) stages ONE named output part instead of completing the attempt — POST /v1/worker/artifact?name=<name> — call again (same or different name) for more parts, then finish with a plain (no-name) call; the step's final output becomes {\"out\": <final submit body>, \"parts\": {<name>: <value>, ...}}, read downstream via bracket notation e.g. \"$.<step>.parts[\\\"plan.md\\\"]\". Optional `degradations` array (GH #32) — each entry POSTed to /v1/worker/degradation before the main submit, structured tool-failure trace persisted on the Run record. Backward compat: absent field = pre-#32 behavior. Expects HTTP 204 and returns {submitted: true} (name path) or {submitted: true} (plain path); any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
+        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Normally `worker_handle` + `body` are the ONLY required params — base_url auto-resolves from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass it explicitly to override (or when the Bearer is a full capability_token). Optional ok=false marks the attempt failed (flow.ir Try catch path); mutually exclusive with `name`. Optional `name` (GH #36) stages ONE named output part instead of completing the attempt — POST /v1/worker/artifact?name=<name> — call again (same or different name) for more parts, then finish with a plain (no-name) call; the step's final output becomes {\"out\": <final submit body>, \"parts\": {<name>: <value>, ...}}, read downstream via bracket notation e.g. \"$.<step>.parts[\\\"plan.md\\\"]\". Optional `degradations` array (GH #32) — each entry POSTed to /v1/worker/degradation before the main submit, structured tool-failure trace persisted on the Run record. Backward compat: absent field = pre-#32 behavior. Optional `stats` object ({worker_kind?, model?, usage?: {input_tokens, output_tokens, total_tokens}, num_turns?, adapter_data?}) — POSTed to /v1/worker/stats after the degradations and before the submit, so the dispatcher's outcome fold lands it on the attempt's StepEntry; report it on the FINAL (no-name) submit, since stats arriving after the fold are dropped. Aggregate a whole run's reports with swarm_run_stats. Expects HTTP 204 and returns {submitted: true} (name path) or {submitted: true} (plain path); any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
     )]
     async fn mse_worker_submit(
         &self,
@@ -2716,6 +2937,37 @@ impl MseServer {
                         None,
                     ));
                 }
+            }
+        }
+
+        // Pre-submit stats reporting, on the same observational plane as
+        // the degradation POSTs above and ordered after them. The
+        // dispatcher drains recorded stats at outcome time — which the
+        // submit POST below triggers — so the report has to land first or
+        // it is dropped with the attempt's cleanup. A non-204 response
+        // fails loud for the same reason as the degradation path: the
+        // caller opted in, so a lost report must not be silent.
+        if let Some(stats) = &req.stats {
+            let stats_url = worker_stats_endpoint_url(&base_url)
+                .map_err(|e| McpError::invalid_params(format!("invalid base_url: {e}"), None))?;
+            let resp = client
+                .post(stats_url)
+                .header("Authorization", format!("Bearer {}", req.worker_handle))
+                .header("Content-Type", "application/json")
+                .json(stats)
+                .send()
+                .await
+                .map_err(|e| McpError::internal_error(format!("worker stats: {e}"), None))?;
+            let status = resp.status();
+            if status != reqwest::StatusCode::NO_CONTENT {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(McpError::internal_error(
+                    format!(
+                        "worker stats: HTTP {} (expected 204) — {body}",
+                        status.as_u16()
+                    ),
+                    None,
+                ));
             }
         }
 
@@ -3440,6 +3692,43 @@ impl MseServer {
                         body["log_tail"] = serde_json::to_value(events).unwrap_or(JsonValue::Null);
                     }
                 }
+            }
+        }
+        json_result(&body)
+    }
+
+    #[tool(
+        description = "Cost/latency report for one run: reads GET /v1/runs/:id on `bind` and folds its step trace into per-step rows (step_ref / status / attempt / duration_ms / worker_kind / model / usage), whole-run `totals` (input_tokens, output_tokens, total_tokens, duration_ms_sum, steps_with_stats, steps_total) and a `by_model` breakdown (steps + token counts per self-reported model). Works off the run id alone — no local run handle required, so a run launched by another driver session reports fine (that is the difference from swarm_status, which needs a run this process launched and returns a status snapshot rather than an aggregate). Stats are optional at every worker boundary: compare `steps_with_stats` against `steps_total` before reading the totals as the run's full cost, and note `duration_ms_sum` adds up per-step durations, so concurrent (Fanout) steps are each counted in full instead of by wall-clock. Workers report their own usage via mse_worker_submit's `stats` param (or POST /v1/worker/stats directly). An unknown run id is an invalid_params error; an unreachable server is internal_error. Params: `run_id`, `bind?`."
+    )]
+    async fn swarm_run_stats(
+        &self,
+        Parameters(req): Parameters<SwarmRunStatsReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let bind = req
+            .bind
+            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+        let record = fetch_run_strict(&bind, &req.run_id)
+            .await
+            .map_err(|e| match e {
+                RunFetchError::NotFound => McpError::invalid_params(
+                    format!("run not found: {} (bind {bind})", req.run_id),
+                    None,
+                ),
+                RunFetchError::Transport(msg) => {
+                    McpError::internal_error(format!("run stats: {msg}"), None)
+                }
+            })?;
+        let entries = record
+            .get("step_entries")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut body = aggregate_run_stats(&entries);
+        body["run_id"] = serde_json::json!(req.run_id);
+        body["bind"] = serde_json::json!(bind);
+        for field in ["task_id", "status"] {
+            if let Some(v) = record.get(field).cloned() {
+                body[field] = v;
             }
         }
         json_result(&body)
@@ -5452,6 +5741,7 @@ mod tests {
                 ok: None,
                 name: None,
                 degradations: None,
+                stats: None,
             }))
             .await
             .unwrap_err();
@@ -5497,6 +5787,7 @@ mod tests {
                 ok: None,
                 name: None,
                 degradations: None,
+                stats: None,
             }))
             .await
             .expect_err("unknown handle must surface the HTTP error");
@@ -5519,6 +5810,7 @@ mod tests {
                 ok: Some(false),
                 name: Some("plan.md".into()),
                 degradations: None,
+                stats: None,
             }))
             .await
             .unwrap_err();
@@ -5553,6 +5845,7 @@ mod tests {
                 ok: None,
                 name: Some("plan.md".into()),
                 degradations: None,
+                stats: None,
             }))
             .await
             .expect_err("unknown handle must surface the HTTP error");
@@ -5598,6 +5891,7 @@ mod tests {
                     fallback: "grep".into(),
                     note: None,
                 }]),
+                stats: None,
             }))
             .await
             .expect_err("unknown handle must surface the HTTP error");
@@ -5637,11 +5931,277 @@ mod tests {
                 ok: None,
                 name: None,
                 degradations: None,
+                stats: None,
             }))
             .await
             .expect_err("unknown handle must surface the HTTP error");
         let msg = format!("{err:?}");
         assert!(msg.contains("worker submit: HTTP"), "err: {msg}");
+    }
+
+    /// A `stats`-bearing submit call POSTs to `/v1/worker/stats` BEFORE
+    /// the submit itself — same proof shape as the degradation sibling
+    /// above: against a real in-process router a bogus (never-minted)
+    /// handle fails handle resolution inside `worker_stats` (not 204),
+    /// which must surface as a `worker stats: HTTP ...` error, showing
+    /// the pre-submit POST fires and short-circuits before the submit
+    /// POST is attempted. Ordering is the whole point: the dispatcher
+    /// folds recorded stats at outcome time, which the submit triggers.
+    #[tokio::test]
+    async fn mse_worker_submit_posts_stats_before_submit() {
+        let engine = Engine::new(EngineCfg::default());
+        let router = mlua_swarm_server::build_router(engine);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let server = MseServer::new();
+        let err = server
+            .mse_worker_submit(Parameters(WorkerSubmitReq {
+                worker_handle: "wh-deadbeef".into(),
+                base_url: Some(base_url),
+                body: "RESULT".into(),
+                ok: None,
+                name: None,
+                degradations: None,
+                stats: Some(StatsInput {
+                    worker_kind: Some("operator".into()),
+                    model: Some("test-model".into()),
+                    usage: Some(TokenUsage {
+                        input_tokens: 1200,
+                        output_tokens: 340,
+                        total_tokens: 1540,
+                    }),
+                    num_turns: Some(3),
+                    adapter_data: None,
+                }),
+            }))
+            .await
+            .expect_err("unknown handle must surface the HTTP error");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("worker stats: HTTP"),
+            "the pre-submit stats POST must fail first, not the plain submit: {msg}"
+        );
+        assert!(
+            !msg.contains("worker submit: HTTP"),
+            "the plain submit POST must never fire once the stats POST fails: {msg}"
+        );
+    }
+
+    /// Without `stats`, the request path is byte-for-byte the pre-existing
+    /// behavior — the error is the plain `worker submit: HTTP ...`
+    /// message, proving the new field is truly opt-in.
+    #[tokio::test]
+    async fn mse_worker_submit_without_stats_unchanged() {
+        let engine = Engine::new(EngineCfg::default());
+        let router = mlua_swarm_server::build_router(engine);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let server = MseServer::new();
+        let err = server
+            .mse_worker_submit(Parameters(WorkerSubmitReq {
+                worker_handle: "wh-deadbeef".into(),
+                base_url: Some(base_url),
+                body: "RESULT".into(),
+                ok: None,
+                name: None,
+                degradations: None,
+                stats: None,
+            }))
+            .await
+            .expect_err("unknown handle must surface the HTTP error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("worker submit: HTTP"), "err: {msg}");
+        assert!(!msg.contains("worker stats"), "err: {msg}");
+    }
+
+    // --- worker_stats_endpoint_url (pure URL-building) ---
+
+    #[test]
+    fn worker_stats_endpoint_url_shape() {
+        let with_slash = worker_stats_endpoint_url("http://127.0.0.1:7777/").unwrap();
+        let without_slash = worker_stats_endpoint_url("http://127.0.0.1:7777").unwrap();
+        assert_eq!(with_slash.as_str(), without_slash.as_str());
+        assert_eq!(
+            without_slash.as_str(),
+            "http://127.0.0.1:7777/v1/worker/stats"
+        );
+        assert_eq!(without_slash.path(), "/v1/worker/stats");
+        assert_eq!(without_slash.query_pairs().count(), 0);
+    }
+
+    #[test]
+    fn worker_stats_endpoint_url_rejects_malformed_base_url() {
+        let err = worker_stats_endpoint_url("not a url").unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    // --- aggregate_run_stats (pure folding) ---
+
+    /// Two reported steps plus the dispatcher-measured durations: totals
+    /// sum both usages, `steps_with_stats` matches `steps_total`, and
+    /// each per-step row keeps the cost fields.
+    #[test]
+    fn aggregate_run_stats_sums_usage_and_durations() {
+        let entries = vec![
+            serde_json::json!({
+                "step_ref": "planner",
+                "status": "passed",
+                "attempt": 1,
+                "duration_ms": 1200,
+                "worker_kind": "operator",
+                "model": "model-a",
+                "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+            }),
+            serde_json::json!({
+                "step_ref": "writer",
+                "status": "passed",
+                "attempt": 2,
+                "duration_ms": 800,
+                "worker_kind": "agent_block",
+                "model": "model-b",
+                "usage": {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12},
+            }),
+        ];
+        let out = aggregate_run_stats(&entries);
+        assert_eq!(out["totals"]["input_tokens"], 105);
+        assert_eq!(out["totals"]["output_tokens"], 27);
+        assert_eq!(out["totals"]["total_tokens"], 132);
+        assert_eq!(out["totals"]["duration_ms_sum"], 2000);
+        assert_eq!(out["totals"]["steps_with_stats"], 2);
+        assert_eq!(out["totals"]["steps_total"], 2);
+        assert_eq!(out["steps"][0]["step_ref"], "planner");
+        assert_eq!(out["steps"][0]["attempt"], 1);
+        assert_eq!(out["steps"][1]["worker_kind"], "agent_block");
+    }
+
+    /// `by_model` groups by the self-reported model; two steps on one
+    /// model fold into one bucket.
+    #[test]
+    fn aggregate_run_stats_groups_by_model() {
+        let entries = vec![
+            serde_json::json!({
+                "step_ref": "a", "model": "model-a",
+                "usage": {"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
+            }),
+            serde_json::json!({
+                "step_ref": "b", "model": "model-a",
+                "usage": {"input_tokens": 30, "output_tokens": 3, "total_tokens": 33},
+            }),
+            serde_json::json!({
+                "step_ref": "c", "model": "model-b",
+                "usage": {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+            }),
+        ];
+        let out = aggregate_run_stats(&entries);
+        assert_eq!(out["by_model"]["model-a"]["steps"], 2);
+        assert_eq!(out["by_model"]["model-a"]["input_tokens"], 40);
+        assert_eq!(out["by_model"]["model-a"]["total_tokens"], 44);
+        assert_eq!(out["by_model"]["model-b"]["steps"], 1);
+        assert!(out["by_model"].get("model-c").is_none());
+    }
+
+    /// Stats are optional at every worker boundary: an entry without
+    /// `usage` contributes nothing to the token totals and is excluded
+    /// from `steps_with_stats` (so a reader can tell partial coverage
+    /// from a genuinely cheap run), while its dispatcher-measured
+    /// `duration_ms` still counts and a model-less entry lands in no
+    /// bucket.
+    #[test]
+    fn aggregate_run_stats_skips_entries_without_stats() {
+        let entries = vec![
+            serde_json::json!({
+                "step_ref": "reported", "duration_ms": 500, "model": "model-a",
+                "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+            }),
+            serde_json::json!({"step_ref": "silent", "status": "passed", "duration_ms": 700}),
+        ];
+        let out = aggregate_run_stats(&entries);
+        assert_eq!(out["totals"]["input_tokens"], 10);
+        assert_eq!(out["totals"]["total_tokens"], 12);
+        assert_eq!(out["totals"]["duration_ms_sum"], 1200);
+        assert_eq!(out["totals"]["steps_with_stats"], 1);
+        assert_eq!(out["totals"]["steps_total"], 2);
+        assert_eq!(out["by_model"].as_object().map(|m| m.len()), Some(1));
+        // The unreported step still appears, carrying only what it had.
+        assert_eq!(out["steps"][1]["step_ref"], "silent");
+        assert!(out["steps"][1].get("usage").is_none());
+        assert!(out["steps"][1].get("model").is_none());
+    }
+
+    /// A run with no step entries at all reports zeros, not an error —
+    /// `swarm_run_stats` is a read tool and an empty run is a legitimate
+    /// (just-launched) state.
+    #[test]
+    fn aggregate_run_stats_empty_is_all_zeros() {
+        let out = aggregate_run_stats(&[]);
+        assert_eq!(out["totals"]["input_tokens"], 0);
+        assert_eq!(out["totals"]["output_tokens"], 0);
+        assert_eq!(out["totals"]["total_tokens"], 0);
+        assert_eq!(out["totals"]["duration_ms_sum"], 0);
+        assert_eq!(out["totals"]["steps_with_stats"], 0);
+        assert_eq!(out["totals"]["steps_total"], 0);
+        assert_eq!(out["steps"].as_array().map(Vec::len), Some(0));
+        assert_eq!(out["by_model"].as_object().map(|m| m.len()), Some(0));
+    }
+
+    /// `swarm_run_stats` keeps the "no such run" / "could not ask"
+    /// distinction its strict fetch exists for: a server that answers
+    /// `404` for an unknown id must surface as `invalid_params`, not as
+    /// an empty report and not as a transport error.
+    #[tokio::test]
+    async fn swarm_run_stats_unknown_run_id_returns_invalid_params() {
+        let engine = Engine::new(EngineCfg::default());
+        let router = mlua_swarm_server::build_router(engine);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let server = MseServer::new();
+        let err = server
+            .swarm_run_stats(Parameters(SwarmRunStatsReq {
+                run_id: "R-does-not-exist".into(),
+                bind: Some(addr.to_string()),
+            }))
+            .await
+            .expect_err("an unknown run id must fail loud");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("run not found"), "err: {msg}");
+    }
+
+    /// The sibling half of the error contract: an unreachable bind is a
+    /// transport fault (`internal_error`), never reported as a missing
+    /// run. Port 1 (RFC 6335 reserved) always refuses.
+    #[tokio::test]
+    async fn swarm_run_stats_unreachable_server_is_not_reported_as_missing_run() {
+        let server = MseServer::new();
+        let err = server
+            .swarm_run_stats(Parameters(SwarmRunStatsReq {
+                run_id: "R-whatever".into(),
+                bind: Some("127.0.0.1:1".into()),
+            }))
+            .await
+            .expect_err("an unreachable server must fail loud");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("run stats:"), "err: {msg}");
+        assert!(!msg.contains("run not found"), "err: {msg}");
     }
 
     // --- worker_submit_endpoint_url (pure URL-building) tests ---
