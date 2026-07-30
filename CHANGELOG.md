@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/ynishi/mlua-swarm/compare/v0.18.0...v0.19.0) - 2026-07-30
+
+### Added
+
+- *(bp_doctor)* flag the fully-dead verdict gate separately from per-value noise
+- *(context)* deliver Blueprint-declared agent ctx to in-process workers
+- *(agent-block)* both verdict channels + task_metadata via SDK extra_globals
+
+### Fixed
+
+- *(worker)* fold an in-process worker's staged parts into the BP chain
+- *(verdict)* give the contract rejection a reader, at both ends
+- *(agent-block)* register the AgentBlock spawner on the default paths
+
+### Other
+
+- *(agent-block)* isolate SQLite state to :memory: and poll the audit marker
+- use neutral role names in fixtures instead of real agent names
+- *(context)* one in-process seam for task context, and deliver task_metadata to Lua
+- *(agent-block)* e2e the Pure-Lua ScriptBasedAgent dispatch lane
+- *(guides)* give worker-io-contract its in-process half
+
 ## [0.18.0](https://github.com/ynishi/mlua-swarm/compare/v0.17.0...v0.18.0) - 2026-07-25
 
 ### Added
