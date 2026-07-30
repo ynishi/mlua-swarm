@@ -712,10 +712,22 @@ fn render_verdict_template(
 /// `indent` is the leading whitespace of the line the expression starts
 /// on; nested lines extend it. The returned string carries no trailing
 /// comma or newline — the caller places it.
+///
+/// **Per-lane `out`.** Each lane writes to `$.lane.<checker>`, not to a
+/// shared depth-1 path. A depth-1 `out` (`$.branch_out`) is a STRONG
+/// StepNaming claim, so N lanes writing the identical `$.branch_out`
+/// contest that one name and register a soft `StepNamingWarning` at
+/// register time (see [`mlua_swarm::StepNaming`]'s "Strong and weak
+/// claims"). Nesting under a shared root makes each lane's claim on
+/// `lane` WEAK — contested weak claims yield silently — so the N lanes
+/// land on N distinct addresses with no warning. This is also the
+/// default `bp_dsl`'s heterogeneous stage sugar emits for a lane
+/// (`fanout = { lanes = ... }` — see `mse://guides/dsl-authoring`), so
+/// hand-written and scaffolded lanes read the same.
 fn render_fanout_lane_body(head: &str, tail: &[String], indent: &str) -> String {
     let step = |checker: &str| {
         format!(
-            "F.step({{ agent = \"{checker}\", input = F.p(\"$.d.{checker}\"), out = F.p(\"$.branch_out\") }})"
+            "F.step({{ agent = \"{checker}\", input = F.p(\"$.d.{checker}\"), out = F.p(\"$.lane.{checker}\") }})"
         )
     };
     let Some((next, rest)) = tail.split_first() else {
@@ -817,6 +829,17 @@ fn render_fanout_template(
     out.push_str("-- dispatch per lane: a branch cascade on the bound `$.item` picks\n");
     out.push_str("-- that lane's checker. (A `seq` of every checker in the body would\n");
     out.push_str("-- run all of them for every item — N checkers x N items.)\n");
+    out.push_str("--\n");
+    out.push_str("-- Each lane writes its own `$.lane.<checker>` slot rather than a\n");
+    out.push_str("-- shared depth-1 path: lanes are disjoint ctx copies, so N lanes on\n");
+    out.push_str("-- one address are indistinguishable in the joined result — and a\n");
+    out.push_str("-- depth-1 `out` is a strong step-naming claim, so N lanes sharing\n");
+    out.push_str("-- it would contest that name and log a collision warning at\n");
+    out.push_str("-- register time. Nesting under `$.lane` keeps each claim weak, so\n");
+    out.push_str("-- the addresses stay distinct and the register stays quiet. A\n");
+    out.push_str("-- lane's own result therefore sits at `lane.<checker>` inside that\n");
+    out.push_str("-- lane's entry of the join array (read by the aggregate stage —\n");
+    out.push_str("-- see below).\n");
     out.push_str("--\n");
     out.push_str("-- The fanout `join = \"all\"` gathers every lane's final ctx into an\n");
     out.push_str("-- ordered array at `$.results`; the aggregate stage reads that\n");
@@ -1614,6 +1637,13 @@ mod tests {
         );
         assert_eq!(body["then"]["kind"], "step");
         assert_eq!(body["then"]["ref"], "lint");
+        // Each lane writes its own nested slot — a shared depth-1 `out`
+        // would be a contested strong step-naming claim (see the
+        // sibling `..._lanes_claim_distinct_step_names` test).
+        assert_eq!(
+            body["then"]["out"],
+            serde_json::json!({"op": "path", "at": "$.lane.lint"})
+        );
 
         let inner = &body["else"];
         assert_eq!(inner["kind"], "branch", "cascade depth must be 2: {inner}");
@@ -1623,10 +1653,18 @@ mod tests {
         );
         assert_eq!(inner["then"]["ref"], "test");
         assert_eq!(
+            inner["then"]["out"],
+            serde_json::json!({"op": "path", "at": "$.lane.test"})
+        );
+        assert_eq!(
             inner["else"]["kind"], "step",
             "the last checker is the terminal else, not another branch"
         );
         assert_eq!(inner["else"]["ref"], "build");
+        assert_eq!(
+            inner["else"]["out"],
+            serde_json::json!({"op": "path", "at": "$.lane.build"})
+        );
 
         // Exactly one step runs per item: 3 step nodes, 2 branch nodes,
         // no `seq` inside the fanout body.
@@ -1663,6 +1701,13 @@ mod tests {
             body["in"],
             serde_json::json!({"op": "path", "at": "$.d.solo"})
         );
+        // The lane `out` convention does not special-case N == 1: the
+        // degenerate lane still writes `$.lane.<checker>`, so widening
+        // `--stages` later needs no rewrite of the surviving lane.
+        assert_eq!(
+            body["out"],
+            serde_json::json!({"op": "path", "at": "$.lane.solo"})
+        );
 
         // 1 checker + aggregate = 2 operator agents on the one operator.
         let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
@@ -1673,6 +1718,61 @@ mod tests {
                 operators: 1
             }
         ));
+    }
+
+    /// The scaffold must register warning-free. N lanes writing one
+    /// shared depth-1 `out` (`$.branch_out`) each claim that name
+    /// STRONGLY, and the second claim raises a soft `StepNamingWarning`
+    /// at register time — a scaffold is exactly where an author should
+    /// not have to learn that rule. Nesting each lane under `$.lane`
+    /// makes the claim weak, and contested weak claims yield silently.
+    ///
+    /// The second half rewrites the rendered lanes back onto the shared
+    /// path to prove the assertion has teeth (i.e. it is the `out`
+    /// choice being locked, not a shape that never warns anyway).
+    #[test]
+    fn fanout_template_lanes_claim_distinct_step_names() {
+        let rendered = render_template_by_kind(
+            "fanout",
+            "naming-fanout",
+            Some("lint,test,build"),
+            None,
+            None,
+            None,
+        )
+        .expect("render must succeed with 3 stages");
+
+        let warnings = step_naming_warnings(&rendered);
+        assert!(
+            warnings.is_empty(),
+            "scaffolded lanes must not contest a step name: {warnings:?}"
+        );
+
+        let collided = rendered
+            .replace("$.lane.lint", "$.branch_out")
+            .replace("$.lane.test", "$.branch_out")
+            .replace("$.lane.build", "$.branch_out");
+        let collided_warnings = step_naming_warnings(&collided);
+        assert!(
+            collided_warnings.iter().any(|w| w.name == "branch_out"),
+            "control: a shared depth-1 lane `out` must contest `branch_out`, \
+             otherwise this test cannot fail: {collided_warnings:?}"
+        );
+    }
+
+    /// Build a rendered scaffold into a `Blueprint` and return the soft
+    /// naming warnings its addressing-space table reports. `Compiler`
+    /// only `tracing::warn!`s these (they are non-fatal), so the table is
+    /// built directly rather than read back off a lint report.
+    fn step_naming_warnings(rendered: &str) -> Vec<mlua_swarm::StepNamingWarning> {
+        let bp_value = dsl::build_bp_from_script(rendered).expect("rendered scaffold must build");
+        // No `$file` / `$agent_md` refs in rendered templates, so the
+        // wire JSON deserializes without the ref-expansion pass.
+        let bp: mlua_swarm::Blueprint =
+            serde_json::from_value(bp_value).expect("scaffold must be a valid Blueprint");
+        let (_, warnings) =
+            mlua_swarm::StepNaming::from_blueprint(&bp).expect("scaffold must not hard-collide");
+        warnings
     }
 
     #[test]

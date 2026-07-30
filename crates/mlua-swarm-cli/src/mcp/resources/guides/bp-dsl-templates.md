@@ -134,15 +134,26 @@ fanout). `--stages solo` degenerates to a bare `F.step` body.
 ```lua
 body = F.branch({
   cond     = F.p("$.item"):eq("lint"),
-  on_true  = F.step({ agent = "lint", input = F.p("$.d.lint"), out = F.p("$.branch_out") }),
+  on_true  = F.step({ agent = "lint", input = F.p("$.d.lint"), out = F.p("$.lane.lint") }),
   on_false = F.branch({
     cond     = F.p("$.item"):eq("test"),
-    on_true  = F.step({ agent = "test", input = F.p("$.d.test"), out = F.p("$.branch_out") }),
+    on_true  = F.step({ agent = "test", input = F.p("$.d.test"), out = F.p("$.lane.test") }),
     -- Closed item set: the last checker is the fallthrough.
-    on_false = F.step({ agent = "build", input = F.p("$.d.build"), out = F.p("$.branch_out") }),
+    on_false = F.step({ agent = "build", input = F.p("$.d.build"), out = F.p("$.lane.build") }),
   }),
 }),
 ```
+
+**Why each lane writes `$.lane.<checker>`.** Lanes are disjoint ctx
+copies, so N lanes sharing one depth-1 address (`$.branch_out`) are
+indistinguishable in the joined result — and a depth-1 `out` is a
+*strong* step-naming claim, so N lanes claiming it contest that one name
+and log a soft collision warning at register time. Nesting under a shared
+`$.lane` root keeps every claim weak (contested weak claims yield
+silently), so the lanes stay addressable and the register stays quiet.
+This is the same default `bp_dsl`'s heterogeneous `fanout = { lanes = … }`
+stage sugar emits (`mse://guides/dsl-authoring`). The *homogeneous* shape
+keeps `$.branch_out`: one agent writes it, so there is nothing to contest.
 
 The rendered flow uses `F.fanout{items, bind, body, join, out}` with
 `join = "all"` (every lane runs, results collect in order). To
