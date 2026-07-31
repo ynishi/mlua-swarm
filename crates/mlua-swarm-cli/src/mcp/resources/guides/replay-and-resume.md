@@ -171,13 +171,18 @@ responsibility (see the "Deferred" note below).
 
 The boot sweep only fires at process start, and the shutdown
 drain only when the server exits cleanly. Neither covers a run
-driver future that is simply **dropped** mid-flight — the client
-of a synchronous launch disconnects, the axum handler future is
-cancelled, and the driver inside it disappears. Nothing runs on a
-drop: the panic guard is for unwinds, and the TTL timeout lives
-inside the very future that went away. Such a Run stays `Running`
-with nobody left to advance it, and until the next restart it was
-not even resumable (resume only accepts `Interrupted`).
+driver that stops advancing its Run without ever reaching a
+terminal write — a driver task killed outside the panic guard, for
+instance. Such a Run stays `Running` with nobody left to advance
+it, and until the next restart it was not even resumable (resume
+only accepts `Interrupted`).
+
+Client disconnect is **not** one of those cases: every launch /
+rekick driver runs on its own spawned task, so dropping the
+request future (a `curl` timeout, an aborted tool call) drops only
+the handler's wait for the result. The run itself keeps going to
+its terminal status, and a `/v1/worker/submit` that lands after
+the disconnect is folded normally.
 
 `mse serve` therefore runs a periodic sweep alongside the server:
 

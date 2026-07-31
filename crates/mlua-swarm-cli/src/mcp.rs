@@ -22,7 +22,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::FutureExt;
-use mlua_swarm::application::{BlueprintRef, TaskApplication, TaskApplicationInput};
+use mlua_swarm::application::{
+    BlueprintRef, TaskApplication, TaskApplicationInput, TaskApplicationOutput,
+};
 use mlua_swarm::blueprint::store::{BlueprintStore, InMemoryBlueprintStore};
 use mlua_swarm::blueprint::{resolve_bound_agents, Blueprint, RunnerResolutionSource};
 use mlua_swarm::store::run::{
@@ -423,6 +425,24 @@ where
             Err(message)
         }
     }
+}
+
+/// What the spawned in-process run driver reports back to a synchronous
+/// `swarm_run` tool call: the driver owns the run to its
+/// terminal state on its own task, so an aborted tool call drops only the
+/// wait for this value.
+enum SyncRunReport {
+    /// The flow ran to completion; the payload shapes the `status: "done"`
+    /// tool body.
+    Done(Box<TaskApplicationOutput>),
+    /// The flow failed or hit the TTL ceiling — the string is the `error`
+    /// field of the `status: "failed"` tool body.
+    Failed(String),
+    /// The driver never produced an outcome (panic caught by
+    /// [`catch_in_process_run_panic`], or the driver task itself vanished).
+    /// Reported through the short body shape that carries no post-run
+    /// store snapshot.
+    Aborted(String),
 }
 
 /// Maps `operator_client::ClientError` to an `McpError` for tool responses.
@@ -3271,29 +3291,104 @@ impl MseServer {
             }));
         }
 
-        let exec = task_app.handle_with_run(input, run_ctx);
+        // Driver-lifetime fix: the driver runs in its own spawned task — same
+        // shape as the detached branch above — and this tool call only
+        // awaits its report over a `oneshot`. An aborted tool call
+        // therefore drops the wait, not the run: the driver still reaches
+        // its terminal store write, so a `/v1/worker/submit` arriving
+        // after the abort has a driver left to fold it into. The TTL
+        // ceiling stays inside the driver, so no second wait bound is
+        // needed here.
+        //
         // Panic guard — see `catch_in_process_run_panic`. A panicking driver
         // yields a structured `failed` tool response instead of unwinding the
         // tool call and leaving the Run pinned at `running`.
-        let result = match catch_in_process_run_panic(
-            &self.state,
-            &run_store,
-            &run_id,
-            &run_id_typed,
-            "mcp.launch.sync",
-            tokio::time::timeout(ttl, exec),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(message) => {
+        let (tx, rx) = tokio::sync::oneshot::channel::<SyncRunReport>();
+        let state_bg = self.state.clone();
+        let run_id_bg = run_id.clone();
+        let run_id_typed_bg = run_id_typed.clone();
+        let run_store_bg = run_store.clone();
+        let guard_state = self.state.clone();
+        let guard_run_id = run_id.clone();
+        let guard_run_id_typed = run_id_typed.clone();
+        let guard_run_store = run_store.clone();
+        tokio::spawn(async move {
+            let driver = async move {
+                let result =
+                    tokio::time::timeout(ttl, task_app.handle_with_run(input, run_ctx)).await;
+                let (status, store_status, report) = match result {
+                    Ok(Ok(out)) => (
+                        RunStatus::Done,
+                        StoreRunStatus::Done,
+                        SyncRunReport::Done(Box::new(out)),
+                    ),
+                    Ok(Err(e)) => (
+                        RunStatus::Failed,
+                        StoreRunStatus::Failed,
+                        SyncRunReport::Failed(e.to_string()),
+                    ),
+                    Err(_) => (
+                        RunStatus::Failed,
+                        StoreRunStatus::Failed,
+                        SyncRunReport::Failed(format!("timeout after {}s", ttl.as_secs())),
+                    ),
+                };
+                // Finalize the local run trace (best effort; the wire
+                // response is authoritative for the caller).
+                let _ = run_store_bg
+                    .update_status(&run_id_typed_bg, store_status)
+                    .await;
+                if let SyncRunReport::Done(out) = &report {
+                    let _ = run_store_bg
+                        .set_result(&run_id_typed_bg, out.final_ctx.clone())
+                        .await;
+                }
+                {
+                    let mut inner = state_bg.write().await;
+                    if let Some(h) = inner.runs.get_mut(&run_id_bg) {
+                        h.status = status;
+                    }
+                }
+                report
+            };
+            let report = match catch_in_process_run_panic(
+                &guard_state,
+                &guard_run_store,
+                &guard_run_id,
+                &guard_run_id_typed,
+                "mcp.launch.sync",
+                driver,
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(message) => SyncRunReport::Aborted(format!(
+                    "run driver panicked: {message}; the run was marked Interrupted"
+                )),
+            };
+            // An aborted tool call leaves no receiver; the run is already
+            // finalized, so the undeliverable report is dropped.
+            let _ = tx.send(report);
+        });
+
+        // A receive error only happens if the spawned task died without
+        // reporting — a panic outside the guard, or a runtime shutdown.
+        let report = rx.await.unwrap_or_else(|_| {
+            SyncRunReport::Aborted(
+                "run driver task ended without reporting an outcome; poll swarm_status for the \
+                 run's persisted state"
+                    .to_string(),
+            )
+        });
+        let outcome = match report {
+            SyncRunReport::Done(out) => Ok(out),
+            SyncRunReport::Failed(error) => Err(error),
+            SyncRunReport::Aborted(error) => {
                 return json_result(&serde_json::json!({
                     "run_id": run_id,
                     "task_id": task_id_typed,
                     "status": "failed",
-                    "error": format!(
-                        "run driver panicked: {message}; the run was marked Interrupted"
-                    ),
+                    "error": error,
                 }));
             }
         };
@@ -3335,65 +3430,30 @@ impl MseServer {
             })
             .unwrap_or_default();
 
-        let (status, body) = match result {
-            Ok(Ok(out)) => (
-                RunStatus::Done,
-                serde_json::json!({
-                    "run_id": run_id,
-                    "task_id": task_id_typed,
-                    "status": "done",
-                    "final_ctx": out.final_ctx,
-                    "bound_version": out.bound_version.map(|v| format!("{:?}", v)),
-                    "head": head_id,
-                    "history_len": history_len,
-                    "log_tail": log_tail,
-                }),
-            ),
-            Ok(Err(e)) => (
-                RunStatus::Failed,
-                serde_json::json!({
-                    "run_id": run_id,
-                    "task_id": task_id_typed,
-                    "status": "failed",
-                    "error": e.to_string(),
-                    "head": head_id,
-                    "history_len": history_len,
-                    "log_tail": log_tail,
-                }),
-            ),
-            Err(_) => (
-                RunStatus::Failed,
-                serde_json::json!({
-                    "run_id": run_id,
-                    "task_id": task_id_typed,
-                    "status": "failed",
-                    "error": format!("timeout after {}s", ttl.as_secs()),
-                    "head": head_id,
-                    "history_len": history_len,
-                    "log_tail": log_tail,
-                }),
-            ),
+        // The Run's own terminal state (`RunStore` + local `RunHandle`) was
+        // persisted by the driver task; what is left here is purely the
+        // wire body the caller sees.
+        let body = match outcome {
+            Ok(out) => serde_json::json!({
+                "run_id": run_id,
+                "task_id": task_id_typed,
+                "status": "done",
+                "final_ctx": out.final_ctx,
+                "bound_version": out.bound_version.map(|v| format!("{:?}", v)),
+                "head": head_id,
+                "history_len": history_len,
+                "log_tail": log_tail,
+            }),
+            Err(error) => serde_json::json!({
+                "run_id": run_id,
+                "task_id": task_id_typed,
+                "status": "failed",
+                "error": error,
+                "head": head_id,
+                "history_len": history_len,
+                "log_tail": log_tail,
+            }),
         };
-
-        // Finalize the local run trace (best effort; the wire response is
-        // authoritative for the caller).
-        let store_status = match status {
-            RunStatus::Done => StoreRunStatus::Done,
-            _ => StoreRunStatus::Failed,
-        };
-        let _ = run_store.update_status(&run_id_typed, store_status).await;
-        if matches!(status, RunStatus::Done) {
-            if let Some(fc) = body.get("final_ctx") {
-                let _ = run_store.set_result(&run_id_typed, fc.clone()).await;
-            }
-        }
-
-        {
-            let mut inner = self.state.write().await;
-            if let Some(h) = inner.runs.get_mut(&run_id) {
-                h.status = status;
-            }
-        }
         json_result(&body)
     }
 

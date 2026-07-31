@@ -709,17 +709,19 @@ const STALE_RUN_SWEEP_PERIOD: Duration = Duration::from_secs(60);
 /// `Interrupted`, so it becomes resumable via `POST /v1/runs/:id/resume`
 /// without waiting for a process restart.
 ///
-/// This covers the one lifecycle hole the boot sweep
+/// This covers the lifecycle hole the boot sweep
 /// ([`recover_interrupted_runs`]) and the shutdown drain
-/// ([`interrupt_running_on_shutdown`]) leave open: a driver future that is
-/// simply **dropped** mid-flight (the client of a synchronous launch
-/// disconnects, so the axum handler future — and the run driver inside it
-/// — is cancelled). Nothing runs on a drop: the panic guard is for
-/// unwinds, and the TTL timeout lives inside the very future that went
-/// away. Such a Run stays `Running` forever with no one left to advance
-/// it, which is exactly what `updated_at` reveals — every store write on
-/// the live path (`append_step_entry`, `set_result`, `update_status`,
-/// `try_transition`) bumps it, on both the InMemory and SQLite backends.
+/// ([`interrupt_running_on_shutdown`]) leave open: a driver that stops
+/// advancing its Run without ever reaching a terminal write. Client
+/// disconnect is no longer such a case — every launch/rekick driver runs
+/// on its own spawned task, so dropping the request
+/// future drops only the handler's wait — but a driver task that dies
+/// outside the panic guard (an abort, a panic under `panic = "abort"`)
+/// still leaves nothing behind to advance the Run. Such a Run stays
+/// `Running` forever, which is exactly what `updated_at` reveals — every
+/// store write on the live path (`append_step_entry`, `set_result`,
+/// `update_status`, `try_transition`) bumps it, on both the InMemory and
+/// SQLite backends.
 ///
 /// The status flip is a compare-and-set (`RunStore::try_transition`
 /// `Running -> Interrupted`) rather than the boot/shutdown path's direct

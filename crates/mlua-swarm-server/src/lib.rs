@@ -1028,34 +1028,43 @@ async fn tasks_start(
 ///   a session with nothing attached to serve it. Coarse by design — a
 ///   launch that cannot be cheaply determined to route through an operator
 ///   is never rejected here (Guard 2 still covers the hang in that case).
-/// - **Guard 2 (sync timeout, `504`)**: the single
-///   `state.task_app.handle_with_run` await is wrapped in
-///   `tokio::time::timeout`. Ceiling cascade, highest priority first:
-///   request `timeout_secs` (rejecting `Some(0)` with `400`), then
+/// - **Guard 2 (sync timeout, `504`)**: the `handle_with_run` driver is
+///   wrapped in `tokio::time::timeout`. Ceiling cascade, highest priority
+///   first: request `timeout_secs` (rejecting `Some(0)` with `400`), then
 ///   `AppState::sync_timeout_secs` (server config), then the built-in
 ///   default (300s). On expiry the timed-out future is dropped — this
 ///   cancels the in-process flow eval (the flow is abandoned, not
 ///   resumed; intended v1 semantics) — and the Task/Run records are
 ///   best-effort marked `Failed` so they do not stay `Running` forever.
 ///
+/// # Driver lifetime (survives client disconnect)
+///
+/// The synchronous path spawns its driver exactly like the detached one
+/// below: the eval, the Guard 2 ceiling, the panic guard and
+/// `finalize_run` all live in a `tokio::spawn`ed task, and the handler
+/// only awaits that task's verdict over a `oneshot`. A client disconnect
+/// therefore drops the *wait*, not the run — before this, dropping the
+/// request future dropped the driver with it, and any `/v1/worker/submit`
+/// that arrived afterwards was written into `EngineState` with no reader
+/// left to fold it (the Run then sat `Running` until the stale-run
+/// sweeper reaped it).
+///
 /// # GH #37 — detached launch (`detach: true`)
 ///
-/// The sync semantics above tie the flow-eval driver's lifetime to this
-/// request's future — a long-running detached worker that outlives the
-/// ceiling gets its (individually successful) `/v1/worker/*` submits
-/// orphaned when the driver is cancelled. `detach: true` decouples them:
-/// the eval (plus `finalize_run`) runs in a `tokio::spawn`ed background
-/// task whose only lifetime bound is the resolved `ttl_secs` (marked
+/// `detach: true` additionally decouples the *response* from the run: the
+/// driver's only lifetime bound is the resolved `ttl_secs` (marked
 /// `Failed` on expiry, same best-effort persistence as Guard 2), and the
-/// handler returns `202 Accepted` with `status: "running"` immediately.
-/// Guard 1 still applies (checked before any store write); Guard 2's
-/// ceiling does not (`timeout_secs` + `detach` together is a `400`).
-/// Client disconnect after the `202` cannot cancel the run.
+/// handler returns `202 Accepted` with `status: "running"` immediately
+/// instead of waiting for the terminal outcome. Guard 1 still applies
+/// (checked before any store write); Guard 2's ceiling does not
+/// (`timeout_secs` + `detach` together is a `400`).
 async fn run_flow_form(
     state: &AppState,
     req: TaskLaunchRequest,
 ) -> Result<TaskLaunchReply, ApiError> {
-    use mlua_swarm::application::{BlueprintRef as AppBlueprintRef, TaskApplicationInput};
+    use mlua_swarm::application::{
+        BlueprintRef as AppBlueprintRef, TaskApplicationInput, TaskApplicationOutput,
+    };
     use mlua_swarm::OperatorKind;
 
     // Snapshot everything the TaskRecord needs before `req.blueprint` /
@@ -1363,74 +1372,109 @@ async fn run_flow_form(
         ));
     }
 
-    // GH #33 Guard 2: the single await point this handler blocks on. On
-    // expiry the timed-out future is dropped, cancelling the in-process
-    // flow eval — the flow is abandoned, not resumed (intended v1
-    // semantics; stage-granularity resume is a coarser guarantee than
-    // this handler makes, out of scope here).
+    // GH #33 Guard 2 + driver-lifetime fix: the driver runs in its own spawned
+    // task — the same shape as the detached branch above — and this
+    // handler only awaits its verdict over a `oneshot`. What the client's
+    // connection owns is therefore the *wait*, not the run: a disconnect
+    // drops the receiver while the spawned driver keeps going to its own
+    // terminal step (`finalize_run`, or the ceiling's `Failed` marking),
+    // so a `/v1/worker/submit` arriving after the disconnect still has a
+    // driver to fold it into.
+    //
+    // Guard 2's ceiling still bounds the driver itself: on expiry the
+    // timed-out future is dropped, cancelling the in-process flow eval —
+    // the flow is abandoned, not resumed (intended v1 semantics;
+    // stage-granularity resume is a coarser guarantee than this handler
+    // makes, out of scope here). No second handler-side timeout exists:
+    // the driver self-bounds, so this await ends when the driver ends.
     //
     // Wrapped in the panic guard (`tasks::catch_run_panic`) so a panicking
     // driver returns a structured 500 with a resumable `Interrupted` Run
-    // instead of propagating into the connection task and dropping the
-    // response mid-request.
-    let timed = tasks::catch_run_panic(
-        state,
-        &task_id,
-        &run_id,
-        "launch.sync",
-        tokio::time::timeout(
-            Duration::from_secs(sync_timeout_secs),
-            state.task_app.handle_with_run(input, Some(run_ctx)),
-        ),
-    )
-    .await
-    .map_err(|msg| {
-        ApiError::engine(format!(
-            "run driver panicked: {msg}; the run was marked Interrupted and can be resumed \
-             via POST /v1/runs/{run_id}/resume"
-        ))
-    })?;
-    let outcome = match timed {
-        Ok(outcome) => outcome,
-        Err(_elapsed) => {
-            // Best effort: mark the Task/Run so they do not stay `Running`
-            // forever. Reuses the existing `Failed` variant (no new
-            // schema-crate enum additions) and stashes a reason string
-            // into `RunRecord.result_ref` — the only free-form field the
-            // Run schema carries; secondary persistence failures here are
-            // logged and swallowed, mirroring `tasks::finalize_run`'s
-            // error-path convention.
-            let reason = json!({
-                "error": format!("sync launch exceeded {sync_timeout_secs}s timeout ceiling"),
-            });
-            if let Err(e) = state.run_store.set_result(&run_id, reason).await {
-                tracing::warn!(%run_id, error = %e, "run_flow_form: timeout run set_result failed");
-            }
-            if let Err(e) = state
-                .run_store
-                .update_status(&run_id, RunStatus::Failed)
-                .await
+    // instead of unwinding the spawned task with the Run stuck `Running`.
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<TaskApplicationOutput, ApiError>>();
+    let bg_state = state.clone();
+    let bg_task_id = task_id.clone();
+    let bg_run_id = run_id.clone();
+    let guard_state = state.clone();
+    let guard_task_id = task_id.clone();
+    let guard_run_id = run_id.clone();
+    tokio::spawn(async move {
+        let driver = async move {
+            let outcome = match tokio::time::timeout(
+                Duration::from_secs(sync_timeout_secs),
+                bg_state.task_app.handle_with_run(input, Some(run_ctx)),
+            )
+            .await
             {
-                tracing::warn!(%run_id, error = %e, "run_flow_form: timeout run update_status(Failed) failed");
-            }
-            if let Err(e) = state
-                .task_store
-                .update_status(&task_id, TaskRecordStatus::Failed)
+                Ok(outcome) => outcome,
+                Err(_elapsed) => {
+                    // Best effort: mark the Task/Run so they do not stay
+                    // `Running` forever. Reuses the existing `Failed`
+                    // variant (no new schema-crate enum additions) and
+                    // stashes a reason string into `RunRecord.result_ref`
+                    // — the only free-form field the Run schema carries;
+                    // secondary persistence failures here are logged and
+                    // swallowed, mirroring `tasks::finalize_run`'s
+                    // error-path convention.
+                    let reason = json!({
+                        "error": format!("sync launch exceeded {sync_timeout_secs}s timeout ceiling"),
+                    });
+                    if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
+                        tracing::warn!(%bg_run_id, error = %e, "run_flow_form: timeout run set_result failed");
+                    }
+                    if let Err(e) = bg_state
+                        .run_store
+                        .update_status(&bg_run_id, RunStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_run_id, error = %e, "run_flow_form: timeout run update_status(Failed) failed");
+                    }
+                    if let Err(e) = bg_state
+                        .task_store
+                        .update_status(&bg_task_id, TaskRecordStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_task_id, error = %e, "run_flow_form: timeout task update_status(Failed) failed");
+                    }
+                    return Err(ApiError::timeout(format!(
+                        "sync launch exceeded {sync_timeout_secs}s timeout ceiling: the in-process flow \
+                         eval was abandoned (dropping the future cancels it); attach an operator that \
+                         acks promptly (POST /v1/operators + WS), or raise timeout_secs / sync_timeout_secs"
+                    )));
+                }
+            };
+            tasks::finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome)
                 .await
-            {
-                tracing::warn!(%task_id, error = %e, "run_flow_form: timeout task update_status(Failed) failed");
-            }
-            return Err(ApiError::timeout(format!(
-                "sync launch exceeded {sync_timeout_secs}s timeout ceiling: the in-process flow \
-                 eval was abandoned (dropping the future cancels it); attach an operator that \
-                 acks promptly (POST /v1/operators + WS), or raise timeout_secs / sync_timeout_secs"
-            )));
-        }
-    };
-
-    let out = tasks::finalize_run(state, &task_id, &run_id, outcome)
+                .map_err(flow_eval_error_to_api_error)
+        };
+        let reply = match tasks::catch_run_panic(
+            &guard_state,
+            &guard_task_id,
+            &guard_run_id,
+            "launch.sync",
+            driver,
+        )
         .await
-        .map_err(flow_eval_error_to_api_error)?;
+        {
+            Ok(reply) => reply,
+            Err(msg) => Err(ApiError::engine(format!(
+                "run driver panicked: {msg}; the run was marked Interrupted and can be resumed \
+                 via POST /v1/runs/{guard_run_id}/resume"
+            ))),
+        };
+        // A disconnected client leaves no receiver; the run is already
+        // persisted, so the undeliverable reply is dropped.
+        let _ = tx.send(reply);
+    });
+
+    // Only reachable if the spawned task died without sending — a panic
+    // outside the guard, or a runtime shutdown.
+    let out = rx.await.map_err(|_| {
+        ApiError::engine(format!(
+            "run driver task ended without reporting an outcome; see GET /v1/runs/{run_id} \
+             for the run's persisted status"
+        ))
+    })??;
 
     Ok(TaskLaunchReply(
         TaskLaunchResponse {

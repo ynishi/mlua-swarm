@@ -834,61 +834,92 @@ pub async fn task_rekick(
         ));
     }
 
-    // GH #33 Guard 2 (issue #35 ST3 — mirrors `run_flow_form`'s
-    // `lib.rs:935-990` exactly): the single await point this handler
-    // blocks on. On expiry the timed-out future is dropped, cancelling the
+    // GH #33 Guard 2 (issue #35 ST3 — mirrors `run_flow_form`'s sync
+    // branch exactly, including its driver-detach shape):
+    // the driver runs in a spawned task bounded by the sync ceiling, and
+    // this handler only awaits its verdict over a `oneshot`. A client
+    // disconnect drops the wait, not the run, so a `/v1/worker/submit`
+    // landing after the disconnect still has a driver to fold it into. On
+    // ceiling expiry the timed-out future is dropped, cancelling the
     // in-process flow eval — the flow is abandoned, not resumed. Best
     // effort: mark the Run/Task so they do not stay `Running` forever.
     // Wrapped in the panic guard (`catch_run_panic`) — same rationale as the
     // sync launch path in `crate::lib`.
-    let timed = catch_run_panic(
-        &state,
-        &task_id,
-        &run_id,
-        "rekick.sync",
-        tokio::time::timeout(
-            Duration::from_secs(sync_timeout_secs),
-            state.task_app.handle_with_run(input, Some(run_ctx)),
-        ),
-    )
-    .await
-    .map_err(|msg| {
-        ApiError::engine(format!(
-            "run driver panicked: {msg}; the run was marked Interrupted and can be resumed \
-             via POST /v1/runs/{run_id}/resume"
-        ))
-    })?;
-    let outcome = match timed {
-        Ok(outcome) => outcome,
-        Err(_elapsed) => {
-            let reason = serde_json::json!({
-                "error": format!("sync rekick exceeded {sync_timeout_secs}s timeout ceiling")
-            });
-            if let Err(e) = state.run_store.set_result(&run_id, reason).await {
-                tracing::warn!(%run_id, error = %e, "task_rekick: timeout set_result failed");
-            }
-            if let Err(e) = state
-                .run_store
-                .update_status(&run_id, RunStatus::Failed)
-                .await
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), ApiError>>();
+    let bg_state = state.clone();
+    let bg_task_id = task_id.clone();
+    let bg_run_id = run_id.clone();
+    let guard_state = state.clone();
+    let guard_task_id = task_id.clone();
+    let guard_run_id = run_id.clone();
+    tokio::spawn(async move {
+        let driver = async move {
+            let outcome = match tokio::time::timeout(
+                Duration::from_secs(sync_timeout_secs),
+                bg_state.task_app.handle_with_run(input, Some(run_ctx)),
+            )
+            .await
             {
-                tracing::warn!(%run_id, error = %e, "task_rekick: timeout run update_status failed");
-            }
-            if let Err(e) = state
-                .task_store
-                .update_status(&task_id, TaskRecordStatus::Failed)
+                Ok(outcome) => outcome,
+                Err(_elapsed) => {
+                    let reason = serde_json::json!({
+                        "error": format!("sync rekick exceeded {sync_timeout_secs}s timeout ceiling")
+                    });
+                    if let Err(e) = bg_state.run_store.set_result(&bg_run_id, reason).await {
+                        tracing::warn!(%bg_run_id, error = %e, "task_rekick: timeout set_result failed");
+                    }
+                    if let Err(e) = bg_state
+                        .run_store
+                        .update_status(&bg_run_id, RunStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_run_id, error = %e, "task_rekick: timeout run update_status failed");
+                    }
+                    if let Err(e) = bg_state
+                        .task_store
+                        .update_status(&bg_task_id, TaskRecordStatus::Failed)
+                        .await
+                    {
+                        tracing::warn!(%bg_task_id, error = %e, "task_rekick: timeout task update_status failed");
+                    }
+                    return Err(ApiError::timeout(format!(
+                        "sync rekick exceeded {sync_timeout_secs}s timeout ceiling: task {bg_task_id}, run {bg_run_id}"
+                    )));
+                }
+            };
+            finalize_run(&bg_state, &bg_task_id, &bg_run_id, outcome)
                 .await
-            {
-                tracing::warn!(%task_id, error = %e, "task_rekick: timeout task update_status failed");
-            }
-            return Err(ApiError::timeout(format!(
-                "sync rekick exceeded {sync_timeout_secs}s timeout ceiling: task {task_id}, run {run_id}"
-            )));
-        }
-    };
-    finalize_run(&state, &task_id, &run_id, outcome)
+                .map(|_| ())
+                .map_err(|e| ApiError::bad_request(format!("run: {e}")))
+        };
+        let reply = match catch_run_panic(
+            &guard_state,
+            &guard_task_id,
+            &guard_run_id,
+            "rekick.sync",
+            driver,
+        )
         .await
-        .map_err(|e| ApiError::bad_request(format!("run: {e}")))?;
+        {
+            Ok(reply) => reply,
+            Err(msg) => Err(ApiError::engine(format!(
+                "run driver panicked: {msg}; the run was marked Interrupted and can be resumed \
+                 via POST /v1/runs/{guard_run_id}/resume"
+            ))),
+        };
+        // A disconnected client leaves no receiver; the run is already
+        // persisted, so the undeliverable reply is dropped.
+        let _ = tx.send(reply);
+    });
+
+    // Only reachable if the spawned task died without sending — a panic
+    // outside the guard, or a runtime shutdown.
+    rx.await.map_err(|_| {
+        ApiError::engine(format!(
+            "run driver task ended without reporting an outcome; see GET /v1/runs/{run_id} \
+             for the run's persisted status"
+        ))
+    })??;
 
     Ok((
         StatusCode::CREATED,
