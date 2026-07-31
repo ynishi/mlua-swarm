@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0](https://github.com/ynishi/mlua-swarm/compare/v0.20.0...v0.21.0) - 2026-07-31
+
+### Added
+
+- *(engine)* [**breaking**] fold JSON container worker output as structured values by default
+
+### Fixed
+
+- *(server,mcp)* spawn sync launch drivers so client disconnect no longer drops the run
+
 ## [0.20.0](https://github.com/ynishi/mlua-swarm/compare/v0.19.0...v0.20.0) - 2026-07-30
 
 ### Added
