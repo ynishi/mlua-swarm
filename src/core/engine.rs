@@ -595,9 +595,9 @@ impl Engine {
 
     /// The closure is a **sync** `FnOnce` — you cannot pass an async
     /// closure, which enforces R3 at the type level. Exceeding `max_hold`
-    /// panics in debug builds so that R4 violations surface immediately;
-    /// release builds emit a `tracing::warn!` and continue, so a
-    /// load-dependent overrun never unwinds the caller's task.
+    /// emits a `tracing::warn!` and continues, so a load-dependent overrun
+    /// never unwinds the caller's task; set `EngineCfg::max_hold_panic`
+    /// to escalate the overrun to a panic when hunting an R3 violation.
     pub async fn with_state<F, R>(&self, op: &'static str, f: F) -> Result<R, EngineError>
     where
         F: FnOnce(&mut EngineState) -> R,
@@ -628,21 +628,24 @@ impl Engine {
         drop(guard);
 
         if elapsed_ms > cfg.max_hold_ms {
-            // R4 violation. In dev/test this is a hard failure so a long op
-            // inside the lock surfaces immediately; in release it must never
-            // take the caller's task down with it (a panic here kills the run
-            // driver future and strands the RunRecord in `Running`).
+            // R4 violation. Warn-and-continue is the default in every build:
+            // elapsed is wall-clock time, so on a loaded shared runner it
+            // includes scheduler preemption and a panic here is structurally
+            // flaky (and kills the run driver future, stranding the
+            // RunRecord in `Running`). `max_hold_panic` opts back into the
+            // hard failure for local R3-violation hunts.
             tracing::warn!(
                 op,
                 elapsed_ms = %elapsed_ms,
                 max_hold_ms = %cfg.max_hold_ms,
                 "with_state exceeded max hold — suspected R3 violation (long op inside lock)"
             );
-            #[cfg(debug_assertions)]
-            panic!(
-                "Engine.with_state('{op}') held {elapsed_ms}ms > max {}ms — suspected R3 violation (long op inside lock)",
-                cfg.max_hold_ms
-            );
+            if cfg.max_hold_panic {
+                panic!(
+                    "Engine.with_state('{op}') held {elapsed_ms}ms > max {}ms — suspected R3 violation (long op inside lock)",
+                    cfg.max_hold_ms
+                );
+            }
         }
         Ok(result)
     }
@@ -3529,20 +3532,20 @@ mod check_policy_helper_tests {
     }
 }
 
-// ─── UT: R4 max-hold guard — panic in debug, warn + continue in release ─────
+// ─── UT: R4 max-hold guard — warn + continue by default, panic on opt-in ────
 #[cfg(test)]
 mod max_hold_guard_tests {
     use super::*;
 
-    /// Debug builds keep the hard failure: an over-budget closure unwinds
-    /// with the historical message so an R3 violation is impossible to miss
-    /// in dev and test.
-    #[cfg(debug_assertions)]
+    /// `max_hold_panic = true` keeps the hard failure available: an
+    /// over-budget closure unwinds with the historical message so an R3
+    /// violation is impossible to miss during a local hunt.
     #[tokio::test]
     #[should_panic(expected = "suspected R3 violation")]
-    async fn with_state_over_max_hold_panics_in_debug() {
+    async fn with_state_over_max_hold_panics_when_opted_in() {
         let engine = Engine::new(EngineCfg {
             max_hold_ms: 0,
+            max_hold_panic: true,
             ..EngineCfg::default()
         });
         // `with_state` takes a sync `FnOnce`, so a blocking sleep is the
@@ -3554,12 +3557,13 @@ mod max_hold_guard_tests {
             .await;
     }
 
-    /// Release builds only warn: the call returns `Ok` and the caller's task
-    /// survives, which is what keeps a run driver future from being unwound
-    /// (and its RunRecord stranded in `Running`) by a load-dependent overrun.
-    #[cfg(not(debug_assertions))]
+    /// Default config only warns in every build: the call returns `Ok` and
+    /// the caller's task survives. This keeps a run driver future from being
+    /// unwound (RunRecord stranded in `Running`) and keeps CI deterministic —
+    /// wall-clock hold time on a loaded shared runner includes scheduler
+    /// preemption, which is not an R3 violation.
     #[tokio::test]
-    async fn with_state_over_max_hold_warns_and_returns_in_release() {
+    async fn with_state_over_max_hold_warns_and_returns_by_default() {
         let engine = Engine::new(EngineCfg {
             max_hold_ms: 0,
             ..EngineCfg::default()
@@ -3570,7 +3574,7 @@ mod max_hold_guard_tests {
                 42u32
             })
             .await;
-        assert_eq!(result.expect("release build must not panic"), 42);
+        assert_eq!(result.expect("default config must not panic"), 42);
     }
 }
 

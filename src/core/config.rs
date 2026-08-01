@@ -23,11 +23,20 @@ pub struct EngineCfg {
     pub backoff_ms_step: u64,
     /// R4 guard threshold: if a single `with_state` closure holds the lock
     /// longer than this (ms), `with_state` reports a long operation having
-    /// leaked inside the lock in violation of the R3 discipline — it panics
-    /// in debug builds (`debug_assertions`), and emits a `tracing::warn!`
-    /// with `op` / `elapsed_ms` / `max_hold_ms` and continues in release
-    /// builds.
+    /// leaked inside the lock in violation of the R3 discipline — it emits
+    /// a `tracing::warn!` with `op` / `elapsed_ms` / `max_hold_ms` and
+    /// continues, unless [`Self::max_hold_panic`] escalates the overrun to
+    /// a panic.
     pub max_hold_ms: u128,
+    /// When `true`, an R4 overrun panics (after the warn) instead of
+    /// continuing. Off by default in every build: the guard measures
+    /// wall-clock hold time, which on a loaded shared runner includes
+    /// scheduler preemption, so a threshold panic is structurally flaky in
+    /// CI — a trivial closure was observed held for 186ms > 50ms on a
+    /// GitHub macOS runner, and the panic killed the server under test.
+    /// Enable locally when hunting a suspected R3 violation (a long op /
+    /// blocking call leaked inside the lock).
+    pub max_hold_panic: bool,
     /// HMAC secret used by `TokenSigner` to sign/verify `CapToken`s.
     ///
     /// `Default` generates this fresh (32 random bytes from the OS RNG) on
@@ -112,6 +121,7 @@ impl Default for EngineCfg {
             max_retry: 3,
             backoff_ms_step: 10,
             max_hold_ms: 50,
+            max_hold_panic: false,
             token_secret: random_token_secret(),
             long_hold: LongHoldConfig::default(),
             max_spawn_depth: 4,
