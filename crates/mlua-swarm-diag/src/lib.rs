@@ -177,6 +177,10 @@ pub enum BpDoctorFamily {
     /// GH #78: `context_policy` / projection-root vs launch-seed
     /// cross-checks (silent `file_path: null` prevention).
     ContextPolicyLint,
+    /// Findings about the `lints` declaration itself rather than about
+    /// the Blueprint's behavior — the meta-lints `unknown-lint-kind` and
+    /// `non-suppressible-lint` (rustc's `unknown_lints` analogue).
+    LintControl,
     /// Declared `agents[].verdict` contracts nothing downstream reads —
     /// the reverse-direction verdict lint, surfaced report-only on an
     /// already-registered Blueprint (the compile stage only fires it under

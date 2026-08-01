@@ -665,17 +665,44 @@ struct BpDoctorReq {
     /// band when running against a strict 200 K-window model.
     #[serde(default)]
     disable_block: Option<bool>,
+    /// Clippy-style lint level overrides for this call — the
+    /// top-precedence layer of the three-layer cascade (this >
+    /// `agents[].lints` > `metadata.lints`). Keys are a stable lint kind
+    /// literal (`"agent-md-size"`), a
+    /// `"category:<correctness|suspicious|style|contract|migration>"`
+    /// group, or `"all"`; values are `"allow"` / `"warn"` / `"deny"`.
+    ///
+    /// Parsed leniently on both axes: an unknown key *and* an
+    /// unparseable value degrade to the `unknown-lint-kind` meta-lint —
+    /// a typo never rejects the request. `allow` moves the finding to
+    /// the response's `suppressed[]` array (omitted ≠ passed); `deny`
+    /// escalates it to the BLOCK band of the aggregate verdict, which
+    /// stays a report label (this tool never blocks anything).
+    ///
+    /// Finer-grained than the legacy `disable_*_lint` flags below: those
+    /// are family-granular and call-site-only, this is per-kind,
+    /// per-category and declarable in the Blueprint itself.
+    #[serde(default)]
+    lints: Option<BTreeMap<String, String>>,
     /// GH #45 tool_lint family (default enabled): when true, skip
     /// checking each agent profile's `tools` list against the live
     /// `mse://api/mcp-tools` registry. Set true to bypass the family
     /// when running against a Blueprint that intentionally references
     /// tool names not surfaced by the local `mse` build.
+    ///
+    /// Legacy spelling of the call-site `lints` entry
+    /// `{"tool-unknown-mcp-ref": "allow"}`, with one difference kept for
+    /// compatibility: this flag omits the family's per-agent field
+    /// entirely instead of reporting the finding under `suppressed[]`.
     #[serde(default)]
     disable_tool_lint: Option<bool>,
     /// GH #45 output_contract_lint family (default enabled): when true,
     /// skip checking each agent profile's `extras.expected_output`
     /// declaration (see GH #44 for the field convention). Set true to
     /// bypass while the convention is still being rolled out.
+    ///
+    /// Legacy spelling of `{"output-contract-missing": "allow"}` (see
+    /// `disable_tool_lint` for the one behavioral difference).
     #[serde(default)]
     disable_output_contract_lint: Option<bool>,
     /// GH #61 worker_binding_lint family (default enabled): when true,
@@ -684,6 +711,9 @@ struct BpDoctorReq {
     /// Blueprint whose operator backends genuinely do not need one (i.e.
     /// direct-LLM operators; `mse serve`'s stock WS thin-path backend
     /// requires it).
+    ///
+    /// Legacy spelling of `{"worker-binding-missing": "allow"}` (see
+    /// `disable_tool_lint` for the one behavioral difference).
     #[serde(default)]
     disable_worker_binding_lint: Option<bool>,
     /// C4 binding_lint family (default enabled): when true, skip the
@@ -692,6 +722,11 @@ struct BpDoctorReq {
     /// `legacy_worker_binding`). Set true to omit the top-level
     /// `binding_lint` section when auditing a Blueprint whose binding
     /// requirements are already understood.
+    ///
+    /// Legacy spelling of a call-site `allow` on the family's four kinds
+    /// (`binding-requirements-info`, `strict-binding-without-runners`,
+    /// `legacy-worker-binding`, `binding-resolution-error`) — see
+    /// `disable_tool_lint` for the one behavioral difference.
     #[serde(default)]
     disable_binding_lint: Option<bool>,
     /// GH #76 DSL sugar skip_on_lint family (default enabled): when true,
@@ -702,6 +737,10 @@ struct BpDoctorReq {
     /// BLOCK-disabled by default (WARN is the maximum severity ever
     /// emitted); pass `disable_skip_on_lint=true` to omit the
     /// top-level `skip_on_lint` section entirely.
+    ///
+    /// Legacy spelling of a call-site `allow` on the family's three
+    /// `skip-on-*` kinds — see `disable_tool_lint` for the one
+    /// behavioral difference.
     #[serde(default)]
     disable_skip_on_lint: Option<bool>,
     /// GH #78 context_policy_lint family (default enabled): when true,
@@ -710,6 +749,11 @@ struct BpDoctorReq {
     /// `projection_root_seed_missing`) and omit the top-level
     /// `context_policy_lint` section entirely. WARN is the maximum
     /// severity ever emitted.
+    ///
+    /// Legacy spelling of a call-site `allow` on
+    /// `context-policy-strips-projection-roots` +
+    /// `projection-root-seed-missing` — see `disable_tool_lint` for the
+    /// one behavioral difference.
     #[serde(default)]
     disable_context_policy_lint: Option<bool>,
     /// `verdict_contract_lint` family (default enabled): when true, skip
@@ -719,6 +763,10 @@ struct BpDoctorReq {
     /// WARN is the maximum severity ever emitted. Disable it for a
     /// Blueprint that deliberately declares informational verdict tokens
     /// nothing branches on.
+    ///
+    /// Legacy spelling of a call-site `allow` on
+    /// `verdict-value-unhandled` + `verdict-contract-never-read` — see
+    /// `disable_tool_lint` for the one behavioral difference.
     #[serde(default)]
     disable_verdict_contract_lint: Option<bool>,
     /// GH #78: optional simulated launch payload for the
@@ -1853,10 +1901,36 @@ fn diag_from_worker_binding_lint(
 /// walker — the two families' findings carry the same
 /// `check` / `severity` / `message` / optional `agent` shape; `check`
 /// keys map to the kebab-case registry kinds.
+///
+/// The tool itself walks the array through
+/// [`apply_findings_family_lints`] instead (a lint-suppressed finding has
+/// to leave that same array, which a project-only pass cannot express);
+/// this whole-verdict form remains as the family-level projection the
+/// per-family tests assert against.
+#[cfg(test)]
 fn diag_from_findings(
     family: mlua_swarm_diag::BpDoctorFamily,
     verdict: &serde_json::Value,
 ) -> Vec<mlua_swarm_diag::Diagnostic> {
+    let Some(findings) = verdict.get("findings").and_then(|f| f.as_array()) else {
+        return Vec::new();
+    };
+    findings
+        .iter()
+        .filter_map(|finding| diag_from_finding(family, finding))
+        .collect()
+}
+
+/// Per-entry half of [`diag_from_findings`] — projects a single
+/// `{"check", "severity", "message", "agent"?}` finding. Split out so the
+/// lint-level resolution can walk the `findings` array positionally (a
+/// suppressed finding has to be removed from that same array, which the
+/// vector-returning form cannot express). `None` = the check has no
+/// registry kind yet.
+fn diag_from_finding(
+    family: mlua_swarm_diag::BpDoctorFamily,
+    finding: &serde_json::Value,
+) -> Option<mlua_swarm_diag::Diagnostic> {
     use mlua_swarm_diag::{
         Applicability, DiagElement, DiagSpan, DiagStage, Diagnostic, DocsRef, Suggestion,
     };
@@ -1865,81 +1939,427 @@ fn diag_from_findings(
         mlua_swarm_diag::BpDoctorFamily::VerdictContractLint => "mse://guides/blueprint-authoring",
         _ => "mse://guides/operator-execution-model",
     };
-    let Some(findings) = verdict.get("findings").and_then(|f| f.as_array()) else {
+    let check = finding.get("check")?.as_str()?;
+    let kind: &'static str = match check {
+        "binding_requirements_info" => "binding-requirements-info",
+        "strict_binding_without_runners" => "strict-binding-without-runners",
+        "legacy_worker_binding" => "legacy-worker-binding",
+        "binding_resolution_error" => "binding-resolution-error",
+        "skip_on_missing_for_skip_like_verdict_value" => {
+            "skip-on-missing-for-skip-like-verdict-value"
+        }
+        "skip_on_declared_but_no_matching_verdict_value" => {
+            "skip-on-declared-but-no-matching-verdict-value"
+        }
+        "skip_on_pattern_conflicts_with_halt_on" => "skip-on-pattern-conflicts-with-halt-on",
+        "context_policy_strips_projection_roots" => "context-policy-strips-projection-roots",
+        "projection_root_seed_missing" => "projection-root-seed-missing",
+        "verdict_value_unhandled" => "verdict-value-unhandled",
+        "verdict_contract_never_read" => "verdict-contract-never-read",
+        // A future check without a registry kind is skipped
+        // rather than emitted with an undeclared kind — the
+        // old `findings` field still carries it verbatim.
+        _ => return None,
+    };
+    let severity = finding
+        .get("severity")
+        .and_then(|s| s.as_str())
+        .unwrap_or("WARN");
+    let message = finding
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or(check)
+        .to_string();
+    let span = match finding.get("agent").and_then(|a| a.as_str()) {
+        Some(agent) => diag_agent_span(agent),
+        None => DiagSpan {
+            element: DiagElement::BlueprintRoot,
+            json_path: None,
+        },
+    };
+    let mut d = Diagnostic::new(
+        kind,
+        DiagStage::BpDoctor { family },
+        diag_level_from_severity(severity),
+        message,
+    )
+    .with_docs_ref(DocsRef {
+        uri: docs_uri,
+        anchor: None,
+    })
+    .with_span(span);
+    // The per-agent "whole gate is dead" finding carries a
+    // concrete recovery: opt into a gate at the B.pipeline
+    // stage. `MaybeIncorrect` because the fix presumes the
+    // Blueprint was authored via `B.pipeline` (the common
+    // path); a hand-rolled flow needs the equivalent Branch
+    // shape by hand.
+    if kind == "verdict-contract-never-read" {
+        d = d.with_suggestion(Suggestion {
+            msg: "opt the stage into gate emission (bafe47d4 opt-in flip)".into(),
+            patch: "gate = true,".into(),
+            applicability: Applicability::MaybeIncorrect,
+        });
+    }
+    Some(d)
+}
+
+// ─── Lint level control: allow / warn / deny over three layers ────────────
+//
+// `mlua_swarm_diag::resolve_level` owns precedence (call-site > agent >
+// Blueprint, first layer with any matching key wins outright). This
+// section owns the `bp_doctor` stage contract: which kinds the stage
+// emits, how an allowed-away finding stays visible on the wire, and the
+// two meta-lints about the lints config itself.
+
+/// Every lint kind `bp_doctor` can emit, grouped by producing family —
+/// keep in sync with the `diag_from_*` helpers above.
+///
+/// This set is the stage half of the non-suppressible boundary. The
+/// boundary is stage-scoped, not kind-scoped: a compile hard error
+/// ([`mlua_swarm_diag::is_compile_hard_error`]) that appears here stays
+/// suppressible at `bp_doctor`, because this stage emits it at `Warn`
+/// (`worker-binding-missing`, `verdict-value-unhandled` — the legacy
+/// `disable_*_lint` flags already suppress them here). An exact-kind
+/// `allow` / `warn` on a compile hard error *absent* from this set can
+/// have no effect at any stage and raises `non-suppressible-lint`.
+const BP_DOCTOR_EMITTED_KINDS: &[&str] = &[
+    // agent.md size family — `diag_from_agent_md`
+    "agent-md-size",
+    // per-agent families — `diag_from_tool_lint` /
+    // `diag_from_output_contract_lint` / `diag_from_worker_binding_lint`
+    "tool-unknown-mcp-ref",
+    "output-contract-missing",
+    "worker-binding-missing",
+    // Blueprint-scoped families — `diag_from_finding`
+    "binding-requirements-info",
+    "strict-binding-without-runners",
+    "legacy-worker-binding",
+    "binding-resolution-error",
+    "skip-on-missing-for-skip-like-verdict-value",
+    "skip-on-declared-but-no-matching-verdict-value",
+    "skip-on-pattern-conflicts-with-halt-on",
+    "context-policy-strips-projection-roots",
+    "projection-root-seed-missing",
+    "verdict-value-unhandled",
+    "verdict-contract-never-read",
+];
+
+/// Inverse of [`diag_level_from_severity`]: the `bp_doctor` severity
+/// label a resolved level reports as.
+fn severity_from_diag_level(level: mlua_swarm_diag::DiagLevel) -> &'static str {
+    match level {
+        mlua_swarm_diag::DiagLevel::Error => "BLOCK",
+        mlua_swarm_diag::DiagLevel::Warn => "WARN",
+        mlua_swarm_diag::DiagLevel::Info => "INFO",
+    }
+}
+
+/// Bridges the schema's author-facing enum onto the diag crate's twin —
+/// the diag crate depends on no other mlua-swarm crate, so the consumer
+/// maps one onto the other.
+fn diag_lint_setting(setting: mlua_swarm_schema::LintSetting) -> mlua_swarm_diag::LintSetting {
+    match setting {
+        mlua_swarm_schema::LintSetting::Allow => mlua_swarm_diag::LintSetting::Allow,
+        mlua_swarm_schema::LintSetting::Warn => mlua_swarm_diag::LintSetting::Warn,
+        mlua_swarm_schema::LintSetting::Deny => mlua_swarm_diag::LintSetting::Deny,
+    }
+}
+
+/// What the declared layers say about one finding.
+enum LintOutcome {
+    /// Allowed away by the named layer (`"call-site"` / `"agent:<name>"`
+    /// / `"blueprint"`) — the finding moves to the response's
+    /// `suppressed[]` array and folds into nothing.
+    Suppressed {
+        /// The layer whose key matched.
+        source: String,
+    },
+    /// The finding fires at this level.
+    Reported {
+        /// The declared override, or the level the producing family
+        /// emitted the finding at when no layer spoke.
+        level: mlua_swarm_diag::DiagLevel,
+    },
+}
+
+/// The three declared lint layers of one `bp_doctor` invocation.
+struct LintLayers {
+    /// `BpDoctorReq.lints` — top precedence, untyped (lenient) input.
+    call_site: mlua_swarm_diag::LintConfig,
+    /// `metadata.lints` — Blueprint-wide, lowest precedence.
+    blueprint: mlua_swarm_diag::LintConfig,
+    /// `agents[].lints`, keyed by agent name. Applies only to findings
+    /// spanning that agent (or a step referencing it).
+    per_agent: BTreeMap<String, mlua_swarm_diag::LintConfig>,
+}
+
+impl LintLayers {
+    /// Build all three layers for one invocation. The call-site map is
+    /// parsed leniently (an unknown key or an unparseable value becomes a
+    /// meta-lint, never a rejected request); the two Blueprint-declared
+    /// layers arrive already typed by serde and only need the key check.
+    fn new(call_site: Option<&BTreeMap<String, String>>, bp: &Blueprint) -> Self {
+        use mlua_swarm_diag::LintConfig;
+        let to_pairs = |map: &BTreeMap<String, mlua_swarm_schema::LintSetting>| {
+            LintConfig::from_pairs(
+                map.iter()
+                    .map(|(key, setting)| (key.clone(), diag_lint_setting(*setting)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        Self {
+            call_site: call_site.map(LintConfig::from_str_map).unwrap_or_default(),
+            blueprint: bp.metadata.lints.as_ref().map(to_pairs).unwrap_or_default(),
+            per_agent: bp
+                .agents
+                .iter()
+                .filter_map(|agent| Some((agent.name.clone(), to_pairs(agent.lints.as_ref()?))))
+                .collect(),
+        }
+    }
+
+    /// The layers applying to a finding scoped to `agent`, most specific
+    /// first — the order [`mlua_swarm_diag::resolve_level`] documents.
+    /// The per-agent layer is present only for a finding that spans that
+    /// agent.
+    fn layers_for(&self, agent: Option<&str>) -> Vec<(String, &mlua_swarm_diag::LintConfig)> {
+        let mut layers: Vec<(String, &mlua_swarm_diag::LintConfig)> = Vec::with_capacity(3);
+        layers.push(("call-site".to_string(), &self.call_site));
+        if let Some((name, cfg)) =
+            agent.and_then(|name| self.per_agent.get(name).map(|cfg| (name, cfg)))
+        {
+            layers.push((format!("agent:{name}"), cfg));
+        }
+        layers.push(("blueprint".to_string(), &self.blueprint));
+        layers
+    }
+
+    /// Every declared layer with its source label, for the meta-lints
+    /// (which are about the config, not about any one finding).
+    fn declared_layers(&self) -> Vec<(String, &mlua_swarm_diag::LintConfig)> {
+        let mut layers = vec![("call-site".to_string(), &self.call_site)];
+        layers.extend(
+            self.per_agent
+                .iter()
+                .map(|(name, cfg)| (format!("agent:{name}"), cfg)),
+        );
+        layers.push(("blueprint".to_string(), &self.blueprint));
+        layers
+    }
+
+    /// Resolve one finding of `kind`, scoped to `agent` when it has one.
+    ///
+    /// `stage_level` is the level the producing family emitted the
+    /// finding at and is what survives when no layer declares anything:
+    /// [`mlua_swarm_diag::resolve_level`]'s own fallback is the *registry
+    /// default*, which for a dual-stage kind is the compile level
+    /// (`Error` for `worker-binding-missing`) rather than the report-only
+    /// level this stage uses. Probing for a declaring layer first also
+    /// yields the `source` label a suppressed finding is reported under.
+    fn resolve(
+        &self,
+        kind: &str,
+        agent: Option<&str>,
+        stage_level: mlua_swarm_diag::DiagLevel,
+    ) -> LintOutcome {
+        let Some(decl) = mlua_swarm_diag::lint_decl(kind) else {
+            return LintOutcome::Reported { level: stage_level };
+        };
+        let layers = self.layers_for(agent);
+        let Some(source) = layers
+            .iter()
+            .find(|(_, cfg)| cfg.setting_for(decl).is_some())
+            .map(|(source, _)| source.clone())
+        else {
+            return LintOutcome::Reported { level: stage_level };
+        };
+        let configs: Vec<&mlua_swarm_diag::LintConfig> =
+            layers.iter().map(|(_, cfg)| *cfg).collect();
+        match mlua_swarm_diag::resolve_level(decl, &configs) {
+            mlua_swarm_diag::ResolvedLint::Suppressed => LintOutcome::Suppressed { source },
+            mlua_swarm_diag::ResolvedLint::Level(level) => LintOutcome::Reported { level },
+        }
+    }
+
+    /// The meta-lints about the config itself, walked layer by layer:
+    /// `unknown-lint-kind` (one per key no layer could honor — unknown
+    /// key or unparseable value) and `non-suppressible-lint` (one per
+    /// exact-kind `allow` / `warn` that can have no effect at any stage,
+    /// see [`BP_DOCTOR_EMITTED_KINDS`]). `category:` / `all` keys never
+    /// raise the latter: addressing whole sets is expected to cover kinds
+    /// this stage never emits. Both fold as `Warn`.
+    fn meta_diagnostics(&self) -> Vec<mlua_swarm_diag::Diagnostic> {
+        let mut out = Vec::new();
+        for (source, cfg) in self.declared_layers() {
+            for key in cfg.unknown_keys() {
+                out.push(meta_lint_diagnostic(
+                    "unknown-lint-kind",
+                    &source,
+                    format!(
+                        "lints key '{key}' matches no lint kind, no 'category:<cat>' group and is \
+                         not 'all' (or its value is not allow/warn/deny) — the entry has no effect"
+                    ),
+                ));
+            }
+            for (key, setting) in cfg.entries() {
+                if matches!(setting, mlua_swarm_diag::LintSetting::Deny) {
+                    continue;
+                }
+                let Some(decl) = mlua_swarm_diag::lint_decl(key) else {
+                    continue;
+                };
+                if mlua_swarm_diag::is_compile_hard_error(decl)
+                    && !BP_DOCTOR_EMITTED_KINDS.contains(&decl.kind)
+                {
+                    out.push(meta_lint_diagnostic(
+                        "non-suppressible-lint",
+                        &source,
+                        format!(
+                            "lints key '{key}' targets a compile-stage hard error that bp_doctor \
+                             never emits — the setting is ignored at every stage"
+                        ),
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One meta-lint diagnostic. Blueprint-scoped span: the finding is about
+/// the `lints` declaration, not about any Blueprint element, and the
+/// declaring layer is named in a note (`"declared by: agent:planner"`).
+fn meta_lint_diagnostic(
+    kind: &'static str,
+    source: &str,
+    message: String,
+) -> mlua_swarm_diag::Diagnostic {
+    use mlua_swarm_diag::{
+        BpDoctorFamily, DiagElement, DiagLevel, DiagSpan, DiagStage, Diagnostic, DocsRef,
+    };
+    Diagnostic::new(
+        kind,
+        DiagStage::BpDoctor {
+            family: BpDoctorFamily::LintControl,
+        },
+        DiagLevel::Warn,
+        message,
+    )
+    .with_note(format!("declared by: {source}"))
+    .with_docs_ref(DocsRef {
+        uri: "mse://guides/lint-diagnostic-model",
+        anchor: None,
+    })
+    .with_span(DiagSpan {
+        element: DiagElement::BlueprintRoot,
+        json_path: None,
+    })
+}
+
+/// Route one built diagnostic through the declared layers. Returns it at
+/// its resolved level, or `None` when a layer allowed it away — in which
+/// case a `{kind, span, source, message}` record is appended to
+/// `suppressed`, so an allowed finding stays visible (omitted ≠ passed).
+fn resolve_diagnostic(
+    layers: &LintLayers,
+    suppressed: &mut Vec<JsonValue>,
+    agent: Option<&str>,
+    mut d: mlua_swarm_diag::Diagnostic,
+) -> Option<mlua_swarm_diag::Diagnostic> {
+    match layers.resolve(d.kind, agent, d.level) {
+        LintOutcome::Suppressed { source } => {
+            suppressed.push(serde_json::json!({
+                "kind": d.kind,
+                "span": d.span,
+                "source": source,
+                "message": d.message,
+            }));
+            None
+        }
+        LintOutcome::Reported { level } => {
+            d.level = level;
+            Some(d)
+        }
+    }
+}
+
+/// Resolve one per-agent family verdict object (`tool_lint` /
+/// `output_contract_lint` / `worker_binding_lint`) in place.
+///
+/// The object stays on the agent entry either way — its measurements are
+/// still true — but its `severity` reports the resolved outcome: `OK`
+/// when a layer allowed the finding away (the finding itself moves to
+/// `suppressed[]`), `BLOCK` under `deny`. `built = None` means the family
+/// verdict was already `OK` and there is nothing to resolve.
+fn apply_agent_family_lints(
+    verdict: &mut JsonValue,
+    agent: &str,
+    built: Option<mlua_swarm_diag::Diagnostic>,
+    layers: &LintLayers,
+    suppressed: &mut Vec<JsonValue>,
+    diagnostics: &mut Vec<mlua_swarm_diag::Diagnostic>,
+) {
+    let Some(built) = built else {
+        return;
+    };
+    let severity = match resolve_diagnostic(layers, suppressed, Some(agent), built) {
+        Some(d) => {
+            let severity = severity_from_diag_level(d.level);
+            diagnostics.push(d);
+            severity
+        }
+        None => "OK",
+    };
+    if let Some(obj) = verdict.as_object_mut() {
+        obj.insert("severity".to_string(), JsonValue::from(severity));
+    }
+}
+
+/// Resolve one Blueprint-scoped `{"findings": [...]}` family verdict in
+/// place: allowed findings are removed from the array (and recorded in
+/// `suppressed`), the rest carry their resolved severity label and feed
+/// `diagnostics`. A finding whose `check` has no registry kind yet is
+/// carried verbatim — no kind, no lint control.
+///
+/// Returns the retained severities in array order, for the aggregate
+/// verdict fold.
+fn apply_findings_family_lints(
+    family: mlua_swarm_diag::BpDoctorFamily,
+    verdict: &mut JsonValue,
+    layers: &LintLayers,
+    suppressed: &mut Vec<JsonValue>,
+    diagnostics: &mut Vec<mlua_swarm_diag::Diagnostic>,
+) -> Vec<String> {
+    let Some(findings) = verdict.get_mut("findings").and_then(|f| f.as_array_mut()) else {
         return Vec::new();
     };
-    findings
-        .iter()
-        .filter_map(|finding| {
-            let check = finding.get("check")?.as_str()?;
-            let kind: &'static str = match check {
-                "binding_requirements_info" => "binding-requirements-info",
-                "strict_binding_without_runners" => "strict-binding-without-runners",
-                "legacy_worker_binding" => "legacy-worker-binding",
-                "binding_resolution_error" => "binding-resolution-error",
-                "skip_on_missing_for_skip_like_verdict_value" => {
-                    "skip-on-missing-for-skip-like-verdict-value"
-                }
-                "skip_on_declared_but_no_matching_verdict_value" => {
-                    "skip-on-declared-but-no-matching-verdict-value"
-                }
-                "skip_on_pattern_conflicts_with_halt_on" => {
-                    "skip-on-pattern-conflicts-with-halt-on"
-                }
-                "context_policy_strips_projection_roots" => {
-                    "context-policy-strips-projection-roots"
-                }
-                "projection_root_seed_missing" => "projection-root-seed-missing",
-                "verdict_value_unhandled" => "verdict-value-unhandled",
-                "verdict_contract_never_read" => "verdict-contract-never-read",
-                // A future check without a registry kind is skipped
-                // rather than emitted with an undeclared kind — the
-                // old `findings` field still carries it verbatim.
-                _ => return None,
-            };
-            let severity = finding
-                .get("severity")
-                .and_then(|s| s.as_str())
-                .unwrap_or("WARN");
-            let message = finding
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or(check)
-                .to_string();
-            let span = match finding.get("agent").and_then(|a| a.as_str()) {
-                Some(agent) => diag_agent_span(agent),
-                None => DiagSpan {
-                    element: DiagElement::BlueprintRoot,
-                    json_path: None,
-                },
-            };
-            let mut d = Diagnostic::new(
-                kind,
-                DiagStage::BpDoctor { family },
-                diag_level_from_severity(severity),
-                message,
-            )
-            .with_docs_ref(DocsRef {
-                uri: docs_uri,
-                anchor: None,
-            })
-            .with_span(span);
-            // The per-agent "whole gate is dead" finding carries a
-            // concrete recovery: opt into a gate at the B.pipeline
-            // stage. `MaybeIncorrect` because the fix presumes the
-            // Blueprint was authored via `B.pipeline` (the common
-            // path); a hand-rolled flow needs the equivalent Branch
-            // shape by hand.
-            if kind == "verdict-contract-never-read" {
-                d = d.with_suggestion(Suggestion {
-                    msg: "opt the stage into gate emission (bafe47d4 opt-in flip)".into(),
-                    patch: "gate = true,".into(),
-                    applicability: Applicability::MaybeIncorrect,
-                });
+    let mut severities = Vec::with_capacity(findings.len());
+    let mut retained = Vec::with_capacity(findings.len());
+    for mut finding in std::mem::take(findings) {
+        let Some(built) = diag_from_finding(family, &finding) else {
+            if let Some(sev) = finding.get("severity").and_then(|s| s.as_str()) {
+                severities.push(sev.to_string());
             }
-            Some(d)
-        })
-        .collect()
+            retained.push(finding);
+            continue;
+        };
+        let agent = finding
+            .get("agent")
+            .and_then(|a| a.as_str())
+            .map(String::from);
+        if let Some(d) = resolve_diagnostic(layers, suppressed, agent.as_deref(), built) {
+            let severity = severity_from_diag_level(d.level);
+            if let Some(obj) = finding.as_object_mut() {
+                obj.insert("severity".to_string(), JsonValue::from(severity));
+            }
+            severities.push(severity.to_string());
+            diagnostics.push(d);
+            retained.push(finding);
+        }
+    }
+    *findings = retained;
+    severities
 }
 
 /// Builds the [`WRAPPER_ONLY_CONTRACT_TOOLS`] allow-list as a `BTreeSet`,
@@ -4100,7 +4520,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Per-Blueprint agent.md size check plus GH #45 contract lints and GH #61 worker_binding lint. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline. GH #45: each agent entry also carries `tool_lint` (phantom MCP tool refs — profile.tools entries with the `mcp__mse__` prefix are compared against the live `mse://api/mcp-tools` registry; unknown names surface as WARN with the unknown tool list) and `output_contract_lint` (absent or malformed `profile.extras.expected_output` under the GH #44 convention surfaces as WARN with a specific reason). GH #61: each operator-kind agent additionally carries `worker_binding_lint` (missing `profile.worker_binding` surfaces as WARN — same fail-loud condition `Compiler::compile` enforces at dispatch, retroactively surfaced on already-registered Blueprints); non-operator kinds are OK and carry `kind_requires_binding: false`. Any per-agent family can be disabled per call via `disable_tool_lint` / `disable_output_contract_lint` / `disable_worker_binding_lint`; the disabled family's field is omitted entirely from each entry (not `null`) so a caller cannot mistake a disabled family for a passed check. C4: a Blueprint-scoped `binding_lint` family (default enabled; disable via `disable_binding_lint`) is attached as a top-level `binding_lint.findings` array (omitted entirely when disabled) — advisory operator-binding checks: `binding_requirements_info` (INFO — one finding per Runner-backed agent listing the launch variant / tools / model a joining operator's capability_manifest must cover, identical to GET /v1/blueprints/:id/binding-requirements), `strict_binding_without_runners` (WARN — strategy.strict_binding is true but no agent resolves to a Runner, so strict is a no-op), and `legacy_worker_binding` (WARN — an agent's Runner came from the deprecated profile.worker_binding fallback; migrate to runner / runner_ref). The aggregate verdict folds size + tool + contract + worker_binding + binding_lint-WARN severities via the same OK/WARN/BLOCK precedence (binding_lint INFO findings never escalate the verdict). GH #79 Phase 3: the response additionally carries a top-level `diagnostics: [...]` array — the unified Clippy-style projection of every finding across every family (`mlua-swarm-diag` `Diagnostic` wire shape: stable `kind`, `stage {type, family}`, `level`, `message`/`notes`/`help`, optional `suggestion {msg, patch, applicability}`, `docs_ref`, `span`). Additive alongside the family-specific fields above (which remain authoritative for current callers and are slated for removal in a future major bump); an OK verdict contributes no diagnostics entry, so an all-clear Blueprint reports `diagnostics: []`. Lint kinds and the add-a-lint recipe: `mse://guides/lint-diagnostic-model`. GH #78: a Blueprint-scoped `context_policy_lint` family (default enabled; disable via `disable_context_policy_lint`) is attached as a top-level `context_policy_lint.findings` array — front-loads the silent `file_path: null` failure: `context_policy_strips_projection_roots` (WARN — an agent's effective context_policy filters out both `work_dir` and `project_root`, so the projection root can never resolve) and, only when the caller passes `simulated_launch` (an object whose `project_root` / `work_dir` string fields mirror the canonical launch seed; pass `{}` to simulate a seedless launch), `projection_root_seed_missing` (WARN — no seeded field survives the agent's policy, so materialized step reads will return `content_url`-only). WARN-only family; its findings fold into the aggregate verdict and the `diagnostics` array like every other family. A Blueprint-scoped `verdict_contract_lint` family (default enabled; disable via `disable_verdict_contract_lint`) is attached as a top-level `verdict_contract_lint.findings` array — `verdict_value_unhandled` (WARN — an `agents[].verdict.values` entry that no downstream Branch/Loop cond ever compares against). This is the reader-visible surface for the reverse-direction check `Compiler::compile` already runs but only reports as a `tracing::warn!` outside `metadata.strict_verdict_handling`. It front-loads the decorative-contract failure: a flow with no Branch at all still compiles with a `channel: \"body\"` contract on every gate, and `channel: \"body\"` additionally constrains the step's terminal OUTPUT value to be one of the declared tokens — so a gate that returns a report body has its `Final` rejected at completion time and the attempt fails far from the declaration that caused it. Findings carry `agent` / `value` / `channel` / `declared_values` / `step_ref`, and the body-channel message names that OUTPUT-shape consequence. The family also emits a per-agent aggregate finding `verdict_contract_never_read` (WARN, one per agent whose entire declared `verdict.values` set is unread — the \"whole gate is dead\" reading, separated from the per-value baseline so a full gate loss is not hidden by the always-unread PASS token; carries a concrete `gate = true` suggestion for the B.pipeline authoring path). Aggregate findings appear first in `findings[]`; both views coexist and both fold into `verdict_contract_lint_warn_count`. WARN-only; folds into the aggregate verdict and `diagnostics` like every other family."
+        description = "Per-Blueprint agent.md size check plus GH #45 contract lints and GH #61 worker_binding lint. Fetches the Blueprint head from GET /v1/blueprints/:id/head and inspects every agent's profile.system_prompt (= the body that will be pushed to the SubAgent context via fetch). Reports per-agent bytes / lines / severity (OK|WARN|BLOCK) plus an aggregate verdict. The verdict is a report label only — this tool never blocks any dispatch. Default thresholds (`mse://guides/agent-md-authoring §Size targets`): WARN at ≥ 25 KB or ≥ 200 lines, BLOCK at ≥ 50 KB or ≥ 500 lines. BLOCK is disabled by default; callers targeting a strict 200 K-window model can pass `disable_block=false` to opt into the BLOCK band. Any threshold can also be overridden per call. Agents without a profile (RustFn / spec-only) are reported with severity OK and bytes/lines 0. GH #31: each agent entry additionally carries `last_rendered_bytes` (the live, most-recently-baked post-render size from GET /v1/agents/:name/render-size — `null` when never dispatched, an N+1-per-agent HTTP cost this operator-diagnostic tool accepts) and, only once that value crosses the same `warn_bytes` threshold, a `delivery: \"system_ref\"` note (omitted entirely, not false/null, when under threshold) flagging that this agent's prompt is delivered by-reference rather than inline. GH #45: each agent entry also carries `tool_lint` (phantom MCP tool refs — profile.tools entries with the `mcp__mse__` prefix are compared against the live `mse://api/mcp-tools` registry; unknown names surface as WARN with the unknown tool list) and `output_contract_lint` (absent or malformed `profile.extras.expected_output` under the GH #44 convention surfaces as WARN with a specific reason). GH #61: each operator-kind agent additionally carries `worker_binding_lint` (missing `profile.worker_binding` surfaces as WARN — same fail-loud condition `Compiler::compile` enforces at dispatch, retroactively surfaced on already-registered Blueprints); non-operator kinds are OK and carry `kind_requires_binding: false`. Any per-agent family can be disabled per call via `disable_tool_lint` / `disable_output_contract_lint` / `disable_worker_binding_lint`; the disabled family's field is omitted entirely from each entry (not `null`) so a caller cannot mistake a disabled family for a passed check. C4: a Blueprint-scoped `binding_lint` family (default enabled; disable via `disable_binding_lint`) is attached as a top-level `binding_lint.findings` array (omitted entirely when disabled) — advisory operator-binding checks: `binding_requirements_info` (INFO — one finding per Runner-backed agent listing the launch variant / tools / model a joining operator's capability_manifest must cover, identical to GET /v1/blueprints/:id/binding-requirements), `strict_binding_without_runners` (WARN — strategy.strict_binding is true but no agent resolves to a Runner, so strict is a no-op), and `legacy_worker_binding` (WARN — an agent's Runner came from the deprecated profile.worker_binding fallback; migrate to runner / runner_ref). The aggregate verdict folds size + tool + contract + worker_binding + binding_lint-WARN severities via the same OK/WARN/BLOCK precedence (binding_lint INFO findings never escalate the verdict). GH #79 Phase 3: the response additionally carries a top-level `diagnostics: [...]` array — the unified Clippy-style projection of every finding across every family (`mlua-swarm-diag` `Diagnostic` wire shape: stable `kind`, `stage {type, family}`, `level`, `message`/`notes`/`help`, optional `suggestion {msg, patch, applicability}`, `docs_ref`, `span`). Additive alongside the family-specific fields above (which remain authoritative for current callers and are slated for removal in a future major bump); an OK verdict contributes no diagnostics entry, so an all-clear Blueprint reports `diagnostics: []`. Lint kinds and the add-a-lint recipe: `mse://guides/lint-diagnostic-model`. GH #78: a Blueprint-scoped `context_policy_lint` family (default enabled; disable via `disable_context_policy_lint`) is attached as a top-level `context_policy_lint.findings` array — front-loads the silent `file_path: null` failure: `context_policy_strips_projection_roots` (WARN — an agent's effective context_policy filters out both `work_dir` and `project_root`, so the projection root can never resolve) and, only when the caller passes `simulated_launch` (an object whose `project_root` / `work_dir` string fields mirror the canonical launch seed; pass `{}` to simulate a seedless launch), `projection_root_seed_missing` (WARN — no seeded field survives the agent's policy, so materialized step reads will return `content_url`-only). WARN-only family; its findings fold into the aggregate verdict and the `diagnostics` array like every other family. A Blueprint-scoped `verdict_contract_lint` family (default enabled; disable via `disable_verdict_contract_lint`) is attached as a top-level `verdict_contract_lint.findings` array — `verdict_value_unhandled` (WARN — an `agents[].verdict.values` entry that no downstream Branch/Loop cond ever compares against). This is the reader-visible surface for the reverse-direction check `Compiler::compile` already runs but only reports as a `tracing::warn!` outside `metadata.strict_verdict_handling`. It front-loads the decorative-contract failure: a flow with no Branch at all still compiles with a `channel: \"body\"` contract on every gate, and `channel: \"body\"` additionally constrains the step's terminal OUTPUT value to be one of the declared tokens — so a gate that returns a report body has its `Final` rejected at completion time and the attempt fails far from the declaration that caused it. Findings carry `agent` / `value` / `channel` / `declared_values` / `step_ref`, and the body-channel message names that OUTPUT-shape consequence. The family also emits a per-agent aggregate finding `verdict_contract_never_read` (WARN, one per agent whose entire declared `verdict.values` set is unread — the \"whole gate is dead\" reading, separated from the per-value baseline so a full gate loss is not hidden by the always-unread PASS token; carries a concrete `gate = true` suggestion for the B.pipeline authoring path). Aggregate findings appear first in `findings[]`; both views coexist and both fold into `verdict_contract_lint_warn_count`. WARN-only; folds into the aggregate verdict and `diagnostics` like every other family. Lint level control (Clippy-style `allow` / `warn` / `deny`): every finding of every family above is resolved against three declared layers before it folds into the verdict — the call-site `lints` request field (top precedence), `agents[].lints` (applies only to findings spanning that agent), and `metadata.lints` (Blueprint-wide). The first layer with any matching key wins outright, no merging across layers (rustc's attribute-proximity model); within one layer an exact kind key (`\"agent-md-size\"`) beats a `\"category:<correctness|suspicious|style|contract|migration>\"` group, which beats `\"all\"`. `allow` moves the finding to the new always-present top-level `suppressed: [{kind, span, source, message}]` array (`source` is `\"call-site\"` / `\"agent:<name>\"` / `\"blueprint\"`) — it leaves its family surface and `diagnostics[]` and folds into nothing, but is never silently dropped, the same \"omitted ≠ passed\" discipline the per-family disable flags follow; an empty `suppressed[]` is the nothing-was-allowed reading. `deny` escalates a finding to `DiagLevel::Error` in `diagnostics[]` and to the BLOCK band of the aggregate verdict — including for WARN-only families — and the verdict stays a report label: this tool still blocks nothing. Per-agent surfaces keep their measurements either way and report the resolved band in their own `severity` (an allowed `agent-md-size` finding leaves the agent entry with its real bytes/lines and `severity: \"OK\"`); Blueprint-scoped `findings[]` arrays drop the allowed entries. Two meta-lints about the `lints` config itself land in `diagnostics[]` and fold as WARN: `unknown-lint-kind` (a key matching no kind, no category group and not `all`, or a call-site value that is not allow/warn/deny — a typo degrades to this, it never rejects the request; the note names the declaring layer) and `non-suppressible-lint` (an exact-kind `allow`/`warn` on a compile-stage hard error this tool never emits, e.g. `duplicate-agent-name`, where the setting cannot have any effect anywhere; `category:` / `all` keys never raise it). Full grammar and the recipe: `mse://guides/lint-diagnostic-model`."
     )]
     async fn bp_doctor(
         &self,
@@ -4160,6 +4580,15 @@ impl MseServer {
         let disable_context_policy_lint = req.disable_context_policy_lint.unwrap_or(false);
         let disable_verdict_contract_lint = req.disable_verdict_contract_lint.unwrap_or(false);
 
+        // Clippy-style lint level control: the call-site `lints` field,
+        // `agents[].lints` and `metadata.lints` resolve every finding
+        // below before it folds into the verdict. An allowed finding is
+        // removed from its family surface and re-surfaces in
+        // `suppressed[]` — always present (empty when nothing was
+        // allowed) so callers can rely on the key.
+        let lint_layers = LintLayers::new(req.lints.as_ref(), &bp);
+        let mut suppressed: Vec<JsonValue> = Vec::new();
+
         let mut per_agent = Vec::with_capacity(bp.agents.len());
         let mut severities: Vec<&'static str> = Vec::with_capacity(bp.agents.len());
         // GH #79 Phase 3: the unified `diagnostics` projection,
@@ -4178,9 +4607,30 @@ impl MseServer {
                 Some(p) => (p.system_prompt.len(), p.system_prompt.lines().count()),
                 None => (0usize, 0usize),
             };
-            let severity = classify_agent_md_severity(bytes, lines, &thresholds);
+            // The measured band, then the band after lint resolution: the
+            // entry keeps its raw bytes/lines either way, but `severity`
+            // reports the resolved outcome (`OK` when a layer allowed the
+            // size finding away, `BLOCK` under `deny`).
+            let measured = classify_agent_md_severity(bytes, lines, &thresholds);
+            let severity = match diag_from_agent_md(&agent.name, measured, bytes, lines) {
+                None => measured,
+                Some(built) => {
+                    match resolve_diagnostic(
+                        &lint_layers,
+                        &mut suppressed,
+                        Some(&agent.name),
+                        built,
+                    ) {
+                        Some(d) => {
+                            let severity = severity_from_diag_level(d.level);
+                            diagnostics.push(d);
+                            severity
+                        }
+                        None => "OK",
+                    }
+                }
+            };
             severities.push(severity);
-            diagnostics.extend(diag_from_agent_md(&agent.name, severity, bytes, lines));
 
             // GH #31: live post-render size lookup, reusing the same
             // `bind`/`client` already constructed above.
@@ -4234,8 +4684,16 @@ impl MseServer {
                     .as_ref()
                     .map(|p| p.tools.as_slice())
                     .unwrap_or(&[]);
-                let tool_lint = classify_tool_lint(tools_ref, &tool_registry);
-                diagnostics.extend(diag_from_tool_lint(&agent.name, &tool_lint));
+                let mut tool_lint = classify_tool_lint(tools_ref, &tool_registry);
+                let built = diag_from_tool_lint(&agent.name, &tool_lint);
+                apply_agent_family_lints(
+                    &mut tool_lint,
+                    &agent.name,
+                    built,
+                    &lint_layers,
+                    &mut suppressed,
+                    &mut diagnostics,
+                );
                 if let Some(sev) = tool_lint.get("severity").and_then(|v| v.as_str()) {
                     tool_lint_severities.push(sev.to_string());
                 }
@@ -4250,8 +4708,16 @@ impl MseServer {
                     .map(|p| &p.extras)
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let contract_lint = classify_output_contract_lint(&extras);
-                diagnostics.extend(diag_from_output_contract_lint(&agent.name, &contract_lint));
+                let mut contract_lint = classify_output_contract_lint(&extras);
+                let built = diag_from_output_contract_lint(&agent.name, &contract_lint);
+                apply_agent_family_lints(
+                    &mut contract_lint,
+                    &agent.name,
+                    built,
+                    &lint_layers,
+                    &mut suppressed,
+                    &mut diagnostics,
+                );
                 if let Some(sev) = contract_lint.get("severity").and_then(|v| v.as_str()) {
                     output_contract_lint_severities.push(sev.to_string());
                 }
@@ -4264,8 +4730,16 @@ impl MseServer {
                     .profile
                     .as_ref()
                     .and_then(|p| p.worker_binding.as_deref());
-                let wb_lint = classify_worker_binding_lint(&agent.kind, wb);
-                diagnostics.extend(diag_from_worker_binding_lint(&agent.name, &wb_lint));
+                let mut wb_lint = classify_worker_binding_lint(&agent.kind, wb);
+                let built = diag_from_worker_binding_lint(&agent.name, &wb_lint);
+                apply_agent_family_lints(
+                    &mut wb_lint,
+                    &agent.name,
+                    built,
+                    &lint_layers,
+                    &mut suppressed,
+                    &mut diagnostics,
+                );
                 if let Some(sev) = wb_lint.get("severity").and_then(|v| v.as_str()) {
                     worker_binding_lint_severities.push(sev.to_string());
                 }
@@ -4284,23 +4758,22 @@ impl MseServer {
         // the per-agent families' conditional-presence convention). Its
         // WARN findings feed the aggregate verdict; INFO findings do not
         // (they are informational manifest requirements, not defects).
-        let binding_lint = (!disable_binding_lint).then(|| classify_binding_lint(&bp));
-        if let Some(b) = &binding_lint {
-            diagnostics.extend(diag_from_findings(
-                mlua_swarm_diag::BpDoctorFamily::BindingLint,
-                b,
-            ));
-        }
+        //
+        // Blueprint-scoped findings resolve against the call-site and
+        // Blueprint layers (plus the per-agent layer for a finding that
+        // names an agent); an allowed finding leaves `findings[]`
+        // entirely and re-surfaces in `suppressed[]`.
+        let mut binding_lint = (!disable_binding_lint).then(|| classify_binding_lint(&bp));
         let binding_lint_severities: Vec<String> = binding_lint
-            .as_ref()
-            .and_then(|b| b.get("findings"))
-            .and_then(|f| f.as_array())
-            .map(|findings| {
-                findings
-                    .iter()
-                    .filter_map(|f| f.get("severity").and_then(|s| s.as_str()))
-                    .map(|s| s.to_string())
-                    .collect()
+            .as_mut()
+            .map(|b| {
+                apply_findings_family_lints(
+                    mlua_swarm_diag::BpDoctorFamily::BindingLint,
+                    b,
+                    &lint_layers,
+                    &mut suppressed,
+                    &mut diagnostics,
+                )
             })
             .unwrap_or_default();
 
@@ -4311,24 +4784,18 @@ impl MseServer {
         // GH #78 — Blueprint-scoped context_policy_lint (see
         // `classify_context_policy_lint` doc for the 2 checks). Same
         // conditional-presence convention as `binding_lint`.
-        let context_policy_lint = (!disable_context_policy_lint)
+        let mut context_policy_lint = (!disable_context_policy_lint)
             .then(|| classify_context_policy_lint(&bp, req.simulated_launch.as_ref()));
-        if let Some(c) = &context_policy_lint {
-            diagnostics.extend(diag_from_findings(
-                mlua_swarm_diag::BpDoctorFamily::ContextPolicyLint,
-                c,
-            ));
-        }
         let context_policy_lint_severities: Vec<String> = context_policy_lint
-            .as_ref()
-            .and_then(|b| b.get("findings"))
-            .and_then(|f| f.as_array())
-            .map(|findings| {
-                findings
-                    .iter()
-                    .filter_map(|f| f.get("severity").and_then(|s| s.as_str()))
-                    .map(|s| s.to_string())
-                    .collect()
+            .as_mut()
+            .map(|c| {
+                apply_findings_family_lints(
+                    mlua_swarm_diag::BpDoctorFamily::ContextPolicyLint,
+                    c,
+                    &lint_layers,
+                    &mut suppressed,
+                    &mut diagnostics,
+                )
             })
             .unwrap_or_default();
 
@@ -4336,46 +4803,40 @@ impl MseServer {
         // `classify_verdict_contract_lint` doc for the single check and
         // why the compile-side `tracing::warn!` needed a reader-visible
         // surface). Same conditional-presence convention as `binding_lint`.
-        let verdict_contract_lint =
+        let mut verdict_contract_lint =
             (!disable_verdict_contract_lint).then(|| classify_verdict_contract_lint(&bp));
-        if let Some(v) = &verdict_contract_lint {
-            diagnostics.extend(diag_from_findings(
-                mlua_swarm_diag::BpDoctorFamily::VerdictContractLint,
-                v,
-            ));
-        }
         let verdict_contract_lint_severities: Vec<String> = verdict_contract_lint
-            .as_ref()
-            .and_then(|b| b.get("findings"))
-            .and_then(|f| f.as_array())
-            .map(|findings| {
-                findings
-                    .iter()
-                    .filter_map(|f| f.get("severity").and_then(|s| s.as_str()))
-                    .map(|s| s.to_string())
-                    .collect()
+            .as_mut()
+            .map(|v| {
+                apply_findings_family_lints(
+                    mlua_swarm_diag::BpDoctorFamily::VerdictContractLint,
+                    v,
+                    &lint_layers,
+                    &mut suppressed,
+                    &mut diagnostics,
+                )
             })
             .unwrap_or_default();
 
-        let skip_on_lint = (!disable_skip_on_lint).then(|| classify_skip_on_lint(&bp));
-        if let Some(s) = &skip_on_lint {
-            diagnostics.extend(diag_from_findings(
-                mlua_swarm_diag::BpDoctorFamily::SkipOnLint,
-                s,
-            ));
-        }
+        let mut skip_on_lint = (!disable_skip_on_lint).then(|| classify_skip_on_lint(&bp));
         let skip_on_lint_severities: Vec<String> = skip_on_lint
-            .as_ref()
-            .and_then(|b| b.get("findings"))
-            .and_then(|f| f.as_array())
-            .map(|findings| {
-                findings
-                    .iter()
-                    .filter_map(|f| f.get("severity").and_then(|s| s.as_str()))
-                    .map(|s| s.to_string())
-                    .collect()
+            .as_mut()
+            .map(|s| {
+                apply_findings_family_lints(
+                    mlua_swarm_diag::BpDoctorFamily::SkipOnLint,
+                    s,
+                    &lint_layers,
+                    &mut suppressed,
+                    &mut diagnostics,
+                )
             })
             .unwrap_or_default();
+
+        // The meta-lints are about the `lints` config itself, so they are
+        // independent of every family above and fold as WARN.
+        let meta_lint_diagnostics = lint_layers.meta_diagnostics();
+        let meta_lint_severities: Vec<&str> = vec!["WARN"; meta_lint_diagnostics.len()];
+        diagnostics.extend(meta_lint_diagnostics);
 
         // GH #45 / #61 + C4: fold the four lint families into the aggregate
         // verdict. `aggregate_agent_md_verdict` already implements the
@@ -4393,7 +4854,8 @@ impl MseServer {
                 + binding_lint_severities.len()
                 + skip_on_lint_severities.len()
                 + context_policy_lint_severities.len()
-                + verdict_contract_lint_severities.len(),
+                + verdict_contract_lint_severities.len()
+                + meta_lint_severities.len(),
         );
         all_severities.extend(severities.iter().copied());
         all_severities.extend(tool_lint_severities.iter().map(|s| s.as_str()));
@@ -4403,6 +4865,7 @@ impl MseServer {
         all_severities.extend(skip_on_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(context_policy_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(verdict_contract_lint_severities.iter().map(|s| s.as_str()));
+        all_severities.extend(meta_lint_severities.iter().copied());
         let verdict = aggregate_agent_md_verdict(&all_severities);
         let over_threshold_count = severities.iter().filter(|s| **s != "OK").count();
         let tool_lint_warn_count = tool_lint_severities
@@ -4480,6 +4943,11 @@ impl MseServer {
             // `Diagnostic` wire shape. Additive alongside the
             // family-specific fields; Phase 4 retires those.
             "diagnostics": diagnostics,
+            // Findings a `lints` layer allowed away: removed from their
+            // family surface and from `diagnostics[]`, folding into
+            // nothing, but never silently dropped. Always present —
+            // an empty array is the "nothing was allowed" reading.
+            "suppressed": suppressed,
             "guide_ref": "mse://guides/agent-md-authoring",
         });
         // C4: Blueprint-scoped operator-binding advisories. Inserted only
@@ -9038,5 +9506,346 @@ mod verdict_contract_lint_tests {
         // the recovery narrative for the fully-dead-gate case.
         assert!(ds[1].suggestion.is_none());
         assert!(ds[2].suggestion.is_none());
+    }
+}
+
+// ─── bp_doctor lint level control (allow / warn / deny, 3 layers) ─────────
+//
+// End-to-end over the real tool body against a stub
+// `GET /v1/blueprints/:id/head`: the resolution seam only exists inside
+// `bp_doctor` (which family surface a finding leaves, what the verdict
+// folds), so a unit test of the resolver alone would not cover it.
+#[cfg(test)]
+mod bp_doctor_lint_control_tests {
+    use super::*;
+
+    /// Number of `system_prompt` lines every fixture agent carries — over
+    /// the 200-line WARN threshold, far under every byte threshold, so
+    /// `agent-md-size` fires at WARN by lines alone.
+    const OVERSIZED_LINES: usize = 250;
+
+    fn text_payload(result: &rmcp::model::CallToolResult) -> String {
+        match &result.content.first().expect("content").raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// One operator agent whose `system_prompt` trips the size WARN band.
+    fn oversized_agent(name: &str) -> mlua_swarm::blueprint::AgentDef {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "kind": "operator",
+            "spec": {},
+            "profile": { "system_prompt": "x\n".repeat(OVERSIZED_LINES) },
+        }))
+        .expect("fixture agent must deserialize")
+    }
+
+    /// Minimal Blueprint carrying the given over-threshold agents (serde
+    /// defaults are the canonical minimal shape — `Blueprint` has no
+    /// `Default`).
+    fn oversized_bp(agents: &[&str]) -> Blueprint {
+        let mut bp: Blueprint = serde_json::from_value(serde_json::json!({
+            "id": "lint-control-fixture",
+            "flow": {"kind": "seq", "children": []},
+            "agents": [],
+        }))
+        .expect("fixture blueprint must deserialize");
+        bp.agents = agents.iter().copied().map(oversized_agent).collect();
+        bp
+    }
+
+    fn lint_map(pairs: &[(&str, &str)]) -> BTreeMap<String, mlua_swarm_schema::LintSetting> {
+        pairs
+            .iter()
+            .map(|(key, value)| {
+                (
+                    (*key).to_string(),
+                    match *value {
+                        "allow" => mlua_swarm_schema::LintSetting::Allow,
+                        "warn" => mlua_swarm_schema::LintSetting::Warn,
+                        "deny" => mlua_swarm_schema::LintSetting::Deny,
+                        other => panic!("fixture lint value: {other}"),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn call_site_lints(pairs: &[(&str, &str)]) -> Option<BTreeMap<String, String>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        )
+    }
+
+    /// Serves the fixture at `GET /v1/blueprints/:id/head`. Every other
+    /// route 404s, which the per-agent render-size lookup tolerates
+    /// (`last_rendered_bytes: null`).
+    async fn spawn_head_stub(bp: Blueprint) -> String {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let head = serde_json::json!({ "blueprint": bp });
+        let router = Router::new().route(
+            "/v1/blueprints/:id/head",
+            get(move || {
+                let head = head.clone();
+                async move { Json(head) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        addr.to_string()
+    }
+
+    /// Run the tool against `bp` with the given call-site `lints`. Every
+    /// family except `agent-md-size` is disabled so the assertions read
+    /// the size family's resolution alone.
+    async fn doctor(bp: Blueprint, lints: Option<BTreeMap<String, String>>) -> JsonValue {
+        let bind = spawn_head_stub(bp).await;
+        let result = MseServer::new()
+            .bp_doctor(Parameters(BpDoctorReq {
+                id: "lint-control-fixture".into(),
+                bind: Some(bind),
+                warn_bytes: None,
+                warn_lines: None,
+                block_bytes: None,
+                block_lines: None,
+                disable_block: None,
+                lints,
+                disable_tool_lint: Some(true),
+                disable_output_contract_lint: Some(true),
+                disable_worker_binding_lint: Some(true),
+                disable_binding_lint: Some(true),
+                disable_skip_on_lint: Some(true),
+                disable_context_policy_lint: Some(true),
+                disable_verdict_contract_lint: Some(true),
+                simulated_launch: None,
+            }))
+            .await
+            .expect("bp_doctor");
+        serde_json::from_str(&text_payload(&result)).expect("bp_doctor json")
+    }
+
+    fn diagnostic_kinds(json: &JsonValue) -> Vec<String> {
+        json["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .map(|d| d["kind"].as_str().expect("kind string").to_string())
+            .collect()
+    }
+
+    /// Baseline + the call-site layer: an `allow` moves the size WARN out
+    /// of `diagnostics[]` into `suppressed[]`, improves the verdict, and
+    /// leaves the agent entry with its real measurements under a resolved
+    /// `severity: "OK"`.
+    #[tokio::test]
+    async fn call_site_allow_moves_the_size_warn_into_suppressed() {
+        let baseline = doctor(oversized_bp(&["planner"]), None).await;
+        assert_eq!(baseline["verdict"], "WARN", "body: {baseline}");
+        assert_eq!(baseline["agents"][0]["severity"], "WARN");
+        assert!(
+            baseline["suppressed"]
+                .as_array()
+                .expect("suppressed is always present")
+                .is_empty(),
+            "body: {baseline}"
+        );
+
+        let json = doctor(
+            oversized_bp(&["planner"]),
+            call_site_lints(&[("agent-md-size", "allow")]),
+        )
+        .await;
+        assert_eq!(json["verdict"], "OK", "body: {json}");
+        assert_eq!(json["agents"][0]["severity"], "OK");
+        assert_eq!(json["agents"][0]["lines"], OVERSIZED_LINES);
+        assert_eq!(json["over_threshold_count"], 0);
+        assert!(diagnostic_kinds(&json).is_empty(), "body: {json}");
+
+        let suppressed = json["suppressed"].as_array().expect("suppressed array");
+        assert_eq!(suppressed.len(), 1, "body: {json}");
+        assert_eq!(suppressed[0]["kind"], "agent-md-size");
+        assert_eq!(suppressed[0]["source"], "call-site");
+        assert_eq!(suppressed[0]["span"]["element"]["name"], "planner");
+        assert!(suppressed[0]["message"]
+            .as_str()
+            .expect("message string")
+            .contains("planner"));
+    }
+
+    /// The per-agent layer is scoped: it silences its own agent's finding
+    /// and nothing else, so the second over-threshold agent still WARNs.
+    #[tokio::test]
+    async fn agent_layer_allow_suppresses_only_that_agents_finding() {
+        let mut bp = oversized_bp(&["quiet", "loud"]);
+        bp.agents[0].lints = Some(lint_map(&[("agent-md-size", "allow")]));
+
+        let json = doctor(bp, None).await;
+        assert_eq!(json["verdict"], "WARN", "body: {json}");
+        assert_eq!(json["agents"][0]["severity"], "OK");
+        assert_eq!(json["agents"][1]["severity"], "WARN");
+        assert_eq!(diagnostic_kinds(&json), vec!["agent-md-size"]);
+
+        let suppressed = json["suppressed"].as_array().expect("suppressed array");
+        assert_eq!(suppressed.len(), 1, "body: {json}");
+        assert_eq!(suppressed[0]["source"], "agent:quiet");
+        assert_eq!(suppressed[0]["span"]["element"]["name"], "quiet");
+    }
+
+    /// The Blueprint layer: declared once in `metadata.lints`, no caller
+    /// flag needed on any later invocation.
+    #[tokio::test]
+    async fn blueprint_layer_allow_suppresses_without_a_call_site_flag() {
+        let mut bp = oversized_bp(&["planner"]);
+        bp.metadata.lints = Some(lint_map(&[("agent-md-size", "allow")]));
+
+        let json = doctor(bp, None).await;
+        assert_eq!(json["verdict"], "OK", "body: {json}");
+        let suppressed = json["suppressed"].as_array().expect("suppressed array");
+        assert_eq!(suppressed.len(), 1, "body: {json}");
+        assert_eq!(suppressed[0]["source"], "blueprint");
+    }
+
+    /// Precedence: the first layer with any matching key wins outright.
+    /// A call-site `warn` overrides the agent's `allow` — the finding
+    /// fires and nothing is suppressed.
+    #[tokio::test]
+    async fn call_site_warn_beats_an_agent_layer_allow() {
+        let mut bp = oversized_bp(&["planner"]);
+        bp.agents[0].lints = Some(lint_map(&[("agent-md-size", "allow")]));
+
+        let json = doctor(bp, call_site_lints(&[("agent-md-size", "warn")])).await;
+        assert_eq!(json["verdict"], "WARN", "body: {json}");
+        assert_eq!(json["agents"][0]["severity"], "WARN");
+        assert_eq!(diagnostic_kinds(&json), vec!["agent-md-size"]);
+        assert!(
+            json["suppressed"]
+                .as_array()
+                .expect("suppressed array")
+                .is_empty(),
+            "body: {json}"
+        );
+    }
+
+    /// `deny` escalates a WARN-only family to a BLOCK verdict and to
+    /// `DiagLevel::Error` in `diagnostics[]`. The verdict stays a report
+    /// label — this tool blocks nothing either way.
+    #[tokio::test]
+    async fn deny_escalates_the_size_warn_to_a_block_verdict() {
+        let json = doctor(
+            oversized_bp(&["planner"]),
+            call_site_lints(&[("agent-md-size", "deny")]),
+        )
+        .await;
+        assert_eq!(json["verdict"], "BLOCK", "body: {json}");
+        assert_eq!(json["agents"][0]["severity"], "BLOCK");
+        assert_eq!(json["diagnostics"][0]["kind"], "agent-md-size");
+        assert_eq!(json["diagnostics"][0]["level"], "Error");
+        assert!(
+            json["suppressed"]
+                .as_array()
+                .expect("suppressed array")
+                .is_empty(),
+            "body: {json}"
+        );
+    }
+
+    /// A key typo (and an unparseable value) degrade to the
+    /// `unknown-lint-kind` meta-lint: the request is answered, the
+    /// targeted finding is untouched, and the note names the layer.
+    #[tokio::test]
+    async fn unknown_key_becomes_a_meta_lint_and_never_rejects_the_request() {
+        let json = doctor(
+            oversized_bp(&["planner"]),
+            call_site_lints(&[("agent-md-sizes", "allow"), ("agent-md-size", "allowe")]),
+        )
+        .await;
+        // Nothing was honored: the size WARN still stands.
+        assert_eq!(json["verdict"], "WARN", "body: {json}");
+        assert_eq!(json["agents"][0]["severity"], "WARN");
+        assert!(
+            json["suppressed"]
+                .as_array()
+                .expect("suppressed array")
+                .is_empty(),
+            "body: {json}"
+        );
+
+        let metas: Vec<&JsonValue> = json["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .filter(|d| d["kind"] == "unknown-lint-kind")
+            .collect();
+        // One per unhonored entry: the unknown key, and the known key
+        // whose value did not parse.
+        assert_eq!(metas.len(), 2, "body: {json}");
+        for meta in &metas {
+            assert_eq!(meta["level"], "Warn");
+            assert_eq!(meta["notes"][0], "declared by: call-site");
+        }
+        assert!(metas.iter().any(|m| m["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("'agent-md-sizes'")));
+    }
+
+    /// The stage-scoped non-suppressible boundary: an exact-kind `allow`
+    /// on a compile hard error `bp_doctor` never emits cannot have any
+    /// effect, and says so. A blanket `all` key never raises it.
+    #[tokio::test]
+    async fn exact_kind_allow_on_a_compile_only_kind_raises_non_suppressible_lint() {
+        let json = doctor(
+            oversized_bp(&["planner"]),
+            call_site_lints(&[("duplicate-agent-name", "allow")]),
+        )
+        .await;
+        let metas: Vec<&JsonValue> = json["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .filter(|d| d["kind"] == "non-suppressible-lint")
+            .collect();
+        assert_eq!(metas.len(), 1, "body: {json}");
+        assert_eq!(metas[0]["level"], "Warn");
+        assert_eq!(metas[0]["notes"][0], "declared by: call-site");
+        assert!(metas[0]["message"]
+            .as_str()
+            .expect("message string")
+            .contains("'duplicate-agent-name'"));
+        // The setting is inert, so the size family is untouched.
+        assert_eq!(json["agents"][0]["severity"], "WARN");
+
+        // `all` addresses whole sets — covering kinds this stage never
+        // emits is expected there, so no meta-lint noise.
+        let blanket = doctor(
+            oversized_bp(&["planner"]),
+            call_site_lints(&[("all", "allow")]),
+        )
+        .await;
+        assert!(
+            !diagnostic_kinds(&blanket).contains(&"non-suppressible-lint".to_string()),
+            "body: {blanket}"
+        );
+        assert_eq!(blanket["verdict"], "OK", "body: {blanket}");
+        assert_eq!(
+            blanket["suppressed"]
+                .as_array()
+                .expect("suppressed array")
+                .len(),
+            1,
+            "body: {blanket}"
+        );
     }
 }
