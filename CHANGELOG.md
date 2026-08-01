@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/ynishi/mlua-swarm/compare/v0.21.0...v0.22.0) - 2026-08-01
+
+### Added
+
+- *(compile)* agent.md frontmatter `lints:` authoring + per-agent compile-stage verdict gate
+- *(engine)* metadata.lints drives the compile-stage verdict-value-unhandled gate; document lint control
+- *(schema, diag)* author-declared lint levels — LintSetting wire types + layered suppression resolver
+- *(mcp)* bp_doctor honors declared lint levels with visible suppression
+- *(mcp,server)* report the running build version and flag cross-process drift
+
 ## [0.21.0](https://github.com/ynishi/mlua-swarm/compare/v0.20.0...v0.21.0) - 2026-07-31
 
 ### Added
