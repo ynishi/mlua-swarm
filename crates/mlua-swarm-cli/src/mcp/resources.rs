@@ -238,7 +238,7 @@ pub const RESOURCES: &[ResourceEntry] = &[
     ResourceEntry {
         uri: "mse://guides/lint-diagnostic-model",
         title: "mse — Lint & Diagnostic model (Diagnostic / LINT_DECLS / Applicability)",
-        description: "GH #79: the unified Clippy-style diagnostic model every feedback stage produces (compile-lint / bp_doctor / launch pre-flight). Wire shape (stable kind, internally-tagged stage, per-stage level, suggestion with Applicability auto-apply gate, mse:// docs_ref, Blueprint-document span), the mlua-swarm-diag LINT_DECLS registry, where diagnostics surface today (bp_build `diagnostic`, bp_doctor `diagnostics`), and the 4-step add-a-lint recipe (declare → document → produce → test).",
+        description: "GH #79: the unified Clippy-style diagnostic model every feedback stage produces (compile-lint / bp_doctor / launch pre-flight). Wire shape (stable kind, internally-tagged stage, per-stage level, suggestion with Applicability auto-apply gate, mse:// docs_ref, Blueprint-document span), the mlua-swarm-diag LINT_DECLS registry, where diagnostics surface today (bp_build `diagnostic`, bp_doctor `diagnostics`), allow/warn/deny lint control (3 layers, key grammar, suppressed[], the stage-scoped non-suppressible boundary, disable_*_lint aliases), and the 4-step add-a-lint recipe (declare → document → produce → test).",
         mime_type: "text/markdown",
         body: ResourceBody::Static(LINT_DIAGNOSTIC_MODEL_BODY),
     },

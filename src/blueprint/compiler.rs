@@ -758,14 +758,15 @@ impl Compiler {
         //
         // GH #50 follow-up (issue `33bc825b`): the reverse-direction lint
         // — declared `verdict.values` entries that no downstream cond
-        // references — runs in the same walk. Under
-        // `BlueprintMetadata.strict_verdict_handling = Some(true)` it
-        // rejects the compile; otherwise it only surfaces
-        // `tracing::warn!` so existing Blueprints that intentionally leave
-        // some verdict values as silent-pass informational tokens keep
-        // compiling unchanged.
-        let strict_verdict_handling = bp.metadata.strict_verdict_handling.unwrap_or(false);
-        verify_verdict_conds(&bp.flow, &verdict_contracts, strict_verdict_handling)?;
+        // references — runs in the same walk. Its compile-stage
+        // disposition comes from `BlueprintMetadata.strict_verdict_handling`
+        // unioned with a `metadata.lints` entry for the same kind (see
+        // [`resolve_unhandled_verdict_gate`]); the default still only
+        // surfaces `tracing::warn!` so existing Blueprints that
+        // intentionally leave some verdict values as silent-pass
+        // informational tokens keep compiling unchanged.
+        let unhandled_gate = resolve_unhandled_verdict_gate(&bp.metadata);
+        verify_verdict_conds(&bp.flow, &verdict_contracts, unhandled_gate)?;
 
         if bp.strategy.strict_refs {
             verify_refs(&bp.flow, &routes, self.default_spawner.is_some())?;
@@ -914,6 +915,68 @@ fn static_step_meta_ref(value: &Value) -> Option<String> {
 
 // ─── GH #50: verdict contract cond↔output-shape lint ───────────────────────
 
+/// The lint kind whose compile-stage disposition `metadata.lints` may
+/// change. Deliberately a single literal and not a loop over
+/// [`mlua_swarm_diag::LINT_DECLS`]: at the compile stage every other kind
+/// is a hard error, not a lint, so no other `CompileError` path is routed
+/// through the lint resolver (design §3 "non-suppressible boundary").
+const UNHANDLED_VERDICT_LINT_KIND: &str = "verdict-value-unhandled";
+
+/// What `Compiler::compile` does with an unhandled declared verdict value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnhandledVerdictGate {
+    /// Reject the Blueprint with [`CompileError::VerdictValueUnhandled`].
+    Deny,
+    /// Surface `tracing::warn!` and keep compiling — the default.
+    Warn,
+    /// Say nothing at all: the author declared `allow` for this kind.
+    Silence,
+}
+
+/// Resolve the compile-stage disposition of `verdict-value-unhandled` from
+/// the two spellings a Blueprint can use, `strict_verdict_handling` and
+/// `metadata.lints`.
+///
+/// Union toward `deny`: either spelling saying deny denies, and strict
+/// wins over a `lints` `allow` (the explicit legacy opt-in is never
+/// silently undone by a broad `all` / `category:` key). An undeclared kind
+/// keeps the historical warn-only default — which is why the Blueprint
+/// layer is queried with [`mlua_swarm_diag::LintConfig::setting_for`]
+/// rather than [`mlua_swarm_diag::resolve_level`]: the latter falls back to
+/// the kind's registry default (`Error`), the level bp_doctor's sibling
+/// stage never applies here.
+fn resolve_unhandled_verdict_gate(metadata: &BlueprintMetadata) -> UnhandledVerdictGate {
+    use mlua_swarm_diag::{lint_decl, LintConfig, LintSetting};
+
+    let strict = metadata.strict_verdict_handling.unwrap_or(false);
+    let declared = metadata.lints.as_ref().and_then(|lints| {
+        let cfg = LintConfig::from_pairs(
+            lints
+                .iter()
+                .map(|(key, setting)| (key.clone(), diag_lint_setting(*setting))),
+        );
+        cfg.setting_for(lint_decl(UNHANDLED_VERDICT_LINT_KIND)?)
+    });
+    match declared {
+        _ if strict => UnhandledVerdictGate::Deny,
+        Some(LintSetting::Deny) => UnhandledVerdictGate::Deny,
+        Some(LintSetting::Allow) => UnhandledVerdictGate::Silence,
+        Some(LintSetting::Warn) | None => UnhandledVerdictGate::Warn,
+    }
+}
+
+/// Bridge the schema's author-facing enum onto the diag crate's twin — the
+/// diag crate depends on no other mlua-swarm crate, so each consumer maps
+/// one onto the other (`bp_doctor` carries the same bridge for its own
+/// three layers).
+fn diag_lint_setting(setting: mlua_swarm_schema::LintSetting) -> mlua_swarm_diag::LintSetting {
+    match setting {
+        mlua_swarm_schema::LintSetting::Allow => mlua_swarm_diag::LintSetting::Allow,
+        mlua_swarm_schema::LintSetting::Warn => mlua_swarm_diag::LintSetting::Warn,
+        mlua_swarm_schema::LintSetting::Deny => mlua_swarm_diag::LintSetting::Deny,
+    }
+}
+
 /// GH #50: `Blueprint.agents[].verdict` cond↔output-shape lint, run from
 /// `Compiler::compile` after the routing table is built. Two-pass, same
 /// shape as [`collect_step_meta_refs`]'s best-effort static walk: Pass 1
@@ -926,7 +989,7 @@ fn static_step_meta_ref(value: &Value) -> Option<String> {
 fn verify_verdict_conds(
     flow: &FlowNode,
     verdict_contracts: &HashMap<String, VerdictContract>,
-    strict_verdict_handling: bool,
+    unhandled_gate: UnhandledVerdictGate,
 ) -> Result<(), CompileError> {
     let mut step_outputs: HashMap<String, String> = HashMap::new();
     let mut step_agents: HashMap<String, String> = HashMap::new();
@@ -945,7 +1008,7 @@ fn verify_verdict_conds(
         verdict_contracts,
         &referenced_values,
         &step_agents,
-        strict_verdict_handling,
+        unhandled_gate,
         &mut errors,
     );
     match errors.into_iter().next() {
@@ -1276,38 +1339,46 @@ fn resolve_and_check(
 /// that no cond references is a `verdict_value` the flow author declared
 /// but forgot to write a handler for.
 ///
-/// When `strict_verdict_handling` is `true` (opt-in via
-/// [`BlueprintMetadata::strict_verdict_handling`]), every unhandled value
-/// pushes a [`CompileError::VerdictValueUnhandled`] onto `errors` and
+/// Under [`UnhandledVerdictGate::Deny`] (`strict_verdict_handling: true`
+/// or `metadata.lints = {"verdict-value-unhandled": "deny"}`, see
+/// [`resolve_unhandled_verdict_gate`]), every unhandled value pushes a
+/// [`CompileError::VerdictValueUnhandled`] onto `errors` and
 /// [`verify_verdict_conds`] surfaces the first one, rejecting the compile.
-/// Under the default (`false`), unhandled values only surface via
-/// `tracing::warn!` — existing Blueprints that intentionally leave some
-/// verdict values as silent-pass informational tokens keep compiling
-/// unchanged (back-compat with GH #50's opt-in posture).
+/// Under the default [`UnhandledVerdictGate::Warn`], unhandled values only
+/// surface via `tracing::warn!` — existing Blueprints that intentionally
+/// leave some verdict values as silent-pass informational tokens keep
+/// compiling unchanged (back-compat with GH #50's opt-in posture) — and
+/// under [`UnhandledVerdictGate::Silence`] (an author-declared `allow`)
+/// not even that.
 fn check_unhandled_verdict_values(
     verdict_contracts: &HashMap<String, VerdictContract>,
     referenced_values: &HashMap<String, std::collections::HashSet<String>>,
     step_agents: &HashMap<String, String>,
-    strict_verdict_handling: bool,
+    unhandled_gate: UnhandledVerdictGate,
     errors: &mut Vec<CompileError>,
 ) {
+    if unhandled_gate == UnhandledVerdictGate::Silence {
+        return;
+    }
     for finding in fold_unhandled_verdict_values(verdict_contracts, referenced_values, step_agents)
     {
-        if strict_verdict_handling {
-            errors.push(CompileError::VerdictValueUnhandled {
+        match unhandled_gate {
+            UnhandledVerdictGate::Deny => errors.push(CompileError::VerdictValueUnhandled {
                 agent: finding.agent,
                 value: finding.value,
                 declared_values: finding.declared_values,
                 step_ref: finding.step_ref,
-            });
-        } else {
-            tracing::warn!(
+            }),
+            UnhandledVerdictGate::Warn => tracing::warn!(
                 agent = %finding.agent,
                 value = %finding.value,
                 step_ref = %finding.step_ref,
                 "declared verdict value has no downstream cond handler; \
-                 opt in to `metadata.strict_verdict_handling` to reject at compile"
-            );
+                 declare `metadata.lints = {{\"verdict-value-unhandled\": \"deny\"}}` \
+                 to reject at compile"
+            ),
+            // Returned above, before the (potentially costly) fold.
+            UnhandledVerdictGate::Silence => {}
         }
     }
 }
@@ -4065,6 +4136,182 @@ mod verdict_contract_lint_tests {
                  downstream handler (part channel) under strict_verdict_handling=Some(true)"
             ),
         }
+    }
+
+    // ─── metadata.lints, compile stage (design §5) ───────────────────
+
+    /// A `metadata.lints` map, as the schema's author-facing form.
+    fn lints(
+        pairs: &[(&str, mlua_swarm_schema::LintSetting)],
+    ) -> Option<std::collections::BTreeMap<String, mlua_swarm_schema::LintSetting>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(key, setting)| ((*key).to_string(), *setting))
+                .collect(),
+        )
+    }
+
+    /// The `unhandled_gate` fixture: the contract declares
+    /// `["PASS", "BLOCKED"]` but only "BLOCKED" is cond-referenced, so
+    /// "PASS" is unhandled and the gate decides what happens.
+    fn bp_with_unhandled_value() -> Blueprint {
+        let agent = gate_agent(Some(body_contract(&["PASS", "BLOCKED"])));
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("gate", "$.verdict"),
+                branch(eq_cond("$.verdict", "BLOCKED"), noop(), noop()),
+            ],
+        };
+        minimal_bp(agent, flow)
+    }
+
+    /// `metadata.lints = {"verdict-value-unhandled": "deny"}` rejects the
+    /// same Blueprint `strict_verdict_handling: Some(true)` rejects —
+    /// without the legacy flag being set at all.
+    #[test]
+    fn lints_deny_rejects_unhandled_declared_value() {
+        let mut bp = bp_with_unhandled_value();
+        bp.metadata.lints = lints(&[(
+            "verdict-value-unhandled",
+            mlua_swarm_schema::LintSetting::Deny,
+        )]);
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::VerdictValueUnhandled { agent, value, .. }) => {
+                assert_eq!(agent, "gate");
+                assert_eq!(value, "PASS");
+            }
+            Err(other) => {
+                panic!("expected VerdictValueUnhandled, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!(
+                "expected compile-time rejection under \
+                 metadata.lints = {{\"verdict-value-unhandled\": \"deny\"}}"
+            ),
+        }
+    }
+
+    /// The kind's category group key reaches it too — `verdict-value-
+    /// unhandled` is `LintCategory::Suspicious`.
+    #[test]
+    fn lints_category_deny_rejects_unhandled_declared_value() {
+        let mut bp = bp_with_unhandled_value();
+        bp.metadata.lints = lints(&[("category:suspicious", mlua_swarm_schema::LintSetting::Deny)]);
+        assert!(
+            matches!(
+                Compiler::new(registry_with_echo()).compile(&bp),
+                Err(CompileError::VerdictValueUnhandled { .. })
+            ),
+            "a category: group deny must reach the kind it covers"
+        );
+    }
+
+    /// `allow` silences the warn-only default; the compile still succeeds
+    /// (the observable difference from the default is asserted directly on
+    /// [`resolve_unhandled_verdict_gate`] below).
+    #[test]
+    fn lints_allow_compiles_and_silences_the_warn() {
+        let mut bp = bp_with_unhandled_value();
+        bp.metadata.lints = lints(&[(
+            "verdict-value-unhandled",
+            mlua_swarm_schema::LintSetting::Allow,
+        )]);
+        assert!(
+            Compiler::new(registry_with_echo()).compile(&bp).is_ok(),
+            "an allowed lint must never reject the compile"
+        );
+        assert_eq!(
+            resolve_unhandled_verdict_gate(&bp.metadata),
+            UnhandledVerdictGate::Silence
+        );
+    }
+
+    /// Union toward deny: the legacy flag wins over a `lints` `allow`, so
+    /// an existing strict Blueprint cannot be silently softened by a broad
+    /// `all` / `category:` key.
+    #[test]
+    fn strict_flag_wins_over_lints_allow() {
+        let mut bp = bp_with_unhandled_value();
+        bp.metadata.strict_verdict_handling = Some(true);
+        bp.metadata.lints = lints(&[("all", mlua_swarm_schema::LintSetting::Allow)]);
+        assert!(
+            matches!(
+                Compiler::new(registry_with_echo()).compile(&bp),
+                Err(CompileError::VerdictValueUnhandled { .. })
+            ),
+            "strict_verdict_handling=Some(true) must still reject under a lints allow"
+        );
+    }
+
+    /// The gate's full resolution table, including the two cases the
+    /// compile result cannot tell apart (warn vs silence).
+    #[test]
+    fn unhandled_verdict_gate_resolution_table() {
+        use mlua_swarm_schema::LintSetting;
+
+        let gate = |strict, map| {
+            resolve_unhandled_verdict_gate(&BlueprintMetadata {
+                strict_verdict_handling: strict,
+                lints: map,
+                ..Default::default()
+            })
+        };
+        let kind = "verdict-value-unhandled";
+
+        assert_eq!(gate(None, None), UnhandledVerdictGate::Warn);
+        assert_eq!(gate(Some(false), None), UnhandledVerdictGate::Warn);
+        assert_eq!(gate(Some(true), None), UnhandledVerdictGate::Deny);
+        assert_eq!(
+            gate(None, lints(&[(kind, LintSetting::Deny)])),
+            UnhandledVerdictGate::Deny
+        );
+        assert_eq!(
+            gate(None, lints(&[(kind, LintSetting::Warn)])),
+            UnhandledVerdictGate::Warn
+        );
+        assert_eq!(
+            gate(None, lints(&[(kind, LintSetting::Allow)])),
+            UnhandledVerdictGate::Silence
+        );
+        assert_eq!(
+            gate(Some(true), lints(&[(kind, LintSetting::Allow)])),
+            UnhandledVerdictGate::Deny,
+            "strict wins over allow"
+        );
+        // Within-layer specificity: the exact kind beats the group.
+        assert_eq!(
+            gate(
+                None,
+                lints(&[
+                    (kind, LintSetting::Allow),
+                    ("category:suspicious", LintSetting::Deny),
+                ])
+            ),
+            UnhandledVerdictGate::Silence
+        );
+        // Unknown keys are meta-lint material at bp_doctor, never a
+        // compile-stage signal.
+        assert_eq!(
+            gate(None, lints(&[("no-such-lint", LintSetting::Deny)])),
+            UnhandledVerdictGate::Warn
+        );
+    }
+
+    /// `metadata.lints` has exactly one compile-stage effect. Every other
+    /// `CompileError` is a hard error, not a lint: a blanket `all` allow
+    /// leaves them rejecting (design §3 non-suppressible boundary).
+    #[test]
+    fn lints_never_soften_other_compile_errors() {
+        let mut bp = bp_with_unhandled_value();
+        bp.agents.push(gate_agent(None));
+        bp.metadata.lints = lints(&[("all", mlua_swarm_schema::LintSetting::Allow)]);
+        assert!(
+            matches!(
+                Compiler::new(registry_with_echo()).compile(&bp),
+                Err(CompileError::DuplicateAgent(name)) if name == "gate"
+            ),
+            "an `all` allow must not suppress a compile hard error"
+        );
     }
 
     /// Acceptance criterion #7 (5th case): a Blueprint shaped like the

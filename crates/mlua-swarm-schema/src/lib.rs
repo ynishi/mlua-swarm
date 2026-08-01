@@ -2036,6 +2036,15 @@ pub struct BlueprintMetadata {
     /// `CompileError::VerdictValueUnhandled`. Opt-in so existing Blueprints
     /// that intentionally leave some verdict values as silent-pass
     /// informational tokens keep compiling unchanged.
+    ///
+    /// **Legacy spelling.** This is now sugar for
+    /// [`lints`](Self::lints)` = {"verdict-value-unhandled": "deny"}`,
+    /// which is the preferred form (it addresses the same lint kind as
+    /// every other layer and reads next to the rest of the Blueprint's
+    /// lint policy). Both spellings are honored and union toward `deny`:
+    /// either one saying deny rejects the compile, and `true` here wins
+    /// over a `lints` `allow`. The field is kept indefinitely — existing
+    /// Blueprints are not asked to migrate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_verdict_handling: Option<bool>,
     /// Blueprint-wide lint level overrides — the outermost layer of the
@@ -2045,6 +2054,13 @@ pub struct BlueprintMetadata {
     /// `"all"`; see [`LintSetting`] for the full grammar and the
     /// precedence rules. `None` (the default) = no Blueprint-wide
     /// overrides.
+    ///
+    /// One entry also reaches the compile stage: a `deny` matching
+    /// `"verdict-value-unhandled"` rejects the Blueprint exactly like
+    /// [`strict_verdict_handling`](Self::strict_verdict_handling), and an
+    /// `allow` silences its `tracing::warn!`. No other kind's compile
+    /// behavior can be changed — compile-stage errors are hard errors, not
+    /// lints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lints: Option<BTreeMap<String, LintSetting>>,
 }

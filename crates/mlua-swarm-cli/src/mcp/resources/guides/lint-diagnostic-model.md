@@ -5,8 +5,9 @@ diagnostic-producing stage — compile-lint (`mse bp build` / `bp_build` /
 `mse bp lint`), post-register lint (`bp_doctor`), launch pre-flight,
 runtime, ref resolution — projects its findings into one Clippy-style
 `Diagnostic` shape, declared once in the `mlua-swarm-diag` vocabulary
-crate. This guide documents the model and the 4-step recipe for adding
-a new lint.
+crate. This guide documents the model, how to turn individual lints
+down or up (allow / warn / deny), and the 4-step recipe for adding a new
+lint.
 
 ## The model
 
@@ -54,10 +55,11 @@ Reading rules for consumers:
   (report-only). One lint, one docs anchor, two enforcement points.
   `verdict-value-unhandled` is the same shape with the stages weighted
   differently: `Error` at `{"type": "CompileLint"}` but **only under**
-  `metadata.strict_verdict_handling`, and `Warn` at `{"type":
+  `metadata.lints = {"verdict-value-unhandled": "deny"}` (or its legacy
+  spelling `metadata.strict_verdict_handling`), and `Warn` at `{"type":
   "BpDoctor", "family": "VerdictContractLint"}` unconditionally — the
   report-only stage is the one that always runs, so an author who never
-  opts into strict mode still sees the finding.
+  denies the kind still sees the finding.
 - **`suggestion.applicability` is the auto-apply gate**: only
   `MachineApplicable` patches are candidates for unreviewed
   application; `HasPlaceholders` patches contain tokens the author must
@@ -70,7 +72,7 @@ Reading rules for consumers:
 | surface | field | notes |
 |---|---|---|
 | `bp_build` MCP tool (`stage: "lint"` failures) | `diagnostic` (single object or `null`) | Typed projection of the Compiler's `CompileError` — no substring re-parse. The legacy `fix_hint` field derives from the same diagnostic and stays for back-compat. |
-| `bp_doctor` MCP tool | `diagnostics` (array) | One entry per finding across every lint family, alongside the family-specific fields (which remain until a future major bump removes them). |
+| `bp_doctor` MCP tool | `diagnostics` (array) | One entry per finding across every lint family, alongside the family-specific fields (which remain until a future major bump removes them). Findings an `allow` took out move to the sibling `suppressed` array — see "Controlling lint levels". |
 | `mse bp build` / `mse bp lint` (CLI stderr) | rendered as the `fix hint (…)` block | Same diagnostic, prose-rendered. |
 
 ## The registry: `LINT_DECLS`
@@ -92,6 +94,146 @@ The registry is the single enumeration point: docs generation,
 Producers must only emit `kind` values that resolve via
 `mlua_swarm_diag::lint_decl(kind)` — the producing crates' tests assert
 this.
+
+## Controlling lint levels
+
+Any lint `bp_doctor` reports can be turned down or up, Clippy-style, in
+three places. The declaration is a `{key: level}` map:
+
+| layer | where | scope |
+|---|---|---|
+| call-site | `bp_doctor` request field `lints` | this invocation only |
+| per-agent | `agents[].lints` in the Blueprint | findings that span that agent (or a step referencing it) |
+| blueprint | `metadata.lints` in the Blueprint | every finding |
+
+**Precedence: call-site > agent > blueprint > the kind's registry
+default.** The first layer that has *any* matching key wins outright —
+no merging across layers. This is rustc's attribute-proximity model: the
+innermost `#[allow]` decides, and a broad `all` key on a nearer layer
+beats an exact-kind key on a farther one.
+
+Keys address one kind, one category, or everything:
+
+| key form | example | matches |
+|---|---|---|
+| kind literal | `"agent-md-size"` | exactly that `LINT_DECLS` kind |
+| category group | `"category:style"` | every kind in that category — `correctness`, `suspicious`, `style`, `contract`, `migration` |
+| `all` | `"all"` | every kind |
+
+**Within one layer, specificity orders the keys**: exact kind >
+`category:<cat>` > `all`. So a layer saying
+`{"all": "allow", "agent-md-size": "deny"}` denies that one kind and
+allows the rest.
+
+Values are `allow`, `warn`, `deny`:
+
+- `allow` — the finding does not fold into the verdict and does not
+  appear in `diagnostics[]`.
+- `warn` — reported at `Warn`.
+- `deny` — reported at `Error`, and the `bp_doctor` verdict label
+  escalates to `BLOCK`. A WARN-only family can therefore become a BLOCK
+  verdict. The verdict stays a report label either way: `bp_doctor`
+  blocks nothing, it only names what it found.
+
+An allowed finding is never dropped silently. It moves to the top-level
+`suppressed` array, which is **always present** (empty when nothing was
+allowed) — omitted ≠ passed, the same discipline the family fields
+follow:
+
+```json
+{
+  "suppressed": [
+    {
+      "kind": "agent-md-size",
+      "span": {"element": {"type": "Agent", "name": "researcher"}, "json_path": null},
+      "source": "agent:researcher",
+      "message": "agent 'researcher' system_prompt is 24680 bytes / 412 lines — over the authoring-guide size target"
+    }
+  ]
+}
+```
+
+`source` names the layer that allowed it: `"call-site"`,
+`"agent:<name>"`, or `"blueprint"`.
+
+### The non-suppressible boundary is per stage, not per kind
+
+At the **compile** stage a finding that fires at `Error` is a hard
+error, not a lint: `Compiler::compile` refuses the Blueprint and no
+`allow` / `warn` changes that. At **`bp_doctor`** (report-only)
+everything the stage emits is suppressible and escalatable — including
+the dual-stage kinds that are compile hard errors, such as
+`worker-binding-missing` and `verdict-value-unhandled`. Suppressing one
+at `bp_doctor` says "do not report this here"; it does not make the
+Blueprint compile.
+
+**The one compile-stage exception**: `metadata.lints` can change the
+compile behavior of exactly one kind, `verdict-value-unhandled`.
+`deny` (via the kind literal, `category:suspicious`, or `all`) rejects
+the compile with the same error `metadata.strict_verdict_handling: true`
+produces — that flag is now the legacy sugar for
+`{"verdict-value-unhandled": "deny"}` — and `allow` silences its
+`tracing::warn!`. The two spellings union toward deny: either one saying
+deny denies, and the flag wins over an `allow`. No other kind's compile
+behavior can be changed, and only the Blueprint layer is read at compile
+(per-agent compile enforcement is a follow-up).
+
+### Two meta-lints about the declaration itself
+
+Both fire at `Warn` from `bp_doctor`, with a `BlueprintRoot` span and a
+`declared by: <layer>` note — a typo degrades to a diagnostic, never to
+a rejected request or a failed register:
+
+| kind | fires when |
+|---|---|
+| `unknown-lint-kind` | a key matches no kind, no `category:<cat>` group and is not `all` — or its value is not `allow` / `warn` / `deny` |
+| `non-suppressible-lint` | an exact-kind `allow` / `warn` targets a compile hard error `bp_doctor` never emits (e.g. `duplicate-agent-name`) — the setting is ignored at every stage. `category:` / `all` keys never raise it: addressing whole sets is expected to cover such kinds |
+
+### Legacy `disable_*_lint` flags
+
+The seven `bp_doctor` request flags keep their exact current semantics
+(the family's field is omitted from the response entirely). They are
+call-site `allow` on a fixed kind set:
+
+| flag | equivalent to `allow` on |
+|---|---|
+| `disable_tool_lint` | `tool-unknown-mcp-ref` |
+| `disable_output_contract_lint` | `output-contract-missing` |
+| `disable_worker_binding_lint` | `worker-binding-missing` |
+| `disable_binding_lint` | `binding-requirements-info`, `strict-binding-without-runners`, `legacy-worker-binding`, `binding-resolution-error` |
+| `disable_skip_on_lint` | `skip-on-missing-for-skip-like-verdict-value`, `skip-on-declared-but-no-matching-verdict-value`, `skip-on-pattern-conflicts-with-halt-on` |
+| `disable_context_policy_lint` | `context-policy-strips-projection-roots`, `projection-root-seed-missing` |
+| `disable_verdict_contract_lint` | `verdict-value-unhandled`, `verdict-contract-never-read` |
+
+New authoring uses `lints`: it is per-kind rather than per-family, it
+survives in the artifact, and an allowed finding stays visible in
+`suppressed[]` instead of vanishing with its whole family. There is no
+`disable_agent_md_lint` — `"agent-md-size": "allow"` covers it, at
+whichever layer is right.
+
+### Worked example: one legitimately large agent
+
+One agent's system prompt is over the size target on purpose. Instead of
+disabling the size family for every agent, allow the kind on that one
+agent:
+
+```json
+{
+  "agents": [
+    {
+      "name": "researcher",
+      "kind": "operator",
+      "lints": {"agent-md-size": "allow"}
+    }
+  ]
+}
+```
+
+Every other agent keeps the size lint. The finding still appears in
+`suppressed[]` on each run, with `source: "agent:researcher"`, so
+the exemption stays auditable — and it is declared in the Blueprint, so
+a reader can see *that* it was exempted without re-deriving it from a
+caller's flags.
 
 ## Adding a new lint: the 4-step recipe
 
@@ -144,8 +286,10 @@ so it cannot drift.
 
 - `mse bp fix` auto-apply — `Applicability` is declared here; the apply
   loop is not.
-- User-level `#[allow]`-style lint control — the 5 categories are the
-  baseline; per-lint opt-out surfaces would read `LINT_DECLS`.
+- Per-agent lint control at the *compile* stage — `agents[].lints` is
+  read by `bp_doctor` only; the compile stage reads `metadata.lints`,
+  and just for `verdict-value-unhandled` (see "Controlling lint
+  levels").
 - Runtime error-path unification — `DiagStage::Runtime` is declared,
   unconsumed.
 - Colorized terminal rendering — the model is data-only.
