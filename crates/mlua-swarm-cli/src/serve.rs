@@ -607,6 +607,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     };
 
     let doctor_info = DoctorInfo {
+        // The `mse serve` process IS this binary, so its own crate version
+        // is the authoritative "what vintage is actually running" answer.
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
         bind: cfg.bind.to_string(),
         blueprint_backend: "git2".into(),
         blueprint_store_root: Some(cfg.git_store_path.join("blueprints").display().to_string()),

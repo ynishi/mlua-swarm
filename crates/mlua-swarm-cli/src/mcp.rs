@@ -38,9 +38,9 @@ use mlua_swarm::{
 use operator_client::{ClientError, OperatorClientState};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    AnnotateAble, CallToolResult, Content, ListResourcesResult, PaginatedRequestParams,
-    RawResource, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
-    ServerCapabilities, ServerInfo,
+    AnnotateAble, CallToolResult, Content, Implementation, ListResourcesResult,
+    PaginatedRequestParams, RawResource, ReadResourceRequestParams, ReadResourceResult,
+    ResourceContents, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -4759,7 +4759,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Doctor snapshot: mse mcp self state (in-process store = InMemory ephemeral) + server-side config (backend / store root / ref_base / registered BP list) fetched from GET /v1/doctor + an audit_findings section (GH #34) flagging `audit:<step>` artifacts across every run this mse mcp process is tracking + a `degradations` section (GH #32) counting per-Run structured worker-degradation entries. Answers 'where is the store?', 'how many BPs are registered?', 'did any after-run audit leave a finding?', and 'did any worker report a degraded fallback?' in a single call."
+        description = "Doctor snapshot: mse mcp self state (own build version + in-process store = InMemory ephemeral) + server-side config (its own build version / backend / store root / ref_base / registered BP list) fetched from GET /v1/doctor + a `version_drift` section comparing the two running processes + an audit_findings section (GH #34) flagging `audit:<step>` artifacts across every run this mse mcp process is tracking + a `degradations` section (GH #32) counting per-Run structured worker-degradation entries. Answers 'what version is actually running (and did one side miss a restart after cargo install)?', 'where is the store?', 'how many BPs are registered?', 'did any after-run audit leave a finding?', and 'did any worker report a degraded fallback?' in a single call. `version_drift.drift` is tri-state: true / false / null (null = could not compare, NOT 'no drift')."
     )]
     async fn mse_doctor(
         &self,
@@ -4915,8 +4915,30 @@ impl MseServer {
             degradation_notes.push("mse serve down; degradations scan skipped".to_string());
         }
 
+        // Version drift across the three independently-aged `mse`
+        // processes (this `mse mcp`, the launchd `mse serve`, and whatever
+        // `mse <cmd>` picks up off disk). `cargo install` replaces the
+        // binary but leaves already-running processes on their original
+        // vintage, so "is the thing answering me the version I just
+        // built?" is not answerable from `mse --version` alone.
+        //
+        // Tri-state on purpose: `null` means "could not compare" (server
+        // down, or its doctor payload predates `server_version`) — never
+        // collapse an unchecked comparison into `false`, which would read
+        // as "verified no drift".
+        let mcp_version = env!("CARGO_PKG_VERSION");
+        let server_version = server_info
+            .get("server_version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let version_drift: JsonValue = match server_version.as_deref() {
+            Some(sv) => JsonValue::Bool(sv != mcp_version),
+            None => JsonValue::Null,
+        };
+
         let body = serde_json::json!({
             "mse_mcp": {
+                "version": mcp_version,
                 "in_process_blueprint_store": "InMemory (ephemeral, mse mcp process-local)",
                 "in_flight_run_count": run_count,
                 "note": "The mse mcp in-process store is dedicated to swarm_run(Inline). The register path uses a separate store on the HTTP server side (POST /v1/blueprints/:id).",
@@ -4927,6 +4949,12 @@ impl MseServer {
                 "launchd_state": server_status.launchd_state,
                 "launchd_pid": server_status.launchd_pid,
                 "doctor": server_info,
+            },
+            "version_drift": {
+                "mse_mcp": mcp_version,
+                "mlua_swarm_server": server_version,
+                "drift": version_drift,
+                "note": "drift=null means the comparison could not be made (server down, or its /v1/doctor predates server_version) — not 'no drift'. Each process keeps the version it was started with; restart the drifting side to pick up a newly installed binary.",
             },
             "audit_findings": {
                 "count": audit_findings.len(),
@@ -5186,6 +5214,12 @@ impl MseServer {
 impl ServerHandler for MseServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
+        // `ServerInfo::default()` fills `server_info` via
+        // `Implementation::from_build_env()`, whose `env!` macros expand
+        // inside the *rmcp* crate — so the handshake would otherwise
+        // advertise `{name: "rmcp", version: "<rmcp ver>"}` instead of
+        // ours. Override with this crate's own build env.
+        info.server_info = Implementation::new("mse-mcp", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(
             "mse mcp: MCP server for mlua-swarm-engine (stdio, sibling of mse serve). Bundled \
              guides, Blueprint samples, and the live Blueprint JSON Schema are exposed as MCP \
@@ -7834,6 +7868,109 @@ mod tests {
                 .any(|n| n.as_str().unwrap_or_default().contains("mse serve down")),
             "notes: {notes:?}"
         );
+    }
+
+    /// The MCP handshake must advertise *this* crate, not rmcp.
+    ///
+    /// `ServerInfo::default()` fills `server_info` from
+    /// `Implementation::from_build_env()`, whose `env!` macros expand
+    /// inside the rmcp crate — so the default advertises rmcp's own name
+    /// and version. Locking this down keeps the protocol-level identity
+    /// honest and prevents a silent regression if the override is ever
+    /// dropped during an rmcp bump.
+    #[test]
+    fn get_info_advertises_this_crate_not_rmcp() {
+        let info = MseServer::new().get_info();
+        assert_eq!(info.server_info.name, "mse-mcp");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert_ne!(
+            info.server_info.name, "rmcp",
+            "regressed to the rmcp-supplied build env"
+        );
+    }
+
+    /// Server unreachable: the drift comparison must report `null`
+    /// (could-not-compare), never `false` — a `false` here would read as a
+    /// verified "both sides agree" when nothing was actually checked.
+    #[tokio::test]
+    async fn mse_doctor_version_drift_is_null_when_the_server_is_unreachable() {
+        let server = MseServer::new();
+        let result = server
+            .mse_doctor(Parameters(DoctorReq {
+                // Black-hole address: fails fast, never a live server.
+                bind: Some("127.0.0.1:1".into()),
+            }))
+            .await
+            .expect("mse_doctor must never fail on an unreachable server");
+        let json: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("doctor json");
+
+        assert_eq!(json["mse_mcp"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            json["version_drift"]["mse_mcp"],
+            env!("CARGO_PKG_VERSION"),
+            "body: {json}"
+        );
+        assert!(
+            json["version_drift"]["drift"].is_null(),
+            "unchecked comparison must stay null, not collapse to false: {json}"
+        );
+        assert!(
+            json["version_drift"]["mlua_swarm_server"].is_null(),
+            "body: {json}"
+        );
+    }
+
+    /// Both determinate arms of the tri-state, against a stub `/v1/doctor`
+    /// (same stub-router pattern as
+    /// `mse_doctor_surfaces_audit_findings_via_stub_steps_api`): a server
+    /// built from a different `mse` vintage flags `drift: true`, a
+    /// matching one flags `drift: false`. This is the
+    /// `cargo install`-without-restart case the section exists for.
+    #[tokio::test]
+    async fn mse_doctor_version_drift_compares_against_the_server_reported_version() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        async fn spawn_stub(server_version: String) -> String {
+            let router = Router::new()
+                .route("/v1/healthz", get(|| async { "ok" }))
+                .route(
+                    "/v1/doctor",
+                    get(move || {
+                        let v = server_version.clone();
+                        async move { Json(serde_json::json!({ "server_version": v })) }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind ephemeral port");
+            let addr = listener.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+            addr.to_string()
+        }
+
+        async fn drift_for(bind: String) -> JsonValue {
+            let result = MseServer::new()
+                .mse_doctor(Parameters(DoctorReq { bind: Some(bind) }))
+                .await
+                .expect("mse_doctor");
+            serde_json::from_str::<JsonValue>(&extract_text_payload(&result)).expect("doctor json")
+                ["version_drift"]
+                .clone()
+        }
+
+        // A stale `mse serve` still running a pre-install build.
+        let stale = drift_for(spawn_stub("0.0.0-stale".to_string()).await).await;
+        assert_eq!(stale["drift"], JsonValue::Bool(true), "body: {stale}");
+        assert_eq!(stale["mlua_swarm_server"], "0.0.0-stale", "body: {stale}");
+        assert_eq!(stale["mse_mcp"], env!("CARGO_PKG_VERSION"), "body: {stale}");
+
+        // Both sides restarted onto the same build.
+        let matched = drift_for(spawn_stub(env!("CARGO_PKG_VERSION").to_string()).await).await;
+        assert_eq!(matched["drift"], JsonValue::Bool(false), "body: {matched}");
     }
 
     /// GH #34: end-to-end coverage that dispatches a real Blueprint with

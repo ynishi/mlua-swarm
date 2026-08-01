@@ -16,6 +16,13 @@ use std::sync::Arc;
 /// Startup config snapshot. Populated from `Args` in `main.rs` and mounted on the router.
 #[derive(Clone, Serialize)]
 pub struct DoctorInfo {
+    /// Version of the `mse` binary this **running** server process was
+    /// built from. Distinct from whatever `mse --version` reports on
+    /// disk: a long-lived launchd `mse serve` keeps serving its original
+    /// vintage across a `cargo install`, so this is the only way to tell
+    /// what is actually answering requests. Paired with `mse mcp`'s own
+    /// version in the `mse_doctor` tool's drift check.
+    pub server_version: String,
     /// Listen address (`--bind` value).
     pub bind: String,
     /// Backend type: `"git2"` | `"in_memory"`.
