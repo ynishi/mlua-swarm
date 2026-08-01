@@ -1223,6 +1223,7 @@ mod tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -2849,6 +2850,7 @@ mod tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -3079,6 +3081,7 @@ mod tests {
                 runner: None,
                 runner_ref: None,
                 verdict: None,
+                lints: None,
             }
         }
 

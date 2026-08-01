@@ -235,6 +235,9 @@ pub fn parse(text: &str, source_label: &str, kind: AgentKind) -> Result<AgentDef
         // directly (`agents[N].verdict`) until a later follow-up wires
         // frontmatter authoring for it too.
         verdict: None,
+        // Lint level overrides are Blueprint-JSON-authored as well (the
+        // same frontmatter carry as `runner` / `verdict` above).
+        lints: None,
     })
 }
 

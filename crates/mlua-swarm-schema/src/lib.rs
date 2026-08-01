@@ -55,6 +55,7 @@
 //!         runner: None,
 //!         runner_ref: None,
 //!         verdict: None,
+//!         lints: None,
 //!     }],
 //!     operators: vec![],
 //!     metas: vec![],
@@ -132,7 +133,7 @@ use mlua_flow_ir::Node as FlowNode;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // ──────────────────────────────────────────────────────────────────────────
 // Versioning
@@ -673,6 +674,61 @@ pub struct SpawnerHints {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// LintSetting (author-declared lint levels)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Author-declared level for one lint kind or group — the Blueprint
+/// analogue of rustc's `#[allow]` / `#[warn]` / `#[deny]` attributes.
+///
+/// Declared in a `lints` map on two Blueprint layers
+/// ([`BlueprintMetadata::lints`] Blueprint-wide, [`AgentDef::lints`]
+/// per-agent); `bp_doctor` supplies a third call-site layer at request
+/// time and is the consumer that resolves all three (the resolver lives
+/// in the `mlua-swarm-diag` crate, which carries its own twin of this
+/// enum so it stays free of schema dependencies).
+///
+/// A map key selects what the setting applies to:
+///
+/// | key form | selects |
+/// |---|---|
+/// | `"agent-md-size"` | one stable lint kind literal from the diag crate's registry |
+/// | `"category:style"` | every kind in one category (`correctness` / `suspicious` / `style` / `contract` / `migration`) |
+/// | `"all"` | every kind |
+///
+/// Keys are validated at consumption time, not at parse time: a key that
+/// matches nothing surfaces as the `unknown-lint-kind` meta-lint
+/// (rustc's `unknown_lints` analogue) rather than failing the register.
+/// Values are typed, so an unrecognized *value* is a serde error
+/// (fail-loud on the spelling the author controls exhaustively).
+///
+/// Resolution: the most specific layer that has any matching key wins
+/// outright — call-site, then agent, then Blueprint, then the kind's
+/// registry default level (rustc's attribute-proximity model, no merging
+/// across layers). Within one layer, an exact kind key beats
+/// `category:<cat>`, which beats `all`.
+///
+/// The non-suppressible boundary is stage-scoped: compile-stage hard
+/// errors ignore `allow` / `warn` at compile, but a kind that also
+/// fires at `bp_doctor` (at `Warn`) stays suppressible there. Targeting
+/// a kind that only exists as a compile hard error by exact kind
+/// literal raises the `non-suppressible-lint` meta-lint at `bp_doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LintSetting {
+    /// Suppress the lint: `bp_doctor` moves the finding into its
+    /// `suppressed[]` array instead of `diagnostics[]`, and it no longer
+    /// folds into the verdict (omitted ≠ passed — the finding stays
+    /// visible).
+    Allow,
+    /// Report the lint as an advisory (`WARN` band).
+    Warn,
+    /// Escalate the lint to an error (`BLOCK` band in the `bp_doctor`
+    /// verdict). The verdict remains a report label — `bp_doctor` still
+    /// blocks nothing.
+    Deny,
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // AgentDef / AgentKind / AgentProfile / AgentMeta
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -739,6 +795,21 @@ pub struct AgentDef {
     /// Blueprint is unaffected, byte-for-byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<VerdictContract>,
+    /// Per-agent lint level overrides — the middle layer of the
+    /// [`LintSetting`] cascade (call-site > this >
+    /// [`BlueprintMetadata::lints`] > the kind's registry default),
+    /// applied to diagnostics whose span points at this agent or at a
+    /// step referencing it. `bp_doctor` is the consumer; nothing here
+    /// changes compile behavior. Keys are kind literals
+    /// (`"agent-md-size"`), `"category:<cat>"` groups, or `"all"` — see
+    /// [`LintSetting`] for the full grammar and the precedence rules.
+    ///
+    /// Top-level rather than inside [`AgentProfile::extras`] on purpose:
+    /// `extras` is the engine-untouched free-form contract and stays
+    /// that way. `None` (the default) = this agent declares no
+    /// overrides; every pre-existing Blueprint is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lints: Option<BTreeMap<String, LintSetting>>,
 }
 
 /// Agent persona information. Orthogonal to the backend kind (Shell / InProc / Operator).
@@ -1967,6 +2038,15 @@ pub struct BlueprintMetadata {
     /// informational tokens keep compiling unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_verdict_handling: Option<bool>,
+    /// Blueprint-wide lint level overrides — the outermost layer of the
+    /// [`LintSetting`] cascade (call-site > [`AgentDef::lints`] > this >
+    /// the kind's registry default), consumed by `bp_doctor`. Keys are
+    /// kind literals (`"agent-md-size"`), `"category:<cat>"` groups, or
+    /// `"all"`; see [`LintSetting`] for the full grammar and the
+    /// precedence rules. `None` (the default) = no Blueprint-wide
+    /// overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lints: Option<BTreeMap<String, LintSetting>>,
 }
 
 /// Provenance record of a Blueprint.
@@ -2689,6 +2769,7 @@ mod tests {
             runner,
             runner_ref,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -3562,5 +3643,152 @@ mod tests {
             "platform_secret": true
         });
         assert!(serde_json::from_value::<AgentProviderManifest>(invalid).is_err());
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Lint suppression: `LintSetting`, `AgentDef.lints`,
+    // `BlueprintMetadata.lints`
+    // ──────────────────────────────────────────────────────────────
+
+    /// The wire form is the lowercase rustc attribute spelling — the diag
+    /// crate's twin enum parses the same three literals.
+    #[test]
+    fn lint_setting_wire_form_round_trips_lowercase() {
+        for (variant, wire) in [
+            (LintSetting::Allow, "allow"),
+            (LintSetting::Warn, "warn"),
+            (LintSetting::Deny, "deny"),
+        ] {
+            let json = serde_json::to_value(variant).expect("serializes");
+            assert_eq!(json, serde_json::json!(wire), "wire form for {variant:?}");
+            let back: LintSetting = serde_json::from_value(json).expect("deserializes");
+            assert_eq!(back, variant, "round-trip for {variant:?}");
+        }
+    }
+
+    /// Values are typed: an unrecognized *value* is a hard parse error
+    /// (unrecognized *keys* are lenient by design — they surface as the
+    /// `unknown-lint-kind` meta-lint at consumption time).
+    #[test]
+    fn lint_setting_invalid_value_errors() {
+        let err = serde_json::from_value::<LintSetting>(serde_json::json!("forbid"))
+            .expect_err("an unknown LintSetting value must be rejected");
+        assert!(
+            err.to_string().contains("forbid") || err.to_string().contains("variant"),
+            "error should point at the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_def_lints_omitted_when_none() {
+        let agent = agent_with_runner("gate", None, None, None);
+        let json = serde_json::to_value(&agent).expect("serializes");
+        assert!(
+            json.as_object().unwrap().get("lints").is_none(),
+            "lints key must be absent when None: {json}"
+        );
+        let back: AgentDef = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.lints, None);
+    }
+
+    /// All three key forms (kind literal / `category:` group / `all`)
+    /// survive the round-trip — key validation happens at consumption
+    /// time, so serde accepts every string here.
+    #[test]
+    fn agent_def_lints_round_trips_every_key_form() {
+        let mut agent = agent_with_runner("planner", None, None, None);
+        agent.lints = Some(BTreeMap::from([
+            ("agent-md-size".to_string(), LintSetting::Allow),
+            ("category:style".to_string(), LintSetting::Warn),
+            ("all".to_string(), LintSetting::Deny),
+        ]));
+        let json = serde_json::to_value(&agent).expect("serializes");
+        assert_eq!(json["lints"]["agent-md-size"], "allow");
+        assert_eq!(json["lints"]["category:style"], "warn");
+        assert_eq!(json["lints"]["all"], "deny");
+        let back: AgentDef = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.lints, agent.lints);
+    }
+
+    /// The per-agent layer is top-level, never folded into
+    /// `profile.extras` (which stays the engine-untouched free-form
+    /// contract).
+    #[test]
+    fn agent_def_lints_stay_out_of_profile_extras() {
+        let mut agent = agent_with_runner("planner", None, None, None);
+        agent.profile = Some(AgentProfile::default());
+        agent.lints = Some(BTreeMap::from([(
+            "agent-md-size".to_string(),
+            LintSetting::Allow,
+        )]));
+        let json = serde_json::to_value(&agent).expect("serializes");
+        assert!(
+            json["lints"].is_object(),
+            "lints is a top-level key: {json}"
+        );
+        assert!(
+            json["profile"]["extras"].get("lints").is_none(),
+            "extras must stay untouched: {json}"
+        );
+    }
+
+    #[test]
+    fn blueprint_metadata_lints_omitted_when_none() {
+        let bp = minimal_bp(None);
+        let json = serde_json::to_value(&bp).expect("serializes");
+        assert!(
+            json["metadata"].as_object().unwrap().get("lints").is_none(),
+            "metadata.lints key must be absent when None: {json}"
+        );
+        let back: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.metadata.lints, None);
+        assert_eq!(bp, back);
+    }
+
+    #[test]
+    fn blueprint_metadata_lints_round_trips_when_some() {
+        let mut bp = minimal_bp(None);
+        bp.metadata.lints = Some(BTreeMap::from([
+            ("verdict-value-unhandled".to_string(), LintSetting::Deny),
+            ("category:migration".to_string(), LintSetting::Allow),
+        ]));
+        let json = serde_json::to_string(&bp).expect("serializes");
+        let back: Blueprint = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.metadata.lints, bp.metadata.lints);
+        assert_eq!(bp, back);
+    }
+
+    /// A Blueprint written before this field parses unchanged — both
+    /// `lints` maps are `#[serde(default)]`.
+    #[test]
+    fn lints_absent_on_both_layers_deserializes_to_none() {
+        let json = serde_json::json!({
+            "schema_version": current_schema_version(),
+            "id": "lints-absent-ut",
+            "flow": { "kind": "seq", "children": [] },
+            "agents": [{ "name": "greeter", "kind": "rust_fn" }],
+            "metadata": { "description": "no lints declared" },
+        });
+        let bp: Blueprint = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(bp.metadata.lints, None);
+        assert_eq!(bp.agents[0].lints, None);
+    }
+
+    #[test]
+    fn blueprint_json_schema_exports_lints_on_both_layers() {
+        let schema = schemars::schema_for!(Blueprint);
+        let v = serde_json::to_value(&schema).expect("schema serializes");
+        let dump = v.to_string();
+        assert!(
+            dump.contains("LintSetting"),
+            "LintSetting definition must reach the exported schema: {dump}"
+        );
+        for def in ["AgentDef", "BlueprintMetadata"] {
+            assert!(
+                v["definitions"][def]["properties"]["lints"].is_object()
+                    || v["$defs"][def]["properties"]["lints"].is_object(),
+                "{def}.lints must appear in the exported schema: {dump}"
+            );
+        }
     }
 }

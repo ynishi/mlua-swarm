@@ -797,6 +797,7 @@ mod tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 
@@ -870,6 +871,7 @@ mod tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 

@@ -18,6 +18,7 @@
 //! | `Suggestion`    | [`Suggestion`]                |
 //! | `Applicability` | [`Applicability`]             |
 //! | `Lint` registry | [`LintDecl`] / [`LINT_DECLS`] |
+//! | `#[allow]` / `#[warn]` / `#[deny]` | [`LintSetting`] / [`LintConfig`] / [`resolve_level`] |
 //!
 //! ## Boundary discipline
 //!
@@ -38,6 +39,7 @@
 //! `mse://guides/lint-diagnostic-model`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Severity of one [`Diagnostic`]. Mirrors Clippy's `Level`, collapsed
 /// to the three bands the existing MSE surfaces actually use
@@ -315,6 +317,20 @@ pub enum LintCategory {
     Migration,
 }
 
+impl LintCategory {
+    /// The lowercase name this category is addressed by in a
+    /// [`LintConfig`] group key (`"category:<name>"`).
+    pub fn as_key(&self) -> &'static str {
+        match self {
+            Self::Correctness => "correctness",
+            Self::Suspicious => "suspicious",
+            Self::Style => "style",
+            Self::Contract => "contract",
+            Self::Migration => "migration",
+        }
+    }
+}
+
 /// Static declaration of one lint kind — the registry row. One
 /// [`LintDecl`] per kind, whatever stages that kind fires at (the
 /// per-stage level lives on the emitted [`Diagnostic`]; the decl
@@ -581,6 +597,21 @@ pub const LINT_DECLS: &[LintDecl] = &[
          will carry file_path: null (content_url-only).",
         "mse://guides/operator-execution-model",
     ),
+    // ─── Meta-lints (findings about the lints config itself) ─────────
+    decl(
+        "unknown-lint-kind",
+        DiagLevel::Warn,
+        LintCategory::Suspicious,
+        "A lints map key matches no declared lint kind, category, or 'all'.",
+        "mse://guides/lint-diagnostic-model",
+    ),
+    decl(
+        "non-suppressible-lint",
+        DiagLevel::Warn,
+        LintCategory::Suspicious,
+        "A lints map entry targets a compile-hard-error kind with allow; ignored.",
+        "mse://guides/lint-diagnostic-model",
+    ),
 ];
 
 /// Look up the [`LintDecl`] for a kind key. `None` for unknown kinds —
@@ -588,6 +619,213 @@ pub const LINT_DECLS: &[LintDecl] = &[
 /// [`Diagnostic::kind`] must be declared).
 pub fn lint_decl(kind: &str) -> Option<&'static LintDecl> {
     LINT_DECLS.iter().find(|d| d.kind == kind)
+}
+
+/// Author-declared level for one lint kind or group — the diag-side twin
+/// of `mlua_swarm_schema::LintSetting` (same three lowercase wire
+/// literals). The twin exists because this crate depends on no other
+/// mlua-swarm crate: the schema owns the Blueprint-side vocabulary, this
+/// crate owns resolution, and the consumer (`bp_doctor`) maps one onto
+/// the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LintSetting {
+    /// Suppress the lint — resolves to [`ResolvedLint::Suppressed`].
+    Allow,
+    /// Report as advisory — resolves to [`DiagLevel::Warn`].
+    Warn,
+    /// Escalate to an error — resolves to [`DiagLevel::Error`].
+    Deny,
+}
+
+impl LintSetting {
+    /// Parse the wire spelling (`"allow"` / `"warn"` / `"deny"`, ASCII
+    /// case-insensitive). `None` for anything else — the call-site layer
+    /// arrives as untyped strings and a typo there must surface as a
+    /// meta-lint, never as a rejected request (see
+    /// [`LintConfig::from_str_map`]).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "allow" => Some(Self::Allow),
+            "warn" => Some(Self::Warn),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+/// One layer of author-declared lint levels, with the entries that could
+/// not be honored kept aside instead of dropped.
+///
+/// A key selects what its setting applies to: an exact lint kind literal
+/// (`"agent-md-size"`), a category group (`"category:style"`, see
+/// [`LintCategory::as_key`]), or `"all"`. Keys are validated here
+/// against [`LINT_DECLS`]; anything unrecognized — and any entry whose
+/// *value* failed to parse — lands in [`LintConfig::unknown_keys`] for
+/// the `unknown-lint-kind` meta-lint rather than failing construction.
+/// Construction is total: no input shape errors or panics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LintConfig {
+    entries: BTreeMap<String, LintSetting>,
+    unknown_keys: Vec<String>,
+}
+
+impl LintConfig {
+    /// Build from already-typed pairs — the Blueprint path, where serde
+    /// has already rejected invalid values (the caller maps
+    /// `mlua_swarm_schema::LintSetting` onto [`LintSetting`]). Keys are
+    /// still validated, so an unknown kind literal in a Blueprint is a
+    /// meta-lint, not a register failure.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, LintSetting)>) -> Self {
+        let mut cfg = Self::default();
+        for (key, setting) in pairs {
+            cfg.insert(key, Some(setting));
+        }
+        cfg
+    }
+
+    /// Build from the untyped call-site form (`bp_doctor`'s
+    /// `lints: {kind: level}` request field). Lenient on both axes: an
+    /// unknown key *and* an unparseable value are collected the same way,
+    /// so a typo degrades to a meta-lint instead of rejecting the request.
+    pub fn from_str_map(map: &BTreeMap<String, String>) -> Self {
+        let mut cfg = Self::default();
+        for (key, raw) in map {
+            cfg.insert(key.clone(), LintSetting::parse(raw));
+        }
+        cfg
+    }
+
+    /// The honored entries (registry-known key, parsed value).
+    pub fn entries(&self) -> &BTreeMap<String, LintSetting> {
+        &self.entries
+    }
+
+    /// Keys this layer declared that matched no lint kind, no
+    /// `category:<cat>` group and not `all`, plus keys whose value did
+    /// not parse. One `unknown-lint-kind` diagnostic per entry; the
+    /// emitting layer is the caller's to name.
+    pub fn unknown_keys(&self) -> &[String] {
+        &self.unknown_keys
+    }
+
+    /// `true` when this layer honors no entry at all — it can never win a
+    /// [`resolve_level`] lookup and callers may skip it.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The setting this layer declares for `decl`, applying within-layer
+    /// specificity: an exact kind key beats `category:<cat>`, which beats
+    /// `all`. `None` = this layer says nothing about `decl`. Kind keys
+    /// match the registry literal exactly; the category name after
+    /// `category:` is matched ASCII case-insensitively (keys are stored
+    /// as the author spelled them, so the meta-lint can quote them back).
+    pub fn setting_for(&self, decl: &LintDecl) -> Option<LintSetting> {
+        if let Some(s) = self.entries.get(decl.kind) {
+            return Some(*s);
+        }
+        let category = decl.category.as_key();
+        let group = self.entries.iter().find(|(key, _)| {
+            key.strip_prefix("category:")
+                .is_some_and(|cat| cat.eq_ignore_ascii_case(category))
+        });
+        if let Some((_, s)) = group {
+            return Some(*s);
+        }
+        self.entries.get("all").copied()
+    }
+
+    /// Record one entry, routing it to `entries` or `unknown_keys`.
+    /// `setting == None` means the value did not parse.
+    fn insert(&mut self, key: String, setting: Option<LintSetting>) {
+        match setting {
+            Some(s) if key_is_known(&key) => {
+                self.entries.insert(key, s);
+            }
+            _ => self.unknown_keys.push(key),
+        }
+    }
+}
+
+/// Whether a [`LintConfig`] key addresses something that exists: a
+/// declared kind literal, a `category:<cat>` group with a known category,
+/// or `all`. Category names are compared ASCII case-insensitively against
+/// [`LintCategory::as_key`].
+fn key_is_known(key: &str) -> bool {
+    if key == "all" || lint_decl(key).is_some() {
+        return true;
+    }
+    match key.strip_prefix("category:") {
+        Some(cat) => LINT_DECLS
+            .iter()
+            .any(|d| d.category.as_key().eq_ignore_ascii_case(cat)),
+        None => false,
+    }
+}
+
+/// Outcome of resolving one lint kind against the declared layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedLint {
+    /// The lint is allowed away: the finding must not fold into a verdict
+    /// and must not appear among the reported diagnostics. Consumers move
+    /// it to a visible `suppressed[]` array — omitted ≠ passed.
+    Suppressed,
+    /// The lint fires at this level (the declared override, or the kind's
+    /// [`LintDecl::default_level`] when nothing declared it).
+    Level(DiagLevel),
+}
+
+/// Resolve the effective level of `decl` against the declared layers.
+///
+/// `layers` is **most-specific first** — the consumer passes
+/// `[call_site, agent, blueprint]`, omitting the layers that do not apply
+/// to the diagnostic at hand (an agent layer only applies to diagnostics
+/// spanning that agent or a step referencing it). The first layer with
+/// *any* matching key wins outright, with no merging across layers: this
+/// mirrors rustc's attribute-proximity model, where the innermost
+/// `#[allow]` decides. Within one layer, specificity orders the keys
+/// (exact kind > `category:<cat>` > `all`, see
+/// [`LintConfig::setting_for`]). With no match anywhere the kind's
+/// registry default level applies.
+///
+/// This function is deliberately **stage-agnostic**: it maps settings to
+/// levels and nothing else. The non-suppressible boundary is the
+/// caller's contract and is *stage-scoped*, not kind-scoped — a kind
+/// that is a compile-stage hard error ([`is_compile_hard_error`])
+/// ignores `allow` / `warn` at [`DiagStage::CompileLint`], but the same
+/// kind stays suppressible at `bp_doctor` when that stage emits it at
+/// `Warn` (`worker-binding-missing`, `verdict-value-unhandled`). At
+/// `bp_doctor`, an exact-kind entry targeting a kind the stage never
+/// emits raises the `non-suppressible-lint` meta-lint; `category:` /
+/// `all` keys never do. Encoding that here would require a stage
+/// argument the resolver has no other use for.
+pub fn resolve_level(decl: &LintDecl, layers: &[&LintConfig]) -> ResolvedLint {
+    for layer in layers {
+        match layer.setting_for(decl) {
+            Some(LintSetting::Allow) => return ResolvedLint::Suppressed,
+            Some(LintSetting::Warn) => return ResolvedLint::Level(DiagLevel::Warn),
+            Some(LintSetting::Deny) => return ResolvedLint::Level(DiagLevel::Error),
+            None => continue,
+        }
+    }
+    ResolvedLint::Level(decl.default_level)
+}
+
+/// Whether `decl` is a compile-stage hard error rather than a lint —
+/// i.e. its [`LintDecl::default_level`] is [`DiagLevel::Error`], so
+/// `Compiler::compile` refuses the Blueprint and no author setting can
+/// change that *at compile*.
+///
+/// Callers use this as the guard around [`resolve_level`]'s result,
+/// stage-scoped: at [`DiagStage::CompileLint`] an `allow` / `warn` on
+/// such a kind is ignored outright. At `bp_doctor` the kind stays
+/// suppressible when that stage emits it (at `Warn`); the
+/// `non-suppressible-lint` meta-lint fires only for an exact-kind entry
+/// on a kind `bp_doctor` never emits, and a `category:` / `all` key
+/// skips those without noise.
+pub fn is_compile_hard_error(decl: &LintDecl) -> bool {
+    matches!(decl.default_level, DiagLevel::Error)
 }
 
 #[cfg(test)]
@@ -697,5 +935,265 @@ mod tests {
         assert_eq!(v["suggestion"], serde_json::Value::Null);
         assert_eq!(v["docs_ref"], serde_json::Value::Null);
         assert_eq!(v["span"], serde_json::Value::Null);
+    }
+
+    // ─── lint level control (LintConfig / resolve_level) ─────────────
+
+    /// `agent-md-size` — Warn / Style, the canonical suppressible lint.
+    fn style_decl() -> &'static LintDecl {
+        lint_decl("agent-md-size").expect("declared")
+    }
+
+    /// `worker-binding-missing` — Error / Contract, a compile-stage hard
+    /// error.
+    fn hard_error_decl() -> &'static LintDecl {
+        lint_decl("worker-binding-missing").expect("declared")
+    }
+
+    fn cfg(pairs: &[(&str, LintSetting)]) -> LintConfig {
+        LintConfig::from_pairs(pairs.iter().map(|(k, v)| (k.to_string(), *v)))
+    }
+
+    #[test]
+    fn resolve_level_falls_through_to_the_registry_default() {
+        assert_eq!(
+            resolve_level(style_decl(), &[]),
+            ResolvedLint::Level(DiagLevel::Warn)
+        );
+        let empty = LintConfig::default();
+        assert_eq!(
+            resolve_level(style_decl(), &[&empty, &empty]),
+            ResolvedLint::Level(DiagLevel::Warn)
+        );
+    }
+
+    #[test]
+    fn resolve_level_maps_allow_warn_deny() {
+        for (setting, expected) in [
+            (LintSetting::Allow, ResolvedLint::Suppressed),
+            (LintSetting::Warn, ResolvedLint::Level(DiagLevel::Warn)),
+            (LintSetting::Deny, ResolvedLint::Level(DiagLevel::Error)),
+        ] {
+            let layer = cfg(&[("agent-md-size", setting)]);
+            assert_eq!(
+                resolve_level(style_decl(), &[&layer]),
+                expected,
+                "mapping for {setting:?}"
+            );
+        }
+    }
+
+    /// The first layer with any matching key wins outright — an outer
+    /// layer never overrides or merges into an inner one.
+    #[test]
+    fn resolve_level_first_matching_layer_wins() {
+        let call_site = cfg(&[("agent-md-size", LintSetting::Allow)]);
+        let agent = cfg(&[("agent-md-size", LintSetting::Deny)]);
+        let blueprint = cfg(&[("agent-md-size", LintSetting::Warn)]);
+
+        assert_eq!(
+            resolve_level(style_decl(), &[&call_site, &agent, &blueprint]),
+            ResolvedLint::Suppressed,
+            "call-site beats agent"
+        );
+        assert_eq!(
+            resolve_level(style_decl(), &[&agent, &blueprint]),
+            ResolvedLint::Level(DiagLevel::Error),
+            "agent beats blueprint"
+        );
+        assert_eq!(
+            resolve_level(style_decl(), &[&blueprint]),
+            ResolvedLint::Level(DiagLevel::Warn)
+        );
+    }
+
+    /// A less specific key in a nearer layer still wins over an exact
+    /// key further out (proximity is decided before specificity).
+    #[test]
+    fn resolve_level_layer_proximity_beats_key_specificity() {
+        let agent = cfg(&[("all", LintSetting::Allow)]);
+        let blueprint = cfg(&[("agent-md-size", LintSetting::Deny)]);
+        assert_eq!(
+            resolve_level(style_decl(), &[&agent, &blueprint]),
+            ResolvedLint::Suppressed
+        );
+    }
+
+    #[test]
+    fn resolve_level_within_a_layer_kind_beats_category_beats_all() {
+        let all_three = cfg(&[
+            ("agent-md-size", LintSetting::Deny),
+            ("category:style", LintSetting::Warn),
+            ("all", LintSetting::Allow),
+        ]);
+        assert_eq!(
+            resolve_level(style_decl(), &[&all_three]),
+            ResolvedLint::Level(DiagLevel::Error),
+            "exact kind wins"
+        );
+
+        let category_and_all = cfg(&[
+            ("category:style", LintSetting::Warn),
+            ("all", LintSetting::Allow),
+        ]);
+        assert_eq!(
+            resolve_level(style_decl(), &[&category_and_all]),
+            ResolvedLint::Level(DiagLevel::Warn),
+            "category beats all"
+        );
+
+        let all_only = cfg(&[("all", LintSetting::Allow)]);
+        assert_eq!(
+            resolve_level(style_decl(), &[&all_only]),
+            ResolvedLint::Suppressed,
+            "all is the fallback within the layer"
+        );
+    }
+
+    /// A `category:` key only matches its own category, and the category
+    /// name is compared case-insensitively.
+    #[test]
+    fn category_keys_match_only_their_own_category() {
+        let style_group = cfg(&[("category:style", LintSetting::Allow)]);
+        assert_eq!(
+            resolve_level(style_decl(), &[&style_group]),
+            ResolvedLint::Suppressed
+        );
+        assert_eq!(
+            resolve_level(hard_error_decl(), &[&style_group]),
+            ResolvedLint::Level(DiagLevel::Error),
+            "a Contract kind is untouched by a Style group key"
+        );
+
+        let upper = cfg(&[("category:STYLE", LintSetting::Allow)]);
+        assert_eq!(
+            resolve_level(style_decl(), &[&upper]),
+            ResolvedLint::Suppressed,
+            "category names are ASCII case-insensitive"
+        );
+        assert!(upper.unknown_keys().is_empty());
+    }
+
+    #[test]
+    fn every_declared_category_is_addressable_as_a_group_key() {
+        for d in LINT_DECLS {
+            let key = format!("category:{}", d.category.as_key());
+            let layer = cfg(&[(key.as_str(), LintSetting::Allow)]);
+            assert!(
+                layer.unknown_keys().is_empty(),
+                "{key} must be a known group key"
+            );
+            assert_eq!(
+                resolve_level(d, &[&layer]),
+                ResolvedLint::Suppressed,
+                "{} must be reachable through {key}",
+                d.kind
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_collected_not_honored() {
+        let layer = cfg(&[
+            ("agent-md-size", LintSetting::Allow),
+            ("agent-md-sizes", LintSetting::Deny),
+            ("category:nonsense", LintSetting::Deny),
+            ("everything", LintSetting::Deny),
+        ]);
+        assert_eq!(
+            layer.unknown_keys(),
+            ["agent-md-sizes", "category:nonsense", "everything"]
+        );
+        assert_eq!(layer.entries().len(), 1);
+        assert_eq!(
+            resolve_level(style_decl(), &[&layer]),
+            ResolvedLint::Suppressed,
+            "the one honored entry still resolves"
+        );
+    }
+
+    /// The untyped call-site form never errors: an unparseable value is
+    /// collected exactly like an unknown key.
+    #[test]
+    fn from_str_map_collects_invalid_values_alongside_unknown_keys() {
+        let map = BTreeMap::from([
+            ("agent-md-size".to_string(), "ALLOW".to_string()),
+            ("category:style".to_string(), "forbid".to_string()),
+            ("no-such-lint".to_string(), "deny".to_string()),
+            ("all".to_string(), "warn".to_string()),
+        ]);
+        let layer = LintConfig::from_str_map(&map);
+
+        assert_eq!(layer.unknown_keys(), ["category:style", "no-such-lint"]);
+        assert_eq!(
+            layer.entries().get("agent-md-size"),
+            Some(&LintSetting::Allow),
+            "values parse ASCII case-insensitively"
+        );
+        assert_eq!(layer.entries().get("all"), Some(&LintSetting::Warn));
+        assert_eq!(
+            resolve_level(hard_error_decl(), &[&layer]),
+            ResolvedLint::Level(DiagLevel::Warn),
+            "the surviving 'all' entry still applies"
+        );
+    }
+
+    #[test]
+    fn empty_config_is_reported_empty_and_never_matches() {
+        let empty = LintConfig::from_str_map(&BTreeMap::new());
+        assert!(empty.is_empty());
+        assert!(empty.unknown_keys().is_empty());
+        assert_eq!(empty.setting_for(style_decl()), None);
+
+        let only_unknown =
+            LintConfig::from_str_map(&BTreeMap::from([("typo".to_string(), "allow".to_string())]));
+        assert!(only_unknown.is_empty(), "unknown keys honor nothing");
+        assert_eq!(only_unknown.unknown_keys(), ["typo"]);
+    }
+
+    /// The boundary helper is a pure `default_level` probe — the stage
+    /// rules on top of it belong to the consumer.
+    #[test]
+    fn is_compile_hard_error_tracks_the_registry_default_level() {
+        assert!(is_compile_hard_error(hard_error_decl()));
+        assert!(!is_compile_hard_error(style_decl()));
+        for d in LINT_DECLS {
+            assert_eq!(
+                is_compile_hard_error(d),
+                d.default_level == DiagLevel::Error,
+                "{}",
+                d.kind
+            );
+        }
+    }
+
+    /// The two meta-lints are declared like any other kind, so the
+    /// consumer emits them through the same registry lookup.
+    #[test]
+    fn meta_lints_are_declared_in_the_registry() {
+        for kind in ["unknown-lint-kind", "non-suppressible-lint"] {
+            let d = lint_decl(kind).expect("meta-lint must be declared");
+            assert_eq!(d.default_level, DiagLevel::Warn);
+            assert_eq!(d.category, LintCategory::Suspicious);
+            assert_eq!(d.docs_ref.uri, "mse://guides/lint-diagnostic-model");
+            assert!(!is_compile_hard_error(d));
+        }
+    }
+
+    #[test]
+    fn lint_setting_parses_and_serializes_the_lowercase_wire_form() {
+        assert_eq!(LintSetting::parse("allow"), Some(LintSetting::Allow));
+        assert_eq!(LintSetting::parse("Warn"), Some(LintSetting::Warn));
+        assert_eq!(LintSetting::parse("DENY"), Some(LintSetting::Deny));
+        assert_eq!(LintSetting::parse("forbid"), None);
+        assert_eq!(LintSetting::parse(""), None);
+        assert_eq!(
+            serde_json::to_value(LintSetting::Allow).expect("serializes"),
+            serde_json::json!("allow")
+        );
+        assert_eq!(
+            serde_json::from_value::<LintSetting>(serde_json::json!("deny")).expect("deserializes"),
+            LintSetting::Deny
+        );
     }
 }

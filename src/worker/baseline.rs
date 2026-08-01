@@ -89,6 +89,7 @@ mod tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         };
         factory
             .build(&agent_def, None)

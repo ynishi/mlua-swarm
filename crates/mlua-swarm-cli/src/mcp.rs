@@ -5363,6 +5363,7 @@ mod tests {
                 runner: None,
                 runner_ref: None,
                 verdict: None,
+                lints: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -5376,6 +5377,7 @@ mod tests {
                 project_name_alias: None,
                 default_run_ttl_secs: None,
                 strict_verdict_handling: None,
+                lints: None,
             },
             spawner_hints: Default::default(),
             default_agent_kind: AgentKind::Operator,
@@ -7431,6 +7433,7 @@ mod tests {
             }),
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -7451,6 +7454,7 @@ mod tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -7465,6 +7469,7 @@ mod tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -7583,6 +7588,7 @@ mod tests {
                     channel: mlua_swarm_schema::VerdictChannel::Part,
                     values: values.iter().map(|s| (*s).into()).collect(),
                 }),
+                lints: None,
             })
             .collect();
         bp
@@ -8064,6 +8070,7 @@ mod tests {
                     runner: None,
                     runner_ref: None,
                     verdict: None,
+                    lints: None,
                 },
                 AgentDef {
                     name: "auditor".into(),
@@ -8074,6 +8081,7 @@ mod tests {
                     runner: None,
                     runner_ref: None,
                     verdict: None,
+                    lints: None,
                 },
             ],
             operators: vec![],

@@ -4453,6 +4453,7 @@ mod submit_time_projection_sink_tests {
                 runner: None,
                 runner_ref: None,
                 verdict: None,
+                lints: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -6123,6 +6124,7 @@ mod skip_tier_tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 
@@ -6187,6 +6189,7 @@ mod skip_tier_tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 
@@ -6237,6 +6240,7 @@ mod skip_tier_tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 

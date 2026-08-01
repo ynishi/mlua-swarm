@@ -1084,6 +1084,7 @@ mod explain_agent_tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 

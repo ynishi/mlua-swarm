@@ -2628,6 +2628,7 @@ mod operator_spawner_factory_worker_binding_tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -2758,6 +2759,7 @@ mod lua_inline_source_tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -2877,6 +2879,7 @@ mod meta_ref_validation_tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -3059,6 +3062,7 @@ mod audit_agent_validation_tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -3421,6 +3425,7 @@ mod operator_run_pin_tests {
             runner: None,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -3557,6 +3562,7 @@ mod projection_placement_compile_tests {
                 runner: None,
                 runner_ref: None,
                 verdict: None,
+                lints: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -3673,6 +3679,7 @@ mod verdict_contract_lint_tests {
             runner: None,
             runner_ref: None,
             verdict,
+            lints: None,
         }
     }
 
@@ -4211,6 +4218,7 @@ mod subprocess_embed_compile_tests {
             runner,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
@@ -4343,6 +4351,7 @@ mod subprocess_embed_compile_tests {
             runner,
             runner_ref: None,
             verdict: None,
+            lints: None,
         }
     }
 
