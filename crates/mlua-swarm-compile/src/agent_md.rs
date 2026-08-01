@@ -11,6 +11,8 @@
 //! effort: high
 //! tools: Read, Edit, Write, Grep, Glob
 //! worker_binding: code-worker
+//! lints:
+//!   agent-md-size: allow
 //! permissionMode: bypassPermissions
 //! memory: user
 //! abtest: true
@@ -35,9 +37,17 @@
 //!   agent binds to at spawn time — first-class (not dumped into
 //!   `extras`) because the compiler and the WS thin path read it
 //!   directly (see `AgentProfile::worker_binding`).
+//! - `lints` is a map of lint key → level (`allow` / `warn` / `deny`)
+//!   populating `AgentDef::lints` — the per-agent layer of the lint
+//!   cascade (see `mlua_swarm_schema::LintSetting`). First-class, not
+//!   dumped into `extras`. An unrecognized *value* is a loud parse
+//!   error ([`LoadError::Lints`]); an unrecognized *key* passes through
+//!   untouched, because keys are validated at consumption time
+//!   (`bp_doctor`'s `unknown-lint-kind` meta-lint).
 //! - Any field beyond the known set (`name` / `description` / `model`
-//!   / `effort` / `tools` / `worker_binding`) is dumped into an
-//!   `extras` `Value` — a future-proof carry for C-C-specific fields.
+//!   / `effort` / `tools` / `worker_binding` / `lints`) is dumped into
+//!   an `extras` `Value` — a future-proof carry for C-C-specific
+//!   fields.
 //! - The body is kept verbatim, from just after the closing `---` to
 //!   the end of the file. Body headings (e.g. `## Input`, `## When
 //!   invoked:`, `## Output format`) are treated as opaque prompt text —
@@ -46,8 +56,9 @@
 //!   is verbatim in its system prompt (matches
 //!   `mse://guides/agent-md-authoring` § "Input is not a section").
 
-use mlua_swarm_schema::{AgentDef, AgentKind, AgentProfile};
+use mlua_swarm_schema::{AgentDef, AgentKind, AgentProfile, LintSetting};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -75,6 +86,20 @@ pub enum LoadError {
         /// Path (or source label) of the offending file.
         path: String,
     },
+    /// The frontmatter `lints` field is malformed: not a map, or an
+    /// entry whose level is not `allow` / `warn` / `deny`.
+    ///
+    /// Values fail loud (the author controls that spelling
+    /// exhaustively — same rationale as the typed
+    /// `mlua_swarm_schema::LintSetting` on the Blueprint JSON side);
+    /// unrecognized *keys* do not, they are consumption-time material
+    /// for the `unknown-lint-kind` meta-lint.
+    Lints {
+        /// Path (or source label) of the offending file.
+        path: String,
+        /// What was wrong, naming the offending key and value.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for LoadError {
@@ -87,6 +112,9 @@ impl std::fmt::Display for LoadError {
             LoadError::Yaml { path, source } => write!(f, "yaml parse error in {path}: {source}"),
             LoadError::MissingName { path } => {
                 write!(f, "frontmatter missing required `name` field in {path}")
+            }
+            LoadError::Lints { path, detail } => {
+                write!(f, "invalid frontmatter `lints` in {path}: {detail}")
             }
         }
     }
@@ -182,6 +210,7 @@ pub fn parse(text: &str, source_label: &str, kind: AgentKind) -> Result<AgentDef
         .get("worker_binding")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let lints = parse_lints(obj.get("lints"), source_label)?;
 
     // Dump everything outside the known set into `extras` — a
     // future-proof carry for C-C-specific fields.
@@ -192,6 +221,7 @@ pub fn parse(text: &str, source_label: &str, kind: AgentKind) -> Result<AgentDef
         "effort",
         "tools",
         "worker_binding",
+        "lints",
     ];
     let mut extras = Map::new();
     for (k, v) in &obj {
@@ -235,10 +265,44 @@ pub fn parse(text: &str, source_label: &str, kind: AgentKind) -> Result<AgentDef
         // directly (`agents[N].verdict`) until a later follow-up wires
         // frontmatter authoring for it too.
         verdict: None,
-        // Lint level overrides are Blueprint-JSON-authored as well (the
-        // same frontmatter carry as `runner` / `verdict` above).
-        lints: None,
+        lints,
     })
+}
+
+/// Turn the frontmatter `lints` value into `AgentDef::lints`.
+///
+/// Absent **and** present-but-empty both yield `None`: an empty map
+/// declares nothing, and dropping it keeps the wire minimal (the field
+/// is `skip_serializing_if = "Option::is_none"`, so a no-op `lints:`
+/// block never shows up in the serialized `AgentDef`).
+///
+/// Values are typed and fail loud ([`LoadError::Lints`]); keys are
+/// carried through verbatim, including unrecognized ones — key validity
+/// is a consumption-time question (`bp_doctor` reports an unmatched key
+/// as the `unknown-lint-kind` meta-lint rather than refusing to load).
+fn parse_lints(
+    value: Option<&Value>,
+    source_label: &str,
+) -> Result<Option<BTreeMap<String, LintSetting>>, LoadError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let obj = value.as_object().ok_or_else(|| LoadError::Lints {
+        path: source_label.into(),
+        detail: format!("expected a map of lint key to level, got {value}"),
+    })?;
+    let mut out = BTreeMap::new();
+    for (key, level) in obj {
+        let setting =
+            serde_json::from_value::<LintSetting>(level.clone()).map_err(|_| LoadError::Lints {
+                path: source_label.into(),
+                detail: format!(
+                    "key `{key}` has level {level}, expected \"allow\", \"warn\" or \"deny\""
+                ),
+            })?;
+        out.insert(key.clone(), setting);
+    }
+    Ok(if out.is_empty() { None } else { Some(out) })
 }
 
 /// Compute the content hash of an agent body (its `system_prompt`).
@@ -409,10 +473,77 @@ mod tests {
     }
 
     #[test]
+    fn lints_frontmatter_populates_agent_def_lints() {
+        let t = "---\nname: researcher\nlints:\n  agent-md-size: allow\n  \"category:style\": deny\n---\nbody\n";
+        let def = parse(t, "researcher.md", AgentKind::Operator).unwrap();
+        let lints = def.lints.expect("lints present");
+        assert_eq!(lints.get("agent-md-size"), Some(&LintSetting::Allow));
+        assert_eq!(lints.get("category:style"), Some(&LintSetting::Deny));
+        // First-class: must not also leak into extras.
+        let p = def.profile.expect("profile present");
+        assert!(matches!(p.extras, Value::Null));
+    }
+
+    /// Keys are consumption-time material: an unrecognized one loads
+    /// fine and becomes `bp_doctor`'s `unknown-lint-kind` meta-lint.
+    #[test]
+    fn lints_unknown_key_passes_through() {
+        let t = "---\nname: reviewer\nlints:\n  no-such-lint: warn\n---\nbody\n";
+        let def = parse(t, "reviewer.md", AgentKind::Operator).unwrap();
+        let lints = def.lints.expect("lints present");
+        assert_eq!(lints.get("no-such-lint"), Some(&LintSetting::Warn));
+    }
+
+    #[test]
+    fn lints_absent_or_empty_is_none() {
+        let absent = parse(SAMPLE, "sample", AgentKind::Operator).unwrap();
+        assert_eq!(absent.lints, None);
+        // A `lints: {}` block declares nothing — kept off the wire too.
+        let empty = parse(
+            "---\nname: planner\nlints: {}\n---\nbody\n",
+            "planner.md",
+            AgentKind::Operator,
+        )
+        .unwrap();
+        assert_eq!(empty.lints, None);
+    }
+
+    #[test]
+    fn lints_invalid_value_errors_naming_key_and_value() {
+        let t = "---\nname: greeter\nlints:\n  agent-md-size: forbid\n---\nbody\n";
+        let err = parse(t, "greeter.md", AgentKind::Operator).expect_err("invalid level rejected");
+        assert!(matches!(err, LoadError::Lints { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("agent-md-size"), "names the key, got: {msg}");
+        assert!(msg.contains("forbid"), "names the value, got: {msg}");
+        assert!(msg.contains("greeter.md"), "names the file, got: {msg}");
+    }
+
+    /// Uppercase is not the schema's serde spelling either — the wire
+    /// literals are exactly `allow` / `warn` / `deny`.
+    #[test]
+    fn lints_value_spelling_is_exact_lowercase() {
+        let t = "---\nname: greeter\nlints:\n  all: ALLOW\n---\nbody\n";
+        assert!(matches!(
+            parse(t, "greeter.md", AgentKind::Operator),
+            Err(LoadError::Lints { .. })
+        ));
+    }
+
+    #[test]
+    fn lints_non_map_errors() {
+        let t = "---\nname: greeter\nlints: allow\n---\nbody\n";
+        let err = parse(t, "greeter.md", AgentKind::Operator).expect_err("scalar rejected");
+        assert!(err.to_string().contains("expected a map"), "got: {err}");
+    }
+
+    #[test]
     fn version_hash_stable_across_frontmatter_reorder() {
         // Reordering the frontmatter must not affect the body → hash stays the same.
-        let t1 = "---\nname: x\nmodel: sonnet\n---\nsame body\n";
-        let t2 = "---\nmodel: sonnet\nname: x\n---\nsame body\n";
+        // `lints` is parsed out of the frontmatter like every other field
+        // and never reaches the body, so it cannot move the hash either.
+        let t1 = "---\nname: x\nmodel: sonnet\nlints:\n  all: allow\n---\nsame body\n";
+        let t2 = "---\nlints:\n  all: allow\nmodel: sonnet\nname: x\n---\nsame body\n";
         let h1 = parse(t1, "x", AgentKind::Operator)
             .unwrap()
             .profile

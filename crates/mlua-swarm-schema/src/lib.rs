@@ -799,10 +799,26 @@ pub struct AgentDef {
     /// [`LintSetting`] cascade (call-site > this >
     /// [`BlueprintMetadata::lints`] > the kind's registry default),
     /// applied to diagnostics whose span points at this agent or at a
-    /// step referencing it. `bp_doctor` is the consumer; nothing here
-    /// changes compile behavior. Keys are kind literals
+    /// step referencing it. Keys are kind literals
     /// (`"agent-md-size"`), `"category:<cat>"` groups, or `"all"` — see
     /// [`LintSetting`] for the full grammar and the precedence rules.
+    ///
+    /// `bp_doctor` is the main consumer, and it reads every kind. The
+    /// compile stage reads exactly one: a `deny` matching
+    /// `"verdict-value-unhandled"` rejects the Blueprint over *this*
+    /// agent's unhandled declared verdict values, and an `allow`
+    /// silences them — the same single compile-stage effect
+    /// [`BlueprintMetadata::lints`] carries, resolved one layer nearer.
+    /// Proximity decides: whichever of the two layers declares the kind
+    /// first (this one, then the Blueprint's) wins outright for this
+    /// agent, so an agent `allow` beats a Blueprint `deny` — but
+    /// [`BlueprintMetadata::strict_verdict_handling`]` = true` still
+    /// wins over either `allow` (union toward deny). No other kind's
+    /// compile behavior can be changed: compile-stage errors are hard
+    /// errors, not lints.
+    ///
+    /// Authorable from an `agent.md` frontmatter `lints:` map as well as
+    /// from Blueprint JSON (`mlua_swarm_compile::agent_md`).
     ///
     /// Top-level rather than inside [`AgentProfile::extras`] on purpose:
     /// `extras` is the engine-untouched free-form contract and stays
@@ -2043,8 +2059,10 @@ pub struct BlueprintMetadata {
     /// every other layer and reads next to the rest of the Blueprint's
     /// lint policy). Both spellings are honored and union toward `deny`:
     /// either one saying deny rejects the compile, and `true` here wins
-    /// over a `lints` `allow`. The field is kept indefinitely — existing
-    /// Blueprints are not asked to migrate.
+    /// over a `lints` `allow` on *either* layer — this one or
+    /// [`AgentDef::lints`]. The field is kept indefinitely — existing
+    /// Blueprints are not asked to migrate. Blueprint-wide by nature: to
+    /// exempt one agent, drop the flag and declare the kind per agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_verdict_handling: Option<bool>,
     /// Blueprint-wide lint level overrides — the outermost layer of the
@@ -2058,7 +2076,10 @@ pub struct BlueprintMetadata {
     /// One entry also reaches the compile stage: a `deny` matching
     /// `"verdict-value-unhandled"` rejects the Blueprint exactly like
     /// [`strict_verdict_handling`](Self::strict_verdict_handling), and an
-    /// `allow` silences its `tracing::warn!`. No other kind's compile
+    /// `allow` silences its `tracing::warn!`. This is the outer of the two
+    /// layers the compile stage reads — an agent that declares the kind in
+    /// its own [`AgentDef::lints`] decides for itself, and only agents
+    /// that declare nothing fall through to here. No other kind's compile
     /// behavior can be changed — compile-stage errors are hard errors, not
     /// lints.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -60,8 +60,9 @@ mse consumes. There's no separate mse-specific frontmatter dialect.
   `MissingName`. Every other key is optional; missing keys default to nothing
   and are not reported as errors.
 
-- **First-class fields.** These six keys are extracted into typed
-  `AgentProfile` slots. The names and semantics are Claude Code's:
+- **First-class fields.** These seven keys are extracted into typed slots
+  (all but `lints` land on `AgentProfile`). The names and semantics of the
+  first six are Claude Code's:
 
   | key              | shape                              | slot                          |
   |------------------|------------------------------------|-------------------------------|
@@ -71,10 +72,26 @@ mse consumes. There's no separate mse-specific frontmatter dialect.
   | `effort`         | string (`low` / `medium` / `high` / …) | `profile.effort`          |
   | `tools`          | CSV string **or** YAML array       | `profile.tools` (normalized `Vec<String>`) |
   | `worker_binding` | string (SubAgent variant name)     | `profile.worker_binding`      |
+  | `lints`          | map of lint key → `allow` / `warn` / `deny` | `AgentDef.lints`     |
 
   `tools` accepts either form — `tools: "Read, Edit, Grep"` and
   `tools: [Read, Edit, Grep]` produce the same `Vec<String>`. Whitespace and
   empty entries are trimmed.
+
+  `lints` is the per-agent layer of the lint cascade
+  (`mse://guides/lint-diagnostic-model`), declared where the agent lives:
+
+  ```yaml
+  lints:
+    agent-md-size: allow
+  ```
+
+  A level that is not `allow` / `warn` / `deny` fails the load loudly,
+  naming the key and the value. An unrecognized *key* loads fine — keys
+  are validated when consumed, as `bp_doctor`'s `unknown-lint-kind`
+  meta-lint. An empty map is the same as no map at all. A sibling `lints`
+  key next to the `$agent_md` ref replaces this whole map (the sibling
+  merge is shallow, per top-level key).
 
 - **Everything else is dumped into `extras`.** Any key outside the first-class
   set (`permissionMode`, `memory`, `abtest`, arbitrary custom keys, …) is
@@ -97,10 +114,10 @@ mse consumes. There's no separate mse-specific frontmatter dialect.
 
 **Practical implication for authoring.** You can write agent.md files in the
 same shape you already use with Claude Code and drop them straight into a
-mse Blueprint with `$agent_md`. mse-only fields (`worker_binding`) go in the
-same frontmatter block; Claude Code-only fields (`permissionMode`, `memory`,
-…) survive round-trip but don't affect mse's dispatch — they belong to the
-wrapper's grant, not to this durable prompt.
+mse Blueprint with `$agent_md`. mse-only fields (`worker_binding`, `lints`)
+go in the same frontmatter block; Claude Code-only fields (`permissionMode`,
+`memory`, …) survive round-trip but don't affect mse's dispatch — they belong
+to the wrapper's grant, not to this durable prompt.
 
 ## Output contract: inline body vs `@file:` sentinel
 

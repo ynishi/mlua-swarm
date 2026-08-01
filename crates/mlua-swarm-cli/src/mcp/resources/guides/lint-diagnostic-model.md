@@ -106,6 +106,10 @@ three places. The declaration is a `{key: level}` map:
 | per-agent | `agents[].lints` in the Blueprint | findings that span that agent (or a step referencing it) |
 | blueprint | `metadata.lints` in the Blueprint | every finding |
 
+The per-agent layer is authorable from an `agent.md` frontmatter `lints:`
+map too, not just from Blueprint JSON — see
+`mse://guides/agent-md-authoring`.
+
 **Precedence: call-site > agent > blueprint > the kind's registry
 default.** The first layer that has *any* matching key wins outright —
 no merging across layers. This is rustc's attribute-proximity model: the
@@ -167,16 +171,33 @@ the dual-stage kinds that are compile hard errors, such as
 at `bp_doctor` says "do not report this here"; it does not make the
 Blueprint compile.
 
-**The one compile-stage exception**: `metadata.lints` can change the
+**The one compile-stage exception**: a `lints` map can change the
 compile behavior of exactly one kind, `verdict-value-unhandled`.
 `deny` (via the kind literal, `category:suspicious`, or `all`) rejects
 the compile with the same error `metadata.strict_verdict_handling: true`
 produces — that flag is now the legacy sugar for
 `{"verdict-value-unhandled": "deny"}` — and `allow` silences its
 `tracing::warn!`. The two spellings union toward deny: either one saying
-deny denies, and the flag wins over an `allow`. No other kind's compile
-behavior can be changed, and only the Blueprint layer is read at compile
-(per-agent compile enforcement is a follow-up).
+deny denies, and the flag wins over an `allow` at any layer. No other
+kind's compile behavior can be changed.
+
+Both Blueprint layers are read at compile, per agent and in the same
+proximity order as at `bp_doctor` — `agents[].lints`, then
+`metadata.lints` (there is no call-site layer at compile). So one agent
+can be exempted without touching its siblings:
+
+```json
+{
+  "agents": [
+    {"name": "researcher", "lints": {"verdict-value-unhandled": "allow"}},
+    {"name": "reviewer"}
+  ],
+  "metadata": {"lints": {"verdict-value-unhandled": "deny"}}
+}
+```
+
+`researcher`'s unhandled declared verdict values stay silent; an
+unhandled value on `reviewer` still rejects the compile.
 
 ### Two meta-lints about the declaration itself
 
@@ -286,10 +307,10 @@ so it cannot drift.
 
 - `mse bp fix` auto-apply — `Applicability` is declared here; the apply
   loop is not.
-- Per-agent lint control at the *compile* stage — `agents[].lints` is
-  read by `bp_doctor` only; the compile stage reads `metadata.lints`,
-  and just for `verdict-value-unhandled` (see "Controlling lint
-  levels").
+- More compile-stage kinds — the compile stage reads both Blueprint
+  layers (`agents[].lints`, then `metadata.lints`) but still for
+  `verdict-value-unhandled` only; every other compile finding is a hard
+  error, not a lint (see "Controlling lint levels").
 - Runtime error-path unification — `DiagStage::Runtime` is declared,
   unconsumed.
 - Colorized terminal rendering — the model is data-only.

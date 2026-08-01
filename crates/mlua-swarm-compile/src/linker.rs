@@ -37,6 +37,12 @@
 //! object with `profile.system_prompt`, `meta`, `spec`, and so on already
 //! filled in. Path hygiene matches `$file`: absolute paths and `..` are
 //! rejected.
+//!
+//! Sibling keys next to `$agent_md` are shallow-merged onto that object,
+//! so the call site overrides what the agent.md declared. Shallow means
+//! per top-level key: a sibling `lints` replaces the frontmatter's whole
+//! `lints:` map (and `{}` clears it) rather than merging entry by entry —
+//! same for `spec` / `meta` / `profile`.
 
 use mlua_swarm_schema::{default_global_agent_kind, AgentKind, Blueprint};
 use serde_json::Value;
@@ -327,6 +333,12 @@ pub fn expand_file_refs_with_config(
             // name and profile from the agent.md but override only
             // `spec.operator_ref` or `meta` at the call site.
             //
+            // The merge is shallow at the AgentDef's top level, so a
+            // map-valued key replaces the md's map wholesale rather than
+            // merging into it: a sibling `lints` overrides the whole
+            // frontmatter `lints:` map (`{}` disables every level the
+            // agent.md declared), it does not add entries to it.
+            //
             // Kind resolution cascade: (a) if a sibling `"kind"` literal
             // is present, use it as-is; (b) otherwise, fall back to the
             // `default_kind` argument, which the caller already resolved
@@ -478,6 +490,48 @@ You are a researcher. Focus on XX/YY sites.\n";
                 .contains("You are a researcher"),
             "profile from md preserved"
         );
+    }
+
+    /// The frontmatter `lints:` map lands on the expanded AgentDef, and
+    /// a sibling `lints` key replaces it wholesale (shallow override —
+    /// map values are not merged key by key).
+    #[test]
+    fn agent_md_ref_sibling_lints_override_the_frontmatter_map() {
+        let dir = TempDir::new().unwrap();
+        write_md(
+            dir.path(),
+            "agents/r.md",
+            "---\nname: researcher\nlints:\n  agent-md-size: allow\n  \"category:style\": warn\n---\nYou are a researcher.\n",
+        );
+
+        // No sibling: the frontmatter map is what the AgentDef carries.
+        let from_md = expand_file_refs(
+            json!({ "$agent_md": "agents/r.md" }),
+            dir.path(),
+            AgentKind::Operator,
+        )
+        .expect("expand ok");
+        assert_eq!(
+            from_md["lints"],
+            json!({"agent-md-size": "allow", "category:style": "warn"})
+        );
+
+        // Sibling present: the whole map is replaced, not merged.
+        let overridden = expand_file_refs(
+            json!({
+                "$agent_md": "agents/r.md",
+                "lints": { "verdict-value-unhandled": "deny" },
+            }),
+            dir.path(),
+            AgentKind::Operator,
+        )
+        .expect("expand ok");
+        assert_eq!(
+            overridden["lints"],
+            json!({"verdict-value-unhandled": "deny"}),
+            "sibling lints replaces the frontmatter map wholesale"
+        );
+        assert_eq!(overridden["name"], "researcher", "name from md preserved");
     }
 
     #[test]

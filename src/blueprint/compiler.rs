@@ -44,7 +44,7 @@ use async_trait::async_trait;
 use mlua_flow_ir::{Expr, Node as FlowNode, Path};
 use mlua_swarm_schema::{VerdictChannel, VerdictContract};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -759,14 +759,16 @@ impl Compiler {
         // GH #50 follow-up (issue `33bc825b`): the reverse-direction lint
         // — declared `verdict.values` entries that no downstream cond
         // references — runs in the same walk. Its compile-stage
-        // disposition comes from `BlueprintMetadata.strict_verdict_handling`
-        // unioned with a `metadata.lints` entry for the same kind (see
-        // [`resolve_unhandled_verdict_gate`]); the default still only
+        // disposition is resolved per agent from
+        // `BlueprintMetadata.strict_verdict_handling` unioned with the
+        // nearest `lints` layer that declares the kind — `agents[].lints`
+        // first, then `metadata.lints` (see
+        // [`resolve_unhandled_verdict_gates`]); the default still only
         // surfaces `tracing::warn!` so existing Blueprints that
         // intentionally leave some verdict values as silent-pass
         // informational tokens keep compiling unchanged.
-        let unhandled_gate = resolve_unhandled_verdict_gate(&bp.metadata);
-        verify_verdict_conds(&bp.flow, &verdict_contracts, unhandled_gate)?;
+        let unhandled_gates = resolve_unhandled_verdict_gates(bp);
+        verify_verdict_conds(&bp.flow, &verdict_contracts, &unhandled_gates)?;
 
         if bp.strategy.strict_refs {
             verify_refs(&bp.flow, &routes, self.default_spawner.is_some())?;
@@ -915,11 +917,12 @@ fn static_step_meta_ref(value: &Value) -> Option<String> {
 
 // ─── GH #50: verdict contract cond↔output-shape lint ───────────────────────
 
-/// The lint kind whose compile-stage disposition `metadata.lints` may
-/// change. Deliberately a single literal and not a loop over
-/// [`mlua_swarm_diag::LINT_DECLS`]: at the compile stage every other kind
-/// is a hard error, not a lint, so no other `CompileError` path is routed
-/// through the lint resolver (design §3 "non-suppressible boundary").
+/// The lint kind whose compile-stage disposition a `lints` map may change
+/// (on either the `agents[]` or the `metadata` layer). Deliberately a
+/// single literal and not a loop over [`mlua_swarm_diag::LINT_DECLS`]: at
+/// the compile stage every other kind is a hard error, not a lint, so no
+/// other `CompileError` path is routed through the lint resolver
+/// (design §3 "non-suppressible boundary").
 const UNHANDLED_VERDICT_LINT_KIND: &str = "verdict-value-unhandled";
 
 /// What `Compiler::compile` does with an unhandled declared verdict value.
@@ -933,30 +936,112 @@ enum UnhandledVerdictGate {
     Silence,
 }
 
-/// Resolve the compile-stage disposition of `verdict-value-unhandled` from
-/// the two spellings a Blueprint can use, `strict_verdict_handling` and
-/// `metadata.lints`.
+/// The gate, resolved once per contract-bearing agent.
+///
+/// The compile stage reads two of the three [`mlua_swarm_schema::LintSetting`]
+/// layers — `AgentDef.lints` then `BlueprintMetadata.lints` (there is no
+/// call-site layer at compile; that one belongs to `bp_doctor`) — under the
+/// same proximity model: the nearer layer that says anything about the kind
+/// wins outright, so an agent-level `allow` beats a Blueprint-level `deny`
+/// for that agent only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnhandledVerdictGates {
+    /// Agents whose own `lints` decided the gate, by `AgentDef.name`.
+    per_agent: HashMap<String, UnhandledVerdictGate>,
+    /// What every other agent gets: the Blueprint layer's outcome.
+    blueprint: UnhandledVerdictGate,
+}
+
+impl UnhandledVerdictGates {
+    /// The gate for one agent — its own layer if it declared the kind,
+    /// otherwise the Blueprint-wide outcome.
+    fn for_agent(&self, agent: &str) -> UnhandledVerdictGate {
+        self.per_agent.get(agent).copied().unwrap_or(self.blueprint)
+    }
+
+    /// `true` when no agent can produce a finding — lets the caller skip
+    /// the fold entirely (the pre-per-agent short circuit, preserved).
+    fn all_silent(&self) -> bool {
+        self.blueprint == UnhandledVerdictGate::Silence
+            && self
+                .per_agent
+                .values()
+                .all(|g| *g == UnhandledVerdictGate::Silence)
+    }
+}
+
+/// Resolve the compile-stage disposition of `verdict-value-unhandled` per
+/// agent, from the layers a Blueprint can declare it on:
+/// `strict_verdict_handling`, `metadata.lints`, and `agents[].lints`.
+///
+/// The Blueprint layer is resolved once and reused as the fallback; only
+/// agents that declare the kind themselves get an entry in
+/// [`UnhandledVerdictGates::per_agent`].
+fn resolve_unhandled_verdict_gates(bp: &Blueprint) -> UnhandledVerdictGates {
+    let strict = bp.metadata.strict_verdict_handling.unwrap_or(false);
+    let blueprint = resolve_unhandled_verdict_gate(&bp.metadata);
+    let per_agent = bp
+        .agents
+        .iter()
+        .filter_map(|ad| {
+            let declared = declared_unhandled_verdict_setting(&ad.lints)?;
+            Some((
+                ad.name.clone(),
+                unhandled_verdict_gate(strict, Some(declared)),
+            ))
+        })
+        .collect();
+    UnhandledVerdictGates {
+        per_agent,
+        blueprint,
+    }
+}
+
+/// Resolve the Blueprint-wide gate on its own — the layer every agent
+/// without its own `lints` inherits.
+fn resolve_unhandled_verdict_gate(metadata: &BlueprintMetadata) -> UnhandledVerdictGate {
+    unhandled_verdict_gate(
+        metadata.strict_verdict_handling.unwrap_or(false),
+        declared_unhandled_verdict_setting(&metadata.lints),
+    )
+}
+
+/// What one `lints` map says about `verdict-value-unhandled`, applying
+/// within-layer specificity (exact kind > `category:` > `all`). `None` =
+/// this layer says nothing, so the next one out decides.
+///
+/// Queried with [`mlua_swarm_diag::LintConfig::setting_for`] rather than
+/// [`mlua_swarm_diag::resolve_level`]: the latter falls back to the kind's
+/// registry default (`Error`), the level bp_doctor's sibling stage applies
+/// but the compile stage never does — an undeclared kind keeps the
+/// historical warn-only default here.
+fn declared_unhandled_verdict_setting(
+    lints: &Option<BTreeMap<String, mlua_swarm_schema::LintSetting>>,
+) -> Option<mlua_swarm_diag::LintSetting> {
+    use mlua_swarm_diag::{lint_decl, LintConfig};
+
+    let cfg = LintConfig::from_pairs(
+        lints
+            .as_ref()?
+            .iter()
+            .map(|(key, setting)| (key.clone(), diag_lint_setting(*setting))),
+    );
+    cfg.setting_for(lint_decl(UNHANDLED_VERDICT_LINT_KIND)?)
+}
+
+/// Fold the winning layer's setting together with the legacy
+/// `strict_verdict_handling` flag.
 ///
 /// Union toward `deny`: either spelling saying deny denies, and strict
-/// wins over a `lints` `allow` (the explicit legacy opt-in is never
-/// silently undone by a broad `all` / `category:` key). An undeclared kind
-/// keeps the historical warn-only default — which is why the Blueprint
-/// layer is queried with [`mlua_swarm_diag::LintConfig::setting_for`]
-/// rather than [`mlua_swarm_diag::resolve_level`]: the latter falls back to
-/// the kind's registry default (`Error`), the level bp_doctor's sibling
-/// stage never applies here.
-fn resolve_unhandled_verdict_gate(metadata: &BlueprintMetadata) -> UnhandledVerdictGate {
-    use mlua_swarm_diag::{lint_decl, LintConfig, LintSetting};
+/// wins over an `allow` at *any* layer (the explicit legacy opt-in is
+/// never silently undone by a broad `all` / `category:` key, nor by one
+/// agent allowing itself out of it).
+fn unhandled_verdict_gate(
+    strict: bool,
+    declared: Option<mlua_swarm_diag::LintSetting>,
+) -> UnhandledVerdictGate {
+    use mlua_swarm_diag::LintSetting;
 
-    let strict = metadata.strict_verdict_handling.unwrap_or(false);
-    let declared = metadata.lints.as_ref().and_then(|lints| {
-        let cfg = LintConfig::from_pairs(
-            lints
-                .iter()
-                .map(|(key, setting)| (key.clone(), diag_lint_setting(*setting))),
-        );
-        cfg.setting_for(lint_decl(UNHANDLED_VERDICT_LINT_KIND)?)
-    });
     match declared {
         _ if strict => UnhandledVerdictGate::Deny,
         Some(LintSetting::Deny) => UnhandledVerdictGate::Deny,
@@ -989,7 +1074,7 @@ fn diag_lint_setting(setting: mlua_swarm_schema::LintSetting) -> mlua_swarm_diag
 fn verify_verdict_conds(
     flow: &FlowNode,
     verdict_contracts: &HashMap<String, VerdictContract>,
-    unhandled_gate: UnhandledVerdictGate,
+    unhandled_gates: &UnhandledVerdictGates,
 ) -> Result<(), CompileError> {
     let mut step_outputs: HashMap<String, String> = HashMap::new();
     let mut step_agents: HashMap<String, String> = HashMap::new();
@@ -1008,7 +1093,7 @@ fn verify_verdict_conds(
         verdict_contracts,
         &referenced_values,
         &step_agents,
-        unhandled_gate,
+        unhandled_gates,
         &mut errors,
     );
     match errors.into_iter().next() {
@@ -1339,10 +1424,13 @@ fn resolve_and_check(
 /// that no cond references is a `verdict_value` the flow author declared
 /// but forgot to write a handler for.
 ///
-/// Under [`UnhandledVerdictGate::Deny`] (`strict_verdict_handling: true`
-/// or `metadata.lints = {"verdict-value-unhandled": "deny"}`, see
-/// [`resolve_unhandled_verdict_gate`]), every unhandled value pushes a
-/// [`CompileError::VerdictValueUnhandled`] onto `errors` and
+/// The gate is per finding-owning agent ([`UnhandledVerdictGates::for_agent`]),
+/// so one agent's declared level never decides another's.
+///
+/// Under [`UnhandledVerdictGate::Deny`] (`strict_verdict_handling: true`,
+/// or a `{"verdict-value-unhandled": "deny"}` entry on the agent or the
+/// Blueprint, see [`resolve_unhandled_verdict_gates`]), every unhandled
+/// value pushes a [`CompileError::VerdictValueUnhandled`] onto `errors` and
 /// [`verify_verdict_conds`] surfaces the first one, rejecting the compile.
 /// Under the default [`UnhandledVerdictGate::Warn`], unhandled values only
 /// surface via `tracing::warn!` — existing Blueprints that intentionally
@@ -1354,15 +1442,16 @@ fn check_unhandled_verdict_values(
     verdict_contracts: &HashMap<String, VerdictContract>,
     referenced_values: &HashMap<String, std::collections::HashSet<String>>,
     step_agents: &HashMap<String, String>,
-    unhandled_gate: UnhandledVerdictGate,
+    unhandled_gates: &UnhandledVerdictGates,
     errors: &mut Vec<CompileError>,
 ) {
-    if unhandled_gate == UnhandledVerdictGate::Silence {
+    if unhandled_gates.all_silent() {
         return;
     }
     for finding in fold_unhandled_verdict_values(verdict_contracts, referenced_values, step_agents)
     {
-        match unhandled_gate {
+        let gate = unhandled_gates.for_agent(&finding.agent);
+        match gate {
             UnhandledVerdictGate::Deny => errors.push(CompileError::VerdictValueUnhandled {
                 agent: finding.agent,
                 value: finding.value,
@@ -1377,7 +1466,9 @@ fn check_unhandled_verdict_values(
                  declare `metadata.lints = {{\"verdict-value-unhandled\": \"deny\"}}` \
                  to reject at compile"
             ),
-            // Returned above, before the (potentially costly) fold.
+            // This agent declared `allow`; another one did not, which is
+            // why the fold ran at all (`all_silent` returned above only
+            // when nothing anywhere could report).
             UnhandledVerdictGate::Silence => {}
         }
     }
@@ -4138,9 +4229,11 @@ mod verdict_contract_lint_tests {
         }
     }
 
-    // ─── metadata.lints, compile stage (design §5) ───────────────────
+    // ─── lints at the compile stage (design §5) ──────────────────────
+    // Two layers: `agents[].lints` (nearer) then `metadata.lints`.
 
-    /// A `metadata.lints` map, as the schema's author-facing form.
+    /// A `lints` map, as the schema's author-facing form — used for both
+    /// the agent and the Blueprint layer.
     fn lints(
         pairs: &[(&str, mlua_swarm_schema::LintSetting)],
     ) -> Option<std::collections::BTreeMap<String, mlua_swarm_schema::LintSetting>> {
@@ -4164,6 +4257,164 @@ mod verdict_contract_lint_tests {
             ],
         };
         minimal_bp(agent, flow)
+    }
+
+    /// The same contract-bearing agent as [`gate_agent`] under a chosen
+    /// name, so one agent's `lints` can be observed against a sibling
+    /// that declares none.
+    fn named_agent(name: &str, verdict: Option<VerdictContract>) -> AgentDef {
+        AgentDef {
+            name: name.to_string(),
+            ..gate_agent(verdict)
+        }
+    }
+
+    /// Two contract-bearing agents, each declaring `["PASS", "BLOCKED"]`
+    /// with only "BLOCKED" cond-referenced — so *both* have an unhandled
+    /// "PASS" and the per-agent layer is what tells them apart.
+    fn bp_with_two_unhandled_agents() -> Blueprint {
+        let flow = FlowNode::Seq {
+            children: vec![
+                step("researcher", "$.researcher_verdict"),
+                step("reviewer", "$.reviewer_verdict"),
+                branch(eq_cond("$.researcher_verdict", "BLOCKED"), noop(), noop()),
+                branch(eq_cond("$.reviewer_verdict", "BLOCKED"), noop(), noop()),
+            ],
+        };
+        let mut bp = minimal_bp(
+            named_agent("researcher", Some(body_contract(&["PASS", "BLOCKED"]))),
+            flow,
+        );
+        bp.agents.push(named_agent(
+            "reviewer",
+            Some(body_contract(&["PASS", "BLOCKED"])),
+        ));
+        bp
+    }
+
+    /// An `agents[].lints` deny reaches the compile stage, and reaches
+    /// only the agent that declared it: the sibling's identical unhandled
+    /// value stays a `tracing::warn!` (so the only error is the declaring
+    /// agent's).
+    #[test]
+    fn agent_lints_deny_rejects_only_the_declaring_agent() {
+        let mut bp = bp_with_two_unhandled_agents();
+        bp.agents[0].lints = lints(&[(
+            "verdict-value-unhandled",
+            mlua_swarm_schema::LintSetting::Deny,
+        )]);
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::VerdictValueUnhandled { agent, value, .. }) => {
+                assert_eq!(agent, "researcher", "the sibling only warns");
+                assert_eq!(value, "PASS");
+            }
+            Err(other) => {
+                panic!("expected VerdictValueUnhandled, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!(
+                "expected compile-time rejection under \
+                 agents[0].lints = {{\"verdict-value-unhandled\": \"deny\"}}"
+            ),
+        }
+    }
+
+    /// Proximity: the agent layer wins outright over the Blueprint layer,
+    /// so an agent-level `allow` silences that agent while a
+    /// Blueprint-level `deny` still rejects its sibling.
+    #[test]
+    fn agent_allow_beats_blueprint_deny_for_that_agent() {
+        let mut bp = bp_with_two_unhandled_agents();
+        bp.metadata.lints = lints(&[(
+            "verdict-value-unhandled",
+            mlua_swarm_schema::LintSetting::Deny,
+        )]);
+        bp.agents[0].lints = lints(&[(
+            "verdict-value-unhandled",
+            mlua_swarm_schema::LintSetting::Allow,
+        )]);
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::VerdictValueUnhandled { agent, .. }) => {
+                assert_eq!(
+                    agent, "reviewer",
+                    "the allowing agent is silenced; the sibling still denies"
+                );
+            }
+            Err(other) => {
+                panic!("expected VerdictValueUnhandled, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!("the sibling agent's Blueprint-level deny must still reject"),
+        }
+    }
+
+    /// Union toward deny at the agent layer too: the legacy strict flag
+    /// wins over an `agents[].lints` `allow`, exactly as it does over a
+    /// `metadata.lints` one.
+    #[test]
+    fn strict_flag_wins_over_agent_lints_allow() {
+        let mut bp = bp_with_unhandled_value();
+        bp.metadata.strict_verdict_handling = Some(true);
+        bp.agents[0].lints = lints(&[("all", mlua_swarm_schema::LintSetting::Allow)]);
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::VerdictValueUnhandled { agent, .. }) => assert_eq!(agent, "gate"),
+            Err(other) => {
+                panic!("expected VerdictValueUnhandled, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!(
+                "strict_verdict_handling=Some(true) must still reject under an agent-level allow"
+            ),
+        }
+    }
+
+    /// Within the agent layer, the category group key reaches the kind —
+    /// same specificity ladder as the Blueprint layer.
+    #[test]
+    fn agent_category_key_reaches_the_kind() {
+        let mut bp = bp_with_two_unhandled_agents();
+        bp.agents[0].lints =
+            lints(&[("category:suspicious", mlua_swarm_schema::LintSetting::Deny)]);
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::VerdictValueUnhandled { agent, .. }) => assert_eq!(
+                agent, "researcher",
+                "a category: group deny must reach the kind it covers, on the declaring agent"
+            ),
+            Err(other) => {
+                panic!("expected VerdictValueUnhandled, got a different CompileError: {other}")
+            }
+            Ok(_) => panic!("expected compile-time rejection under an agent-level category deny"),
+        }
+    }
+
+    /// An agent that declares nothing inherits the Blueprint layer, and
+    /// an agent-level `allow` does not leak onto it.
+    #[test]
+    fn agent_without_lints_inherits_the_blueprint_layer() {
+        let mut bp = bp_with_two_unhandled_agents();
+        bp.metadata.lints = lints(&[("all", mlua_swarm_schema::LintSetting::Allow)]);
+        assert!(
+            Compiler::new(registry_with_echo()).compile(&bp).is_ok(),
+            "a Blueprint-wide allow covers every agent that declares nothing"
+        );
+
+        let gates = resolve_unhandled_verdict_gates(&bp);
+        assert_eq!(gates.for_agent("reviewer"), UnhandledVerdictGate::Silence);
+        assert!(gates.all_silent());
+
+        bp.agents[0].lints = lints(&[(
+            "verdict-value-unhandled",
+            mlua_swarm_schema::LintSetting::Warn,
+        )]);
+        let gates = resolve_unhandled_verdict_gates(&bp);
+        assert_eq!(
+            gates.for_agent("researcher"),
+            UnhandledVerdictGate::Warn,
+            "the agent's own layer wins over the Blueprint's allow"
+        );
+        assert_eq!(
+            gates.for_agent("reviewer"),
+            UnhandledVerdictGate::Silence,
+            "the sibling keeps the Blueprint layer"
+        );
+        assert!(!gates.all_silent());
     }
 
     /// `metadata.lints = {"verdict-value-unhandled": "deny"}` rejects the
