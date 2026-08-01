@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/ynishi/mlua-swarm/compare/v0.22.0...v0.23.0) - 2026-08-01
+
+### Fixed
+
+- *(engine)* make the R4 max-hold panic opt-in via EngineCfg.max_hold_panic
+
+### Other
+
+- add docs.rs metadata to dsl / compile / cli crates
+
 ## [0.22.0](https://github.com/ynishi/mlua-swarm/compare/v0.21.0...v0.22.0) - 2026-08-01
 
 ### Added
