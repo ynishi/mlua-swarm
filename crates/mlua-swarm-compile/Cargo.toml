@@ -12,6 +12,10 @@ description = "Compile pipeline for mlua-swarm Blueprints: linker (agent.md ref 
 keywords = ["swarm", "blueprint", "compile", "linker"]
 categories = ["development-tools"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 mlua-swarm-schema.workspace = true
 

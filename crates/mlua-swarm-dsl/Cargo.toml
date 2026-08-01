@@ -12,6 +12,10 @@ description = "Lua authoring DSL (flow_dsl + bp_dsl) for mlua-swarm Blueprint / 
 keywords = ["swarm", "lua", "dsl", "blueprint"]
 categories = ["development-tools"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 mlua.workspace = true
 serde_json.workspace = true

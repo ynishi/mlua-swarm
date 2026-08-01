@@ -12,6 +12,10 @@ description = "Command line interface for mlua-swarm (mse binary with serve / mc
 keywords = ["swarm", "lua", "mcp", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [[bin]]
 name = "mse"
 path = "src/main.rs"
