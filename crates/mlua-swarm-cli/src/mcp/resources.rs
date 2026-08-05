@@ -1011,13 +1011,49 @@ mod tests {
     /// test fails and prompts a guide update — so the guide stays a
     /// trustworthy reference instead of silently drifting.
     ///
-    /// Each row is a `(kind_or_op, minimal_json_snippet)` pair. The
-    /// snippets use the exact field names documented in the guide.
+    /// The fixture cases live in `ops_fixture_cases` /
+    /// `node_kinds_fixture_cases` below and are shared with the layer-3
+    /// markdown-parity tests (issue #38) — a single source of truth for
+    /// both drift guards.
     #[test]
     fn guide_expr_ops_match_schema_field_names() {
         use mlua_flow_ir::Expr;
 
-        let cases: &[(&str, serde_json::Value)] = &[
+        for (op, v) in ops_fixture_cases() {
+            serde_json::from_value::<Expr>(v).unwrap_or_else(|e| {
+                panic!(
+                    "guide Expr op `{op}` does not deserialize with the documented field names: {e} \
+                     (fix the blueprint-authoring guide or the guide↔schema mapping)"
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn guide_flow_node_kinds_match_schema_field_names() {
+        use mlua_flow_ir::Node;
+
+        for (kind, v) in node_kinds_fixture_cases() {
+            serde_json::from_value::<Node>(v).unwrap_or_else(|e| {
+                panic!(
+                    "guide Node kind `{kind}` does not deserialize with the documented field names: {e} \
+                     (fix the blueprint-authoring guide or the guide↔schema mapping)"
+                )
+            });
+        }
+    }
+
+    // ============================================================
+    // Shared fixture cases for guide↔schema drift guards.
+    //
+    // These are the single source of truth for every op / kind the
+    // guide documents. They drive:
+    //   * layer 2 (issue #6): serde deserialize check — schema drift
+    //   * layer 3 (issue #38): guide markdown table field-name parity
+    // ============================================================
+
+    fn ops_fixture_cases() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
             ("path", serde_json::json!({"op":"path","at":"$.x"})),
             ("lit", serde_json::json!({"op":"lit","value":42})),
             (
@@ -1092,71 +1128,266 @@ mod tests {
                 "call_extern",
                 serde_json::json!({"op":"call_extern","ref":"math.sqrt","args":[{"op":"lit","value":9}]}),
             ),
-        ];
-        for (op, v) in cases {
-            serde_json::from_value::<Expr>(v.clone()).unwrap_or_else(|e| {
-                panic!(
-                    "guide Expr op `{op}` does not deserialize with the documented field names: {e} \
-                     (fix the blueprint-authoring guide or the guide↔schema mapping)"
-                )
-            });
+        ]
+    }
+
+    fn node_kinds_fixture_cases() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "step",
+                serde_json::json!({
+                    "kind":"step","ref":"a","in":{"op":"path","at":"$.in"},"out":{"op":"path","at":"$.out"}
+                }),
+            ),
+            ("seq", serde_json::json!({"kind":"seq","children":[]})),
+            (
+                "branch",
+                serde_json::json!({
+                    "kind":"branch",
+                    "cond":{"op":"lit","value":true},
+                    "then":{"kind":"seq","children":[]},
+                    "else":{"kind":"seq","children":[]}
+                }),
+            ),
+            (
+                "loop",
+                serde_json::json!({
+                    "kind":"loop",
+                    "counter":{"op":"path","at":"$.i"},
+                    "cond":{"op":"lit","value":true},
+                    "body":{"kind":"seq","children":[]},
+                    "max":3
+                }),
+            ),
+            (
+                "fanout",
+                serde_json::json!({
+                    "kind":"fanout",
+                    "items":{"op":"lit","value":[1,2]},
+                    "bind":{"op":"path","at":"$.item"},
+                    "body":{"kind":"seq","children":[]},
+                    "join":"all",
+                    "out":{"op":"path","at":"$.results"}
+                }),
+            ),
+            (
+                "try",
+                serde_json::json!({
+                    "kind":"try",
+                    "body":{"kind":"seq","children":[]},
+                    "catch":{"kind":"seq","children":[]},
+                    "err_at":{"op":"path","at":"$.err"}
+                }),
+            ),
+            (
+                "assign",
+                serde_json::json!({
+                    "kind":"assign","at":{"op":"path","at":"$.x"},"value":{"op":"lit","value":1}
+                }),
+            ),
+        ]
+    }
+
+    // ---- issue #38 layer 3: markdown table parity ----
+    //
+    // Parse the two field-name tables in the `blueprint-authoring` guide
+    // and assert their field-name sets match the fixture cases above
+    // (bijection on kind/op names + equal field sets per row).
+    //
+    // Layer 2 (above) catches upstream schema drift; layer 3 catches the
+    // remaining hole where the guide markdown edit and the fixture edit
+    // are not made together — the hand-maintained link the fixture-in-Rust
+    // approach left open.
+
+    fn extract_first_backticked(s: &str) -> Option<String> {
+        let start = s.find('`')?;
+        let rest = &s[start + 1..];
+        let end = rest.find('`')?;
+        Some(rest[..end].to_string())
+    }
+
+    fn extract_all_backticked(s: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = s;
+        while let Some(start) = rest.find('`') {
+            let after_open = &rest[start + 1..];
+            let Some(end) = after_open.find('`') else {
+                break;
+            };
+            out.push(after_open[..end].to_string());
+            rest = &after_open[end + 1..];
+        }
+        out
+    }
+
+    fn split_top_level_commas(s: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut depth: i32 = 0;
+        let mut start = 0;
+        for (i, c) in s.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.push(&s[start..i]);
+                    start = i + c.len_utf8();
+                }
+                _ => {}
+            }
+        }
+        out.push(&s[start..]);
+        out
+    }
+
+    /// Parse a markdown table in `md` whose header row's first column
+    /// equals `header_col1` and whose second column is `fields`. Returns
+    /// a map `{ name -> {field-name-set} }`. Multi-op rows (e.g. `` `lt`
+    /// / `lte` / `gt` / `gte` ``) expand into one entry per name, all
+    /// sharing the row's field set. Trailing `?` on a field marks
+    /// optional in the guide — stripped before insertion. Parenthesized
+    /// type annotations (e.g. `` `children` (`Node[]`) ``) after a field
+    /// name are ignored.
+    fn parse_guide_field_sets(
+        md: &str,
+        header_col1: &str,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+        let split_cells = |line: &str| -> Vec<String> {
+            line.trim_start()
+                .trim_start_matches('|')
+                .split('|')
+                .map(|c| c.trim().to_string())
+                .collect()
+        };
+
+        let mut lines = md.lines().peekable();
+        while let Some(line) = lines.next() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('|') {
+                continue;
+            }
+            let cols = split_cells(line);
+            if cols.len() < 3 {
+                continue;
+            }
+            if cols[0] != header_col1 || cols[1] != "fields" {
+                continue;
+            }
+            // Header matched. Skip the separator line.
+            let Some(sep) = lines.next() else {
+                break;
+            };
+            if !sep.trim_start().starts_with('|') || !sep.contains("---") {
+                continue;
+            }
+            // Collect data rows until the first non-`|` line.
+            for row in lines.by_ref() {
+                let trimmed = row.trim_start();
+                if !trimmed.starts_with('|') {
+                    break;
+                }
+                let cols = split_cells(row);
+                if cols.len() < 3 {
+                    continue;
+                }
+                let names = extract_all_backticked(&cols[0]);
+                let mut fields: BTreeSet<String> = BTreeSet::new();
+                for seg in split_top_level_commas(&cols[1]) {
+                    let Some(name) = extract_first_backticked(seg) else {
+                        continue;
+                    };
+                    let name = name.trim_end_matches('?').to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    fields.insert(name);
+                }
+                for name in names {
+                    out.insert(name, fields.clone());
+                }
+            }
+            return out;
+        }
+        out
+    }
+
+    fn fixture_field_sets(
+        cases: &[(&str, serde_json::Value)],
+        discriminator: &str,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (name, value) in cases {
+            let obj = value
+                .as_object()
+                .unwrap_or_else(|| panic!("fixture `{name}` must be a JSON object"));
+            let fields: BTreeSet<String> = obj
+                .keys()
+                .filter(|k| k.as_str() != discriminator)
+                .cloned()
+                .collect();
+            out.insert((*name).to_string(), fields);
+        }
+        out
+    }
+
+    #[test]
+    fn guide_expr_ops_table_field_names_match_fixtures() {
+        let guide = parse_guide_field_sets(BLUEPRINT_AUTHORING_BODY, "op");
+        assert!(
+            !guide.is_empty(),
+            "expected to parse the `op | fields | result` table from mse://guides/blueprint-authoring \
+             (did the table header format change?)"
+        );
+        let cases = ops_fixture_cases();
+        let fixture = fixture_field_sets(&cases, "op");
+
+        assert_eq!(
+            guide.keys().cloned().collect::<Vec<_>>(),
+            fixture.keys().cloned().collect::<Vec<_>>(),
+            "Expr op coverage drift between the blueprint-authoring guide table and the fixture cases. \
+             Guide ops: {guide:?}. Fixture ops: {fixture:?}."
+        );
+        for (op, guide_fields) in &guide {
+            let fixture_fields = fixture
+                .get(op)
+                .unwrap_or_else(|| panic!("op `{op}` present in guide but missing from fixtures"));
+            assert_eq!(
+                guide_fields, fixture_fields,
+                "Expr op `{op}`: field-name drift between the guide table and the fixture. \
+                 Guide fields: {guide_fields:?}. Fixture fields: {fixture_fields:?}."
+            );
         }
     }
 
     #[test]
-    fn guide_flow_node_kinds_match_schema_field_names() {
-        use mlua_flow_ir::Node;
+    fn guide_flow_node_kinds_table_field_names_match_fixtures() {
+        let guide = parse_guide_field_sets(BLUEPRINT_AUTHORING_BODY, "kind");
+        assert!(
+            !guide.is_empty(),
+            "expected to parse the `kind | fields | behavior` table from mse://guides/blueprint-authoring \
+             (did the table header format change?)"
+        );
+        let cases = node_kinds_fixture_cases();
+        let fixture = fixture_field_sets(&cases, "kind");
 
-        let step = serde_json::json!({
-            "kind":"step","ref":"a","in":{"op":"path","at":"$.in"},"out":{"op":"path","at":"$.out"}
-        });
-        let seq = serde_json::json!({"kind":"seq","children":[]});
-        let branch = serde_json::json!({
-            "kind":"branch",
-            "cond":{"op":"lit","value":true},
-            "then":{"kind":"seq","children":[]},
-            "else":{"kind":"seq","children":[]}
-        });
-        let loop_n = serde_json::json!({
-            "kind":"loop",
-            "counter":{"op":"path","at":"$.i"},
-            "cond":{"op":"lit","value":true},
-            "body":{"kind":"seq","children":[]},
-            "max":3
-        });
-        let fanout = serde_json::json!({
-            "kind":"fanout",
-            "items":{"op":"lit","value":[1,2]},
-            "bind":{"op":"path","at":"$.item"},
-            "body":{"kind":"seq","children":[]},
-            "join":"all",
-            "out":{"op":"path","at":"$.results"}
-        });
-        let try_n = serde_json::json!({
-            "kind":"try",
-            "body":{"kind":"seq","children":[]},
-            "catch":{"kind":"seq","children":[]},
-            "err_at":{"op":"path","at":"$.err"}
-        });
-        let assign = serde_json::json!({
-            "kind":"assign","at":{"op":"path","at":"$.x"},"value":{"op":"lit","value":1}
-        });
-
-        for (kind, v) in [
-            ("step", step),
-            ("seq", seq),
-            ("branch", branch),
-            ("loop", loop_n),
-            ("fanout", fanout),
-            ("try", try_n),
-            ("assign", assign),
-        ] {
-            serde_json::from_value::<Node>(v).unwrap_or_else(|e| {
-                panic!(
-                    "guide Node kind `{kind}` does not deserialize with the documented field names: {e} \
-                     (fix the blueprint-authoring guide or the guide↔schema mapping)"
-                )
+        assert_eq!(
+            guide.keys().cloned().collect::<Vec<_>>(),
+            fixture.keys().cloned().collect::<Vec<_>>(),
+            "Flow node kind coverage drift between the blueprint-authoring guide table and the fixture cases. \
+             Guide kinds: {guide:?}. Fixture kinds: {fixture:?}."
+        );
+        for (kind, guide_fields) in &guide {
+            let fixture_fields = fixture.get(kind).unwrap_or_else(|| {
+                panic!("kind `{kind}` present in guide but missing from fixtures")
             });
+            assert_eq!(
+                guide_fields, fixture_fields,
+                "Flow node kind `{kind}`: field-name drift between the guide table and the fixture. \
+                 Guide fields: {guide_fields:?}. Fixture fields: {fixture_fields:?}."
+            );
         }
     }
 }
