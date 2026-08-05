@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1](https://github.com/ynishi/mlua-swarm/compare/v0.23.0...v0.23.1) - 2026-08-05
+
+### Added
+
+- *(plugin)* ship mse Claude Code plugin bundle (GH #30)
+
+### Fixed
+
+- *(trace)* accept partial token-usage reports instead of dropping the whole stats object
+
+### Other
+
+- *(cli)* bind blueprint-authoring guide tables to fixtures (GH #38)
+
 ## [0.23.0](https://github.com/ynishi/mlua-swarm/compare/v0.22.0...v0.23.0) - 2026-08-01
 
 ### Fixed
