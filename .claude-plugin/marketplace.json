@@ -1,0 +1,19 @@
+{
+  "name": "mlua-swarm",
+  "owner": {
+    "name": "Yutaka Nishimura"
+  },
+  "description": "Bundled Claude Code plugins for mlua-swarm (mse) — the long-running swarm engine that compiles flow.ir Blueprints and dispatches agent steps to workers.",
+  "plugins": [
+    {
+      "name": "mse",
+      "source": "./plugins/mse",
+      "description": "mse Blueprint-authoring DX set (mse-adviser / bp-coder + mse-wake / bp-build skills). Ride the mse MCP server for schema-grounded design and bp_doctor-gated implementation.",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "homepage": "https://github.com/ynishi/mlua-swarm",
+      "repository": "https://github.com/ynishi/mlua-swarm",
+      "keywords": ["mlua-swarm", "mse", "blueprint", "flow-ir", "agents", "llm"]
+    }
+  ]
+}

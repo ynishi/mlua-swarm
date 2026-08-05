@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mse": {
+      "command": "mse",
+      "args": ["mcp"]
+    }
+  }
+}

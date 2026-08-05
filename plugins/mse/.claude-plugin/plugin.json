@@ -1,0 +1,12 @@
+{
+  "name": "mse",
+  "version": "0.1.0",
+  "description": "mse Blueprint-authoring DX set (mse-adviser / bp-coder + mse-wake / bp-build skills). Bundled with mlua-swarm.",
+  "author": {
+    "name": "Yutaka Nishimura"
+  },
+  "homepage": "https://github.com/ynishi/mlua-swarm",
+  "repository": "https://github.com/ynishi/mlua-swarm",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["mlua-swarm", "mse", "blueprint", "flow-ir", "agents", "llm"]
+}
