@@ -411,16 +411,40 @@ impl Operator for WSOperatorSession {
 /// to `"operator"` (the axis this ack rode in on). Best-effort: a shape
 /// that doesn't decode, or an all-empty stats object, maps to `None` —
 /// stats must never gate the ack itself.
+///
+/// A failed decode is logged at `warn`: dropping it silently is what
+/// made a whole run's ack-reported stats vanish with `mse_ack` still
+/// answering `{"sent": true}`, leaving `swarm_run_stats` at
+/// `steps_with_stats: 0` and no signal anywhere pointing at the shape
+/// that was rejected.
 fn decode_ack_stats(v: serde_json::Value) -> Option<mlua_swarm::store::trace::WorkerStats> {
-    let mut stats: mlua_swarm::store::trace::WorkerStats = serde_json::from_value(v).ok()?;
+    let mut stats: mlua_swarm::store::trace::WorkerStats = match serde_json::from_value(v.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                stats = %v,
+                "spawn_ack: attached stats failed to decode — dropped (the ack itself \
+                 still succeeded). Expected an object with optional worker_kind / \
+                 model / num_turns / adapter_data plus an optional usage object of \
+                 optional input_tokens / output_tokens / total_tokens"
+            );
+            return None;
+        }
+    };
+    // Emptiness is judged on what the ack actually reported — BEFORE
+    // the `worker_kind` default. Defaulting first made `is_empty()`
+    // unreachable (the label alone is never empty), so an ack carrying
+    // `stats: {}` recorded a content-free entry that still counted
+    // toward `swarm_run_stats.steps_with_stats` — the very number this
+    // path exists to make trustworthy.
+    if stats.is_empty() {
+        return None;
+    }
     if stats.worker_kind.is_none() {
         stats.worker_kind = Some("operator".to_string());
     }
-    if stats.is_empty() {
-        None
-    } else {
-        Some(stats)
-    }
+    Some(stats)
 }
 
 /// Literal instruction text for the MainAI (= WS Client = Operator role). Fix
@@ -738,6 +762,40 @@ mod tests {
             work_dir: work_dir.map(String::from),
             ..AgentContextView::default()
         }
+    }
+
+    #[test]
+    fn ack_stats_survive_a_total_only_operator_report() {
+        // The shape a Claude Code driver relays from the harness
+        // completion notice: one token total, no split. This used to
+        // fail the WorkerStats decode outright, so a whole run's
+        // ack-reported stats vanished and swarm_run_stats read
+        // steps_with_stats: 0 while every mse_ack answered {sent: true}.
+        let stats = decode_ack_stats(serde_json::json!({
+            "usage": {"total_tokens": 198471},
+            "model": "opus",
+            "num_turns": 22,
+        }))
+        .expect("a total-only report must land on the StepEntry");
+        assert_eq!(stats.usage.expect("usage").total_tokens, 198471);
+        assert_eq!(stats.model.as_deref(), Some("opus"));
+        assert_eq!(stats.num_turns, Some(22));
+        assert_eq!(
+            stats.worker_kind.as_deref(),
+            Some("operator"),
+            "the ack axis labels itself"
+        );
+    }
+
+    #[test]
+    fn ack_stats_of_an_undecodable_shape_are_dropped_not_fatal() {
+        // Best-effort stays best-effort — the drop is now logged at
+        // warn, but it must still never gate the ack.
+        assert!(decode_ack_stats(serde_json::json!("not-an-object")).is_none());
+        assert!(
+            decode_ack_stats(serde_json::json!({})).is_none(),
+            "an all-empty stats object records nothing"
+        );
     }
 
     #[tokio::test]

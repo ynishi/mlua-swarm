@@ -251,19 +251,14 @@ impl WorkerResultCaptor {
     fn extract_stats(payload: &Value) -> Option<crate::store::trace::WorkerStats> {
         let usage_raw = payload.get("usage");
         let usage = usage_raw.and_then(|u| {
-            let input = u.get("input_tokens").and_then(|v| v.as_u64());
-            let output = u.get("output_tokens").and_then(|v| v.as_u64());
-            match (input, output) {
-                (Some(i), Some(o)) => Some(crate::store::trace::TokenUsage {
-                    input_tokens: i,
-                    output_tokens: o,
-                    total_tokens: u
-                        .get("total_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(i + o),
-                }),
-                _ => None,
-            }
+            // Partial reports count: a block that surfaces only a total
+            // (or only the splits) still lands a usage record — see
+            // `TokenUsage::from_parts` for the normalization rule.
+            crate::store::trace::TokenUsage::from_parts(
+                u.get("input_tokens").and_then(|v| v.as_u64()),
+                u.get("output_tokens").and_then(|v| v.as_u64()),
+                u.get("total_tokens").and_then(|v| v.as_u64()),
+            )
         });
         let num_turns = payload
             .get("num_turns")
@@ -995,6 +990,40 @@ mod tests {
         let wr = rx.await.expect("recv");
         assert!(wr.ok);
         assert_eq!(wr.value, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn extract_stats_keeps_a_partial_usage_report() {
+        // A block whose provider only surfaced a total used to have its
+        // usage dropped wholesale; partial axes now normalize instead.
+        let stats = WorkerResultCaptor::extract_stats(&serde_json::json!({
+            "usage": {"total_tokens": 512},
+            "num_turns": 3,
+        }))
+        .expect("a total-only usage still carries information");
+        let usage = stats.usage.expect("usage");
+        assert_eq!(usage.total_tokens, 512);
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(
+            stats.adapter_data,
+            Some(serde_json::json!({"total_tokens": 512})),
+            "the raw usage object still rides along verbatim"
+        );
+
+        // Splits without a total keep deriving it.
+        let stats = WorkerResultCaptor::extract_stats(&serde_json::json!({
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        }))
+        .expect("splits-only usage");
+        assert_eq!(stats.usage.expect("usage").total_tokens, 14);
+
+        // No token axis at all → no usage (num_turns alone still counts).
+        let stats = WorkerResultCaptor::extract_stats(&serde_json::json!({
+            "usage": {},
+            "num_turns": 1,
+        }))
+        .expect("num_turns alone is still a report");
+        assert!(stats.usage.is_none(), "an empty usage object records none");
     }
 
     // ─── declared model → per-step stats sidecar ─────────────────────────

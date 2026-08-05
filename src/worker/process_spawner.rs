@@ -545,16 +545,12 @@ fn enrich_declared_stats(
                 .get("output_tokens")
                 .or_else(|| u.get("completion_tokens"))
                 .and_then(|v| v.as_u64());
-            if let (Some(i), Some(o)) = (input, output) {
-                let total = u
-                    .get("total_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(i + o);
-                stats.usage = Some(crate::store::trace::TokenUsage {
-                    input_tokens: i,
-                    output_tokens: o,
-                    total_tokens: total,
-                });
+            let total = u.get("total_tokens").and_then(|v| v.as_u64());
+            // Partial reports count: a CLI that prints only a total (or
+            // only the splits) still lands a usage record — see
+            // `TokenUsage::from_parts` for the normalization rule.
+            if let Some(usage) = crate::store::trace::TokenUsage::from_parts(input, output, total) {
+                stats.usage = Some(usage);
                 // Keep the raw usage object too — cache-token detail and
                 // provider-specific fields ride as adapter data.
                 if let Some(Value::Object(ad)) = stats.adapter_data.as_mut() {
@@ -1333,5 +1329,50 @@ mod embed_tests {
         let out = fake_output(r#"{"result": "r", "ok": "yes"}"#, "", 0);
         let wr = normalize_plain_output(&out, Some(&decl), None);
         assert!(!wr.ok);
+    }
+
+    /// A declared `usage_ptr` whose object carries only one token axis
+    /// still lands a usage record — the CLI backends that print a bare
+    /// total (or only the splits) used to have their usage dropped.
+    #[test]
+    fn declared_usage_ptr_accepts_a_partial_usage_object() {
+        let decl = SubprocessOutput {
+            format: Some("json".to_string()),
+            result_ptr: Some("/result".to_string()),
+            ok_from: None,
+            stats: Some(mlua_swarm_schema::SubprocessStats {
+                usage_ptr: Some("/usage".to_string()),
+                model_ptr: None,
+                num_turns_ptr: None,
+            }),
+        };
+
+        // Total only.
+        let out = fake_output(r#"{"result": "r", "usage": {"total_tokens": 512}}"#, "", 0);
+        let usage = normalize_plain_output(&out, Some(&decl), None)
+            .stats
+            .and_then(|s| s.usage)
+            .expect("a total-only usage must be recorded");
+        assert_eq!(usage.total_tokens, 512);
+        assert_eq!(usage.input_tokens, 0);
+
+        // Splits only (OpenAI spelling) → total derived.
+        let out = fake_output(
+            r#"{"result": "r", "usage": {"prompt_tokens": 10, "completion_tokens": 4}}"#,
+            "",
+            0,
+        );
+        let usage = normalize_plain_output(&out, Some(&decl), None)
+            .stats
+            .and_then(|s| s.usage)
+            .expect("splits-only usage must be recorded");
+        assert_eq!(usage.total_tokens, 14);
+
+        // No token axis at all → no usage recorded.
+        let out = fake_output(r#"{"result": "r", "usage": {"cached": 3}}"#, "", 0);
+        assert!(normalize_plain_output(&out, Some(&decl), None)
+            .stats
+            .and_then(|s| s.usage)
+            .is_none());
     }
 }

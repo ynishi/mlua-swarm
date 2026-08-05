@@ -52,16 +52,94 @@ pub use sqlite::SqliteRunTraceStore;
 /// mapping / operator self-report). Field names follow the Anthropic
 /// wire convention (`input_tokens` / `output_tokens`) that agent-block
 /// already normalizes OpenAI-style responses into.
+///
+/// **Every wire field is optional on the way in** ([`TokenUsageWire`]):
+/// a reporter that only knows one axis (a harness completion notice
+/// that surfaces a single token total, an API response that omits the
+/// total) still lands a usable usage record instead of being dropped.
+/// The stored shape stays the closed 3-field triple — missing splits
+/// read as `0`, and a missing `total_tokens` is derived as
+/// `input + output` on decode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(from = "TokenUsageWire")]
+#[schemars(with = "TokenUsageWire")]
 pub struct TokenUsage {
     /// Prompt-side tokens consumed, summed across the attempt's turns.
+    /// `0` when the reporter did not split its total.
     pub input_tokens: u64,
-    /// Completion-side tokens produced, summed across the attempt's turns.
+    /// Completion-side tokens produced, summed across the attempt's
+    /// turns. `0` when the reporter did not split its total.
     pub output_tokens: u64,
     /// `input + output` (kept explicit because some producers report a
     /// total that includes cache-read/creation tokens the two split
-    /// fields don't cover).
+    /// fields don't cover). Derived from the splits when the reporter
+    /// omits it.
     pub total_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Build a usage record from three independently-optional parts,
+    /// applying the same normalization the wire decode does: absent
+    /// splits read as `0`, and an absent total is derived as
+    /// `input + output`.
+    ///
+    /// `None` only when the reporter carried **no** token axis at all —
+    /// the caller then records no usage rather than a zeroed one.
+    ///
+    /// Shared by the hand-rolled extractors that read usage out of a
+    /// worker's raw payload (agent-block's `agent.run` return,
+    /// subprocess `usage_ptr` declarations) so every axis applies one
+    /// normalization rule.
+    pub fn from_parts(
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        total_tokens: Option<u64>,
+    ) -> Option<Self> {
+        if input_tokens.is_none() && output_tokens.is_none() && total_tokens.is_none() {
+            return None;
+        }
+        let input = input_tokens.unwrap_or(0);
+        let output = output_tokens.unwrap_or(0);
+        Some(Self {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: total_tokens.unwrap_or(input + output),
+        })
+    }
+}
+
+/// Deserialization shadow of [`TokenUsage`] — the wire contract, where
+/// every token field is optional.
+///
+/// Exists so partial reports survive the decode: before it, a producer
+/// that sent `{"total_tokens": N}` alone failed the whole
+/// [`WorkerStats`] decode, and the best-effort ingest sites dropped the
+/// entire stats object (model / num_turns included) without a trace.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct TokenUsageWire {
+    /// Prompt-side tokens, when the reporter splits them out.
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    /// Completion-side tokens, when the reporter splits them out.
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    /// Reporter-supplied total; derived from the splits when absent.
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+}
+
+impl From<TokenUsageWire> for TokenUsage {
+    fn from(w: TokenUsageWire) -> Self {
+        // An all-absent object (`"usage": {}`) is a degenerate but legal
+        // wire value — it lands as an explicit all-zero record rather
+        // than an error, matching the "stats never gate the report"
+        // invariant.
+        TokenUsage::from_parts(w.input_tokens, w.output_tokens, w.total_tokens).unwrap_or(Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+        })
+    }
 }
 
 /// Normalized per-attempt worker statistics, reported by a worker
@@ -508,6 +586,72 @@ mod tests {
             attempt,
             payload: json!({"k": kind}),
         }
+    }
+
+    // ── TokenUsage / WorkerStats wire contract ───────────────────────
+
+    #[test]
+    fn usage_decodes_from_a_total_only_report() {
+        // The canonical operator self-report: a harness completion
+        // notice that surfaces one token total and no split. Before the
+        // wire shadow this failed the decode and took the whole
+        // WorkerStats (model / num_turns included) down with it.
+        let stats: WorkerStats = serde_json::from_value(json!({
+            "usage": {"total_tokens": 198471},
+            "model": "opus",
+            "num_turns": 22,
+        }))
+        .expect("a total-only usage must decode");
+        let usage = stats.usage.clone().expect("usage must survive the decode");
+        assert_eq!(usage.total_tokens, 198471);
+        assert_eq!(usage.input_tokens, 0, "unsplit report reads as 0");
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(stats.model.as_deref(), Some("opus"));
+        assert_eq!(stats.num_turns, Some(22));
+        assert!(!stats.is_empty());
+    }
+
+    #[test]
+    fn usage_derives_the_total_from_the_splits() {
+        let usage: TokenUsage =
+            serde_json::from_value(json!({"input_tokens": 10, "output_tokens": 4}))
+                .expect("splits-only usage must decode");
+        assert_eq!(usage.total_tokens, 14, "absent total is derived");
+    }
+
+    #[test]
+    fn usage_keeps_a_reporter_total_that_exceeds_the_splits() {
+        // Cache-read/creation tokens live in the reporter's total but
+        // not in the two splits — never recompute over the report.
+        let usage: TokenUsage = serde_json::from_value(
+            json!({"input_tokens": 10, "output_tokens": 4, "total_tokens": 900}),
+        )
+        .unwrap();
+        assert_eq!(usage.total_tokens, 900);
+    }
+
+    #[test]
+    fn usage_serializes_as_the_closed_triple() {
+        let usage = TokenUsage::from_parts(None, None, Some(7)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 7}),
+            "the stored shape stays the 3-field triple"
+        );
+    }
+
+    #[test]
+    fn from_parts_is_none_only_when_no_axis_was_reported() {
+        assert_eq!(TokenUsage::from_parts(None, None, None), None);
+        assert!(TokenUsage::from_parts(Some(0), None, None).is_some());
+    }
+
+    #[test]
+    fn empty_usage_object_lands_as_an_explicit_zero_record() {
+        // Degenerate but legal: stats must never gate the report, so an
+        // empty object decodes rather than erroring.
+        let usage: TokenUsage = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(usage.total_tokens, 0);
     }
 
     #[tokio::test]

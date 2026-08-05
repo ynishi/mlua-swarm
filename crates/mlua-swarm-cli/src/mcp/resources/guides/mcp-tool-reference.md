@@ -98,7 +98,7 @@ Pass a non-empty `degradations` array (each entry `{tool, error, fallback, note?
 
 ### Worker stats reporting (`stats`)
 
-Pass a `stats` object (`{worker_kind?, model?, usage?: {input_tokens, output_tokens, total_tokens}, num_turns?, adapter_data?}`) on `mse_worker_submit` to report what the attempt cost. It is POSTed to `/v1/worker/stats` after any `degradations` entries and **before** this call's own submit/artifact POST, which is what makes it land: the dispatcher folds recorded stats at outcome time — the moment the final submit settles the dispatch — so a report arriving afterwards is dropped with the attempt's cleanup.
+Pass a `stats` object (`{worker_kind?, model?, usage?: {input_tokens?, output_tokens?, total_tokens?}, num_turns?, adapter_data?}`) on `mse_worker_submit` to report what the attempt cost. Each token field is optional on its own: report `{"total_tokens": N}` alone when that is all the worker knows (the splits read as `0`), or the splits alone and the total is derived as `input + output`. It is POSTed to `/v1/worker/stats` after any `degradations` entries and **before** this call's own submit/artifact POST, which is what makes it land: the dispatcher folds recorded stats at outcome time — the moment the final submit settles the dispatch — so a report arriving afterwards is dropped with the attempt's cleanup.
 
 Report on the **final** (plain, no-`name`) submit. Stats sent on an earlier artifact-staging call are held per `(task_id, attempt)` and overwritten by a later report (last write wins), so a worker that learns its usage incrementally can simply report again. Every field is optional; omitting `stats` entirely POSTs nothing. A non-`204` response is an error rather than a silent drop — the caller opted into reporting.
 

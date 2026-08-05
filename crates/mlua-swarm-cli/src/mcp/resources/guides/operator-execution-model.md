@@ -683,9 +683,17 @@ There are two entry points, exactly as for degradations:
   before the call's own submit body lands — the ordering the fold below
   requires. An omitted `stats` field POSTs nothing.
 
-Every field is optional; an all-empty body is accepted and dropped. The
-response is `204`, or `410 Gone` once the addressed Run is terminal (the
-same guard the submit / artifact / degradation routes apply).
+Every field is optional — **including each of the three token fields**.
+A reporter that only knows one number sends `"usage": {"total_tokens":
+198471}` and the splits read as `0`; a reporter that only knows the
+splits has its total derived as `input + output`. An all-empty body is
+accepted and dropped. The response is `204`, or `410 Gone` once the
+addressed Run is terminal (the same guard the submit / artifact /
+degradation routes apply).
+
+That partial shape is the normal case on the Operator axis: a harness
+completion notification typically surfaces a single token total for the
+SubAgent, not a prompt/completion split.
 
 **Call it before the attempt's final submit.** The engine holds the
 reported stats per `(task_id, attempt)`, and the dispatcher drains them

@@ -2576,8 +2576,11 @@ struct OperatorAckReq {
     /// (surfaced by `GET /v1/runs/:id/steps` / `swarm_status`). Shape:
     /// `{"usage": {"input_tokens": N, "output_tokens": N,
     /// "total_tokens": N}, "model": "...", "num_turns": N,
-    /// "adapter_data": {...}}` — every field optional. Ignored for the
-    /// other kinds.
+    /// "adapter_data": {...}}` — every field optional, **including each
+    /// of the three token fields**: a harness that only surfaces one
+    /// total reports `{"usage": {"total_tokens": N}}` and the splits
+    /// read as `0` (an omitted total is derived as `input + output`).
+    /// Ignored for the other kinds.
     #[serde(default)]
     #[schemars(schema_with = "any_json_schema")]
     stats: Option<JsonValue>,
@@ -2727,7 +2730,8 @@ struct StatsInput {
     #[serde(default)]
     model: Option<String>,
     /// Normalized token usage (`input_tokens` / `output_tokens` /
-    /// `total_tokens`).
+    /// `total_tokens`) — each one optional, so a worker that only knows
+    /// its total still reports usable usage.
     #[serde(default)]
     usage: Option<TokenUsage>,
     /// Number of LLM turns the attempt ran.
@@ -3086,7 +3090,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Ack a pending frame popped via mse_pending_wait. kind=\"answer\" (SeniorBridge.ask reply, pass `value`), kind=\"hook_ack\" (SpawnHook.before OK/NG, pass `ok` + optional `error` as the rejection reason), kind=\"spawn_ack\" (Operator.execute result, pass `value` + `ok` + optional `error` + optional `stats` — the Operator's proxy report of the SubAgent's resource usage from the harness completion notification, e.g. {\"usage\": {\"input_tokens\": N, \"output_tokens\": N, \"total_tokens\": N}, \"model\": \"...\", \"num_turns\": N}; the server folds it into the terminal StepEntry per-step run stats), kind=\"spawn_halt\" (issue #7: controlled halt for the current spawn — pass optional `value` (partial ctx) + optional `error` (halt reason); the step lands as WorkerResult{ok:true, value:{halted:true, reason, value}} — a normal termination, not a worker error). Sends the corresponding ClientMsg over the sid's WS connection. Returns {sent: true}."
+        description = "Ack a pending frame popped via mse_pending_wait. kind=\"answer\" (SeniorBridge.ask reply, pass `value`), kind=\"hook_ack\" (SpawnHook.before OK/NG, pass `ok` + optional `error` as the rejection reason), kind=\"spawn_ack\" (Operator.execute result, pass `value` + `ok` + optional `error` + optional `stats` — the Operator's proxy report of the SubAgent's resource usage from the harness completion notification, e.g. {\"usage\": {\"input_tokens\": N, \"output_tokens\": N, \"total_tokens\": N}, \"model\": \"...\", \"num_turns\": N}; every field is optional including each token field, so a harness that only knows one total sends {\"usage\": {\"total_tokens\": N}} and the splits read as 0; the server folds it into the terminal StepEntry per-step run stats), kind=\"spawn_halt\" (issue #7: controlled halt for the current spawn — pass optional `value` (partial ctx) + optional `error` (halt reason); the step lands as WorkerResult{ok:true, value:{halted:true, reason, value}} — a normal termination, not a worker error). Sends the corresponding ClientMsg over the sid's WS connection. Returns {sent: true}."
     )]
     async fn mse_ack(
         &self,
@@ -3306,7 +3310,7 @@ impl MseServer {
 
     // convention-token-ok: mse_pending_wait is a mlua-swarm public MCP tool name.
     #[tool(
-        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Normally `worker_handle` + `body` are the ONLY required params — base_url auto-resolves from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass it explicitly to override (or when the Bearer is a full capability_token). Optional ok=false marks the attempt failed (flow.ir Try catch path); mutually exclusive with `name`. Optional `name` (GH #36) stages ONE named output part instead of completing the attempt — POST /v1/worker/artifact?name=<name> — call again (same or different name) for more parts, then finish with a plain (no-name) call; the step's final output becomes {\"out\": <final submit body>, \"parts\": {<name>: <value>, ...}}, read downstream via bracket notation e.g. \"$.<step>.parts[\\\"plan.md\\\"]\". Optional `degradations` array (GH #32) — each entry POSTed to /v1/worker/degradation before the main submit, structured tool-failure trace persisted on the Run record. Backward compat: absent field = pre-#32 behavior. Optional `stats` object ({worker_kind?, model?, usage?: {input_tokens, output_tokens, total_tokens}, num_turns?, adapter_data?}) — POSTed to /v1/worker/stats after the degradations and before the submit, so the dispatcher's outcome fold lands it on the attempt's StepEntry; report it on the FINAL (no-name) submit, since stats arriving after the fold are dropped. Aggregate a whole run's reports with swarm_run_stats. Expects HTTP 204 and returns {submitted: true} (name path) or {submitted: true} (plain path); any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
+        description = "Worker-side submit: POST <base_url>/v1/worker/submit with `Authorization: Bearer <worker_handle>` and the raw `body` as text/plain (task_id is resolved server-side from the Bearer). Normally `worker_handle` + `body` are the ONLY required params — base_url auto-resolves from the route this process recorded when the Spawn frame passed through mse_pending_wait; pass it explicitly to override (or when the Bearer is a full capability_token). Optional ok=false marks the attempt failed (flow.ir Try catch path); mutually exclusive with `name`. Optional `name` (GH #36) stages ONE named output part instead of completing the attempt — POST /v1/worker/artifact?name=<name> — call again (same or different name) for more parts, then finish with a plain (no-name) call; the step's final output becomes {\"out\": <final submit body>, \"parts\": {<name>: <value>, ...}}, read downstream via bracket notation e.g. \"$.<step>.parts[\\\"plan.md\\\"]\". Optional `degradations` array (GH #32) — each entry POSTed to /v1/worker/degradation before the main submit, structured tool-failure trace persisted on the Run record. Backward compat: absent field = pre-#32 behavior. Optional `stats` object ({worker_kind?, model?, usage?: {input_tokens?, output_tokens?, total_tokens?}, num_turns?, adapter_data?}; each token field is optional — report just `total_tokens` when that is all the worker knows, and the splits read as 0) — POSTed to /v1/worker/stats after the degradations and before the submit, so the dispatcher's outcome fold lands it on the attempt's StepEntry; report it on the FINAL (no-name) submit, since stats arriving after the fold are dropped. Aggregate a whole run's reports with swarm_run_stats. Expects HTTP 204 and returns {submitted: true} (name path) or {submitted: true} (plain path); any other status is an error. Pure-MCP replacement for the wrapper agents' Bash curl step — no shell involved."
     )]
     async fn mse_worker_submit(
         &self,

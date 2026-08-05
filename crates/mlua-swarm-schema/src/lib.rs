@@ -1197,7 +1197,11 @@ pub struct SubprocessStats {
     /// JSON Pointer selecting a usage OBJECT out of the parsed stdout.
     /// The engine reads `input_tokens`/`output_tokens` (falling back to
     /// the OpenAI-style `prompt_tokens`/`completion_tokens` spelling)
-    /// and an optional `total_tokens` from it.
+    /// and `total_tokens` from it. **Every one of the three is
+    /// optional**: a CLI that prints only a total still lands a usage
+    /// record (the splits read as `0`), and a CLI that prints only the
+    /// splits has its total derived as `input + output`. Only a usage
+    /// object carrying none of the three records no usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_ptr: Option<String>,
     /// JSON Pointer selecting the model name STRING that actually
