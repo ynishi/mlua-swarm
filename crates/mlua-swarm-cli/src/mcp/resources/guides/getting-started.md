@@ -47,7 +47,10 @@ Notable flags (see `mse serve --help` for the full set):
 
 - `--config <path>` — TOML config file path.
 - `--enable-enhance-flow` — merge the enhance-flow workers (patch-spawner /
-  patch-applier / verifier-router / committer) into the registry.
+  patch-applier / verifier-router / committer) into the registry. Off by
+  default, and the registry is only half of what the flow needs — the setup,
+  the HTTP surface, and the spawner contract are in
+  `mse://guides/enhance-flow`.
 - `--git-store-path <path>` — use a Git2-backed `BlueprintStore` instead of
   the default in-memory store (lost on restart).
 - `--issue-store-path <path>` / `--enhance-setting-store-path <path>` /
@@ -119,4 +122,6 @@ directly, e.g. `mse://guides/blueprint-authoring` or
 - The live Blueprint JSON Schema (always in sync with the running binary):
   `mse://api/blueprint-schema`.
 - All `mse mcp` tools grouped by family: `mse://guides/mcp-tool-reference`.
+- Letting an LLM patch a Blueprint from a plain-language issue, verified and
+  committed by the engine (`/v1/issues`): `mse://guides/enhance-flow`.
 - Deep API docs (types, traits, module map): the crate's docs.rs page.

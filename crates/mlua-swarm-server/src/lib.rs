@@ -628,12 +628,26 @@ pub fn default_registry() -> SpawnerRegistry {
 /// Opt-in registry that merges [`default_registry`] with the enhance flow
 /// (Lua factory + AgentBlock factory).
 ///
-/// Selected via the `the server` CLI flag `--enable-enhance-flow`. The enhance
-/// flow is a separate-axis wrapper: the Lua factory (= 3 Lua workers + 3 primitive
-/// bridges) and the AgentBlock factory (= patch-spawner path, expects
-/// `assets/operator_scripts/blueprint_patch_spawner.lua` + `ANTHROPIC_API_KEY`)
-/// are baked in as pipeline defaults. The baseline RustFn (`identity`) is pre-baked
-/// the same way as in `default_registry`.
+/// Selected via the server CLI flag `--enable-enhance-flow`. The enhance flow
+/// is a separate-axis wrapper, and this registry bakes both of its halves in as
+/// pipeline defaults:
+///
+/// - the **Lua factory** — the three enhance workers (`patch-applier` /
+///   `verifier-router` / `committer`) plus the three host bridges they call.
+///   Their Lua bodies are `include_str!`-embedded, so no file has to exist on
+///   disk for them to dispatch.
+/// - the **AgentBlock factory** — the `patch-spawner` axis. The bundled default
+///   declares no `spec.script_path`, so it runs in PromptBasedAgent mode with
+///   its `profile.system_prompt` carrying the whole `ops` / `bump` /
+///   `rationale` output contract; what it needs at run time is a credential for
+///   the provider behind its declared `profile.model` (`ANTHROPIC_API_KEY` for
+///   the model the bundled default declares). Driving the spawner on a
+///   different backend is a setting-level swap (`EnhanceSetting.spawner`), not
+///   a Blueprint rewrite.
+///
+/// The baseline RustFn (`identity`) is pre-baked the same way as in
+/// [`default_registry`]. End-to-end walkthrough of the flow (prerequisites,
+/// HTTP surface, spawner contract): the bundled `mse://guides/enhance-flow`.
 pub fn default_registry_with_enhance_flow() -> SpawnerRegistry {
     let lua_factory =
         mlua_swarm::enhance::blueprint::extend_factory(LuaInProcessSpawnerFactory::new());

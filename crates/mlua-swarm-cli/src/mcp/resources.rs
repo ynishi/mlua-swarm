@@ -47,6 +47,7 @@
 //! | `mse://guides/bp-lifecycle`                  | Workflow-oriented lifecycle map (develop → trial-run → operate): per-stage feature routing + the `MainAi` vs `Automate` operator contract (GH #80). |
 //! | `mse://guides/lint-diagnostic-model`         | Unified Clippy-style `Diagnostic` model + `LINT_DECLS` registry + the 4-step add-a-lint recipe (GH #79). |
 //! | `mse://guides/strict-embed-modes`            | The two `strict-embed` layers side by side: client build-time pre-embed vs server register-time raw-ref reject (GH #78 P1b). |
+//! | `mse://guides/enhance-flow`                  | Enhance flow (issue → JSON Patch → verify → commit): prerequisites, HTTP surface, the spawner's output contract, and the `EnhanceSetting.spawner` swap. |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
@@ -121,6 +122,7 @@ const LINT_DIAGNOSTIC_MODEL_BODY: &str =
     include_str!("./resources/guides/lint-diagnostic-model.md");
 const STRICT_EMBED_MODES_BODY: &str = include_str!("./resources/guides/strict-embed-modes.md");
 const SUBPROCESS_BACKENDS_BODY: &str = include_str!("./resources/guides/subprocess-backends.md");
+const ENHANCE_FLOW_BODY: &str = include_str!("./resources/guides/enhance-flow.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -248,6 +250,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "GH #78 P1b: side-by-side comparison of the two switches sharing the `strict-embed` token — `mse bp build --strict-embed` (client, build-time: unresolved refs hard-fail the build) vs `mse serve --blueprint-strict-embed` / `blueprint_strict_embed` config (server, register-time: raw-ref bodies get 400). Covers flag surface, layer, trigger point, effect, failure mode, and the four composition postures.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(STRICT_EMBED_MODES_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/enhance-flow",
+        title: "mse — Enhance flow (issue → JSON Patch → verify → commit)",
+        description: "The Blueprint self-improvement loop: the four-step enhance-default flow (patch-spawner / patch-applier / fanout verifier-router / committer), the two prerequisites (`mse serve --enable-enhance-flow`, an EnhanceSetting under id `default`), the HTTP surface (/v1/enhance-settings, /v1/issues, /v1/enhance/log), the spawner's output contract (`ops` / `bump` / `rationale`, RFC 6901 pointer rules, fenced-reply folding), and swapping the spawner's execution backend via `EnhanceSetting.spawner` without rewriting the Blueprint.",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(ENHANCE_FLOW_BODY),
     },
     ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",
