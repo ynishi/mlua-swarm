@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/ynishi/mlua-swarm/compare/v0.23.1...v0.24.0) - 2026-08-06
+
+### Added
+
+- *(enhance)* let EnhanceSetting swap the patch-spawner agent
+
+### Fixed
+
+- *(engine)* fold JSON a model wrapped in a markdown fence
+- *(enhance)* stop the default patch-spawner pointing at a missing script
+
+### Other
+
+- *(mcp)* add the enhance-flow guide
+
 ## [0.23.1](https://github.com/ynishi/mlua-swarm/compare/v0.23.0...v0.23.1) - 2026-08-05
 
 ### Added
