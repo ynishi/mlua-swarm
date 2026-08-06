@@ -46,6 +46,7 @@ use axum::{
     Json,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
+use mlua_swarm::store::operator_session::OperatorSessionRecord;
 use mlua_swarm::{AgentProviderManifest, Operator, SeniorBridge, SessionId, SpawnHook};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -64,8 +65,11 @@ use crate::AppState;
 pub struct OperatorSessionEntry {
     /// Server-minted session id (typed [`SessionId`] since issue #14).
     pub sid: SessionId,
-    /// Bearer auth token (10-hex-char) required on the WS upgrade and admin routes.
-    pub token: String,
+    /// `hex(SHA-256(bearer))` of the auth token required on the WS upgrade
+    /// and admin routes — never the bearer itself, in memory or at rest
+    /// (see [`OperatorSessionRecord`]'s type doc). Compare a presented
+    /// bearer with [`Self::verify_bearer`].
+    pub token_digest: String,
     /// Role aliases claimed by this session (roles-exclusivity set).
     pub roles: Vec<String>,
     /// Provider-owned effective capability manifest submitted at join.
@@ -78,6 +82,18 @@ pub struct OperatorSessionEntry {
     /// The reusable 3-trait session object once a WS has connected at least
     /// once; `None` before first connect. Its sender tracks current connectivity.
     pub ws_session: Mutex<Option<Arc<WSOperatorSession>>>,
+}
+
+impl OperatorSessionEntry {
+    /// Constant-time check of a presented bearer against
+    /// [`Self::token_digest`] — the sole authentication predicate on every
+    /// Bearer-guarded operator route.
+    pub fn verify_bearer(&self, bearer: &str) -> bool {
+        mlua_swarm::types::ct_eq(
+            self.token_digest.as_bytes(),
+            OperatorSessionRecord::digest_of(bearer).as_bytes(),
+        )
+    }
 }
 
 // ─── POST /v1/operators (mint) ──────────────────────────────────────────────
@@ -106,14 +122,22 @@ pub struct OperatorsCreateResp {
 }
 
 /// `POST /v1/operators`. Mints `sid` (`S-<hex>` — the shared `SessionId`
-/// shape; issue #11) + a 10-hex-char token
-/// (`mlua_swarm::types::secure_hex(5)` — OS-RNG hex, unguessable across
-/// calls and restarts, which is the point: this token is the sole bearer
-/// secret on the short-handle path). When `roles` is non-empty, checks
-/// `AppState.roles_to_sid` for conflicts under a single lock (check + insert
-/// atomic w.r.t. concurrent mints) and returns `409 CONFLICT` with the
-/// conflicting role names on collision. Empty `roles` never conflicts (= no
-/// exclusivity is claimed).
+/// shape; issue #11) + a 128-bit bearer token
+/// (`mlua_swarm::types::operator_bearer_token` — OS-RNG hex, unguessable
+/// across calls and restarts, which is the point: this token is the sole
+/// bearer secret on the short-handle path). When `roles` is non-empty,
+/// checks `AppState.roles_to_sid` for conflicts under a single lock (the
+/// check and the insert are atomic w.r.t. concurrent mints) and returns
+/// `409 CONFLICT` with the conflicting role names on collision. Empty
+/// `roles` never conflicts (= no exclusivity is claimed).
+///
+/// # The bearer exists only inside this function
+///
+/// The response below is the one and only place the plaintext leaves the
+/// server: everything retained afterwards — the `operator_sessions` entry
+/// and the persisted [`OperatorSessionRecord`] — holds
+/// `hex(SHA-256(bearer))` instead, and every later check runs
+/// [`OperatorSessionEntry::verify_bearer`] against that digest.
 pub async fn operators_create(
     State(state): State<AppState>,
     Json(req): Json<OperatorsCreateReq>,
@@ -124,10 +148,13 @@ pub async fn operators_create(
     // `SessionId` shape (`S-<hex>`) as the engine-side session id — one
     // session-id form across the system (issue #11 observation 2; the old
     // `op-<uuid>` shape collided with the operator-backend registry prefix).
-    // It is an identifier, not a secret: `token` (secure_hex) is the sole
-    // bearer credential on this path.
+    // It is an identifier, not a secret: `token` is the sole bearer
+    // credential on this path.
     let sid = SessionId::new();
-    let token = mlua_swarm::types::secure_hex(5);
+    let token = mlua_swarm::types::operator_bearer_token();
+    // Derived once, here: the plaintext `token` is moved into the response
+    // at the end of this function and never stored anywhere.
+    let token_digest = OperatorSessionRecord::digest_of(&token);
 
     {
         let mut map = state.roles_to_sid.lock().await;
@@ -169,9 +196,37 @@ pub async fn operators_create(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+
+    // Write-through BEFORE the in-memory insert and the mint response: a
+    // sid the client can see must already be durable, or a crash between
+    // response and persist would resurrect the pre-persistence forced
+    // logout this store exists to remove. On a store failure the roles
+    // reserved above are released so the names stay claimable.
+    let record = OperatorSessionRecord {
+        sid: sid.clone(),
+        token_digest: token_digest.clone(),
+        roles: roles.clone(),
+        capability_manifest: capability_manifest.clone(),
+        joined_at_secs,
+    };
+    if let Err(error) = state.operator_session_store.put(record).await {
+        tracing::error!(%sid, %error, "operators_create: session persist failed");
+        let mut map = state.roles_to_sid.lock().await;
+        for r in &roles {
+            if map.get(r.as_str()) == Some(&sid) {
+                map.remove(r.as_str());
+            }
+        }
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("session persist failed: {error}") })),
+        )
+            .into_response();
+    }
+
     let entry = Arc::new(OperatorSessionEntry {
         sid: sid.clone(),
-        token: token.clone(),
+        token_digest,
         roles: roles.clone(),
         capability_manifest,
         joined_at_secs,
@@ -235,7 +290,7 @@ pub async fn operators_ws_connect(
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "unknown sid").into_response(),
     };
-    if !mlua_swarm::types::ct_eq(entry.token.as_bytes(), bearer.as_bytes()) {
+    if !entry.verify_bearer(&bearer) {
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
@@ -434,6 +489,19 @@ async fn teardown_operator_session(
             }
         }
     }
+
+    // Drop the persisted row too, so a restart does not resurrect a
+    // deliberately torn-down session. Best-effort: `NotFound` is the
+    // idempotent-concurrent-delete case (same contract as the map
+    // removals above), any other failure is logged and swallowed — the
+    // in-memory teardown already happened and must not be rolled back.
+    use mlua_swarm::store::operator_session::OperatorSessionStoreError;
+    match state.operator_session_store.delete(sid).await {
+        Ok(()) | Err(OperatorSessionStoreError::NotFound(_)) => {}
+        Err(error) => {
+            tracing::warn!(%sid, %error, "operator session teardown: persisted row delete failed");
+        }
+    }
 }
 
 /// `DELETE /v1/operators/:sid`. Bearer mandatory. `404` on unknown sid, `401`
@@ -462,7 +530,7 @@ pub async fn operators_delete(
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "unknown sid").into_response(),
     };
-    if !mlua_swarm::types::ct_eq(entry.token.as_bytes(), bearer.as_bytes()) {
+    if !entry.verify_bearer(&bearer) {
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
@@ -580,10 +648,12 @@ pub async fn operators_delete_by_role(
         Some(e) => e,
         None => {
             // The role was mapped to a sid that has no matching
-            // `operator_sessions` entry — a torn state that a mint-time
-            // atomic guard prevents in normal operation. Release the
-            // stale role mapping so a future mint can reclaim the
-            // name, then report NOT_FOUND.
+            // `operator_sessions` entry. Reachable during a mint's
+            // roles-reserved → persisted → map-inserted window (the
+            // session-persistence write-through sits between the two map
+            // updates), or after a mint whose persist failed. Release the
+            // stale role mapping so a future mint can reclaim the name,
+            // then report NOT_FOUND.
             let mut map = state.roles_to_sid.lock().await;
             if map.get(role.as_str()) == Some(&sid) {
                 map.remove(role.as_str());
@@ -709,7 +779,7 @@ pub async fn operators_info(
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "unknown sid").into_response(),
     };
-    if !mlua_swarm::types::ct_eq(entry.token.as_bytes(), bearer.as_bytes()) {
+    if !entry.verify_bearer(&bearer) {
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
@@ -826,6 +896,9 @@ mod tests {
                 data_store: Arc::new(InMemoryOutputStore::new()),
                 operator_sessions: Arc::new(Mutex::new(HashMap::new())),
                 roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
+                operator_session_store: Arc::new(
+                    mlua_swarm::store::operator_session::InMemoryOperatorSessionStore::new(),
+                ),
                 task_store: Arc::new(InMemoryTaskStore::new()),
                 run_store: Arc::new(InMemoryRunStore::new()),
                 replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
@@ -841,7 +914,7 @@ mod tests {
             let sid = SessionId::new();
             let entry = Arc::new(OperatorSessionEntry {
                 sid: sid.clone(),
-                token: "token".to_string(),
+                token_digest: OperatorSessionRecord::digest_of("token"),
                 roles: vec![role.to_string()],
                 capability_manifest: None,
                 joined_at_secs: 0,

@@ -61,6 +61,22 @@ pub fn default_run_store_path() -> PathBuf {
     }
 }
 
+/// Default `OperatorSessionStore` SQLite path,
+/// `~/.mse/store/operator_session.sqlite`. Sibling of
+/// [`default_run_store_path`] — persisted by default so a single-server
+/// restart keeps logged-in Operators logged in (their sids stay resolvable,
+/// including the persisted `RunRecord.operator_sid` pins that pointed at
+/// them).
+pub fn default_operator_session_store_path() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home)
+            .join(".mse")
+            .join("store")
+            .join("operator_session.sqlite"),
+        Err(_) => PathBuf::from(".mse/store/operator_session.sqlite"),
+    }
+}
+
 /// Default `ReplayStore` SQLite path, `~/.mse/store/replay.sqlite`. Sibling
 /// of [`default_run_store_path`] — persisted by default so a restart can
 /// consult the replay log (see `mlua_swarm::store::replay` module doc).
@@ -148,6 +164,16 @@ pub struct FileConfig {
     /// `~/.mse/store/replay.sqlite` unless `ephemeral` is set. `None` = fall
     /// back to `InMemoryReplayStore` (process-volatile).
     pub replay_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `OperatorSessionStore`
+    /// (Operator login sessions — sid / roles / bearer *digest*; the bearer
+    /// itself is never written, see
+    /// `mlua_swarm::store::operator_session::OperatorSessionRecord`).
+    /// Persisted by default even when omitted (sibling of
+    /// `run_store_path`): resolves to
+    /// `~/.mse/store/operator_session.sqlite` unless `ephemeral` is set.
+    /// `None` = fall back to `InMemoryOperatorSessionStore`
+    /// (process-volatile = every restart forces a re-login).
+    pub operator_session_store_path: Option<PathBuf>,
     /// Opt-out flag: when `true`, restores the InMemory default for
     /// `task_store_path`/`run_store_path` even though the built-in default
     /// (issue #35 ST1) is now to persist. Has no effect when an explicit
@@ -236,6 +262,9 @@ pub struct CliOverrides {
     pub run_store_path: Option<PathBuf>,
     /// `--replay-store-path` value (mirrors [`FileConfig::replay_store_path`]).
     pub replay_store_path: Option<PathBuf>,
+    /// `--operator-session-store-path` value (mirrors
+    /// [`FileConfig::operator_session_store_path`]).
+    pub operator_session_store_path: Option<PathBuf>,
     /// `--ephemeral` flag (mirrors [`FileConfig::ephemeral`]).
     pub ephemeral: Option<bool>,
     /// `--seed-blueprint-id` value.
@@ -304,6 +333,9 @@ pub struct ResolvedConfig {
     /// Path to the SQLite database file backing the `ReplayStore`.
     /// `None` = `InMemoryReplayStore`.
     pub replay_store_path: Option<PathBuf>,
+    /// Path to the SQLite database file backing the `OperatorSessionStore`.
+    /// `None` = `InMemoryOperatorSessionStore`.
+    pub operator_session_store_path: Option<PathBuf>,
     /// Seed blueprint id used in combined-mode default routing.
     pub seed_blueprint_id: String,
     /// snake_case `AgentKind` literal, unvalidated. `None` = caller applies
@@ -361,6 +393,7 @@ impl Default for ResolvedConfig {
             task_store_path: None,
             run_store_path: None,
             replay_store_path: None,
+            operator_session_store_path: None,
             seed_blueprint_id: "main".into(),
             default_agent_kind: None,
             token_secret: None,
@@ -498,6 +531,16 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
                     None
                 } else {
                     Some(default_replay_store_path())
+                }
+            }),
+        operator_session_store_path: cli
+            .operator_session_store_path
+            .or(file.operator_session_store_path)
+            .or_else(|| {
+                if ephemeral {
+                    None
+                } else {
+                    Some(default_operator_session_store_path())
                 }
             }),
         seed_blueprint_id: cli

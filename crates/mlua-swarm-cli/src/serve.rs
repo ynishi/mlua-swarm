@@ -24,6 +24,9 @@ use mlua_swarm::store::enhance_setting::{
     EnhanceSettingId, EnhanceSettingStore, InMemoryEnhanceSettingStore, SqliteEnhanceSettingStore,
 };
 use mlua_swarm::store::issue::{InMemoryIssueStore, IssueStore, SqliteIssueStore};
+use mlua_swarm::store::operator_session::{
+    InMemoryOperatorSessionStore, OperatorSessionStore, SqliteOperatorSessionStore,
+};
 use mlua_swarm::store::output::{InMemoryOutputStore, OutputStore, SqliteOutputStore};
 use mlua_swarm::store::replay::{InMemoryReplayStore, ReplayStore, SqliteReplayStore};
 use mlua_swarm::store::run::{InMemoryRunStore, RunStore, SqliteRunStore};
@@ -113,6 +116,16 @@ pub struct Args {
     /// `--ephemeral` / the persist-by-default when set.
     #[arg(long)]
     replay_store_path: Option<std::path::PathBuf>,
+    /// Path to the SQLite database file backing the `OperatorSessionStore`
+    /// (Operator login sessions — sid / roles / bearer digest; the bearer
+    /// itself is never written, and the file is `0600` on unix). Persisted
+    /// by default even when omitted (sibling of `--run-store-path`): falls
+    /// back to `~/.mse/store/operator_session.sqlite` unless `--ephemeral`
+    /// is set, so a server restart keeps logged-in Operators logged in.
+    /// Overrides `operator_session_store_path` in the config file, and
+    /// always wins over `--ephemeral` / the persist-by-default when set.
+    #[arg(long)]
+    operator_session_store_path: Option<std::path::PathBuf>,
     /// Merges the 4 enhance-flow workers (patch-spawner / patch-applier /
     /// verifier-router / committer) + 3 host bridges into `default_registry`.
     /// Used when running the default enhance Blueprint through `/v1/tasks`. A pure
@@ -283,6 +296,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         task_store_path: args.task_store_path.clone(),
         run_store_path: args.run_store_path.clone(),
         replay_store_path: args.replay_store_path.clone(),
+        operator_session_store_path: args.operator_session_store_path.clone(),
         ephemeral: if args.ephemeral { Some(true) } else { None },
         seed_blueprint_id: args.seed_blueprint_id.clone(),
         default_agent_kind: args.default_agent_kind.clone(),
@@ -490,6 +504,38 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
         None => Arc::new(InMemoryReplayStore::new()),
     };
+    let operator_session_store: Arc<dyn OperatorSessionStore> = match &cfg
+        .operator_session_store_path
+    {
+        Some(path) => {
+            eprintln!(
+                "mse serve: SqliteOperatorSessionStore at {}",
+                path.display()
+            );
+            let (s, driver) = SqliteOperatorSessionStore::open(path)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("mse serve: SqliteOperatorSessionStore open failed: {e}")
+                });
+            isle_drivers.push(driver);
+            Arc::new(s)
+        }
+        None => Arc::new(InMemoryOperatorSessionStore::new()),
+    };
+    // Rehydrate persisted Operator login sessions so a restart keeps every
+    // logged-in Operator logged in: their saved sid + token reconnect the
+    // WS directly (no re-mint), and persisted `RunRecord.operator_sid`
+    // pins stay resolvable instead of stranding on `404 unknown sid`.
+    let operator_session_persistence =
+        mlua_swarm_server::OperatorSessionPersistence::restore(operator_session_store)
+            .await
+            .unwrap_or_else(|e| panic!("mse serve: operator session restore failed: {e}"));
+    if !operator_session_persistence.restored.is_empty() {
+        eprintln!(
+            "mse serve: restored {} operator session(s) (reconnect with the saved sid + token)",
+            operator_session_persistence.restored.len()
+        );
+    }
     // The trace rail shares the Run store's database FILE (one Run = one
     // artifact on disk) in its own `run_trace` table — see
     // `mlua_swarm::store::trace::sqlite`. Ephemeral mode (no
@@ -538,7 +584,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let sweep_trace_store = run_trace_store.clone();
 
     // Router assembly (fixed combined mode): merges task, ws_operator_factory, and every enhance route.
-    let mut app = mlua_swarm_server::build_router_full_with_legacy_worker_binding_policy(
+    let mut app = mlua_swarm_server::build_router_full_with_operator_session_persistence(
         engine.clone(),
         make_registry(),
         Some(store.clone()),
@@ -549,6 +595,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(run_store),
         Some(replay_store),
         Some(run_trace_store),
+        Some(operator_session_persistence),
         cfg.sync_timeout_secs,
         cfg.legacy_worker_binding_policy,
     );

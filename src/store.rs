@@ -15,6 +15,7 @@
 pub mod enhance_log;
 pub mod enhance_setting;
 pub mod issue;
+pub mod operator_session;
 pub mod output;
 pub mod replay;
 pub mod run;

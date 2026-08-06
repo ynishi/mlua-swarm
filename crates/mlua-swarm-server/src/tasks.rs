@@ -2030,6 +2030,9 @@ mod tests {
             data_store: Arc::new(InMemoryOutputStore::new()),
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
+            operator_session_store: Arc::new(
+                mlua_swarm::store::operator_session::InMemoryOperatorSessionStore::new(),
+            ),
             task_store: Arc::new(InMemoryTaskStore::new()),
             run_store: Arc::new(InMemoryRunStore::new()),
             replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),

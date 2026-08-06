@@ -732,6 +732,27 @@ pub fn secure_hex(bytes: usize) -> String {
     hex::encode(buf)
 }
 
+/// Number of OS-random bytes behind an Operator login bearer token
+/// ([`operator_bearer_token`]).
+///
+/// 16 bytes = 128 bits. Sized against *offline* attack rather than online
+/// guessing: the token is only ever stored as `hex(SHA-256(bearer))` (see
+/// [`crate::store::operator_session::OperatorSessionRecord`]), and SHA-256
+/// is fast, so the digest's resistance is bounded by the bearer's own
+/// entropy. At the 40 bits an earlier 5-byte token carried, a digest is
+/// recoverable by brute force and would have been little better than
+/// storing the plaintext; 128 bits puts that out of reach.
+pub const OPERATOR_BEARER_TOKEN_BYTES: usize = 16;
+
+/// Mint an Operator login bearer token — [`secure_hex`] at
+/// [`OPERATOR_BEARER_TOKEN_BYTES`].
+///
+/// Named rather than inlined so the entropy choice lives in one place with
+/// its rationale, next to the digest-at-rest decision that depends on it.
+pub fn operator_bearer_token() -> String {
+    secure_hex(OPERATOR_BEARER_TOKEN_BYTES)
+}
+
 /// Hex SHA-256 of a token nonce / bearer string — the lookup-key shape
 /// used by [`CapToken::fingerprint`]. Standalone so callers holding only
 /// the bearer string (not a decoded token) can derive the same key.

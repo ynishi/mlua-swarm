@@ -178,6 +178,7 @@ impl AgentBindingProvider for OperatorSessionBindingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlua_swarm::store::operator_session::OperatorSessionRecord;
     use mlua_swarm::{AgentProviderCapability, AgentProviderManifest, BindingDigest};
 
     fn request() -> BindRequest {
@@ -196,7 +197,7 @@ mod tests {
         let sid = SessionId::new();
         let entry = Arc::new(OperatorSessionEntry {
             sid: sid.clone(),
-            token: "token".to_string(),
+            token_digest: OperatorSessionRecord::digest_of("token"),
             roles: vec!["main-ai".to_string()],
             capability_manifest: manifest,
             joined_at_secs: 0,
@@ -297,7 +298,7 @@ mod tests {
         let pinned_sid = SessionId::new();
         let role_holder = Arc::new(OperatorSessionEntry {
             sid: role_holder_sid.clone(),
-            token: "token".to_string(),
+            token_digest: OperatorSessionRecord::digest_of("token"),
             roles: vec!["main-ai".to_string()],
             capability_manifest: None,
             joined_at_secs: 0,
@@ -305,7 +306,7 @@ mod tests {
         });
         let pinned = Arc::new(OperatorSessionEntry {
             sid: pinned_sid.clone(),
-            token: "token".to_string(),
+            token_digest: OperatorSessionRecord::digest_of("token"),
             roles: Vec::new(),
             capability_manifest: Some(manifest),
             joined_at_secs: 0,

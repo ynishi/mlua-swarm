@@ -125,6 +125,10 @@ use mlua_swarm::application::{BlueprintRef, TaskApplication, TaskApplicationErro
 use mlua_swarm::blueprint::store::BlueprintStore;
 use mlua_swarm::core::config::CheckPolicy;
 use mlua_swarm::service::{TaskLaunchError, TaskLaunchService};
+use mlua_swarm::store::operator_session::{
+    InMemoryOperatorSessionStore, OperatorSessionRecord, OperatorSessionStore,
+    OperatorSessionStoreError,
+};
 use mlua_swarm::store::replay::{InMemoryReplayStore, ReplayStore};
 use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStore};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
@@ -187,6 +191,15 @@ pub struct AppState {
     /// causes `POST /v1/operators` to return `409 CONFLICT`. Entries are
     /// released on `DELETE /v1/operators/:sid`.
     pub roles_to_sid: Arc<Mutex<HashMap<String, SessionId>>>,
+    /// Persistence behind `operator_sessions` / `roles_to_sid`: mint
+    /// (`POST /v1/operators`) writes through, teardown deletes, and a fresh
+    /// boot rehydrates both maps from it (see [`OperatorSessionPersistence`])
+    /// — so a single-server restart keeps every logged-in Operator logged in
+    /// instead of forcing a re-mint (the pre-persistence behaviour stranded
+    /// persisted `RunRecord.operator_sid` pins on `404 unknown sid`).
+    /// Default = `InMemoryOperatorSessionStore` (process-volatile, the old
+    /// behaviour); `mse serve` swaps in a `SqliteOperatorSessionStore`.
+    pub operator_session_store: Arc<dyn OperatorSessionStore>,
     /// Persistence for `Task` records (issue #13 ID-hierarchy work-item
     /// identity; see `mlua_swarm::store::task` module doc). Default =
     /// `InMemoryTaskStore` (constructed inside `build_router_full`); callers
@@ -416,8 +429,106 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
     sync_timeout_secs: u64,
     legacy_worker_binding_policy: mlua_swarm::LegacyWorkerBindingPolicy,
 ) -> Router {
-    let operator_sessions = Arc::new(Mutex::new(HashMap::new()));
-    let roles_to_sid = Arc::new(Mutex::new(HashMap::new()));
+    build_router_full_with_operator_session_persistence(
+        engine,
+        registry,
+        store,
+        ws_operator_factory,
+        output_store,
+        base_url,
+        task_store,
+        run_store,
+        replay_store,
+        run_trace_store,
+        None,
+        sync_timeout_secs,
+        legacy_worker_binding_policy,
+    )
+}
+
+/// Operator login-session persistence bundle for the terminal router
+/// builder: the write-through [`OperatorSessionStore`] plus the records
+/// already in it, pre-listed so the (synchronous) builder can seed
+/// `AppState.operator_sessions` / `roles_to_sid` without an await.
+///
+/// Construct via [`OperatorSessionPersistence::restore`] at boot. Restored
+/// entries rehydrate with `ws_session: None` — the client's next WS connect
+/// on its saved `sid` + token walks the existing first-connect path in
+/// `operator_ws::login::handle_operator_socket` (3-registry + role-alias
+/// registration), which is exactly what re-resolves a persisted
+/// `RunRecord.operator_sid` pin after a restart.
+pub struct OperatorSessionPersistence {
+    /// Write-through target for mint / teardown.
+    pub store: Arc<dyn OperatorSessionStore>,
+    /// Records listed from `store` at boot, in mint order.
+    pub restored: Vec<OperatorSessionRecord>,
+}
+
+impl OperatorSessionPersistence {
+    /// List `store`'s persisted sessions into a bundle ready to hand to
+    /// [`build_router_full_with_operator_session_persistence`].
+    pub async fn restore(
+        store: Arc<dyn OperatorSessionStore>,
+    ) -> Result<Self, OperatorSessionStoreError> {
+        let restored = store.list().await?;
+        Ok(Self { store, restored })
+    }
+}
+
+/// Terminal router builder — [`build_router_full_with_legacy_worker_binding_policy`]
+/// plus Operator login-session persistence (see
+/// [`OperatorSessionPersistence`]). `None` preserves the process-volatile
+/// default (`InMemoryOperatorSessionStore`, empty seed) every pre-existing
+/// caller gets.
+#[allow(clippy::too_many_arguments)]
+pub fn build_router_full_with_operator_session_persistence(
+    engine: Engine,
+    registry: SpawnerRegistry,
+    store: Option<Arc<dyn BlueprintStore>>,
+    ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+    output_store: Option<Arc<dyn mlua_swarm::store::output::OutputStore>>,
+    base_url: Option<Arc<str>>,
+    task_store: Option<Arc<dyn TaskStore>>,
+    run_store: Option<Arc<dyn RunStore>>,
+    replay_store: Option<Arc<dyn ReplayStore>>,
+    run_trace_store: Option<Arc<dyn mlua_swarm::store::trace::RunTraceStore>>,
+    operator_session_persistence: Option<OperatorSessionPersistence>,
+    sync_timeout_secs: u64,
+    legacy_worker_binding_policy: mlua_swarm::LegacyWorkerBindingPolicy,
+) -> Router {
+    let (operator_session_store, restored_sessions): (
+        Arc<dyn OperatorSessionStore>,
+        Vec<OperatorSessionRecord>,
+    ) = match operator_session_persistence {
+        Some(p) => (p.store, p.restored),
+        None => (Arc::new(InMemoryOperatorSessionStore::new()), Vec::new()),
+    };
+    // Rehydrate the login maps from the persisted records. `ws_session`
+    // starts `None` on every restored entry — the WS adapter state is
+    // process-lifetime by design (see the `operator_session` store module
+    // doc); the owning client reconnects with its saved sid + token and
+    // the login module's existing first-connect path re-registers it.
+    let mut session_map: HashMap<SessionId, Arc<crate::operator_ws::login::OperatorSessionEntry>> =
+        HashMap::new();
+    let mut roles_map: HashMap<String, SessionId> = HashMap::new();
+    for record in restored_sessions {
+        for role in &record.roles {
+            roles_map.insert(role.clone(), record.sid.clone());
+        }
+        session_map.insert(
+            record.sid.clone(),
+            Arc::new(crate::operator_ws::login::OperatorSessionEntry {
+                sid: record.sid,
+                token_digest: record.token_digest,
+                roles: record.roles,
+                capability_manifest: record.capability_manifest,
+                joined_at_secs: record.joined_at_secs,
+                ws_session: Mutex::new(None),
+            }),
+        );
+    }
+    let operator_sessions = Arc::new(Mutex::new(session_map));
+    let roles_to_sid = Arc::new(Mutex::new(roles_map));
     let compiler = Compiler::new(registry);
     let binding_provider = Arc::new(binding::OperatorSessionBindingProvider::new(
         operator_sessions.clone(),
@@ -469,6 +580,7 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
         data_store,
         operator_sessions,
         roles_to_sid,
+        operator_session_store,
         task_store,
         run_store,
         replay_store,
@@ -2009,6 +2121,7 @@ mod tests {
             data_store: Arc::new(mlua_swarm::store::output::InMemoryOutputStore::new()),
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
+            operator_session_store: Arc::new(InMemoryOperatorSessionStore::new()),
             task_store: Arc::new(mlua_swarm::store::task::InMemoryTaskStore::new()),
             run_store: Arc::new(mlua_swarm::store::run::InMemoryRunStore::new()),
             replay_store: Arc::new(mlua_swarm::store::replay::InMemoryReplayStore::new()),
