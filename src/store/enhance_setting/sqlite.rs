@@ -149,6 +149,7 @@ mod tests {
             ttl_secs: 10,
             version: VersionSelector::default(),
             verifier_axes: vec!["des".into()],
+            spawner: None,
             meta: EnhanceSettingMeta::default(),
         }
     }

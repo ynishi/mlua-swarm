@@ -31,8 +31,9 @@ use crate::blueprint::store::{
     blueprint_version, BlueprintEpoch, BlueprintId, BlueprintStore, BlueprintStoreError,
     CommitMetadata, ContentHash, Traced,
 };
-use crate::blueprint::Blueprint;
+use crate::blueprint::{AgentDef, Blueprint};
 use crate::core::errors::EngineError;
+use crate::enhance::blueprint::AG_PATCH_SPAWNER;
 use crate::service::{TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService};
 use crate::store::enhance_log::{
     EnhanceLogEntry, EnhanceLogStore, EnhanceLogStoreError, VerdictSummary,
@@ -111,6 +112,17 @@ pub enum EnhanceApplicationError {
     /// computing `now_ms`.
     #[error("system time before UNIX epoch: {0}")]
     Clock(#[from] std::time::SystemTimeError),
+
+    /// The setting carries an `EnhanceSetting::spawner` override, but the
+    /// orbit Blueprint declares no agent under the name the flow's
+    /// `Step.ref` points at. Fail loud: silently ignoring the override
+    /// would run the Blueprint's own spawner while the operator believes
+    /// the swap took effect.
+    #[error("spawner override: orbit blueprint declares no agent named {name:?}")]
+    SpawnerAgentNotFound {
+        /// The agent name the override targets (= the flow `Step.ref`).
+        name: String,
+    },
 }
 
 impl From<SemverResolveError> for EnhanceApplicationError {
@@ -250,7 +262,8 @@ impl EnhanceApplication {
     /// 1. Fetch the setting (the enhance-orbit BP id, `verifier_axes`,
     ///    and `ttl`).
     /// 2. Resolve the orbit BP (for example the built-in
-    ///    `enhance-default` flow).
+    ///    `enhance-default` flow), then apply the setting's
+    ///    `spawner` override to it when one is declared.
     /// 3. Resolve the target BP (`payload.blueprint_id`) — the
     ///    object being modified, injected into `init_ctx` as
     ///    `prev_bp`.
@@ -268,9 +281,10 @@ impl EnhanceApplication {
     ) -> Result<IssueStatus, EnhanceApplicationError> {
         let setting = self.setting_store.get(&self.setting_id).await?;
 
-        let traced_orch = self
+        let mut traced_orch = self
             .resolve_blueprint(&setting.blueprint_id, &setting.version)
             .await?;
+        apply_spawner_override(&mut traced_orch.value, setting.spawner.as_ref())?;
 
         let traced_target = self.bp_store.read_head(&payload.blueprint_id).await?;
         let prev_bp_yaml = serde_yaml::to_string(&traced_target.value).map_err(|e| {
@@ -460,6 +474,46 @@ pub struct EnhanceApplicationInput {
     pub issue_id: IssueId,
 }
 
+/// Swap the orbit Blueprint's [`AG_PATCH_SPAWNER`] agent for the
+/// definition the setting declares.
+///
+/// `spawner = None` leaves the Blueprint untouched — whatever it
+/// declares is what runs (the pre-override behaviour, byte-for-byte).
+/// `Some(def)` replaces the matching entry in `blueprint.agents` in
+/// place, which is the whole point of the knob: the spawner's execution
+/// backend can be changed without rewriting the Blueprint.
+///
+/// Two deliberate strictnesses:
+///
+/// - No agent under that name → `Err`. The flow step references the
+///   agent by name, so a missing target means the override is inert; a
+///   silent no-op here is the worst possible way for that to surface.
+/// - The swapped-in `name` is forced back to [`AG_PATCH_SPAWNER`], so a
+///   caller supplying a differently-named `AgentDef` cannot break the
+///   flow's `Step.ref` wiring.
+///
+/// The mutation is scoped to the in-memory copy used for this dispatch —
+/// nothing is written back to the `BlueprintStore`.
+fn apply_spawner_override(
+    blueprint: &mut Blueprint,
+    spawner: Option<&AgentDef>,
+) -> Result<(), EnhanceApplicationError> {
+    let Some(spawner) = spawner else {
+        return Ok(());
+    };
+    let slot = blueprint
+        .agents
+        .iter_mut()
+        .find(|a| a.name == AG_PATCH_SPAWNER)
+        .ok_or_else(|| EnhanceApplicationError::SpawnerAgentNotFound {
+            name: AG_PATCH_SPAWNER.to_string(),
+        })?;
+    let mut swapped = spawner.clone();
+    swapped.name = AG_PATCH_SPAWNER.to_string();
+    *slot = swapped;
+    Ok(())
+}
+
 /// Internal verdict produced by strictly parsing `committer.lua`'s
 /// output (`ctx.commit`).
 ///
@@ -635,5 +689,68 @@ impl Application for EnhanceApplication {
             })
             .await?;
         Ok(input.issue_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blueprint::AgentKind;
+    use crate::enhance::blueprint::default_blueprint;
+
+    fn spawner_of(bp: &Blueprint) -> &AgentDef {
+        bp.agents
+            .iter()
+            .find(|a| a.name == AG_PATCH_SPAWNER)
+            .expect("blueprint declares a patch-spawner agent")
+    }
+
+    fn subprocess_spawner(name: &str) -> AgentDef {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "kind": "subprocess",
+            "spec": { "program": "true", "args": [] },
+        }))
+        .expect("literal is a valid AgentDef")
+    }
+
+    #[test]
+    fn no_override_keeps_the_blueprints_own_spawner() {
+        let mut bp = default_blueprint();
+        let before = spawner_of(&bp).clone();
+        apply_spawner_override(&mut bp, None).unwrap();
+        assert_eq!(spawner_of(&bp), &before);
+        assert_eq!(spawner_of(&bp).kind, AgentKind::AgentBlock);
+    }
+
+    #[test]
+    fn override_swaps_the_spawner_and_forces_the_referenced_name() {
+        let mut bp = default_blueprint();
+        let agents_before = bp.agents.len();
+        // A deliberately mis-named override: the flow references the
+        // agent by name, so the swap must rename it back.
+        let def = subprocess_spawner("my-own-spawner");
+        apply_spawner_override(&mut bp, Some(&def)).unwrap();
+
+        let swapped = spawner_of(&bp);
+        assert_eq!(swapped.kind, AgentKind::Subprocess);
+        assert_eq!(swapped.name, AG_PATCH_SPAWNER);
+        assert_eq!(swapped.spec, def.spec);
+        // A swap, not an insert — the other three agents are untouched.
+        assert_eq!(bp.agents.len(), agents_before);
+        assert!(!bp.agents.iter().any(|a| a.name == "my-own-spawner"));
+    }
+
+    #[test]
+    fn override_without_a_matching_agent_fails_loud() {
+        let mut bp = default_blueprint();
+        bp.agents.retain(|a| a.name != AG_PATCH_SPAWNER);
+        let err = apply_spawner_override(&mut bp, Some(&subprocess_spawner(AG_PATCH_SPAWNER)))
+            .expect_err("a missing override target must not be ignored");
+        assert!(matches!(
+            err,
+            EnhanceApplicationError::SpawnerAgentNotFound { ref name } if name == AG_PATCH_SPAWNER
+        ));
+        assert!(err.to_string().contains(AG_PATCH_SPAWNER));
     }
 }
