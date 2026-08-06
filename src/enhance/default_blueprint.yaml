@@ -2,13 +2,16 @@
 #
 # - flow: Seq [patch-spawner -> patch-applier -> Fanout(verifier-router) -> committer]
 # - All 4 agents run on the InProc backend; spec.fn_id selects the worker fn
+#   for the three Lua steps, and patch-spawner runs on the agent_block axis
 # - Verifier axis count is determined by the length of the `$.verifiers` array in
 #   the init ctx (the Blueprint itself is axis-count agnostic)
 #
 # This YAML file is the source of truth and should be edited directly rather
 # than via a Rust struct literal. The patch-applier / verifier-router /
 # committer worker fns are implemented as embedded Lua scripts (see
-# src/enhance/scripts/), registered through LuaScriptSource.
+# src/enhance/scripts/), registered through LuaScriptSource. patch-spawner has
+# no script of its own — it is a PromptBasedAgent whose profile.system_prompt
+# carries the whole contract (see the note on the agent below).
 schema_version: "0.1.0"
 id: enhance-default
 flow:
@@ -37,13 +40,57 @@ flow:
       in: { op: path, at: "$" }
       out: { op: path, at: "$.commit" }
 agents:
+  # No `spec.script_path` on purpose: that selects the PromptBasedAgent mode,
+  # where the invoker is built in-process and this `profile.system_prompt` is
+  # handed to the model as-is. A script path would need a file on disk, which a
+  # bundled default cannot ship (unlike the other three, whose Lua bodies are
+  # `include_str!`-embedded). `spec.project_root` stays: agent-block reads that
+  # directory's `.env` at startup. Swap the whole agent out via
+  # `EnhanceSetting.spawner` to drive a different execution axis.
   - name: patch-spawner
     kind: agent_block
     spec:
-      script_path: assets/operator_scripts/blueprint_patch_spawner.lua
       project_root: "."
     profile:
-      system_prompt: "You are a Blueprint Patch generator."
+      system_prompt: |
+        You turn one natural-language Blueprint issue into an RFC 6902 JSON Patch.
+
+        Your prompt is a JSON object with these keys:
+          issue        - { issue_id, blueprint_id, intent }; `intent` states the
+                         requested change in prose.
+          prev_bp_yaml - the target Blueprint serialized as YAML. This is the
+                         document you patch.
+          prev_hash    - content hash of prev_bp_yaml, for traceability only.
+          epoch_id     - optimistic-concurrency token, for traceability only.
+          verifiers    - names of the verifier axes that will judge your patch.
+
+        Reply with a single JSON object and nothing else:
+
+          {"ops": [...], "bump": "patch", "rationale": "..."}
+
+          ops       - RFC 6902 operations against the JSON representation of
+                      prev_bp_yaml. Every `path` is an RFC 6901 pointer into
+                      that document and array indices are 0-based (for example
+                      "/agents/0/profile/system_prompt"). Emit the smallest set
+                      of operations that satisfies `intent`.
+          bump      - "major", "minor" or "patch": how the resulting
+                      Blueprint's semantic version should move.
+          rationale - one sentence naming what the operations change and why.
+
+        Rules:
+        - Emit the bare JSON object. No markdown code fence, no prose before or
+          after it, no trailing commentary. The next step parses your reply as
+          JSON and fails the run when anything else surrounds it.
+        - Never write a `version_hash` field. Replacing an agent's
+          `system_prompt` recomputes that agent's hash automatically, so an
+          explicit hash operation would only conflict with it.
+        - Keep the patched document a valid Blueprint. It is deserialized back
+          into the schema before it is verified, so operations that drop
+          required keys or invent unknown ones are rejected.
+        - When `intent` cannot be expressed as a patch of prev_bp_yaml —
+          ambiguous, out of scope, or already satisfied — return an empty `ops`
+          array and say why in `rationale`. That is a valid answer; a
+          fabricated operation is not.
       model: claude-haiku-4-5-20251001
     meta:
       description: "enhance-flow default: patch-spawner (= LLM-driven NL Issue → JSON Patch)"
@@ -69,4 +116,4 @@ agents:
 metadata:
   description: "Enhance default flow: spawn → apply → verify (Fanout N axes) → commit"
   tags: [enhance, default]
-  version_label: "0.2.0"
+  version_label: "0.3.0"

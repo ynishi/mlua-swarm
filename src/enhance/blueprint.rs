@@ -11,8 +11,11 @@
 //!
 //! - `patch-spawner`   — `AgentKind::AgentBlock` (LLM-driven; turns the
 //!   issue's natural-language `intent` into RFC 6902 ops). Wired via
-//!   `AgentBlockInProcessSpawnerFactory`; the script is
-//!   `assets/operator_scripts/blueprint_patch_spawner.lua`.
+//!   `AgentBlockInProcessSpawnerFactory`. It declares no
+//!   `spec.script_path`, so it runs in PromptBasedAgent mode and its
+//!   `profile.system_prompt` carries the whole `ops` / `bump` /
+//!   `rationale` output contract. Replace the agent wholesale through
+//!   `EnhanceSetting.spawner` to drive a different execution axis.
 //! - `patch-applier`   — `AgentKind::Lua` (pure-Lua RFC 6902 apply plus
 //!   the semver bump).
 //! - `verifier-router` — `AgentKind::Lua` (four verifier implementations
@@ -280,6 +283,54 @@ mod tests {
             assert!(
                 yaml.contains(name),
                 "default_blueprint must reference agent {name}, yaml=\n{yaml}"
+            );
+        }
+    }
+
+    /// Regression lock: `patch-spawner` must stay in PromptBasedAgent
+    /// mode. A `spec.script_path` would select ScriptBasedAgent instead,
+    /// which needs a Lua file on disk — and the bundled default ships no
+    /// such file, so the failure would only surface at spawn time.
+    #[test]
+    fn default_blueprint_patch_spawner_has_no_script_path() {
+        let bp = default_blueprint();
+        let spawner = bp
+            .agents
+            .iter()
+            .find(|a| a.name == AG_PATCH_SPAWNER)
+            .expect("default_blueprint must define patch-spawner");
+        assert!(
+            spawner.spec.get("script_path").is_none(),
+            "patch-spawner must not declare spec.script_path (PromptBasedAgent mode), spec={:?}",
+            spawner.spec
+        );
+        // `project_root` stays — agent-block loads that directory's `.env`.
+        assert_eq!(
+            spawner.spec.get("project_root").and_then(|v| v.as_str()),
+            Some("."),
+        );
+    }
+
+    /// The spawner's whole downstream contract lives in its
+    /// `system_prompt` now that no script assembles the prompt. Lock the
+    /// three result keys `patch_applier.lua` / `committer.lua` read.
+    #[test]
+    fn default_blueprint_patch_spawner_prompt_states_output_contract() {
+        let bp = default_blueprint();
+        let spawner = bp
+            .agents
+            .iter()
+            .find(|a| a.name == AG_PATCH_SPAWNER)
+            .expect("default_blueprint must define patch-spawner");
+        let prompt = &spawner
+            .profile
+            .as_ref()
+            .expect("patch-spawner must carry a profile")
+            .system_prompt;
+        for key in ["ops", "bump", "rationale"] {
+            assert!(
+                prompt.contains(key),
+                "patch-spawner system_prompt must name the {key:?} result key, prompt=\n{prompt}"
             );
         }
     }
