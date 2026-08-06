@@ -1701,6 +1701,7 @@ dependencies = [
  "git2",
  "hex",
  "hmac",
+ "llm-extract",
  "minijinja",
  "mlua",
  "mlua-flow-ir",

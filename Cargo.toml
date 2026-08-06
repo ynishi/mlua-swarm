@@ -49,6 +49,7 @@ mlua = { version = "0.11", features = ["lua54", "vendored", "serde"] }
 tempfile = "3"
 agent-block-core = "0.31.0"
 agent-block-types = "0.31.0"
+llm-extract = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json"] }
@@ -123,6 +124,7 @@ minijinja.workspace = true
 mlua.workspace = true
 agent-block-core.workspace = true
 agent-block-types.workspace = true
+llm-extract.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

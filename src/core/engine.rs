@@ -182,15 +182,19 @@ pub const SUBMIT_FORMAT_TEXT: &str = "text";
 /// downstream node can address fields inside it (`$.<step>.lanes`, a
 /// `fanout` `items` expression, a `branch` cond) with no declaration —
 /// uniformly across the HTTP submit, artifact staging, and in-process
-/// lanes, because they all meet here. Scalar JSON (`true`, `42`,
-/// `"quoted"`, `null`) deliberately stays a string: a scalar has no
-/// addressable interior, so parsing it buys no path capability while
-/// silently changing `Eq` conds and verdict comparisons for any declared
-/// token that happens to be valid JSON. A step that wants full-JSON
-/// semantics (scalars included) declares `submit_format: "json"` and gets
-/// the strict submit-time parse instead; a step that needs a
-/// JSON-container-looking body folded as a raw string declares
-/// `submit_format: "text"` (`Raw`: no parsing at all).
+/// lanes, because they all meet here. A container the model wrapped in a
+/// markdown code fence (```` ```json ... ``` ````) folds the same way:
+/// the fence is stripped and the inner bytes reparsed, because a prompt
+/// asking for bare JSON does not guarantee the shape of what comes back.
+/// Scalar JSON (`true`, `42`, `"quoted"`, `null`) deliberately stays a
+/// string: a scalar has no addressable interior, so parsing it buys no
+/// path capability while silently changing `Eq` conds and verdict
+/// comparisons for any declared token that happens to be valid JSON. A
+/// step that wants full-JSON semantics (scalars included) declares
+/// `submit_format: "json"` and gets the strict submit-time parse
+/// instead; a step that needs a JSON-container-looking body — fenced or
+/// bare — folded as a raw string declares `submit_format: "text"`
+/// (`Raw`: no parsing, no fence stripping at all).
 ///
 /// Parsing at the fold — not at staging — is also what keeps materialized
 /// part files verbatim: `Engine::stage_worker_artifact_trusted` /
@@ -211,16 +215,42 @@ pub enum FoldParse {
 /// `plan.md` part, an operator completion notice) from paying a parse
 /// that could only fail, and is what scopes the parse to containers — a
 /// scalar body never enters `from_str` at all.
+///
+/// One fallback sits behind that: a body that LEADS with a markdown code
+/// fence has the fence stripped ([`llm_extract::strip_fences`]) and the
+/// inner bytes run through the same container check. A model wraps its
+/// JSON in a fenced block even when the system prompt forbids one, and
+/// the wrapped body would otherwise reach the next step as a string
+/// (observed: the enhance flow's `patch-spawner` returning a fenced
+/// patch, rejected by `committer` as "ctx.patch must be a table"). The
+/// fallback is gated on the leading fence so a prose body carrying a
+/// fenced snippet somewhere inside still pays nothing, and it only
+/// applies when the fenced content is itself a parseable container —
+/// otherwise the ORIGINAL string is returned, never the stripped
+/// fragment.
 fn lenient_fold_value(v: Value) -> Value {
     let Value::String(s) = v else { return v };
+    if let Some(parsed) = parse_json_container(&s) {
+        return parsed;
+    }
+    if s.trim_start().starts_with("```") {
+        if let Some(parsed) = parse_json_container(llm_extract::strip_fences(&s)) {
+            return parsed;
+        }
+    }
+    Value::String(s)
+}
+
+/// `Some` only when `s` both leads with a JSON container byte (`{` / `[`,
+/// leading whitespace trimmed) and parses — the containers-only rule
+/// [`lenient_fold_value`] applies to a submitted body and, on the fenced
+/// fallback, to the bytes inside the fence.
+fn parse_json_container(s: &str) -> Option<Value> {
     let trimmed = s.trim_start();
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
-        return Value::String(s);
+        return None;
     }
-    match serde_json::from_str::<Value>(&s) {
-        Ok(parsed) => parsed,
-        Err(_) => Value::String(s),
-    }
+    serde_json::from_str::<Value>(s).ok()
 }
 
 /// [`Engine::dispatch_attempt_with`]'s Final-pull assembly (GH #36 ST1:
@@ -5428,6 +5458,82 @@ mod named_multi_part_worker_output_tests {
             serde_json::json!({
                 "out": {"k": 1},
                 "parts": {"structured": {"already": true}},
+            })
+        );
+    }
+
+    /// Regression lock for the enhance flow's first live failure: the
+    /// `patch-spawner` worker returned a correct patch wrapped in a
+    /// json-tagged markdown fence, the fold kept it a string, and
+    /// `committer` rejected the issue with "ctx.patch must be a table".
+    /// The body below is that exact 171-byte response.
+    #[test]
+    fn lenient_fold_unwraps_fenced_json_container() {
+        let fenced = r#"```json
+{
+  "ops": [{"op": "add", "path": "/metadata/tags/0", "value": "smoke"}],
+  "bump": "patch",
+  "rationale": "Add 'smoke' tag to metadata.tags array."
+}
+```"#;
+        let tail = vec![final_ev(Value::String(fenced.to_string()), true)];
+        let (value, ok) =
+            fold_final_and_parts(&tail, &[], FoldParse::Lenient).expect("Final present");
+        assert!(ok);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "ops": [{"op": "add", "path": "/metadata/tags/0", "value": "smoke"}],
+                "bump": "patch",
+                "rationale": "Add 'smoke' tag to metadata.tags array.",
+            })
+        );
+    }
+
+    /// The fence fallback keys off the fence itself, not the language
+    /// tag: an untagged fence folds structured too, and it applies to
+    /// staged parts on the same terms as the final body.
+    #[test]
+    fn lenient_fold_unwraps_untagged_fence_in_final_and_parts() {
+        let tail = vec![
+            artifact(
+                "plan-meta.json",
+                Value::String("```\n{\"lanes\":[{\"id\":1}]}\n```".to_string()),
+            ),
+            final_ev(Value::String("```\n[\"a\",\"b\"]\n```".to_string()), true),
+        ];
+        let staged = names(&["plan-meta.json"]);
+        let (value, _ok) =
+            fold_final_and_parts(&tail, &staged, FoldParse::Lenient).expect("Final present");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "out": ["a", "b"],
+                "parts": {"plan-meta.json": {"lanes": [{"id": 1}]}},
+            })
+        );
+    }
+
+    /// `submit_format: "text"` (`FoldParse::Raw`) strips nothing: a
+    /// fenced container survives byte-for-byte, fence included. The
+    /// fence fallback lives inside `lenient_fold_value`, so the Raw
+    /// contract ("what the worker submitted is what folds") holds.
+    #[test]
+    fn raw_mode_keeps_fenced_container_strings_unparsed() {
+        let fenced_part = "```json\n{\"k\":1}\n```";
+        let fenced_final = "```\n[\"a\",\"b\"]\n```";
+        let tail = vec![
+            artifact("data.json", Value::String(fenced_part.to_string())),
+            final_ev(Value::String(fenced_final.to_string()), true),
+        ];
+        let staged = names(&["data.json"]);
+        let (value, _ok) =
+            fold_final_and_parts(&tail, &staged, FoldParse::Raw).expect("Final present");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "out": fenced_final,
+                "parts": {"data.json": fenced_part},
             })
         );
     }

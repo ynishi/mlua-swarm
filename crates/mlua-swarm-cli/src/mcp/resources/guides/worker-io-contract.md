@@ -79,12 +79,17 @@ assembles the step's ctx value), in one of three modes:
   structure, with no declaration, uniformly across the HTTP and
   in-process lanes. `$.<step>.lanes`, a fanout
   `items = $.<step>.parts["plan-meta.json"].lanes`, and a branch cond
-  all resolve into it. Scalar JSON (`true`, `42`, `"quoted"`, `null`)
+  all resolve into it. A container the model wrapped in a markdown code
+  fence folds the same way: when the body *starts* with a fence, the
+  fence is stripped and the inner bytes are reparsed, so a step that
+  asked for bare JSON and got ```` ```json {...} ``` ```` back still
+  lands structured. Scalar JSON (`true`, `42`, `"quoted"`, `null`)
   and prose stay strings: a scalar has no addressable interior, and
   parsing it would silently change `Eq` conds and verdict comparisons
   for tokens that happen to be valid JSON. Anything that fails to parse
   also stays a string — a JSON-looking prose body degrades to exactly
-  the old behavior.
+  the old behavior, and a fence whose content is not a parseable
+  container folds as the original text, fence included.
 - **`submit_format: "json"` — strict, body only.** The step *promises*
   JSON: the server parses the final body at submit time (any JSON
   value, scalars included) and rejects an unparseable body with `422`
@@ -94,8 +99,9 @@ assembles the step's ctx value), in one of three modes:
   still stages markdown parts (`plan.md`), which must not 422.
 - **`submit_format: "text"` — opt-out.** Every string the step submits
   — body and parts alike — folds as itself, even when its bytes are a
-  JSON container. The escape hatch for a step whose downstream wants
-  the raw text of JSON-looking output.
+  JSON container and even when they are fenced (no parsing, no fence
+  stripping). The escape hatch for a step whose downstream wants the
+  raw text of JSON-looking output.
 
 `submit_format` is declared on the same meta channels the `@file:`
 opt-in uses:
