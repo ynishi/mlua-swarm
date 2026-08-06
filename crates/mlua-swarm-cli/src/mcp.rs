@@ -446,13 +446,17 @@ enum SyncRunReport {
 }
 
 /// Maps `operator_client::ClientError` to an `McpError` for tool responses.
-/// `UnknownSid` / `InvalidAckKind` are caller-input mistakes (`invalid_params`);
-/// `Http` / `Ws` are transport-layer failures (`internal_error`).
+/// `UnknownSid` / `InvalidAckKind` / `SessionClosed` all name something the
+/// caller passed in as the thing that could not be served, so they are
+/// `invalid_params`; `Http` / `Ws` are transport-layer failures
+/// (`internal_error`). `SessionClosed` says the sid's WS could not be
+/// re-established *for this call* — the sid itself stays valid, and the
+/// driver is free to call again once the server is back.
 fn client_error_to_mcp(e: ClientError) -> McpError {
     match e {
-        ClientError::UnknownSid(_) | ClientError::InvalidAckKind(_) => {
-            McpError::invalid_params(e.to_string(), None)
-        }
+        ClientError::UnknownSid(_)
+        | ClientError::InvalidAckKind(_)
+        | ClientError::SessionClosed(_) => McpError::invalid_params(e.to_string(), None),
         ClientError::Http(_) | ClientError::Ws(_) => McpError::internal_error(e.to_string(), None),
     }
 }

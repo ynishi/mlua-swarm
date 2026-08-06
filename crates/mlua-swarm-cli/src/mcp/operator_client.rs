@@ -37,6 +37,30 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type WsSource = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
+/// How many ③ WS upgrades **one** reconnect attempt may spend before the
+/// call that triggered it gives up. The budget is per call, not per sid:
+/// the next call starts over with a full budget, so a server that is down
+/// now and back in an hour is re-attached by whichever call happens after
+/// it returns.
+///
+/// A count rather than a deadline on purpose — the ② session behind the sid
+/// has no TTL and no sweeper, so however long the outage lasts, a handshake
+/// that finally succeeds is still valid. This client never retires a sid;
+/// only `DELETE /v1/operators/:sid` does.
+const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+
+/// Timeout for the ② `GET /v1/healthz` probe that gates a reconnect.
+///
+/// One second, because the route it probes is `async fn healthz() ->
+/// &'static str { "ok" }` — no I/O, no lock, no store access — served over
+/// loopback in the normal deployment. The only thing a longer budget buys
+/// is patience for scheduler preemption on a loaded machine, and 1s leaves
+/// roughly 5x headroom over the worst preemption this workspace has
+/// measured (186ms, the v0.23.0 `max_hold` CI flake). It is also spent
+/// inside an `mse_pending_wait` call, once per poll for as long as the
+/// server stays down, so the caller pays it repeatedly.
+const HEALTHZ_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Local mirror of `mse_server::operator_ws::protocol::ServerMsg` (deserialize
 /// direction only — the server-side enum only derives `Serialize`). Only used
 /// to validate shape + extract `req_id` / discriminant; the actual payload
@@ -266,11 +290,35 @@ impl PendingQueue {
     }
 }
 
+/// ③ re-establishment bookkeeping for one sid, kept behind a single lock:
+/// holding that lock for the whole reconnect attempt is what keeps two
+/// callers (`pending_wait` and `ack` can both notice the same drop) from
+/// re-upgrading the same session in parallel.
+struct ReconnectState {
+    /// ③ WS upgrades spent by the reconnect attempt currently in progress.
+    /// Zero between attempts — it is cleared both when an upgrade succeeds
+    /// and when [`MAX_RECONNECT_ATTEMPTS`] have been burnt without one, so
+    /// the budget belongs to a single call and never accumulates across
+    /// them. That is what keeps a sid usable for the whole life of a run:
+    /// a call during an outage fails, the call after the server comes back
+    /// re-attaches.
+    attempts: u32,
+    /// Bumped on every successful ③ (re-)connect. A caller that decided to
+    /// reconnect from a failed send reads this before queueing on the lock
+    /// and skips its own attempt when the value moved while it waited —
+    /// someone else already replaced the socket it was about to replace.
+    epoch: u64,
+}
+
 struct SessionEntry {
     token: String,
     writer: Mutex<WsSink>,
     pending: Arc<PendingQueue>,
-    reader_task: JoinHandle<()>,
+    /// Behind a `Mutex` (like `writer`) because the `sessions` map hands out
+    /// `Arc<SessionEntry>`: a reconnect has no `&mut` to swap the handle
+    /// in place with, so the swap goes through interior mutability.
+    reader_task: Mutex<JoinHandle<()>>,
+    reconnect: Mutex<ReconnectState>,
 }
 
 /// Route info for one spawned worker, captured from a Spawn frame as it
@@ -294,6 +342,11 @@ pub enum ClientError {
     Http(String),
     Ws(String),
     InvalidAckKind(String),
+    /// The ③ WS connection for this sid is down and could not be re-established.
+    ///
+    /// Scoped to the call that produced it: the ② session is left alone, so
+    /// the same sid is worth calling again once the server is back.
+    SessionClosed(String),
 }
 
 impl std::fmt::Display for ClientError {
@@ -308,6 +361,7 @@ impl std::fmt::Display for ClientError {
                     "invalid ack kind '{k}' (expected answer|hook_ack|spawn_ack|spawn_halt)"
                 )
             }
+            ClientError::SessionClosed(m) => write!(f, "session closed: {m}"),
         }
     }
 }
@@ -425,27 +479,7 @@ impl OperatorClientState {
             })
             .unwrap_or_default();
 
-        let connect_result: Result<_, ClientError> = async {
-            let ws_url = format!(
-                "{}/v1/operators/{}/ws",
-                http_to_ws_base(&self.http_base),
-                sid
-            );
-            let mut req = ws_url
-                .into_client_request()
-                .map_err(|e| ClientError::Ws(e.to_string()))?;
-            req.headers_mut().insert(
-                "authorization",
-                HeaderValue::from_str(&format!("Bearer {token}"))
-                    .map_err(|e| ClientError::Ws(e.to_string()))?,
-            );
-            let (ws_stream, _) = tokio_tungstenite::connect_async(req)
-                .await
-                .map_err(|e| ClientError::Ws(e.to_string()))?;
-            Ok(ws_stream.split())
-        }
-        .await;
-        let (writer, reader) = match connect_result {
+        let (writer, reader) = match connect_ws(&self.http_base, &sid, &token).await {
             Ok(parts) => parts,
             Err(connect_error) => {
                 if let Err(rollback_error) =
@@ -466,20 +500,136 @@ impl OperatorClientState {
             token,
             writer: Mutex::new(writer),
             pending,
-            reader_task,
+            reader_task: Mutex::new(reader_task),
+            reconnect: Mutex::new(ReconnectState {
+                attempts: 0,
+                epoch: 0,
+            }),
         });
         self.sessions.lock().await.insert(sid.clone(), entry);
         Ok((sid, resolved_roles))
     }
 
+    /// Re-establishes ③ when its reader task has finished — the passive
+    /// detection point. A finished reader means the socket delivered a
+    /// `Close` or an error, which is the only in-process signal that ③ went
+    /// away; the ② session behind the sid is untouched by that and is
+    /// exactly what the new socket re-attaches to.
+    ///
+    /// No-op (and no lock contention beyond one short `reader_task` peek)
+    /// while the reader is alive, so the healthy path pays nothing.
+    async fn ensure_connected(
+        &self,
+        sid: &str,
+        entry: &Arc<SessionEntry>,
+    ) -> Result<(), ClientError> {
+        if !entry.reader_task.lock().await.is_finished() {
+            return Ok(());
+        }
+        let mut state = entry.reconnect.lock().await;
+        // Re-check under the lock: `pending_wait` and `ack` can both spot
+        // the same drop, and the one that queued second must not tear down
+        // the socket the first one just installed.
+        if !entry.reader_task.lock().await.is_finished() {
+            return Ok(());
+        }
+        self.reconnect(sid, entry, &mut state).await
+    }
+
+    /// Re-establishes ③ after a send failed — the active detection point.
+    /// A rejected `writer.send` is the most reliable evidence that the
+    /// socket is gone, and it can arrive while the reader task has not
+    /// noticed yet, so this path does not consult `reader_task`.
+    ///
+    /// Skips its own attempt when another caller re-established ③ while
+    /// this one waited for the lock (the epoch moved); the caller's retry
+    /// then simply uses that fresh socket.
+    async fn reconnect_after_failed_send(
+        &self,
+        sid: &str,
+        entry: &Arc<SessionEntry>,
+    ) -> Result<(), ClientError> {
+        let epoch_before = entry.reconnect.lock().await.epoch;
+        let mut state = entry.reconnect.lock().await;
+        if state.epoch != epoch_before {
+            return Ok(());
+        }
+        self.reconnect(sid, entry, &mut state).await
+    }
+
+    /// The reconnect itself. Runs with `state` held for its whole duration,
+    /// which is what serializes concurrent attempts on one sid.
+    ///
+    /// ② is probed first: when the server is not answering `GET
+    /// /v1/healthz` there is nothing to hand a WS handshake to, so this
+    /// gives up without spending a single ③ upgrade. On a later call the
+    /// probe is what notices the server came back.
+    ///
+    /// Otherwise ③ is retried until it succeeds or the call's
+    /// [`MAX_RECONNECT_ATTEMPTS`] are gone. Either way the attempt counter
+    /// ends at zero — the ceiling bounds **this** call (it always returns,
+    /// so there is no unbounded retry loop) and never the sid, which stays
+    /// as valid as ② says it is. On success the `writer` and the reader
+    /// task are swapped in place while `pending` is carried over untouched
+    /// — frames that arrived before the drop and were never popped stay
+    /// queued.
+    async fn reconnect(
+        &self,
+        sid: &str,
+        entry: &Arc<SessionEntry>,
+        state: &mut ReconnectState,
+    ) -> Result<(), ClientError> {
+        if !server_healthz_ok(&self.http_base).await {
+            return Err(ClientError::SessionClosed(format!(
+                "{sid}: {} is not answering GET /v1/healthz",
+                self.http_base
+            )));
+        }
+        loop {
+            match connect_ws(&self.http_base, sid, &entry.token).await {
+                Ok((writer, reader)) => {
+                    *entry.writer.lock().await = writer;
+                    let replaced = std::mem::replace(
+                        &mut *entry.reader_task.lock().await,
+                        spawn_reader(reader, entry.pending.clone()),
+                    );
+                    // The old reader has normally finished already; abort
+                    // covers the failed-send path, where it may still be
+                    // parked on a socket nothing will ever write to again.
+                    replaced.abort();
+                    state.attempts = 0;
+                    state.epoch = state.epoch.wrapping_add(1);
+                    return Ok(());
+                }
+                Err(error) => {
+                    state.attempts += 1;
+                    if state.attempts >= MAX_RECONNECT_ATTEMPTS {
+                        let spent = state.attempts;
+                        state.attempts = 0;
+                        return Err(ClientError::SessionClosed(format!(
+                            "{sid}: {spent} WS re-upgrades in a row failed (last: {error}); \
+                             the ② session is untouched, so a later call retries"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     /// Pops one pending frame for `sid`, waiting up to `timeout_ms`.
     /// `Ok(None)` = timed out with nothing delivered.
+    ///
+    /// Re-establishes ③ first when it has dropped, so a dead socket
+    /// surfaces as `ClientError::SessionClosed` instead of an endless run
+    /// of empty long-polls. `timeout_ms` is untouched by that: it is the
+    /// budget for waiting on frames and says nothing about ③'s liveness.
     pub async fn pending_wait(
         &self,
         sid: &str,
         timeout_ms: u64,
     ) -> Result<Option<PendingFrame>, ClientError> {
         let entry = self.get_entry(sid).await?;
+        self.ensure_connected(sid, &entry).await?;
         let frame = entry.pending.wait(Duration::from_millis(timeout_ms)).await;
         if let Some(f) = &frame {
             self.record_spawn_route(f).await;
@@ -521,6 +671,11 @@ impl OperatorClientState {
     /// Sends the `ClientMsg` corresponding to `kind` over `sid`'s WS
     /// connection. `kind` validation happens before the session lookup, so an
     /// invalid `kind` fails the same way regardless of whether `sid` exists.
+    ///
+    /// ③ is re-established twice over: once up front if the reader task has
+    /// already noticed the drop, and once more if the send itself fails —
+    /// the failed send is the sharper signal of the two, and the message is
+    /// then sent exactly one more time over the fresh socket.
     // The argument list mirrors the `mse_ack` MCP tool's flat parameter
     // surface one-to-one (kind-discriminated union on the wire); bundling
     // them into a struct only this call would consume adds indirection
@@ -540,14 +695,12 @@ impl OperatorClientState {
         let msg = build_client_msg(kind, req_id, value, ok, error, stats)?;
         let entry = self.get_entry(sid).await?;
         let text = serde_json::to_string(&msg).map_err(|e| ClientError::Ws(e.to_string()))?;
-        let result = entry
-            .writer
-            .lock()
-            .await
-            .send(Message::Text(text))
-            .await
-            .map_err(|e| ClientError::Ws(e.to_string()));
-        result
+        self.ensure_connected(sid, &entry).await?;
+        if send_text(&entry, &text).await.is_err() {
+            self.reconnect_after_failed_send(sid, &entry).await?;
+            return send_text(&entry, &text).await;
+        }
+        Ok(())
     }
 
     /// GH #81 Layer 2 (c): `DELETE /v1/operators/by-role/:role` — release a
@@ -591,7 +744,7 @@ impl OperatorClientState {
             map.remove(sid)
                 .ok_or_else(|| ClientError::UnknownSid(sid.to_string()))?
         };
-        entry.reader_task.abort();
+        entry.reader_task.lock().await.abort();
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -653,6 +806,75 @@ async fn rollback_minted_session(
 impl Default for OperatorClientState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Opens one ③ WS connection: `WS /v1/operators/:sid/ws` with `token` as the
+/// Bearer credential, split into its sink / stream halves.
+///
+/// Used both for the first attach in [`OperatorClientState::join`] and for
+/// every later re-attach — they are literally the same request. The server
+/// accepts an unlimited number of upgrades for a given sid+token pair and
+/// swaps the sender of the existing session in place, so re-running this
+/// against a live ② session is a reconnect, not a second session.
+///
+/// Note what this function does *not* do: it never rolls the ② session
+/// back. `join` owns that decision (it minted the sid moments earlier and
+/// must not leak it); the reconnect path must never delete a sid the
+/// driver is still pinned to.
+async fn connect_ws(
+    http_base: &str,
+    sid: &str,
+    token: &str,
+) -> Result<(WsSink, WsSource), ClientError> {
+    let ws_url = format!("{}/v1/operators/{}/ws", http_to_ws_base(http_base), sid);
+    let mut req = ws_url
+        .into_client_request()
+        .map_err(|e| ClientError::Ws(e.to_string()))?;
+    req.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|e| ClientError::Ws(e.to_string()))?,
+    );
+    let (ws_stream, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .map_err(|e| ClientError::Ws(e.to_string()))?;
+    Ok(ws_stream.split())
+}
+
+/// Writes one text frame to `entry`'s current ③ sink. Split out of
+/// [`OperatorClientState::ack`] so the send and its one retry go through
+/// the same code, and so the sink lock is only ever held for the send
+/// itself — a reconnect must never find it pinned by a caller that is
+/// about to ask for one.
+async fn send_text(entry: &Arc<SessionEntry>, text: &str) -> Result<(), ClientError> {
+    entry
+        .writer
+        .lock()
+        .await
+        .send(Message::Text(text.to_string()))
+        .await
+        .map_err(|e| ClientError::Ws(e.to_string()))
+}
+
+/// ② `GET /v1/healthz` — "is the server process still there at all?".
+/// `true` only for HTTP 200 with body `ok`; every transport failure, every
+/// other status and every other body is `false`.
+///
+/// Mirrors `server::launchd::healthz_ok`, which cannot be reused here: it
+/// takes a bare `host:port` bind and hardcodes the `http://` scheme, while
+/// this client works from a full `http(s)://` base URL.
+async fn server_healthz_ok(http_base: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder().timeout(HEALTHZ_TIMEOUT).build() else {
+        return false;
+    };
+    match client.get(format!("{http_base}/v1/healthz")).send().await {
+        Ok(response) if response.status().is_success() => response
+            .text()
+            .await
+            .map(|body| body.trim() == "ok")
+            .unwrap_or(false),
+        _ => false,
     }
 }
 
@@ -1067,5 +1289,338 @@ mod tests {
             "ws://127.0.0.1:7777"
         );
         assert_eq!(http_to_ws_base("https://example.com"), "wss://example.com");
+    }
+
+    // ─── ③ reconnect ─────────────────────────────────────────────────────
+    //
+    // These run against `stub::StubServer`, a scripted stand-in for `mse
+    // serve`: it mints one ② session, answers ② `GET /v1/healthz`, and
+    // plays one `WsBehavior` per ③ upgrade request. That is enough to
+    // reproduce a real dropped socket (the stub closes it) and a real
+    // re-upgrade (the client dials again), which is what the reconnect path
+    // is made of.
+
+    /// A scripted stand-in for `mse serve`, sized for the ③ reconnect
+    /// tests: `POST /v1/operators` mints one fixed sid+token, `GET
+    /// /v1/healthz` is toggleable, and each ③ upgrade request consumes the
+    /// next entry of a fixed script (`WsBehavior::Refuse` once it runs out).
+    mod stub {
+        use super::*;
+        use axum::extract::ws::{Message as AxumMessage, WebSocketUpgrade};
+        use axum::extract::State;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::{delete, get, post};
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const STUB_SID: &str = "S-reconnect";
+        const STUB_TOKEN: &str = "reconnect-token";
+
+        /// What the stub does with one ③ upgrade request.
+        #[derive(Clone, Copy)]
+        pub(super) enum WsBehavior {
+            /// Accept, then close at once — the ③ drop this module exists for.
+            CloseImmediately,
+            /// Accept, deliver one raw server frame, then close.
+            SendThenClose(&'static str),
+            /// Accept and keep the socket open for the rest of the test.
+            Hold,
+            /// Answer 500 instead of upgrading — one failed ③ re-upgrade.
+            Refuse,
+        }
+
+        struct StubState {
+            script: Vec<WsBehavior>,
+            upgrades: AtomicUsize,
+            authorized_upgrades: AtomicUsize,
+            healthy: AtomicBool,
+        }
+
+        pub(super) struct StubServer {
+            base: String,
+            state: Arc<StubState>,
+            task: tokio::task::JoinHandle<()>,
+        }
+
+        async fn ws_stub(
+            State(state): State<Arc<StubState>>,
+            headers: HeaderMap,
+            ws: WebSocketUpgrade,
+        ) -> Response {
+            let index = state.upgrades.fetch_add(1, Ordering::SeqCst);
+            let expected = format!("Bearer {STUB_TOKEN}");
+            if headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                == Some(expected.as_str())
+            {
+                state.authorized_upgrades.fetch_add(1, Ordering::SeqCst);
+            }
+            match state.script.get(index).copied() {
+                Some(WsBehavior::CloseImmediately) => ws.on_upgrade(|socket| async move {
+                    let _ = socket.close().await;
+                }),
+                Some(WsBehavior::SendThenClose(text)) => {
+                    ws.on_upgrade(move |mut socket| async move {
+                        let _ = socket.send(AxumMessage::Text(text.to_string())).await;
+                        let _ = socket.close().await;
+                    })
+                }
+                Some(WsBehavior::Hold) => ws
+                    .on_upgrade(|mut socket| async move { while socket.recv().await.is_some() {} }),
+                Some(WsBehavior::Refuse) | None => {
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+
+        impl StubServer {
+            /// Binds an ephemeral port and starts serving `script`.
+            pub(super) async fn start(script: Vec<WsBehavior>) -> Self {
+                let state = Arc::new(StubState {
+                    script,
+                    upgrades: AtomicUsize::new(0),
+                    authorized_upgrades: AtomicUsize::new(0),
+                    healthy: AtomicBool::new(true),
+                });
+                let app = Router::new()
+                    .route(
+                        "/v1/operators",
+                        post(|| async {
+                            Json(serde_json::json!({
+                                "sid": STUB_SID,
+                                "token": STUB_TOKEN,
+                                "roles": ["main-ai"],
+                            }))
+                        }),
+                    )
+                    .route(
+                        "/v1/healthz",
+                        get(|State(state): State<Arc<StubState>>| async move {
+                            if state.healthy.load(Ordering::SeqCst) {
+                                "ok".into_response()
+                            } else {
+                                StatusCode::SERVICE_UNAVAILABLE.into_response()
+                            }
+                        }),
+                    )
+                    .route(
+                        "/v1/operators/:sid",
+                        delete(|| async { StatusCode::NO_CONTENT }),
+                    )
+                    .route("/v1/operators/:sid/ws", get(ws_stub))
+                    .with_state(state.clone());
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind reconnect stub server");
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let task = tokio::spawn(async move {
+                    let _ = axum::serve(listener, app).await;
+                });
+                Self { base, state, task }
+            }
+
+            /// HTTP root to hand to [`OperatorClientState::with_http_base`].
+            pub(super) fn base(&self) -> String {
+                self.base.clone()
+            }
+
+            /// ③ upgrade requests received so far, refused ones included.
+            pub(super) fn upgrades(&self) -> usize {
+                self.state.upgrades.load(Ordering::SeqCst)
+            }
+
+            /// Of those, how many carried the minted Bearer token.
+            pub(super) fn authorized_upgrades(&self) -> usize {
+                self.state.authorized_upgrades.load(Ordering::SeqCst)
+            }
+
+            /// Flips ② `GET /v1/healthz` between `200 ok` and `503`.
+            pub(super) fn set_healthy(&self, healthy: bool) {
+                self.state.healthy.store(healthy, Ordering::SeqCst);
+            }
+
+            pub(super) fn shutdown(self) {
+                self.task.abort();
+            }
+        }
+    }
+
+    use stub::{StubServer, WsBehavior};
+
+    /// Blocks until `sid`'s ③ reader task has observed the drop. The close
+    /// travels over a real socket, so "the server closed it" and "this
+    /// process noticed" are separate moments and the second one is what the
+    /// reconnect path keys on.
+    async fn await_reader_finished(state: &OperatorClientState, sid: &str) {
+        let entry = state.get_entry(sid).await.expect("session present");
+        for _ in 0..200 {
+            if entry.reader_task.lock().await.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("③ reader task never finished");
+    }
+
+    #[tokio::test]
+    async fn pending_wait_reconnects_when_the_reader_task_has_finished() {
+        let stub = StubServer::start(vec![WsBehavior::CloseImmediately, WsBehavior::Hold]).await;
+        let state = OperatorClientState::with_http_base(stub.base());
+        let (sid, _) = state
+            .join(vec!["main-ai".to_string()], None)
+            .await
+            .expect("join");
+        await_reader_finished(&state, &sid).await;
+
+        let frame = state
+            .pending_wait(&sid, 20)
+            .await
+            .expect("a re-established ③ long-polls as usual");
+        assert!(frame.is_none(), "nothing was sent, so the poll times out");
+        assert_eq!(
+            stub.upgrades(),
+            2,
+            "the dropped ③ must be repaired by a second upgrade"
+        );
+        assert_eq!(
+            stub.authorized_upgrades(),
+            2,
+            "the re-upgrade reuses the sid+token minted by ②, not a new session"
+        );
+        let entry = state.get_entry(&sid).await.expect("session kept");
+        assert!(
+            !entry.reader_task.lock().await.is_finished(),
+            "a fresh reader task is in place"
+        );
+        stub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reconnect_declines_without_a_ws_attempt_when_healthz_is_down() {
+        let stub = StubServer::start(vec![WsBehavior::CloseImmediately]).await;
+        let state = OperatorClientState::with_http_base(stub.base());
+        let (sid, _) = state
+            .join(vec!["main-ai".to_string()], None)
+            .await
+            .expect("join");
+        await_reader_finished(&state, &sid).await;
+        stub.set_healthy(false);
+
+        let error = state
+            .pending_wait(&sid, 20)
+            .await
+            .expect_err("a ② that is not answering closes the sid");
+        assert!(
+            matches!(error, ClientError::SessionClosed(_)),
+            "got: {error:?}"
+        );
+        assert_eq!(
+            stub.upgrades(),
+            1,
+            "only join's upgrade — a down ② must not be handed a single ③ retry"
+        );
+        let entry = state.get_entry(&sid).await.expect("session kept");
+        assert_eq!(
+            entry.reconnect.lock().await.attempts,
+            0,
+            "the attempt spent none of its ③ budget"
+        );
+        stub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn frames_delivered_before_the_drop_survive_the_reconnect() {
+        let stub = StubServer::start(vec![
+            WsBehavior::SendThenClose(
+                r#"{"type":"ask","req_id":"r-kept","task_id":"ST-1","question":{"q":"?"}}"#,
+            ),
+            WsBehavior::Hold,
+        ])
+        .await;
+        let state = OperatorClientState::with_http_base(stub.base());
+        let (sid, _) = state
+            .join(vec!["main-ai".to_string()], None)
+            .await
+            .expect("join");
+        await_reader_finished(&state, &sid).await;
+        let entry = state.get_entry(&sid).await.expect("session kept");
+        assert_eq!(
+            entry.pending.items.lock().await.len(),
+            1,
+            "the frame arrived before the drop and was never popped"
+        );
+
+        let frame = state
+            .pending_wait(&sid, 200)
+            .await
+            .expect("reconnect succeeds")
+            .expect("the queued frame is still there afterwards");
+        assert_eq!(frame.req_id, "r-kept");
+        assert_eq!(stub.upgrades(), 2, "the reconnect did happen");
+        stub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn three_failed_ws_upgrades_end_the_call_but_leave_the_sid_retryable() {
+        let stub = StubServer::start(vec![
+            WsBehavior::CloseImmediately, // join, then the drop
+            WsBehavior::Refuse,           // call 1: 1/3 fails
+            WsBehavior::Refuse,           // call 1: 2/3 fails
+            WsBehavior::Refuse,           // call 1: 3/3 fails, budget gone
+            WsBehavior::Refuse,           // call 2: 1/3 fails
+            WsBehavior::Refuse,           // call 2: 2/3 fails
+            WsBehavior::Hold,             // call 2: 3/3 succeeds
+        ])
+        .await;
+        let state = OperatorClientState::with_http_base(stub.base());
+        let (sid, _) = state
+            .join(vec!["main-ai".to_string()], None)
+            .await
+            .expect("join");
+        await_reader_finished(&state, &sid).await;
+        let entry = state.get_entry(&sid).await.expect("session kept");
+
+        // Call 1: the server refuses every upgrade, so this call runs out
+        // of budget and reports it.
+        let error = state
+            .pending_wait(&sid, 20)
+            .await
+            .expect_err("a ③ that will not come back ends the call");
+        assert!(
+            matches!(error, ClientError::SessionClosed(_)),
+            "got: {error:?}"
+        );
+        assert_eq!(
+            stub.upgrades(),
+            1 + MAX_RECONNECT_ATTEMPTS as usize,
+            "the call spends exactly its budget, no more"
+        );
+        assert_eq!(
+            entry.reconnect.lock().await.attempts,
+            0,
+            "giving up clears the counter — the budget was this call's, not the sid's"
+        );
+
+        // Call 2: same sid, full budget again. This is the case that
+        // matters — a server that was down during call 1 and is back now
+        // must be re-attached without the driver re-joining.
+        assert!(state
+            .pending_wait(&sid, 20)
+            .await
+            .expect("the sid is still good, so the next call reconnects")
+            .is_none());
+        assert_eq!(
+            stub.upgrades(),
+            1 + 2 * MAX_RECONNECT_ATTEMPTS as usize,
+            "call 2 was allowed its own three attempts"
+        );
+        assert!(
+            !entry.reader_task.lock().await.is_finished(),
+            "③ is live again on the original sid"
+        );
+        assert_eq!(entry.reconnect.lock().await.attempts, 0);
+        stub.shutdown();
     }
 }
