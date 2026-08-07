@@ -66,6 +66,31 @@ impl WSOperatorSession {
         }
     }
 
+    /// Constructor for a session that exists with no socket behind it yet:
+    /// the boot-time restore path (`OperatorSessionPersistence::restore`),
+    /// which puts a persisted login record into the engine's three
+    /// registries before its owning client has reconnected.
+    ///
+    /// `tx: None` is the very state a live session falls into on
+    /// [`Self::clear_tx`] / [`Self::clear_tx_if`], so nothing downstream
+    /// needs a new branch: [`Self::send_and_await`] / [`Self::send_oneway`]
+    /// answer `"ws operator disconnected"` rather than parking, and
+    /// [`Self::is_connected`] answers `false`. Being registered and being
+    /// reachable stay separate facts — the client's first connect walks
+    /// `login::handle_operator_socket`'s existing reconnect arm and only
+    /// swaps the sender in ([`Self::replace_tx`]).
+    pub(super) fn disconnected_with_base_url(
+        sid: SessionId,
+        base_url: Option<std::sync::Arc<str>>,
+    ) -> Self {
+        Self {
+            sid,
+            tx: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            base_url,
+        }
+    }
+
     /// Swaps in a new tx on reconnect. Expected to be called only from the handler side.
     pub(super) async fn replace_tx(&self, new_tx: mpsc::UnboundedSender<ServerMsg>) {
         *self.tx.lock().await = Some(new_tx);

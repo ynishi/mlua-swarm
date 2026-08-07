@@ -447,31 +447,75 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
 }
 
 /// Operator login-session persistence bundle for the terminal router
-/// builder: the write-through [`OperatorSessionStore`] plus the records
-/// already in it, pre-listed so the (synchronous) builder can seed
-/// `AppState.operator_sessions` / `roles_to_sid` without an await.
+/// builder: the write-through [`OperatorSessionStore`] plus the sessions
+/// already restored from it, pre-built so the (synchronous) builder can
+/// seed `AppState.operator_sessions` / `roles_to_sid` without an await.
 ///
-/// Construct via [`OperatorSessionPersistence::restore`] at boot. Restored
-/// entries rehydrate with `ws_session: None` — the client's next WS connect
-/// on its saved `sid` + token walks the existing first-connect path in
-/// `operator_ws::login::handle_operator_socket` (3-registry + role-alias
-/// registration), which is exactly what re-resolves a persisted
-/// `RunRecord.operator_sid` pin after a restart.
+/// Construct via [`OperatorSessionPersistence::restore`] at boot. That call
+/// also registers every restored session into the engine's three registries
+/// (+ role aliases), so a restored `sid` is resolvable — as an
+/// `operator_sid` pin, and through its roles — from the moment the server
+/// is up, without waiting for the owning client's WS to reconnect. The
+/// restored sessions carry no sender until that connect happens: registered
+/// is not reachable, and a send before the client attaches fails loud.
 pub struct OperatorSessionPersistence {
     /// Write-through target for mint / teardown.
     pub store: Arc<dyn OperatorSessionStore>,
-    /// Records listed from `store` at boot, in mint order.
-    pub restored: Vec<OperatorSessionRecord>,
+    /// Login entries rebuilt from `store` at boot, in mint order, each
+    /// already registered with the engine.
+    pub prepared: Vec<Arc<crate::operator_ws::login::OperatorSessionEntry>>,
 }
 
 impl OperatorSessionPersistence {
-    /// List `store`'s persisted sessions into a bundle ready to hand to
-    /// [`build_router_full_with_operator_session_persistence`].
+    /// Restore `store`'s persisted sessions into a bundle ready to hand to
+    /// [`build_router_full_with_operator_session_persistence`], registering
+    /// each one with `engine` (and `ws_operator_factory`, when the caller
+    /// wires one) on the way through.
+    ///
+    /// The registration lives here — inside the one call every boot path
+    /// already makes — rather than in a separate "and now register them"
+    /// step a caller could forget: forgetting it is precisely the window
+    /// this signature exists to close (a restored sid known to
+    /// `GET /v1/operators/:sid` but rejected as a launch pin). `base_url` is
+    /// the same public HTTP root handed to the builder; it is what a
+    /// restored session renders into its Spawn directives once its client
+    /// reconnects.
+    ///
+    /// # Pass the builder's own `ws_operator_factory` / `base_url`
+    ///
+    /// Both arguments must be the same values later handed to
+    /// [`build_router_full_with_operator_session_persistence`] — nothing in
+    /// the types ties the two call sites together, so the split is the
+    /// caller's to keep honest. The "a caller could forget" rationale above
+    /// applies verbatim here: passing `None` for `ws_operator_factory` while
+    /// the builder gets `Some(factory)` restores sessions into the engine's
+    /// three registries (so the launch-time `operator_sid` fail-fast no
+    /// longer fires) but leaves them out of `OperatorSpawnerFactory`'s own
+    /// operator map, moving the failure to a later, less obvious
+    /// `CompileError` out of `OperatorSpawnerFactory::build`. A mismatched
+    /// `base_url` is quieter still: the restored session renders a stale
+    /// root into its Spawn directives while every freshly connected one
+    /// renders the builder's.
     pub async fn restore(
         store: Arc<dyn OperatorSessionStore>,
+        engine: &Engine,
+        ws_operator_factory: Option<&Arc<OperatorSpawnerFactory>>,
+        base_url: Option<Arc<str>>,
     ) -> Result<Self, OperatorSessionStoreError> {
-        let restored = store.list().await?;
-        Ok(Self { store, restored })
+        let records: Vec<OperatorSessionRecord> = store.list().await?;
+        let mut prepared = Vec::with_capacity(records.len());
+        for record in records {
+            prepared.push(
+                crate::operator_ws::login::restored_operator_session_entry(
+                    engine,
+                    ws_operator_factory,
+                    base_url.clone(),
+                    record,
+                )
+                .await,
+            );
+        }
+        Ok(Self { store, prepared })
     }
 }
 
@@ -498,34 +542,25 @@ pub fn build_router_full_with_operator_session_persistence(
 ) -> Router {
     let (operator_session_store, restored_sessions): (
         Arc<dyn OperatorSessionStore>,
-        Vec<OperatorSessionRecord>,
+        Vec<Arc<crate::operator_ws::login::OperatorSessionEntry>>,
     ) = match operator_session_persistence {
-        Some(p) => (p.store, p.restored),
+        Some(p) => (p.store, p.prepared),
         None => (Arc::new(InMemoryOperatorSessionStore::new()), Vec::new()),
     };
-    // Rehydrate the login maps from the persisted records. `ws_session`
-    // starts `None` on every restored entry — the WS adapter state is
-    // process-lifetime by design (see the `operator_session` store module
-    // doc); the owning client reconnects with its saved sid + token and
-    // the login module's existing first-connect path re-registers it.
+    // Seed the login maps from the entries `OperatorSessionPersistence::
+    // restore` already rebuilt and registered with the engine. Their WS
+    // adapter state is process-lifetime by design (see the
+    // `operator_session` store module doc), so each restored session sits
+    // registered-but-disconnected until the owning client reconnects with
+    // its saved sid + token.
     let mut session_map: HashMap<SessionId, Arc<crate::operator_ws::login::OperatorSessionEntry>> =
         HashMap::new();
     let mut roles_map: HashMap<String, SessionId> = HashMap::new();
-    for record in restored_sessions {
-        for role in &record.roles {
-            roles_map.insert(role.clone(), record.sid.clone());
+    for entry in restored_sessions {
+        for role in &entry.roles {
+            roles_map.insert(role.clone(), entry.sid.clone());
         }
-        session_map.insert(
-            record.sid.clone(),
-            Arc::new(crate::operator_ws::login::OperatorSessionEntry {
-                sid: record.sid,
-                token_digest: record.token_digest,
-                roles: record.roles,
-                capability_manifest: record.capability_manifest,
-                joined_at_secs: record.joined_at_secs,
-                ws_session: Mutex::new(None),
-            }),
-        );
+        session_map.insert(entry.sid.clone(), entry);
     }
     let operator_sessions = Arc::new(Mutex::new(session_map));
     let roles_to_sid = Arc::new(Mutex::new(roles_map));

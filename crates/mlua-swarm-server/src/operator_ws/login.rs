@@ -47,7 +47,10 @@ use axum::{
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use mlua_swarm::store::operator_session::OperatorSessionRecord;
-use mlua_swarm::{AgentProviderManifest, Operator, SeniorBridge, SessionId, SpawnHook};
+use mlua_swarm::{
+    AgentProviderManifest, Engine, Operator, OperatorSpawnerFactory, SeniorBridge, SessionId,
+    SpawnHook,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -58,10 +61,13 @@ use super::session::WSOperatorSession;
 use crate::AppState;
 
 /// Login-flow record for a minted Operator session. Held in
-/// `AppState.operator_sessions`, keyed by `sid`. `ws_session` starts `None`
-/// (login only mints sid+token) and is set on first successful WS connect;
-/// on reconnect the same `WSOperatorSession` is reused (`replace_tx`) rather
-/// than re-registered.
+/// `AppState.operator_sessions`, keyed by `sid`. On the mint path
+/// `ws_session` starts `None` (login only mints sid+token) and is set on
+/// first successful WS connect; on the restore path it is already `Some`
+/// (a disconnected session, registered at boot — see
+/// [`restored_operator_session_entry`]). Either way a (re)connect reuses
+/// that same `WSOperatorSession` via `replace_tx` rather than
+/// re-registering it.
 pub struct OperatorSessionEntry {
     /// Server-minted session id (typed [`SessionId`] since issue #14).
     pub sid: SessionId,
@@ -297,6 +303,95 @@ pub async fn operators_ws_connect(
     ws.on_upgrade(move |socket| handle_operator_socket(socket, state, entry))
 }
 
+/// Binds `ws_session` into every registry an Operator session must be
+/// reachable through: the engine's three (`senior_bridge` / `spawn_hook` /
+/// `operator`) under `sid`, the `OperatorSpawnerFactory` when one is wired,
+/// and the operator registries again under each of `roles`.
+///
+/// The single spelling of that registration. Two paths reach it — a first
+/// WS connect ([`handle_operator_socket`]) and the boot-time restore of a
+/// persisted record ([`restored_operator_session_entry`]) — and they have to
+/// leave identical registry state, or a session ends up resolvable on one
+/// axis (`GET /v1/operators/:sid`) and missing on another (an
+/// `operator_sid` pin, a role-aliased spawn).
+///
+/// Role exclusivity is settled at mint time (`operators_create`); this only
+/// binds the aliases it granted.
+async fn register_operator_session(
+    engine: &Engine,
+    ws_operator_factory: Option<&Arc<OperatorSpawnerFactory>>,
+    sid: &SessionId,
+    roles: &[String],
+    ws_session: &Arc<WSOperatorSession>,
+) {
+    engine
+        .register_senior_bridge(sid.clone(), ws_session.clone() as Arc<dyn SeniorBridge>)
+        .await;
+    engine
+        .register_spawn_hook(sid.clone(), ws_session.clone() as Arc<dyn SpawnHook>)
+        .await;
+    engine
+        .register_operator(sid.clone(), ws_session.clone() as Arc<dyn Operator>)
+        .await;
+    if let Some(factory) = ws_operator_factory {
+        factory.register_operator(sid.clone(), ws_session.clone() as Arc<dyn Operator>);
+    }
+    for role in roles {
+        if let Some(factory) = ws_operator_factory {
+            factory.register_operator(role.clone(), ws_session.clone() as Arc<dyn Operator>);
+        }
+        engine
+            .register_operator(role.clone(), ws_session.clone() as Arc<dyn Operator>)
+            .await;
+    }
+}
+
+/// Builds the `operator_sessions` entry for a persisted login record and
+/// registers it — the boot-time half of session persistence, called from
+/// [`crate::OperatorSessionPersistence::restore`].
+///
+/// Restoring the login maps alone leaves a window between boot and the
+/// owning client's WS reconnect in which the sid is known to
+/// `GET /v1/operators/:sid` but not to the engine: a launch pinning it
+/// (`POST /v1/tasks` `operator_sid`) is rejected with `400 no such
+/// registered operator session`, and a role-routed launch has no operator
+/// to reach. Registering here closes that window, which is the whole point
+/// of persisting `RunRecord.operator_sid` pins across a restart.
+///
+/// The session is created **disconnected**
+/// ([`WSOperatorSession::disconnected_with_base_url`]): it is registered,
+/// not reachable. Anything actually sent to it before the client attaches a
+/// socket fails loud with `"ws operator disconnected"`, and the client's
+/// connect then takes [`handle_operator_socket`]'s reconnect arm (a
+/// `replace_tx`, no second registration).
+pub(crate) async fn restored_operator_session_entry(
+    engine: &Engine,
+    ws_operator_factory: Option<&Arc<OperatorSpawnerFactory>>,
+    base_url: Option<Arc<str>>,
+    record: OperatorSessionRecord,
+) -> Arc<OperatorSessionEntry> {
+    let ws_session = Arc::new(WSOperatorSession::disconnected_with_base_url(
+        record.sid.clone(),
+        base_url,
+    ));
+    register_operator_session(
+        engine,
+        ws_operator_factory,
+        &record.sid,
+        &record.roles,
+        &ws_session,
+    )
+    .await;
+    Arc::new(OperatorSessionEntry {
+        sid: record.sid,
+        token_digest: record.token_digest,
+        roles: record.roles,
+        capability_manifest: record.capability_manifest,
+        joined_at_secs: record.joined_at_secs,
+        ws_session: Mutex::new(Some(ws_session)),
+    })
+}
+
 /// Bidirectional pump for a single WS connection, bound to an
 /// `OperatorSessionEntry`. Owns the full wire protocol pump (write task /
 /// read task / `ClientMsg` dispatch / disconnect) for this session.
@@ -320,39 +415,14 @@ async fn handle_operator_socket(
                 tx.clone(),
                 state.base_url.clone(),
             ));
-            state
-                .engine
-                .register_senior_bridge(
-                    entry.sid.clone(),
-                    ws_session.clone() as Arc<dyn SeniorBridge>,
-                )
-                .await;
-            state
-                .engine
-                .register_spawn_hook(entry.sid.clone(), ws_session.clone() as Arc<dyn SpawnHook>)
-                .await;
-            state
-                .engine
-                .register_operator(entry.sid.clone(), ws_session.clone() as Arc<dyn Operator>)
-                .await;
-            if let Some(factory) = &state.ws_operator_factory {
-                factory
-                    .register_operator(entry.sid.clone(), ws_session.clone() as Arc<dyn Operator>);
-            }
-            // Role exclusivity was already resolved at login (POST) time. Here
-            // we just bind the same session into the three registries + factory
-            // under its role aliases (same shape as handler::handle_socket's
-            // ?roles= path).
-            for role in &entry.roles {
-                if let Some(factory) = &state.ws_operator_factory {
-                    factory
-                        .register_operator(role.clone(), ws_session.clone() as Arc<dyn Operator>);
-                }
-                state
-                    .engine
-                    .register_operator(role.clone(), ws_session.clone() as Arc<dyn Operator>)
-                    .await;
-            }
+            register_operator_session(
+                &state.engine,
+                state.ws_operator_factory.as_ref(),
+                &entry.sid,
+                &entry.roles,
+                &ws_session,
+            )
+            .await;
             *entry.ws_session.lock().await = Some(ws_session.clone());
             ws_session
         }

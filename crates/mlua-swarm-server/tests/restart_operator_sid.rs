@@ -25,6 +25,10 @@
 //! `replay_e2e.rs`'s success path for `Run`s runs against the exact same
 //! shared-file setup; this test proves the operator sessions ride along.
 
+use mlua_swarm::blueprint::{
+    current_schema_version, AgentDef, AgentKind, Blueprint, BlueprintMetadata, CompilerHints,
+    CompilerStrategy,
+};
 use mlua_swarm::core::config::EngineCfg;
 use mlua_swarm::core::engine::Engine;
 use mlua_swarm::store::operator_session::{OperatorSessionStore, SqliteOperatorSessionStore};
@@ -104,10 +108,14 @@ async fn spawn_server(bundle: &StoreBundle) -> ServerHandle {
         EngineCfg::default(),
         mlua_swarm_server::default_layer_registry(),
     );
-    // Same boot sequence as `mse serve`: list the persisted sessions once,
-    // hand the bundle to the terminal builder for map rehydration.
+    // Same boot sequence as `mse serve`: restore the persisted sessions
+    // once (which also registers them with this engine), then hand the
+    // bundle to the terminal builder for map rehydration.
     let persistence = mlua_swarm_server::OperatorSessionPersistence::restore(
         bundle.operator_session_store.clone(),
+        &engine,
+        None,
+        None,
     )
     .await
     .expect("operator session restore");
@@ -333,6 +341,139 @@ async fn deleted_session_does_not_resurrect_on_restart() {
         get_after.status(),
         reqwest::StatusCode::NOT_FOUND,
         "a session torn down before the restart must not come back"
+    );
+
+    server_b.shutdown();
+    bundle_b.shutdown().await;
+}
+
+/// Single-step `identity` RustFn Blueprint — the launch payload used by the
+/// pin test below. Same shape as `replay_e2e.rs`'s helper (an integration
+/// test cannot reach that crate-private one); it deliberately routes through
+/// no Operator agent, so the only thing the pin exercises is the launch-time
+/// `operator_sid` resolution.
+fn identity_blueprint() -> Blueprint {
+    Blueprint {
+        schema_version: current_schema_version(),
+        id: "restart-operator-sid-pin-bp".into(),
+        flow: serde_json::from_value(json!({
+            "kind": "step",
+            "ref": mlua_swarm::worker::baseline::AG_IDENTITY,
+            "in": {"op": "lit", "value": "hello"},
+            "out": {"op": "path", "at": "$.out"},
+        }))
+        .expect("flow parse"),
+        agents: vec![AgentDef {
+            name: mlua_swarm::worker::baseline::AG_IDENTITY.into(),
+            kind: AgentKind::RustFn,
+            spec: json!({"fn_id": mlua_swarm::worker::baseline::AG_IDENTITY}),
+            profile: None,
+            meta: None,
+            runner: None,
+            runner_ref: None,
+            verdict: None,
+            lints: None,
+        }],
+        operators: vec![],
+        metas: vec![],
+        hints: CompilerHints::default(),
+        strategy: CompilerStrategy::default(),
+        metadata: BlueprintMetadata::default(),
+        spawner_hints: Default::default(),
+        default_agent_kind: AgentKind::Operator,
+        default_operator_kind: None,
+        default_init_ctx: None,
+        default_agent_ctx: None,
+        default_context_policy: None,
+        projection_placement: None,
+        audits: vec![],
+        degradation_policy: None,
+        runners: vec![],
+        default_runner: None,
+        subprocesses: vec![],
+        check_policy: None,
+        blueprint_ref_includes: Vec::new(),
+    }
+}
+
+/// Restoring the login record is only half of a restart: the sid must also
+/// be resolvable from the **engine** registry the moment the server is up.
+///
+/// `POST /v1/tasks` validates `operator_sid` against
+/// `engine.list_operator_ids()` and answers `400` when the sid is not there
+/// — and before this fix the three `register_*` calls ran only inside
+/// `handle_operator_socket`'s first-connect arm, so between boot and the
+/// owning client's WS reconnect a restored sid was known to
+/// `GET /v1/operators/:sid` yet unusable as a pin. That window is what this
+/// test closes: **no WebSocket is connected anywhere in it**.
+#[tokio::test]
+async fn restored_session_is_launch_pinnable_before_any_ws_connect() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let shared_dir: PathBuf = tmp.path().join("shared");
+    std::fs::create_dir_all(&shared_dir).expect("mkdir shared");
+
+    // ─── Server A: mint, never connect a WS ────────────────────────────
+    let bundle_a = StoreBundle::open(&shared_dir).await;
+    let server_a = spawn_server(&bundle_a).await;
+    let client = reqwest::Client::new();
+
+    let mint = client
+        .post(format!("{}/v1/operators", server_a.base_url))
+        // convention-token-ok: "main-ai" is a mlua-swarm public operator role name.
+        .json(&json!({ "roles": ["main-ai"] }))
+        .send()
+        .await
+        .expect("mint request");
+    assert_eq!(mint.status(), reqwest::StatusCode::OK);
+    let mint_body: serde_json::Value = mint.json().await.expect("mint json");
+    let sid = mint_body["sid"].as_str().expect("sid").to_string();
+    let token = mint_body["token"].as_str().expect("token").to_string();
+
+    server_a.shutdown();
+    bundle_a.shutdown().await;
+
+    // ─── Server B: same store, still no WS ─────────────────────────────
+    let bundle_b = StoreBundle::open(&shared_dir).await;
+    let server_b = spawn_server(&bundle_b).await;
+
+    let launch = client
+        .post(format!("{}/v1/tasks", server_b.base_url))
+        .json(&json!({
+            "blueprint": { "kind": "inline", "value": identity_blueprint() },
+            "init_ctx": {},
+            "operator_sid": sid,
+            "goal": "restored operator session pin",
+        }))
+        .send()
+        .await
+        .expect("pinned launch request");
+    let launch_status = launch.status();
+    let launch_body = launch.text().await.expect("launch body");
+    assert_ne!(
+        launch_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "a restored sid must be a usable pin before any WS reconnect \
+         (the 400 here is the engine registry not carrying it): {launch_body}"
+    );
+    assert_eq!(
+        launch_status,
+        reqwest::StatusCode::OK,
+        "the pinned launch must run to completion: {launch_body}"
+    );
+
+    // Registry membership is not connectivity: the restored session is
+    // registered, and still reports itself as having no live socket.
+    let info = client
+        .get(format!("{}/v1/operators/{sid}", server_b.base_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get request on server B");
+    assert_eq!(info.status(), reqwest::StatusCode::OK);
+    let info_body: serde_json::Value = info.json().await.expect("get json");
+    assert_eq!(
+        info_body["connected"], false,
+        "being registered must not be reported as being connected"
     );
 
     server_b.shutdown();
