@@ -19,7 +19,7 @@
 //! - [`SqliteOperatorSessionStore`] — file-backed persistence via
 //!   `rusqlite-isle` (same shape as [`crate::store::task::SqliteTaskStore`]).
 
-use crate::types::SessionId;
+use crate::types::{OperatorRef, SessionId};
 use crate::AgentProviderManifest;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -62,8 +62,10 @@ pub struct OperatorSessionRecord {
     /// [`Self::verify_bearer`]. The plaintext bearer is deliberately absent
     /// (see the type doc).
     pub token_digest: String,
-    /// Role aliases claimed exclusively by this session.
-    pub roles: Vec<String>,
+    /// Role aliases claimed exclusively by this session. Each element
+    /// serializes as the plain role string it always was — the wire and
+    /// at-rest forms are unchanged by the [`OperatorRef`] typing.
+    pub roles: Vec<OperatorRef>,
     /// Provider-owned effective capability manifest submitted at join.
     pub capability_manifest: Option<AgentProviderManifest>,
     /// Unix epoch seconds when `POST /v1/operators` minted this session.

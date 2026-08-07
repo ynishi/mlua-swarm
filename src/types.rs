@@ -1,5 +1,16 @@
 //! Fundamental types: Role / Verb / RoleVerbGate / CapToken / IDs.
 
+/// The logical Operator role handle (`main-ai`, `phase_a_op`, ...),
+/// re-exported here so it sits alongside [`SessionId`] — the other half of
+/// the operator-login identity pair — despite being defined one layer down.
+///
+/// It has to be defined in `mlua-swarm-schema` rather than in this module:
+/// [`crate::BindRequest`] carries one as `binding_target`, and that struct
+/// lives in the schema crate, which does not (and must not) depend on this
+/// one. Not to be confused with [`Role`] below, which is the closed
+/// authorization enum (`Operator` / `Worker` / `Observer` / `Senior`).
+pub use mlua_swarm_schema::{EmptyOperatorRef, OperatorRef};
+
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;

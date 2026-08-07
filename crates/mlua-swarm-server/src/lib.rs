@@ -135,8 +135,9 @@ use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
 use mlua_swarm::{
     AgentBlockInProcessSpawnerFactory, CapToken, Compiler, Engine, LayerRegistry,
     LongHoldMiddleware, LuaInProcessSpawnerFactory, MainAIMiddleware, OperatorDelegateMiddleware,
-    OperatorSpawnerFactory, Role, RunId, RustFnInProcessSpawnerFactory, SeniorEscalationMiddleware,
-    SessionId, SpawnerRegistry, SubprocessProcessSpawnerFactory, TaskId,
+    OperatorRef, OperatorSpawnerFactory, Role, RunId, RustFnInProcessSpawnerFactory,
+    SeniorEscalationMiddleware, SessionId, SpawnerRegistry, SubprocessProcessSpawnerFactory,
+    TaskId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -190,7 +191,7 @@ pub struct AppState {
     /// `operator_ws::login::operators_create` — a role already present here
     /// causes `POST /v1/operators` to return `409 CONFLICT`. Entries are
     /// released on `DELETE /v1/operators/:sid`.
-    pub roles_to_sid: Arc<Mutex<HashMap<String, SessionId>>>,
+    pub roles_to_sid: Arc<Mutex<HashMap<OperatorRef, SessionId>>>,
     /// Persistence behind `operator_sessions` / `roles_to_sid`: mint
     /// (`POST /v1/operators`) writes through, teardown deletes, and a fresh
     /// boot rehydrates both maps from it (see [`OperatorSessionPersistence`])
@@ -555,7 +556,7 @@ pub fn build_router_full_with_operator_session_persistence(
     // its saved sid + token.
     let mut session_map: HashMap<SessionId, Arc<crate::operator_ws::login::OperatorSessionEntry>> =
         HashMap::new();
-    let mut roles_map: HashMap<String, SessionId> = HashMap::new();
+    let mut roles_map: HashMap<OperatorRef, SessionId> = HashMap::new();
     for entry in restored_sessions {
         for role in &entry.roles {
             roles_map.insert(role.clone(), entry.sid.clone());

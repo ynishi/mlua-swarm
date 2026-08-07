@@ -437,7 +437,9 @@ async fn seed_persisted_session(store: &FaultyDeleteStore, role: &str) -> Sessio
         .put(OperatorSessionRecord {
             sid: sid.clone(),
             token_digest: OperatorSessionRecord::digest_of(SEEDED_BEARER),
-            roles: vec![role.to_string()],
+            roles: vec![
+                mlua_swarm::OperatorRef::new(role).expect("test role literal is never empty")
+            ],
             capability_manifest: None,
             joined_at_secs: 0,
         })

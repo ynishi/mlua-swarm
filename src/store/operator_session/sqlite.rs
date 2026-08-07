@@ -31,7 +31,9 @@
 //! );
 //! ```
 
-use super::{OperatorSessionRecord, OperatorSessionStore, OperatorSessionStoreError, SessionId};
+use super::{
+    OperatorRef, OperatorSessionRecord, OperatorSessionStore, OperatorSessionStoreError, SessionId,
+};
 use crate::AgentProviderManifest;
 use async_trait::async_trait;
 use rusqlite::params;
@@ -162,7 +164,9 @@ fn row_to_record(row: SessionRow) -> Result<OperatorSessionRecord, OperatorSessi
     let (sid, token_digest, roles_json, capability_manifest_json, joined_at_secs) = row;
     let sid = SessionId::parse(sid)
         .map_err(|e| OperatorSessionStoreError::Other(format!("decode sid: {e}")))?;
-    let roles: Vec<String> = serde_json::from_str(&roles_json)
+    // The stored JSON is (and stays) an array of plain strings; the element
+    // type only decides what the decode validates on the way back in.
+    let roles: Vec<OperatorRef> = serde_json::from_str(&roles_json)
         .map_err(|e| OperatorSessionStoreError::Other(format!("decode roles: {e}")))?;
     let capability_manifest: Option<AgentProviderManifest> = match capability_manifest_json {
         Some(text) => Some(serde_json::from_str(&text).map_err(|e| {
@@ -279,11 +283,16 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
 mod tests {
     use super::*;
 
+    /// convention-token-ok: mlua-swarm public operator role literal.
+    fn role(name: &str) -> OperatorRef {
+        OperatorRef::new(name).expect("test role literal is never empty")
+    }
+
     fn mk(sid: &str, joined_at_secs: u64) -> OperatorSessionRecord {
         OperatorSessionRecord {
             sid: SessionId::parse(sid).unwrap(),
             token_digest: OperatorSessionRecord::digest_of(&format!("bearer-{sid}")),
-            roles: vec!["main-ai".into()],
+            roles: vec![role("main-ai")],
             capability_manifest: None,
             joined_at_secs,
         }
@@ -372,7 +381,7 @@ mod tests {
             list[0].verify_bearer("bearer-S-keep"),
             "the restored digest must still verify the original bearer"
         );
-        assert_eq!(list[0].roles, vec!["main-ai".to_string()]);
+        assert_eq!(list[0].roles, vec![role("main-ai")]);
         drop(s);
         driver.shutdown().await.unwrap();
     }

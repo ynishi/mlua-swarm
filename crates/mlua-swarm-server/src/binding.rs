@@ -8,7 +8,7 @@ use crate::operator_ws::login::OperatorSessionEntry;
 use async_trait::async_trait;
 use mlua_swarm::{
     AgentBindingProvider, BindOutcome, BindReceipt, BindRequest, BindingBackend,
-    BindingProviderError, ManifestBindingProvider, SessionId,
+    BindingProviderError, ManifestBindingProvider, OperatorRef, SessionId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 /// Binding provider backed by live Operator login records.
 pub struct OperatorSessionBindingProvider {
     operator_sessions: Arc<Mutex<HashMap<SessionId, Arc<OperatorSessionEntry>>>>,
-    roles_to_sid: Arc<Mutex<HashMap<String, SessionId>>>,
+    roles_to_sid: Arc<Mutex<HashMap<OperatorRef, SessionId>>>,
     /// Run-scoped session pin (`operator_sid` on the launch). `Some`
     /// resolves manifests through this session and never consults
     /// `roles_to_sid`; `None` is the process-global role lookup every
@@ -30,7 +30,7 @@ impl OperatorSessionBindingProvider {
     /// Operator REST/WebSocket login flow.
     pub fn new(
         operator_sessions: Arc<Mutex<HashMap<SessionId, Arc<OperatorSessionEntry>>>>,
-        roles_to_sid: Arc<Mutex<HashMap<String, SessionId>>>,
+        roles_to_sid: Arc<Mutex<HashMap<OperatorRef, SessionId>>>,
     ) -> Self {
         Self {
             operator_sessions,
@@ -47,14 +47,14 @@ impl OperatorSessionBindingProvider {
     /// live session — same tier as an unjoined role, and the launch's own
     /// fail-loud line is the compiler's pinned spawner lookup, which rejects
     /// the same condition outright.
-    async fn resolve_sid(&self, target: &str) -> Result<SessionId, String> {
+    async fn resolve_sid(&self, target: &OperatorRef) -> Result<SessionId, String> {
         match &self.pinned_sid {
             Some(sid) => Ok(sid.clone()),
             None => self
                 .roles_to_sid
                 .lock()
                 .await
-                .get(target)
+                .get(target.as_str())
                 .cloned()
                 .ok_or_else(|| format!("no Operator session owns binding target '{target}'")),
         }
@@ -67,7 +67,7 @@ impl OperatorSessionBindingProvider {
         // A WS-backed agent with no logical binding target is a Blueprint
         // declaration error, not a transient capability gap — keep it
         // fail-closed rather than reporting `Unbound`.
-        let target = request.binding_target.as_deref().ok_or_else(|| {
+        let target = request.binding_target.as_ref().ok_or_else(|| {
             BindingProviderError::Provider(format!(
                 "agent '{}' uses {:?} but declares no logical binding target",
                 request.agent, request.backend
@@ -181,12 +181,17 @@ mod tests {
     use mlua_swarm::store::operator_session::OperatorSessionRecord;
     use mlua_swarm::{AgentProviderCapability, AgentProviderManifest, BindingDigest};
 
+    /// convention-token-ok: mlua-swarm public operator role literal.
+    fn role(name: &str) -> OperatorRef {
+        OperatorRef::new(name).expect("test role literal is never empty")
+    }
+
     fn request() -> BindRequest {
         BindRequest {
             agent: "coder".to_string(),
             request_digest: BindingDigest::sha256("request"),
             backend: BindingBackend::WsOperator,
-            binding_target: Some("main-ai".to_string()),
+            binding_target: Some(role("main-ai")),
             requested_model: Some("sonnet".to_string()),
             requested_tools: vec!["Read".to_string()],
             launch_variant: Some("mse-coder".to_string()),
@@ -198,13 +203,13 @@ mod tests {
         let entry = Arc::new(OperatorSessionEntry {
             sid: sid.clone(),
             token_digest: OperatorSessionRecord::digest_of("token"),
-            roles: vec!["main-ai".to_string()],
+            roles: vec![role("main-ai")],
             capability_manifest: manifest,
             joined_at_secs: 0,
             ws_session: Mutex::new(None),
         });
         let sessions = Arc::new(Mutex::new(HashMap::from([(sid.clone(), entry)])));
-        let roles = Arc::new(Mutex::new(HashMap::from([("main-ai".to_string(), sid)])));
+        let roles = Arc::new(Mutex::new(HashMap::from([(role("main-ai"), sid)])));
         OperatorSessionBindingProvider::new(sessions, roles)
     }
 
@@ -299,7 +304,7 @@ mod tests {
         let role_holder = Arc::new(OperatorSessionEntry {
             sid: role_holder_sid.clone(),
             token_digest: OperatorSessionRecord::digest_of("token"),
-            roles: vec!["main-ai".to_string()],
+            roles: vec![role("main-ai")],
             capability_manifest: None,
             joined_at_secs: 0,
             ws_session: Mutex::new(None),
@@ -317,7 +322,7 @@ mod tests {
             (pinned_sid.clone(), pinned),
         ])));
         let roles = Arc::new(Mutex::new(HashMap::from([(
-            "main-ai".to_string(),
+            role("main-ai"),
             role_holder_sid,
         )])));
         let provider = OperatorSessionBindingProvider::new(sessions, roles);

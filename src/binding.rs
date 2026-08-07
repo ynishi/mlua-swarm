@@ -307,12 +307,17 @@ pub fn binding_request_for_snapshot(bound: &BoundAgent) -> Option<BindRequest> {
             |attestation| attestation.request_digest.clone(),
         ),
         backend,
+        // An `operator_ref` that is present but empty names no Operator, so
+        // it is dropped here rather than carried forward as a role nothing
+        // can hold. The agent then reads as "declares no binding target",
+        // which `OperatorSessionBindingProvider` already fails closed on for
+        // a WS-backed runner — the same tier of declaration error.
         binding_target: bound
             .agent
             .spec
             .get("operator_ref")
             .and_then(|value| value.as_str())
-            .map(str::to_string),
+            .and_then(|value| crate::types::OperatorRef::new(value).ok()),
         requested_model: bound
             .agent
             .profile
@@ -715,7 +720,10 @@ mod tests {
         assert_eq!(requests[0].agent, "coder");
         assert_eq!(requests[0].request_digest, bound[0].binding_digest);
         assert_eq!(requests[0].backend, BindingBackend::WsClaudeCode);
-        assert_eq!(requests[0].binding_target.as_deref(), Some("main-ai"));
+        assert_eq!(
+            requests[0].binding_target.as_ref().map(|t| t.as_str()),
+            Some("main-ai")
+        );
         assert_eq!(requests[0].requested_model.as_deref(), Some("sonnet"));
         assert_eq!(requests[0].requested_tools, ["Read", "Write"]);
         assert_eq!(requests[0].launch_variant.as_deref(), Some("mse-coder"));

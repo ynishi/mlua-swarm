@@ -52,8 +52,8 @@ use axum::{
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use mlua_swarm::store::operator_session::{OperatorSessionRecord, OperatorSessionStoreError};
 use mlua_swarm::{
-    AgentProviderManifest, Engine, Operator, OperatorSpawnerFactory, SeniorBridge, SessionId,
-    SpawnHook,
+    AgentProviderManifest, Engine, Operator, OperatorRef, OperatorSpawnerFactory, SeniorBridge,
+    SessionId, SpawnHook,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -92,7 +92,7 @@ pub struct OperatorSessionEntry {
     /// bearer with [`Self::verify_bearer`].
     pub token_digest: String,
     /// Role aliases claimed by this session (roles-exclusivity set).
-    pub roles: Vec<String>,
+    pub roles: Vec<OperatorRef>,
     /// Provider-owned effective capability manifest submitted at join.
     pub capability_manifest: Option<AgentProviderManifest>,
     /// GH #81 Layer 2: unix epoch seconds when `POST /v1/operators` minted
@@ -131,6 +131,16 @@ impl OperatorSessionEntry {
 #[derive(Debug, Deserialize, Default)]
 pub struct OperatorsCreateReq {
     /// Role aliases to claim exclusively (empty = no exclusivity claimed).
+    ///
+    /// # Why this is `String` when everything downstream is [`OperatorRef`]
+    ///
+    /// This is the untrusted wire-decode boundary, the same shape
+    /// `Path(sid): Path<String>` has on the sibling routes: the request
+    /// arrives as strings and [`operators_create`] validates them into
+    /// `OperatorRef` itself, so a rejection is answered with this module's
+    /// own `400` (and its own message naming the offending element)
+    /// instead of axum's extractor-level `422`. Nothing past that
+    /// conversion handles a role as a bare string.
     #[serde(default)]
     pub roles: Vec<String>,
     /// Effective execution capabilities supplied by the Operator/MainAI.
@@ -146,8 +156,9 @@ pub struct OperatorsCreateResp {
     pub sid: SessionId,
     /// Bearer auth token required on the WS upgrade and admin routes.
     pub token: String,
-    /// Echoes the granted role aliases.
-    pub roles: Vec<String>,
+    /// Echoes the granted role aliases (each serializes as the plain role
+    /// string, unchanged from before the [`OperatorRef`] typing).
+    pub roles: Vec<OperatorRef>,
 }
 
 /// `POST /v1/operators`. Mints `sid` (`S-<hex>` — the shared `SessionId`
@@ -171,7 +182,29 @@ pub async fn operators_create(
     State(state): State<AppState>,
     Json(req): Json<OperatorsCreateReq>,
 ) -> Response {
-    let roles = req.roles;
+    // Validate the wire strings into role handles before anything is
+    // reserved, minted, or persisted. An empty element is the one thing
+    // rejected here: it names no Operator, so a session claiming it could
+    // never be routed to, and every failure it caused would surface far
+    // from the caller that sent it.
+    let roles: Vec<OperatorRef> = match req
+        .roles
+        .into_iter()
+        .map(OperatorRef::new)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(roles) => roles,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("invalid role alias: {error}"),
+                    "hint": "omit `roles` (or send an empty array) to claim no alias at all",
+                })),
+            )
+                .into_response();
+        }
+    };
     let capability_manifest = req.capability_manifest;
     // The sid is the operator-session identity, so it mints in the same
     // `SessionId` shape (`S-<hex>`) as the engine-side session id — one
@@ -187,7 +220,7 @@ pub async fn operators_create(
 
     {
         let mut map = state.roles_to_sid.lock().await;
-        let conflicts: Vec<String> = roles
+        let conflicts: Vec<OperatorRef> = roles
             .iter()
             .filter(|r| map.contains_key(r.as_str()))
             .cloned()
@@ -386,7 +419,7 @@ async fn register_operator_session(
     engine: &Engine,
     ws_operator_factory: Option<&Arc<OperatorSpawnerFactory>>,
     sid: &SessionId,
-    roles: &[String],
+    roles: &[OperatorRef],
     ws_session: &Arc<WSOperatorSession>,
 ) {
     engine
@@ -402,11 +435,20 @@ async fn register_operator_session(
         factory.register_operator(sid.clone(), ws_session.clone() as Arc<dyn Operator>);
     }
     for role in roles {
+        // The registries are keyed by plain strings (a sid and a role alias
+        // share that key space by design), so the alias is spelled out here
+        // rather than handed over as a typed ref.
         if let Some(factory) = ws_operator_factory {
-            factory.register_operator(role.clone(), ws_session.clone() as Arc<dyn Operator>);
+            factory.register_operator(
+                role.as_str().to_string(),
+                ws_session.clone() as Arc<dyn Operator>,
+            );
         }
         engine
-            .register_operator(role.clone(), ws_session.clone() as Arc<dyn Operator>)
+            .register_operator(
+                role.as_str().to_string(),
+                ws_session.clone() as Arc<dyn Operator>,
+            )
             .await;
     }
 }
@@ -701,9 +743,9 @@ async fn teardown_operator_session(
         factory.unregister_operator(sid.as_str());
     }
     for role in &entry.roles {
-        state.engine.unregister_operator(role).await;
+        state.engine.unregister_operator(role.as_str()).await;
         if let Some(factory) = &state.ws_operator_factory {
-            factory.unregister_operator(role);
+            factory.unregister_operator(role.as_str());
         }
     }
 
@@ -744,8 +786,8 @@ async fn teardown_operator_session(
     {
         let mut map = state.roles_to_sid.lock().await;
         for role in &entry.roles {
-            if map.get(role) == Some(sid) {
-                map.remove(role);
+            if map.get(role.as_str()) == Some(sid) {
+                map.remove(role.as_str());
             }
         }
     }
@@ -821,7 +863,7 @@ pub struct OperatorsListEntry {
     /// Session id (`S-<hex>`) — safe to expose; token is the sole bearer secret.
     pub sid: SessionId,
     /// Role aliases held by this session.
-    pub roles: Vec<String>,
+    pub roles: Vec<OperatorRef>,
     /// Unix epoch seconds when the session minted (from
     /// [`OperatorSessionEntry::joined_at_secs`]).
     pub joined_at_secs: u64,
@@ -900,6 +942,17 @@ pub async fn operators_delete_by_role(
     Path(role): Path<String>,
     axum::extract::Query(query): axum::extract::Query<OperatorsDeleteByRoleQuery>,
 ) -> Response {
+    // Same shape as the sibling `:sid` routes' `SessionId::parse`: a path
+    // segment that cannot be a role cannot name a holder of one. Axum does
+    // not match an empty segment, so this arm is unreachable in practice —
+    // it exists so the rest of the handler works in `OperatorRef`.
+    let Ok(role) = OperatorRef::new(role) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no session holds this role"})),
+        )
+            .into_response();
+    };
     let sid = {
         let map = state.roles_to_sid.lock().await;
         match map.get(role.as_str()) {
@@ -1037,7 +1090,7 @@ pub struct OperatorsInfoResp {
     /// Echoes the requested session id.
     pub sid: SessionId,
     /// Role aliases held by this session.
-    pub roles: Vec<String>,
+    pub roles: Vec<OperatorRef>,
     /// Capability manifest pinned when this session joined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capability_manifest: Option<AgentProviderManifest>,
@@ -1201,11 +1254,12 @@ mod tests {
         /// Seed one live session holding `role` (no WS attached — teardown
         /// and the guard both work off the login record).
         async fn seed_session(state: &AppState, role: &str) -> SessionId {
+            let role = OperatorRef::new(role).expect("test role literal is never empty");
             let sid = SessionId::new();
             let entry = Arc::new(OperatorSessionEntry {
                 sid: sid.clone(),
                 token_digest: OperatorSessionRecord::digest_of("token"),
-                roles: vec![role.to_string()],
+                roles: vec![role.clone()],
                 capability_manifest: None,
                 joined_at_secs: 0,
                 ws_session: Mutex::new(None),
@@ -1215,11 +1269,7 @@ mod tests {
                 .lock()
                 .await
                 .insert(sid.clone(), entry);
-            state
-                .roles_to_sid
-                .lock()
-                .await
-                .insert(role.to_string(), sid.clone());
+            state.roles_to_sid.lock().await.insert(role, sid.clone());
             sid
         }
 
@@ -1559,6 +1609,101 @@ mod tests {
             async fn list(&self) -> Result<Vec<OperatorSessionRecord>, OperatorSessionStoreError> {
                 Ok(Vec::new())
             }
+        }
+    }
+
+    // ── the one rule an OperatorRef carries: not empty ───────────────────
+
+    /// `roles: [""]` names no Operator: nothing can hold the role `""`, so a
+    /// session claiming it could never be routed to and every later failure
+    /// would point somewhere other than the caller that sent it. The mint
+    /// rejects it up front with `400`.
+    ///
+    /// The neighbouring case — `roles: []` — is a different thing entirely
+    /// ("claim no alias") and has to keep working; it is asserted here
+    /// alongside so the two can never be conflated by a later change.
+    mod empty_role_is_rejected {
+        use super::by_role_in_flight::{body_json, test_state};
+        use super::*;
+
+        async fn mint_with_roles(state: &AppState, roles: Vec<String>) -> Response {
+            operators_create(
+                State(state.clone()),
+                Json(OperatorsCreateReq {
+                    roles,
+                    capability_manifest: None,
+                }),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn an_empty_role_is_rejected_with_400_and_mints_nothing() {
+            let state = test_state();
+
+            let response = mint_with_roles(&state, vec![String::new()]).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "an empty role alias must be refused at the boundary"
+            );
+            let body = body_json(response).await;
+            assert!(
+                body["error"].as_str().unwrap_or_default().contains("role"),
+                "the 400 must say what was wrong with the request: {body}"
+            );
+
+            // A refused mint is a mint that never happened — the same
+            // all-or-nothing contract the persist-failure path holds to.
+            assert!(
+                state.engine.list_operator_ids().await.is_empty(),
+                "a refused mint must not register anything"
+            );
+            assert!(state.operator_sessions.lock().await.is_empty());
+            assert!(state.roles_to_sid.lock().await.is_empty());
+            assert!(
+                state
+                    .operator_session_store
+                    .list()
+                    .await
+                    .expect("list the store")
+                    .is_empty(),
+                "a refused mint must not persist a row"
+            );
+        }
+
+        /// One empty element poisons the whole request rather than being
+        /// silently dropped: the caller asked for a role it cannot have.
+        #[tokio::test]
+        async fn an_empty_role_alongside_a_valid_one_still_rejects_the_whole_mint() {
+            let state = test_state();
+            let response =
+                mint_with_roles(&state, vec!["main-ai".to_string(), String::new()]).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                state.roles_to_sid.lock().await.is_empty(),
+                "the valid role must not be reserved by a request that was refused"
+            );
+        }
+
+        /// The regression guard for the distinction above: claiming *no*
+        /// alias is not the same as claiming an empty one, and stays a
+        /// successful mint.
+        #[tokio::test]
+        async fn claiming_no_roles_at_all_still_mints() {
+            let state = test_state();
+            let response = mint_with_roles(&state, Vec::new()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "an empty `roles` array claims no alias and must keep working"
+            );
+            let body = body_json(response).await;
+            assert_eq!(
+                body["roles"],
+                serde_json::json!([]),
+                "the response still echoes an empty array: {body}"
+            );
         }
     }
 }
