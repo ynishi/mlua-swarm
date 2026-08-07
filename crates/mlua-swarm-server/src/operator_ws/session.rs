@@ -55,15 +55,23 @@ pub struct WSOperatorSession {
 }
 
 impl WSOperatorSession {
-    /// `login.rs::handle_operator_socket` is the sole constructor call site.
-    /// Auth (Bearer token match) is checked there against `OperatorSessionEntry.token`
-    /// *before* upgrade — this struct no longer carries its own auth_token copy.
+    /// Test-only shorthand for "a session that already has a sender".
+    ///
+    /// Production has no such constructor any more: every session is born
+    /// disconnected via [`Self::disconnected_with_base_url`] — at mint
+    /// (`login::operators_create`) or at boot
+    /// (`login::restored_operator_session_entry`) — and acquires its sender
+    /// through [`Self::replace_tx`] when a socket attaches. This used to be
+    /// the first-connect constructor in `login::handle_operator_socket`;
+    /// that arm registered the session it built, which is exactly what a
+    /// connect racing a teardown must not be able to do.
     ///
     /// `base_url` is the server's public HTTP root (e.g.
     /// `"http://127.0.0.1:7777"`), threaded from `AppState.base_url`.
     /// When `Some`, it is rendered literally into Spawn directives
     /// (issue #8); `None` falls back to a `mse_doctor`-pointer
     /// placeholder.
+    #[cfg(test)]
     pub(super) fn new_with_base_url(
         sid: SessionId,
         tx: mpsc::UnboundedSender<ServerMsg>,

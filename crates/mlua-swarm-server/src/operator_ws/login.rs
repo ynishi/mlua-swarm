@@ -11,16 +11,20 @@
 //!   → 409 if any role already owns a live entry (roles alias exclusivity,
 //!     v1.md §Auth session flow)
 //!   → { sid: "S-<hex>", token: "<10-hex>", roles: [...] }
+//!   → builds a disconnected `WSOperatorSession` and registers it into the
+//!     engine's 3 registries (senior_bridge / spawn_hook / operator) +
+//!     role aliases. The sid is therefore usable as an `operator_sid` pin
+//!     from the moment it is minted; it is not yet *reachable* (no socket).
 //!   The manifest is pinned to this session and later resolved through the
 //!   Core `AgentBindingProvider` interface before any Runner-backed spawn.
 //!
 //! WS /v1/operators/:sid/ws
 //!   Authorization: Bearer <token>   (mandatory — no empty-string default)
 //!   → 401 missing/empty Bearer, 404 unknown sid, 401 token mismatch
-//!   → registers a `WSOperatorSession` into the engine's 3 registries
-//!     (senior_bridge / spawn_hook / operator) + role aliases, same pattern
-//!     as `handler::handle_socket`. Reconnect (same sid, matching token)
-//!     reuses the existing `WSOperatorSession` via `replace_tx`.
+//!   → attaches this socket to the `WSOperatorSession` the sid already owns
+//!     (`replace_tx`). Connect and reconnect are the same operation, and
+//!     neither touches a registry — registration happened at mint, or at
+//!     boot on the restore path.
 //!
 //! DELETE /v1/operators/:sid   (Bearer required)
 //!   → unregisters the 3 registries + role aliases + `operator_sessions`
@@ -62,13 +66,23 @@ use super::session::WSOperatorSession;
 use crate::AppState;
 
 /// Login-flow record for a minted Operator session. Held in
-/// `AppState.operator_sessions`, keyed by `sid`. On the mint path
-/// `ws_session` starts `None` (login only mints sid+token) and is set on
-/// first successful WS connect; on the restore path it is already `Some`
-/// (a disconnected session, registered at boot — see
-/// [`restored_operator_session_entry`]). Either way a (re)connect reuses
-/// that same `WSOperatorSession` via `replace_tx` rather than
-/// re-registering it.
+/// `AppState.operator_sessions`, keyed by `sid`.
+///
+/// # `ws_session` is `Some` for the whole life of an entry
+///
+/// Both paths that build an entry attach a registered `WSOperatorSession`
+/// before the entry is published: the mint path ([`operators_create`]) and
+/// the boot-time restore path ([`restored_operator_session_entry`]). Both
+/// start it *disconnected* — registered is not reachable — and a
+/// (re)connect only swaps a sender in via `replace_tx`.
+///
+/// [`teardown_operator_session`] deliberately leaves the session on the
+/// entry while closing it, so the invariant holds even for an entry that
+/// has already left `operator_sessions` and is still held by a socket
+/// that upgraded before the teardown. That is what lets
+/// [`handle_operator_socket`] have no "no session yet" branch at all: the
+/// branch used to mint a second session and register it, which — reached
+/// after a teardown — left a registration nothing could ever unregister.
 pub struct OperatorSessionEntry {
     /// Server-minted session id (typed [`SessionId`] since issue #14).
     pub sid: SessionId,
@@ -86,8 +100,16 @@ pub struct OperatorSessionEntry {
     /// can pick the oldest stale session without probing each sid
     /// individually.
     pub joined_at_secs: u64,
-    /// The reusable 3-trait session object once a WS has connected at least
-    /// once; `None` before first connect. Its sender tracks current connectivity.
+    /// The reusable 3-trait session object, attached before this entry is
+    /// published and never removed (see the type doc). Its sender — not
+    /// its presence — is what tracks current connectivity, so a session
+    /// that has never seen a socket reads `connected: false` while being
+    /// fully registered.
+    ///
+    /// The `Option` is what the two constructors and
+    /// [`teardown_operator_session`] agree never to write `None` into; it
+    /// survives only because the alternative is a non-`Option` field that
+    /// every `#[cfg(test)]` fixture would have to build a real session for.
     pub ws_session: Mutex<Option<Arc<WSOperatorSession>>>,
 }
 
@@ -231,13 +253,49 @@ pub async fn operators_create(
             .into_response();
     }
 
+    // Registered here, at mint — the same shape the restore path uses at
+    // boot (see [`restored_operator_session_entry`], which carries the
+    // full "registered is not reachable" rationale). The session starts
+    // disconnected: anything sent to it before the client attaches a
+    // socket fails loud with `"ws operator disconnected"`.
+    //
+    // Registering at mint rather than on first WS connect is what keeps
+    // the connect path out of the registries entirely. When the two were
+    // split, a connect whose upgrade completed just before a teardown
+    // landed would run afterwards, find no session on its (already
+    // removed) entry, and register a fresh one — a registration no route
+    // could reach to undo, since every teardown route looks the sid up in
+    // `operator_sessions` first. Registering once, here, removes that
+    // second registration site rather than trying to order it correctly.
+    //
+    // # Why after `put`, not before
+    //
+    // The alternative — register first, unregister on a `put` failure —
+    // guards one fallible step with another. The durable write is already
+    // this function's gate for every in-memory effect (see the
+    // write-through note above), so registration sits on the same side of
+    // it as the map insert below, and the failure path above stays exactly
+    // as it was: release the roles, answer `500`, leave nothing behind.
+    let ws_session = Arc::new(WSOperatorSession::disconnected_with_base_url(
+        sid.clone(),
+        state.base_url.clone(),
+    ));
+    register_operator_session(
+        &state.engine,
+        state.ws_operator_factory.as_ref(),
+        &sid,
+        &roles,
+        &ws_session,
+    )
+    .await;
+
     let entry = Arc::new(OperatorSessionEntry {
         sid: sid.clone(),
         token_digest,
         roles: roles.clone(),
         capability_manifest,
         joined_at_secs,
-        ws_session: Mutex::new(None),
+        ws_session: Mutex::new(Some(ws_session)),
     });
     state
         .operator_sessions
@@ -301,7 +359,7 @@ pub async fn operators_ws_connect(
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
-    ws.on_upgrade(move |socket| handle_operator_socket(socket, state, entry))
+    ws.on_upgrade(move |socket| handle_operator_socket(socket, entry))
 }
 
 /// Binds `ws_session` into every registry an Operator session must be
@@ -309,12 +367,18 @@ pub async fn operators_ws_connect(
 /// `operator`) under `sid`, the `OperatorSpawnerFactory` when one is wired,
 /// and the operator registries again under each of `roles`.
 ///
-/// The single spelling of that registration. Two paths reach it — a first
-/// WS connect ([`handle_operator_socket`]) and the boot-time restore of a
-/// persisted record ([`restored_operator_session_entry`]) — and they have to
+/// The single spelling of that registration, and — since the mint path
+/// took it over from the first-connect arm — the only one. Two callers
+/// reach it, a mint ([`operators_create`]) and the boot-time restore of a
+/// persisted record ([`restored_operator_session_entry`]), and they have to
 /// leave identical registry state, or a session ends up resolvable on one
 /// axis (`GET /v1/operators/:sid`) and missing on another (an
 /// `operator_sid` pin, a role-aliased spawn).
+///
+/// Both callers run **before** their entry reaches `operator_sessions`, so
+/// every entry is registered by the time anything can look it up. Nothing
+/// on the WS connect path calls this: a connect that races a teardown must
+/// not be able to put a registration back.
 ///
 /// Role exclusivity is settled at mint time (`operators_create`); this only
 /// binds the aliases it granted.
@@ -363,8 +427,11 @@ async fn register_operator_session(
 /// ([`WSOperatorSession::disconnected_with_base_url`]): it is registered,
 /// not reachable. Anything actually sent to it before the client attaches a
 /// socket fails loud with `"ws operator disconnected"`, and the client's
-/// connect then takes [`handle_operator_socket`]'s reconnect arm (a
-/// `replace_tx`, no second registration).
+/// connect is then a plain `replace_tx` in [`handle_operator_socket`] — no
+/// second registration.
+///
+/// [`operators_create`] does the same thing at mint time, so this is the
+/// restore half of one shared shape rather than a special case.
 pub(crate) async fn restored_operator_session_entry(
     engine: &Engine,
     ws_operator_factory: Option<&Arc<OperatorSpawnerFactory>>,
@@ -435,38 +502,30 @@ async fn close_requested(signal: &mut watch::Receiver<Option<Arc<str>>>) -> Arc<
 /// Close frame, the read half stops waiting on a client that may never
 /// reply to one. Without that the local `tx` below outlives the session's
 /// own sender, keeping the channel — and the socket — alive after teardown.
-async fn handle_operator_socket(
-    socket: WebSocket,
-    state: AppState,
-    entry: Arc<OperatorSessionEntry>,
-) {
+async fn handle_operator_socket(socket: WebSocket, entry: Arc<OperatorSessionEntry>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
 
-    let existing_ws = entry.ws_session.lock().await.clone();
-    let session = match existing_ws {
-        Some(ws_session) => {
-            // Reconnect: reuse the existing WSOperatorSession on this entry; only swap out `tx`.
-            ws_session.replace_tx(tx.clone()).await;
-            ws_session
-        }
-        None => {
-            let ws_session = Arc::new(WSOperatorSession::new_with_base_url(
-                entry.sid.clone(),
-                tx.clone(),
-                state.base_url.clone(),
-            ));
-            register_operator_session(
-                &state.engine,
-                state.ws_operator_factory.as_ref(),
-                &entry.sid,
-                &entry.roles,
-                &ws_session,
-            )
-            .await;
-            *entry.ws_session.lock().await = Some(ws_session.clone());
-            ws_session
-        }
+    // Attach to the session this entry has carried since it was built —
+    // mint and restore both register one up front, and teardown leaves it
+    // in place (see [`OperatorSessionEntry`]'s type doc). First connect and
+    // reconnect are therefore the same operation: swap `tx` in, touch no
+    // registry.
+    //
+    // A socket whose upgrade completed just before its session was torn
+    // down arrives here too, holding the removed entry. It finds the
+    // closed session, swaps its sender in, and is answered below with the
+    // Close frame teardown latched — instead of minting a replacement
+    // session and registering it behind teardown's back.
+    let Some(session) = entry.ws_session.lock().await.clone() else {
+        // Unreachable by the invariant above; refuse rather than
+        // re-introduce the registration site that made it necessary.
+        tracing::error!(
+            sid = %entry.sid,
+            "operator ws: session entry carried no WSOperatorSession; dropping the socket"
+        );
+        return;
     };
+    session.replace_tx(tx.clone()).await;
 
     let (mut ws_sink, mut ws_stream) = socket.split();
     let mut write_close_signal = session.close_signal();
@@ -648,7 +707,22 @@ async fn teardown_operator_session(
         }
     }
 
-    if let Some(session) = entry.ws_session.lock().await.take() {
+    // Cloned out, not taken. Taking it would put `None` back on an entry
+    // that a socket may still be holding — a socket that upgraded before
+    // this teardown and has not reached `handle_operator_socket` yet. That
+    // socket would then find an empty slot, which is precisely the state
+    // the old first-connect arm answered by registering a fresh session
+    // nothing could unregister. Leaving the session in place means it
+    // finds the closed one instead and is shut down by the latch below.
+    //
+    // Idempotent w.r.t. a repeat teardown on the same entry: `fail_pending`
+    // drains an already-empty map, `close` re-latches the same reason, and
+    // `clear_tx` is a plain `None` write.
+    let session = {
+        let guard = entry.ws_session.lock().await;
+        guard.clone()
+    };
+    if let Some(session) = session {
         // B-2: fail every parked spawn/ask/hook_before on this session
         // right away. Teardown removes the session from `operator_sessions`
         // below (no reconnect can find it again), so unlike a plain WS
@@ -847,12 +921,27 @@ pub async fn operators_delete_by_role(
         Some(e) => e,
         None => {
             // The role was mapped to a sid that has no matching
-            // `operator_sessions` entry. Reachable during a mint's
-            // roles-reserved → persisted → map-inserted window (the
-            // session-persistence write-through sits between the two map
-            // updates), or after a mint whose persist failed. Release the
-            // stale role mapping so a future mint can reclaim the name,
-            // then report NOT_FOUND.
+            // `operator_sessions` entry. Reachable while a mint is still
+            // in flight: `operators_create` reserves the role names first
+            // and inserts the entry last, with the persist write-through
+            // and the engine registration in between. Release the stale
+            // role mapping so a future mint can reclaim the name, then
+            // report NOT_FOUND.
+            //
+            // Deliberately no unregister here: this branch has no entry,
+            // so it has no `roles` list to unregister and no session to
+            // close. A sid can still arrive here already registered — a
+            // mint cancelled between `register_operator_session` and the
+            // map insert leaves exactly that, both being yield points and
+            // hyper dropping the response future when the peer goes away.
+            //
+            // That residue is bounded rather than permanent. The persisted
+            // row survives it (`put` had succeeded and no `delete` ran), so
+            // the next boot's `restored_operator_session_entry` registers
+            // the same sid and roles over the stale keys and this time
+            // publishes a real entry. Until then nothing outside the
+            // process can name the sid: the response carrying it was never
+            // written.
             let mut map = state.roles_to_sid.lock().await;
             if map.get(role.as_str()) == Some(&sid) {
                 map.remove(role.as_str());
@@ -1084,7 +1173,7 @@ mod tests {
         use mlua_swarm::TaskId;
         use std::collections::HashMap;
 
-        fn test_state() -> AppState {
+        pub(super) fn test_state() -> AppState {
             let engine =
                 Engine::new_with_layers(EngineCfg::default(), crate::default_layer_registry());
             let compiler = mlua_swarm::Compiler::new(crate::default_registry());
@@ -1155,7 +1244,7 @@ mod tests {
             run_id
         }
 
-        async fn body_json(response: Response) -> serde_json::Value {
+        pub(super) async fn body_json(response: Response) -> serde_json::Value {
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("read body");
@@ -1252,6 +1341,224 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    // ── registration moved to mint: the invariant behind the deleted arm ──
+
+    /// `handle_operator_socket` no longer has a "this entry has no session
+    /// yet" arm, because no entry is ever in that state. These tests hold
+    /// the two halves of that invariant in place.
+    ///
+    /// The arm mattered: it built a `WSOperatorSession` and **registered**
+    /// it. `operators_ws_connect` clones the entry, verifies the Bearer and
+    /// returns `ws.on_upgrade(...)`, so the closure runs only after the
+    /// HTTP response is written — and a teardown can land in that gap. The
+    /// arm then registered a session under a sid that had already left
+    /// `operator_sessions`, which no route could undo: `DELETE
+    /// /v1/operators/:sid` answers `404` without the entry, and the
+    /// by-role route's torn branch clears the role map without
+    /// unregistering. The registration survived until process exit.
+    ///
+    /// Driving that interleaving through a live server is not something a
+    /// test can order (the gap is between hyper writing `101` and running
+    /// the upgrade callback), so it is pinned structurally instead: mint
+    /// publishes an entry that already carries a registered session, and
+    /// teardown leaves that session on the entry. A late socket therefore
+    /// always finds one, and the only thing it can do is `replace_tx`.
+    mod registration_is_owned_by_mint {
+        use super::by_role_in_flight::{body_json, test_state};
+        use super::*;
+
+        /// convention-token-ok: mlua-swarm public operator role literal.
+        const ROLE: &str = "main-ai";
+
+        async fn mint(state: &AppState) -> SessionId {
+            let response = operators_create(
+                State(state.clone()),
+                Json(OperatorsCreateReq {
+                    roles: vec![ROLE.to_string()],
+                    capability_manifest: None,
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "mint must succeed");
+            let body = body_json(response).await;
+            SessionId::parse(body["sid"].as_str().expect("sid").to_string()).expect("parse sid")
+        }
+
+        /// Half 1: minting registers, and publishes an entry that already
+        /// carries the session. Nothing is left for a connect to do.
+        #[tokio::test]
+        async fn mint_publishes_an_entry_that_already_carries_a_registered_session() {
+            let state = test_state();
+            let sid = mint(&state).await;
+
+            let registered = state.engine.list_operator_ids().await;
+            assert!(
+                registered.contains(&sid.to_string()),
+                "mint must register the sid (this is what makes it usable as an \
+                 `operator_sid` pin before any WS connect): {registered:?}"
+            );
+            assert!(
+                registered.contains(&ROLE.to_string()),
+                "mint must register the role alias too: {registered:?}"
+            );
+
+            let entry = state
+                .operator_sessions
+                .lock()
+                .await
+                .get(&sid)
+                .cloned()
+                .expect("mint must insert the entry");
+            assert!(
+                entry.ws_session.lock().await.is_some(),
+                "the entry must be published with its session already attached — \
+                 a `None` here is the state the deleted first-connect arm existed \
+                 to answer, and it answered it by registering a second session"
+            );
+        }
+
+        /// Half 2: teardown closes the session but leaves it on the entry,
+        /// so a socket still holding that entry finds it and is answered
+        /// with the latched Close — rather than finding an empty slot.
+        #[tokio::test]
+        async fn teardown_leaves_the_closed_session_on_the_entry() {
+            let state = test_state();
+            let sid = mint(&state).await;
+            let entry = state
+                .operator_sessions
+                .lock()
+                .await
+                .get(&sid)
+                .cloned()
+                .expect("mint must insert the entry");
+
+            teardown_operator_session(&state, &sid, &entry)
+                .await
+                .expect("teardown must succeed against a healthy store");
+
+            assert!(
+                !state.operator_sessions.lock().await.contains_key(&sid),
+                "teardown must remove the entry from the map"
+            );
+            let registered = state.engine.list_operator_ids().await;
+            assert!(
+                !registered.contains(&sid.to_string()) && !registered.contains(&ROLE.to_string()),
+                "teardown must unregister both the sid and its role: {registered:?}"
+            );
+
+            // This `entry` clone stands in for the one a socket grabbed in
+            // `operators_ws_connect` before the teardown ran.
+            let session = entry.ws_session.lock().await.clone().expect(
+                "teardown must leave the session on the entry: a socket that \
+                 upgraded before it would otherwise reach `handle_operator_socket` \
+                 with nothing to attach to",
+            );
+            let mut signal = session.close_signal();
+            assert!(
+                signal.borrow_and_update().is_some(),
+                "the close must already be latched, so a socket subscribing after \
+                 the teardown still observes it and shuts down"
+            );
+            assert!(
+                !session.is_connected().await,
+                "teardown must have cleared the sender"
+            );
+        }
+
+        /// A repeat teardown on the same entry stays a no-op. Keeping the
+        /// session in place (rather than taking it) must not turn the
+        /// second call into a second round of side effects.
+        #[tokio::test]
+        async fn a_repeated_teardown_is_still_idempotent() {
+            let state = test_state();
+            let sid = mint(&state).await;
+            let entry = state
+                .operator_sessions
+                .lock()
+                .await
+                .get(&sid)
+                .cloned()
+                .expect("mint must insert the entry");
+
+            teardown_operator_session(&state, &sid, &entry)
+                .await
+                .expect("first teardown");
+            teardown_operator_session(&state, &sid, &entry)
+                .await
+                .expect("a repeat teardown must still report success");
+
+            assert!(!state.operator_sessions.lock().await.contains_key(&sid));
+            assert!(state.roles_to_sid.lock().await.get(ROLE).is_none());
+            assert!(!state
+                .engine
+                .list_operator_ids()
+                .await
+                .contains(&sid.to_string()));
+        }
+
+        /// A mint whose persist fails must leave nothing behind — no
+        /// registration, no entry, no role claim. This is why the
+        /// registration sits *after* `store.put` rather than before it
+        /// with a compensating unregister.
+        #[tokio::test]
+        async fn a_mint_whose_persist_fails_registers_nothing() {
+            let mut state = test_state();
+            state.operator_session_store = Arc::new(AlwaysFailingPutStore);
+
+            let response = operators_create(
+                State(state.clone()),
+                Json(OperatorsCreateReq {
+                    roles: vec![ROLE.to_string()],
+                    capability_manifest: None,
+                }),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a persist failure must surface as 5xx"
+            );
+
+            assert!(
+                state.engine.list_operator_ids().await.is_empty(),
+                "a failed mint must not leave a registration behind — nothing \
+                 would ever be able to unregister it"
+            );
+            assert!(state.operator_sessions.lock().await.is_empty());
+            assert!(
+                state.roles_to_sid.lock().await.get(ROLE).is_none(),
+                "a failed mint must release the role names it reserved"
+            );
+        }
+
+        /// Store whose `put` always fails; `delete` / `list` are honest.
+        struct AlwaysFailingPutStore;
+
+        #[async_trait::async_trait]
+        impl mlua_swarm::store::operator_session::OperatorSessionStore for AlwaysFailingPutStore {
+            fn name(&self) -> &str {
+                "always-failing-put"
+            }
+
+            async fn put(
+                &self,
+                _record: OperatorSessionRecord,
+            ) -> Result<(), OperatorSessionStoreError> {
+                Err(OperatorSessionStoreError::Other(
+                    "injected persist failure".to_string(),
+                ))
+            }
+
+            async fn delete(&self, sid: &SessionId) -> Result<(), OperatorSessionStoreError> {
+                Err(OperatorSessionStoreError::NotFound(sid.clone()))
+            }
+
+            async fn list(&self) -> Result<Vec<OperatorSessionRecord>, OperatorSessionStoreError> {
+                Ok(Vec::new())
+            }
         }
     }
 }

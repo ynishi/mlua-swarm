@@ -24,6 +24,10 @@
 //!    swallowed, so the in-memory maps and the store can never disagree.
 
 use futures_util::StreamExt;
+use mlua_swarm::blueprint::{
+    current_schema_version, AgentDef, AgentKind, Blueprint, BlueprintMetadata, CompilerHints,
+    CompilerStrategy,
+};
 use mlua_swarm::core::config::EngineCfg;
 use mlua_swarm::core::engine::Engine;
 use mlua_swarm::store::operator_session::{
@@ -519,6 +523,245 @@ async fn persisted_row_delete_failure_aborts_the_teardown() {
     assert!(
         !engine.list_operator_ids().await.contains(&sid.to_string()),
         "the successful retry must complete the teardown"
+    );
+
+    server.shutdown();
+}
+
+// ─── registration is owned by the mint, not by the WS connect ───────────────
+
+/// A server on an empty in-memory session store, handing back the same
+/// `Engine` the router got so a test can watch registry membership.
+async fn spawn_server_with_engine() -> (ServerHandle, Engine) {
+    spawn_server_with_session_store(Arc::new(InMemoryOperatorSessionStore::new())).await
+}
+
+/// Engine-registered ids, sorted — comparable across two points in time.
+async fn registered_ids(engine: &Engine) -> Vec<String> {
+    let mut ids = engine.list_operator_ids().await;
+    ids.sort();
+    ids
+}
+
+/// Attaching a WebSocket must not add anything to the engine registry.
+///
+/// Registration belongs to `POST /v1/operators` now; the connect path only
+/// swaps a sender into the session the sid already owns. Before this
+/// change the mint registered nothing and the first connect registered
+/// everything, which is what made a connect that raced a teardown able to
+/// re-create registrations behind it.
+#[tokio::test]
+async fn connecting_a_socket_adds_nothing_to_the_engine_registry() {
+    let (server, engine) = spawn_server_with_engine().await;
+    let client = reqwest::Client::new();
+
+    // convention-token-ok: mlua-swarm public operator role literal.
+    let holder = mint(&client, &server.base_url, "main-ai").await;
+    let sid = holder["sid"].as_str().expect("sid").to_string();
+    let token = holder["token"].as_str().expect("token").to_string();
+
+    let before = registered_ids(&engine).await;
+    assert!(
+        before.contains(&sid),
+        "the mint alone must register the sid: {before:?}"
+    );
+    assert!(
+        // convention-token-ok: mlua-swarm public operator role literal.
+        before.contains(&"main-ai".to_string()),
+        "the mint alone must register the role alias: {before:?}"
+    );
+
+    let _socket = connect_ws(&server.base_url, &sid, &token).await;
+    wait_until_connected(&client, &server.base_url, &sid, &token).await;
+
+    assert_eq!(
+        registered_ids(&engine).await,
+        before,
+        "the WS connect path must leave registry membership exactly as it found it"
+    );
+
+    server.shutdown();
+}
+
+/// The bug this unit exists for: a teardown landing between a socket's
+/// upgrade and its server-side bind.
+///
+/// `operators_ws_connect` returns `ws.on_upgrade(...)`, so the handler runs
+/// only after the `101` has been written — `connect_ws` below can return
+/// while the server has not bound anything yet. Tearing the session down
+/// right there used to leave the late handler looking at an entry with no
+/// session, which it answered by minting one and **registering** it: a
+/// registration under a sid already gone from `operator_sessions`, so
+/// `DELETE /v1/operators/:sid` could only `404` and the by-role route could
+/// only clear the role map. It survived until the process exited, and the
+/// client sat on a socket that would never be spoken on or closed.
+///
+/// Both interleavings now land in the same place, which is what makes this
+/// test stable: if the bind wins, teardown closes an attached socket; if
+/// the teardown wins, the late bind finds the closed session, swaps its
+/// sender in, and is answered by the already-latched close. Neither adds a
+/// registration. (Under the old code the teardown-first ordering both
+/// re-registered and never closed, so this test hangs to its timeout there.)
+#[tokio::test]
+async fn a_teardown_racing_a_connect_registers_nothing_and_still_closes_the_socket() {
+    let (server, engine) = spawn_server_with_engine().await;
+    let client = reqwest::Client::new();
+
+    // convention-token-ok: mlua-swarm public operator role literal.
+    let holder = mint(&client, &server.base_url, "main-ai").await;
+    let sid = holder["sid"].as_str().expect("sid").to_string();
+    let token = holder["token"].as_str().expect("token").to_string();
+
+    // Deliberately NO `wait_until_connected` here — waiting would close
+    // the very window this test is about.
+    let mut socket = connect_ws(&server.base_url, &sid, &token).await;
+
+    let release = client
+        // convention-token-ok: mlua-swarm public operator role literal.
+        .delete(format!("{}/v1/operators/by-role/main-ai", server.base_url))
+        .send()
+        .await
+        .expect("by-role delete request");
+    assert_eq!(release.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // The socket must be closed either way. Reaching this point also means
+    // the handler has run, so the registry assertion below is not racing it.
+    let next = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect(
+            "the socket must be closed whether it bound before or after the \
+             teardown; it stayed open, which is the late-bind path having \
+             created a fresh session with no close latch on it",
+        );
+    match next {
+        Some(Ok(Message::Close(frame))) => {
+            let reason = frame.map(|f| f.reason.to_string()).unwrap_or_default();
+            assert!(
+                reason.contains("torn down"),
+                "the Close frame should say why the session went away, got: {reason:?}"
+            );
+        }
+        other => panic!("expected a WS Close frame after teardown, got: {other:?}"),
+    }
+
+    let after = registered_ids(&engine).await;
+    assert!(
+        !after.contains(&sid),
+        "a connect completing after the teardown must not re-register the sid — \
+         nothing could ever unregister it again: {after:?}"
+    );
+    assert!(
+        // convention-token-ok: mlua-swarm public operator role literal.
+        !after.contains(&"main-ai".to_string()),
+        "...nor its role alias: {after:?}"
+    );
+
+    server.shutdown();
+}
+
+/// Single-step `identity` RustFn Blueprint for the pin test below. Routes
+/// through no Operator agent, so the only thing the pin exercises is
+/// launch-time `operator_sid` resolution. (Duplicated rather than shared:
+/// an integration test cannot reach the crate-private original, the same
+/// reason `restart_operator_sid.rs` carries its own copy.)
+fn identity_blueprint() -> Blueprint {
+    Blueprint {
+        schema_version: current_schema_version(),
+        id: "operator-recovery-mint-pin-bp".into(),
+        flow: serde_json::from_value(json!({
+            "kind": "step",
+            "ref": mlua_swarm::worker::baseline::AG_IDENTITY,
+            "in": {"op": "lit", "value": "hello"},
+            "out": {"op": "path", "at": "$.out"},
+        }))
+        .expect("flow parse"),
+        agents: vec![AgentDef {
+            name: mlua_swarm::worker::baseline::AG_IDENTITY.into(),
+            kind: AgentKind::RustFn,
+            spec: json!({"fn_id": mlua_swarm::worker::baseline::AG_IDENTITY}),
+            profile: None,
+            meta: None,
+            runner: None,
+            runner_ref: None,
+            verdict: None,
+            lints: None,
+        }],
+        operators: vec![],
+        metas: vec![],
+        hints: CompilerHints::default(),
+        strategy: CompilerStrategy::default(),
+        metadata: BlueprintMetadata::default(),
+        spawner_hints: Default::default(),
+        default_agent_kind: AgentKind::Operator,
+        default_operator_kind: None,
+        default_init_ctx: None,
+        default_agent_ctx: None,
+        default_context_policy: None,
+        projection_placement: None,
+        audits: vec![],
+        degradation_policy: None,
+        runners: vec![],
+        default_runner: None,
+        subprocesses: vec![],
+        check_policy: None,
+        blueprint_ref_includes: Vec::new(),
+    }
+}
+
+/// The guarantee `restart_operator_sid.rs` established for the *restore*
+/// path, now held for the *mint* path: a sid is a usable `operator_sid` pin
+/// from the moment it is minted, with no WebSocket anywhere.
+///
+/// And the other half of it — being registered is not being reachable, so
+/// the same session still reports `connected: false`.
+#[tokio::test]
+async fn minted_session_is_launch_pinnable_before_any_ws_connect() {
+    let (server, _engine) = spawn_server_with_engine().await;
+    let client = reqwest::Client::new();
+
+    // convention-token-ok: mlua-swarm public operator role literal.
+    let holder = mint(&client, &server.base_url, "main-ai").await;
+    let sid = holder["sid"].as_str().expect("sid").to_string();
+    let token = holder["token"].as_str().expect("token").to_string();
+
+    let launch = client
+        .post(format!("{}/v1/tasks", server.base_url))
+        .json(&json!({
+            "blueprint": { "kind": "inline", "value": identity_blueprint() },
+            // convention-token-ok: mlua-swarm public `POST /v1/tasks` payload field.
+            "init_ctx": {},
+            "operator_sid": sid,
+            "goal": "minted operator session pin",
+        }))
+        .send()
+        .await
+        .expect("pinned launch request");
+    let launch_status = launch.status();
+    let launch_body = launch.text().await.expect("launch body");
+    assert_ne!(
+        launch_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "a minted sid must be a usable pin before any WS connect \
+         (the 400 here is the engine registry not carrying it): {launch_body}"
+    );
+    assert_eq!(
+        launch_status,
+        reqwest::StatusCode::OK,
+        "the pinned launch must run to completion: {launch_body}"
+    );
+
+    let info: serde_json::Value = client
+        .get(format!("{}/v1/operators/{sid}", server.base_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("info request")
+        .json()
+        .await
+        .expect("info json");
+    assert_eq!(
+        info["connected"], false,
+        "registering at mint must not make the session claim to be connected"
     );
 
     server.shutdown();
