@@ -38,7 +38,7 @@
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Path, State,
     },
     http::{HeaderMap, StatusCode},
@@ -46,7 +46,7 @@ use axum::{
     Json,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use mlua_swarm::store::operator_session::OperatorSessionRecord;
+use mlua_swarm::store::operator_session::{OperatorSessionRecord, OperatorSessionStoreError};
 use mlua_swarm::{
     AgentProviderManifest, Engine, Operator, OperatorSpawnerFactory, SeniorBridge, SessionId,
     SpawnHook,
@@ -54,7 +54,8 @@ use mlua_swarm::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::time::Duration;
+use tokio::sync::{mpsc, watch, Mutex};
 
 use super::protocol::{ClientMsg, PendingReply, ServerMsg};
 use super::session::WSOperatorSession;
@@ -392,9 +393,48 @@ pub(crate) async fn restored_operator_session_entry(
     })
 }
 
+/// Reason handed to a torn-down session's parked replies *and* put on the
+/// WS Close frame its client receives. One literal, both audiences.
+const TEARDOWN_REASON: &str = "operator session torn down";
+
+/// Close-frame text for the degenerate case where the reason could not be
+/// read back off the session (it was dropped outright).
+const SESSION_CLOSED_REASON: &str = "operator session closed";
+
+/// How long [`handle_operator_socket`] gives its write task to drain — and,
+/// on a teardown, to flush the Close frame — before aborting it. Only a
+/// sink that refuses to make progress ever reaches this bound; the ordinary
+/// path finishes as soon as the last sender drops.
+const WRITE_TASK_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Resolves once [`WSOperatorSession::close`] has been called on this
+/// session, yielding the reason to hand the client.
+///
+/// `wait_for` inspects the *current* value before parking, so a close
+/// latched before this socket subscribed still resolves immediately — which
+/// is what a socket that upgrades while its session is being torn down
+/// needs, since no second signal is ever sent.
+async fn close_requested(signal: &mut watch::Receiver<Option<Arc<str>>>) -> Arc<str> {
+    match signal.wait_for(|reason| reason.is_some()).await {
+        // The predicate above already established `Some`.
+        Ok(reason) => (*reason)
+            .clone()
+            .unwrap_or_else(|| Arc::from(SESSION_CLOSED_REASON)),
+        // The sender is gone, i.e. the session itself was dropped: there is
+        // nothing left to pump into, so end the socket as well.
+        Err(_) => Arc::from(SESSION_CLOSED_REASON),
+    }
+}
+
 /// Bidirectional pump for a single WS connection, bound to an
 /// `OperatorSessionEntry`. Owns the full wire protocol pump (write task /
 /// read task / `ClientMsg` dispatch / disconnect) for this session.
+///
+/// Both halves also watch the session's close signal
+/// ([`WSOperatorSession::close`]): the write half answers it with a WS
+/// Close frame, the read half stops waiting on a client that may never
+/// reply to one. Without that the local `tx` below outlives the session's
+/// own sender, keeping the channel — and the socket — alive after teardown.
 async fn handle_operator_socket(
     socket: WebSocket,
     state: AppState,
@@ -429,16 +469,42 @@ async fn handle_operator_socket(
     };
 
     let (mut ws_sink, mut ws_stream) = socket.split();
+    let mut write_close_signal = session.close_signal();
+    let mut read_close_signal = session.close_signal();
 
-    // write task: mpsc → WebSocket
-    let write_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let txt = match serde_json::to_string(&msg) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            if ws_sink.send(Message::Text(txt)).await.is_err() {
-                break;
+    // write task: mpsc → WebSocket, until the channel ends or the session
+    // is closed out from under it (which the client is told about).
+    let mut write_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                // Invariant: whenever both branches are ready, close wins.
+                // The `recv()` arm's channel-end exit closes the socket
+                // with no reason, silently degrading the frame below — so
+                // `biased;` is load-bearing here, not an optimisation.
+                biased;
+
+                reason = close_requested(&mut write_close_signal) => {
+                    // A standard Close frame, not a new protocol verb: the
+                    // client already handles this, and the wire shape stays
+                    // exactly as it was.
+                    let _ = ws_sink
+                        .send(Message::Close(Some(CloseFrame {
+                            code: close_code::NORMAL,
+                            reason: reason.to_string().into(),
+                        })))
+                        .await;
+                    break;
+                }
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    let txt = match serde_json::to_string(&msg) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if ws_sink.send(Message::Text(txt)).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         let _ = ws_sink.close().await;
@@ -446,85 +512,129 @@ async fn handle_operator_socket(
 
     // read task: WS message → ClientMsg parse → session.resolve_pending
     let session_for_read = session.clone();
-    let read_result: Result<(), String> = async {
-        while let Some(item) = ws_stream.next().await {
-            match item {
-                Ok(Message::Text(t)) => {
-                    let parsed: ClientMsg = match serde_json::from_str(&t) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    match parsed {
-                        ClientMsg::Answer { req_id, value } => {
-                            session_for_read
-                                .resolve_pending(&req_id, PendingReply::Answer(value))
-                                .await;
-                        }
-                        ClientMsg::HookAck { req_id, ok, reason } => {
-                            session_for_read
-                                .resolve_pending(&req_id, PendingReply::HookAck { ok, reason })
-                                .await;
-                        }
-                        ClientMsg::SpawnAck {
-                            req_id,
-                            value,
-                            ok,
-                            error,
-                            stats,
-                        } => {
-                            session_for_read
-                                .resolve_pending(
-                                    &req_id,
-                                    PendingReply::SpawnAck {
-                                        value,
-                                        ok,
-                                        error,
-                                        stats,
-                                    },
-                                )
-                                .await;
-                        }
-                        ClientMsg::SpawnHalt {
-                            req_id,
-                            value,
-                            reason,
-                        } => {
-                            session_for_read
-                                .resolve_pending(&req_id, PendingReply::SpawnHalt { value, reason })
-                                .await;
-                        }
+    loop {
+        let item = tokio::select! {
+            item = ws_stream.next() => match item {
+                Some(item) => item,
+                None => break,
+            },
+            // The write half is sending the Close frame; a client that
+            // never answers it must not keep this half parked forever.
+            _ = close_requested(&mut read_close_signal) => break,
+        };
+        match item {
+            Ok(Message::Text(t)) => {
+                let parsed: ClientMsg = match serde_json::from_str(&t) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                match parsed {
+                    ClientMsg::Answer { req_id, value } => {
+                        session_for_read
+                            .resolve_pending(&req_id, PendingReply::Answer(value))
+                            .await;
+                    }
+                    ClientMsg::HookAck { req_id, ok, reason } => {
+                        session_for_read
+                            .resolve_pending(&req_id, PendingReply::HookAck { ok, reason })
+                            .await;
+                    }
+                    ClientMsg::SpawnAck {
+                        req_id,
+                        value,
+                        ok,
+                        error,
+                        stats,
+                    } => {
+                        session_for_read
+                            .resolve_pending(
+                                &req_id,
+                                PendingReply::SpawnAck {
+                                    value,
+                                    ok,
+                                    error,
+                                    stats,
+                                },
+                            )
+                            .await;
+                    }
+                    ClientMsg::SpawnHalt {
+                        req_id,
+                        value,
+                        reason,
+                    } => {
+                        session_for_read
+                            .resolve_pending(&req_id, PendingReply::SpawnHalt { value, reason })
+                            .await;
                     }
                 }
-                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => {}
             }
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => {}
         }
-        Ok(())
     }
-    .await;
 
     // Clear only this socket's sender. A reconnect may already have installed
     // a replacement while this older socket was unwinding.
     session.clear_tx_if(&tx).await;
-    write_task.abort();
-    let _ = read_result;
+    // Dropping the last sender is what lets the write task's `rx.recv()`
+    // end on its own — on a teardown exit, only after it has flushed the
+    // Close frame. Aborting straight away would race that frame, which is
+    // the very thing this path exists to deliver; the abort stays as the
+    // backstop for a sink that refuses to drain.
+    drop(tx);
+    if tokio::time::timeout(WRITE_TASK_DRAIN_GRACE, &mut write_task)
+        .await
+        .is_err()
+    {
+        write_task.abort();
+    }
 }
 
 // ─── DELETE /v1/operators/:sid (Bearer required) ────────────────────────────
 
 /// Shared teardown for `DELETE /v1/operators/:sid` (`operators_delete`) and
 /// `DELETE /v1/operators/by-role/:role` (`operators_delete_by_role` — GH #81
-/// Layer 2 (c)): drops the 3 engine registries + role aliases +
-/// `ws_operator_factory` bindings + `operator_sessions` entry, and releases
-/// the sid's ownership in `roles_to_sid`. Idempotent w.r.t. a concurrent
-/// delete — every `remove` / `unregister` is a no-op when the entry is
-/// already gone.
+/// Layer 2 (c)): drops the persisted row, the 3 engine registries + role
+/// aliases + `ws_operator_factory` bindings + `operator_sessions` entry,
+/// releases the sid's ownership in `roles_to_sid`, and closes the session's
+/// socket. Idempotent w.r.t. a concurrent delete — every `remove` /
+/// `unregister` is a no-op when the entry is already gone, and the socket
+/// close is latched (see [`WSOperatorSession::close`]).
+///
+/// # The persisted row goes first
+///
+/// `Err` means **nothing was torn down**: the store still holds the row and
+/// every in-memory map still holds the session, so the caller can answer
+/// `5xx` and the client can retry against a state that never diverged.
+///
+/// Dropping the row afterwards instead — the original order — could not
+/// offer that. A failure there was logged and swallowed because the
+/// in-memory teardown had already happened and could not be rolled back,
+/// which left the row behind for the next boot's restore to resurrect: the
+/// session came back after being deliberately released. Doing the fallible
+/// step first makes that state unreachable rather than merely reported.
+///
+/// `NotFound` stays a success — the concurrent-delete case, same contract
+/// as the map removals below.
 async fn teardown_operator_session(
     state: &AppState,
     sid: &SessionId,
     entry: &Arc<OperatorSessionEntry>,
-) {
+) -> Result<(), OperatorSessionStoreError> {
+    match state.operator_session_store.delete(sid).await {
+        Ok(()) | Err(OperatorSessionStoreError::NotFound(_)) => {}
+        Err(error) => {
+            tracing::error!(
+                %sid, %error,
+                "operator session teardown: persisted row delete failed; \
+                 teardown abandoned, the session stays live"
+            );
+            return Err(error);
+        }
+    }
+
     state.engine.unregister_senior_bridge(sid.as_str()).await;
     state.engine.unregister_spawn_hook(sid.as_str()).await;
     state.engine.unregister_operator(sid.as_str()).await;
@@ -545,7 +655,13 @@ async fn teardown_operator_session(
         // disconnect there is no reconnect/resend contract to preserve —
         // an in-flight spawn parked in `send_and_await` would otherwise
         // orphan until the run's sync timeout (up to 300s) fires.
-        session.fail_pending("operator session torn down").await;
+        session.fail_pending(TEARDOWN_REASON).await;
+        // Same reasoning one step further out: with no reconnect possible,
+        // the socket itself has no future either. Clearing `tx` alone left
+        // the client parked on a live WebSocket that nothing would ever be
+        // routed to again — `close` is what actually ends it (a WS Close
+        // frame, sent by the pump; see `handle_operator_socket`).
+        session.close(TEARDOWN_REASON);
         session.clear_tx().await;
     }
 
@@ -560,25 +676,18 @@ async fn teardown_operator_session(
         }
     }
 
-    // Drop the persisted row too, so a restart does not resurrect a
-    // deliberately torn-down session. Best-effort: `NotFound` is the
-    // idempotent-concurrent-delete case (same contract as the map
-    // removals above), any other failure is logged and swallowed — the
-    // in-memory teardown already happened and must not be rolled back.
-    use mlua_swarm::store::operator_session::OperatorSessionStoreError;
-    match state.operator_session_store.delete(sid).await {
-        Ok(()) | Err(OperatorSessionStoreError::NotFound(_)) => {}
-        Err(error) => {
-            tracing::warn!(%sid, %error, "operator session teardown: persisted row delete failed");
-        }
-    }
+    Ok(())
 }
 
 /// `DELETE /v1/operators/:sid`. Bearer mandatory. `404` on unknown sid, `401`
-/// on token mismatch. Drops the 3 engine registries + role aliases +
-/// `ws_operator_factory` bindings + `operator_sessions` entry, and releases
-/// this sid's ownership in `roles_to_sid` (re-opening the role names for a
-/// future mint).
+/// on token mismatch. Drops the persisted row, the 3 engine registries +
+/// role aliases + `ws_operator_factory` bindings + `operator_sessions`
+/// entry, releases this sid's ownership in `roles_to_sid` (re-opening the
+/// role names for a future mint), and closes the session's socket.
+///
+/// `500` when the persisted row cannot be dropped: the session is then
+/// still live and fully intact (see [`teardown_operator_session`]), and the
+/// call is safe to retry.
 pub async fn operators_delete(
     State(state): State<AppState>,
     Path(sid): Path<String>,
@@ -604,9 +713,27 @@ pub async fn operators_delete(
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
-    teardown_operator_session(&state, &sid, &entry).await;
+    if let Err(error) = teardown_operator_session(&state, &sid, &entry).await {
+        return teardown_failed_response(&sid, &error);
+    }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `500` body shared by both delete routes when
+/// [`teardown_operator_session`] refuses. Says plainly that nothing was
+/// torn down, because that is what makes the call retryable.
+fn teardown_failed_response(sid: &SessionId, error: &OperatorSessionStoreError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": format!("session teardown failed: {error}"),
+            "sid": sid,
+            "hint": "the persisted session row could not be dropped, so the session was \
+                     left intact rather than half torn down; retry once the store is healthy",
+        })),
+    )
+        .into_response()
 }
 
 // ─── GH #81 Layer 2: GET /v1/operators + DELETE /v1/operators/by-role/:role
@@ -674,7 +801,9 @@ pub async fn operators_list(State(state): State<AppState>) -> Response {
 /// session. Same trust tier as the server-shutdown surface
 /// (`mlua_swarm_server_shutdown`): admin observability, no Bearer.
 ///
-/// `404` when no session holds the role, `204` on successful teardown. The
+/// `404` when no session holds the role, `204` on successful teardown, and
+/// `500` when the persisted row could not be dropped (in which case the
+/// session is left fully intact — see [`teardown_operator_session`]). The
 /// response body on `204` is empty (`teardown_operator_session` performs
 /// the same cleanup as `operators_delete`).
 ///
@@ -778,7 +907,9 @@ pub async fn operators_delete_by_role(
             }
         }
     }
-    teardown_operator_session(&state, &sid, &entry).await;
+    if let Err(error) = teardown_operator_session(&state, &sid, &entry).await {
+        return teardown_failed_response(&sid, &error);
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
