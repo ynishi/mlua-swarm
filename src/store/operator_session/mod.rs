@@ -38,9 +38,9 @@ pub use sqlite::SqliteOperatorSessionStore;
 
 /// One persisted Operator login-flow session.
 ///
-/// Field-for-field the durable subset of the server's
-/// `OperatorSessionEntry` — everything except the process-lifetime WS
-/// adapter state (`ws_session`), which is rebuilt empty on reconnect.
+/// Field-for-field the durable subset of the server's `LoginSession` —
+/// everything except the process-lifetime WS adapter state, which is
+/// rebuilt empty on reconnect.
 ///
 /// # The bearer token is never stored
 ///

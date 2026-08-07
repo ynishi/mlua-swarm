@@ -101,7 +101,7 @@ pub use enhance_settings::build_enhance_settings_router;
 pub use issues::{build_issues_router, GetIssueResponse, PostIssueRequest, PostIssueResponse};
 pub use operator_ws::{
     operators_create, operators_delete, operators_delete_by_role, operators_info, operators_list,
-    operators_ws_connect, ClientMsg, OperatorSessionEntry, OperatorsListEntry, OperatorsListResp,
+    operators_ws_connect, ClientMsg, LoginSession, OperatorsListEntry, OperatorsListResp,
     ServerMsg, WSOperatorSession,
 };
 pub use projection::{McpQueryAdapter, ProjectionSource, StepList, StepPathQuery, StepSummary};
@@ -182,10 +182,10 @@ pub struct AppState {
     /// callers can swap in an sqlite/fs backend later (future carry).
     pub data_store: Arc<dyn mlua_swarm::store::output::OutputStore>,
     /// Login-flow session store (`POST /v1/operators` mint records). `sid` →
-    /// `OperatorSessionEntry`. This is the sole session store for the WS
-    /// Operator role. See `operator_ws::login` module doc.
+    /// `LoginSession`. This is the sole session store for the WS Operator
+    /// role. See `operator_ws::login` module doc.
     pub operator_sessions:
-        Arc<Mutex<HashMap<SessionId, Arc<crate::operator_ws::login::OperatorSessionEntry>>>>,
+        Arc<Mutex<HashMap<SessionId, Arc<crate::operator_ws::login::LoginSession>>>>,
     /// S1 login-flow roles-exclusivity map. Role name → owning `sid`. Checked
     /// (and updated) atomically under a single lock in
     /// `operator_ws::login::operators_create` — a role already present here
@@ -462,9 +462,9 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
 pub struct OperatorSessionPersistence {
     /// Write-through target for mint / teardown.
     pub store: Arc<dyn OperatorSessionStore>,
-    /// Login entries rebuilt from `store` at boot, in mint order, each
+    /// Login sessions rebuilt from `store` at boot, in mint order, each
     /// already registered with the engine.
-    pub prepared: Vec<Arc<crate::operator_ws::login::OperatorSessionEntry>>,
+    pub prepared: Vec<Arc<crate::operator_ws::login::LoginSession>>,
 }
 
 impl OperatorSessionPersistence {
@@ -507,7 +507,7 @@ impl OperatorSessionPersistence {
         let mut prepared = Vec::with_capacity(records.len());
         for record in records {
             prepared.push(
-                crate::operator_ws::login::restored_operator_session_entry(
+                crate::operator_ws::login::restored_login_session(
                     engine,
                     ws_operator_factory,
                     base_url.clone(),
@@ -543,25 +543,25 @@ pub fn build_router_full_with_operator_session_persistence(
 ) -> Router {
     let (operator_session_store, restored_sessions): (
         Arc<dyn OperatorSessionStore>,
-        Vec<Arc<crate::operator_ws::login::OperatorSessionEntry>>,
+        Vec<Arc<crate::operator_ws::login::LoginSession>>,
     ) = match operator_session_persistence {
         Some(p) => (p.store, p.prepared),
         None => (Arc::new(InMemoryOperatorSessionStore::new()), Vec::new()),
     };
-    // Seed the login maps from the entries `OperatorSessionPersistence::
+    // Seed the login maps from the sessions `OperatorSessionPersistence::
     // restore` already rebuilt and registered with the engine. Their WS
     // adapter state is process-lifetime by design (see the
     // `operator_session` store module doc), so each restored session sits
     // registered-but-disconnected until the owning client reconnects with
     // its saved sid + token.
-    let mut session_map: HashMap<SessionId, Arc<crate::operator_ws::login::OperatorSessionEntry>> =
+    let mut session_map: HashMap<SessionId, Arc<crate::operator_ws::login::LoginSession>> =
         HashMap::new();
     let mut roles_map: HashMap<OperatorRef, SessionId> = HashMap::new();
-    for entry in restored_sessions {
-        for role in &entry.roles {
-            roles_map.insert(role.clone(), entry.sid.clone());
+    for live in restored_sessions {
+        for role in &live.record().roles {
+            roles_map.insert(role.clone(), live.record().sid.clone());
         }
-        session_map.insert(entry.sid.clone(), entry);
+        session_map.insert(live.record().sid.clone(), live);
     }
     let operator_sessions = Arc::new(Mutex::new(session_map));
     let roles_to_sid = Arc::new(Mutex::new(roles_map));

@@ -774,10 +774,10 @@ operators:                          POST /v1/operators
   - name: "planner_bot"    ◄──┐       { roles: ["planner_bot"],
     kind: MainAi              │         capability_manifest: {...} }  # optional
                               │        → mints sid, reserves alias (+ manifest if sent)
-                              │
-agents:                       │     WS /v1/operators/:sid/ws
-  - name: task-planner        │        → register_operator(
-    spec:                     │            "planner_bot", ws_session)
+                              │        → register_operator("planner_bot", ...)
+agents:                       │
+  - name: task-planner        │     WS /v1/operators/:sid/ws
+    spec:                     │        → attaches the socket (no registration)
       operator_ref: ──────────┘
         "planner_bot"
 ```

@@ -34,11 +34,19 @@
 //!   → { sid, roles, connected }
 //! ```
 //!
-//! `OperatorSessionEntry` is the login-flow record (`AppState.operator_sessions`),
-//! distinct from `mlua_swarm::OperatorSession` (the engine-side
-//! `attach`/session-token record) and from `WSOperatorSession` (the 3-trait WS
-//! session, `session.rs`) — this module owns the mapping `sid → (token, roles,
-//! Option<WSOperatorSession>)` that the login flow is built on.
+//! ## Four types spell "session"; only the first belongs to this module
+//!
+//! - [`LoginSession`] — the value in `AppState.operator_sessions`, keyed by
+//!   `sid`. Pairs the durable record with the WS session that sid
+//!   dispatches through, and is what every route here resolves a request
+//!   to.
+//! - [`mlua_swarm::store::operator_session::OperatorSessionRecord`] — the
+//!   durable half on its own, as persisted and rehydrated at boot.
+//! - [`WSOperatorSession`] — the 3-trait WS session object (`session.rs`):
+//!   the engine's dispatch target, whose sender is the only part that
+//!   tracks connectivity.
+//! - `mlua_swarm::OperatorSession` — the engine-side `attach`/session-token
+//!   record behind `/v1/sessions`. Unrelated to this route family.
 
 use axum::{
     extract::{
@@ -59,69 +67,70 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch};
 
 use super::protocol::{ClientMsg, PendingReply, ServerMsg};
 use super::session::WSOperatorSession;
 use crate::AppState;
 
-/// Login-flow record for a minted Operator session. Held in
-/// `AppState.operator_sessions`, keyed by `sid`.
+/// A minted Operator login session: the durable record plus the WS session
+/// it dispatches through.
 ///
-/// # `ws_session` is `Some` for the whole life of an entry
-///
-/// Both paths that build an entry attach a registered `WSOperatorSession`
-/// before the entry is published: the mint path ([`operators_create`]) and
-/// the boot-time restore path ([`restored_operator_session_entry`]). Both
-/// start it *disconnected* — registered is not reachable — and a
-/// (re)connect only swaps a sender in via `replace_tx`.
-///
-/// [`teardown_operator_session`] deliberately leaves the session on the
-/// entry while closing it, so the invariant holds even for an entry that
-/// has already left `operator_sessions` and is still held by a socket
-/// that upgraded before the teardown. That is what lets
-/// [`handle_operator_socket`] have no "no session yet" branch at all: the
-/// branch used to mint a second session and register it, which — reached
-/// after a teardown — left a registration nothing could ever unregister.
-pub struct OperatorSessionEntry {
-    /// Server-minted session id (typed [`SessionId`] since issue #14).
-    pub sid: SessionId,
-    /// `hex(SHA-256(bearer))` of the auth token required on the WS upgrade
-    /// and admin routes — never the bearer itself, in memory or at rest
-    /// (see [`OperatorSessionRecord`]'s type doc). Compare a presented
-    /// bearer with [`Self::verify_bearer`].
-    pub token_digest: String,
-    /// Role aliases claimed by this session (roles-exclusivity set).
-    pub roles: Vec<OperatorRef>,
-    /// Provider-owned effective capability manifest submitted at join.
-    pub capability_manifest: Option<AgentProviderManifest>,
-    /// GH #81 Layer 2: unix epoch seconds when `POST /v1/operators` minted
-    /// this entry. Surfaced by `GET /v1/operators` so a recovery driver
-    /// can pick the oldest stale session without probing each sid
-    /// individually.
-    pub joined_at_secs: u64,
-    /// The reusable 3-trait session object, attached before this entry is
-    /// published and never removed (see the type doc). Its sender — not
-    /// its presence — is what tracks current connectivity, so a session
-    /// that has never seen a socket reads `connected: false` while being
-    /// fully registered.
-    ///
-    /// The `Option` is what the two constructors and
-    /// [`teardown_operator_session`] agree never to write `None` into; it
-    /// survives only because the alternative is a non-`Option` field that
-    /// every `#[cfg(test)]` fixture would have to build a real session for.
-    pub ws_session: Mutex<Option<Arc<WSOperatorSession>>>,
+/// Held in `AppState.operator_sessions`, keyed by `sid`. The dispatch
+/// target is attached before the value is published and is never
+/// detached — not an `Option`. A teardown closes it in place instead, so
+/// a route that captured this value across the WebSocket upgrade finds
+/// the closed session and is answered with the Close frame the teardown
+/// latched, rather than minting a replacement nothing could unregister.
+pub struct LoginSession {
+    /// Read-only snapshot of the persisted row: a later update replaces the
+    /// whole `LoginSession` in the map rather than writing through this
+    /// field. Its `token_digest` is never read directly —
+    /// [`Self::verify_bearer`] is the one predicate over it.
+    record: OperatorSessionRecord,
+    /// Shared, not owned — the same object the engine's registries hold and a
+    /// teardown latches.
+    dispatch_target: Arc<WSOperatorSession>,
 }
 
-impl OperatorSessionEntry {
-    /// Constant-time check of a presented bearer against
-    /// [`Self::token_digest`] — the sole authentication predicate on every
-    /// Bearer-guarded operator route.
+impl LoginSession {
+    /// Builds the session for `record` and the disconnected
+    /// [`WSOperatorSession`] its sid dispatches through.
+    ///
+    /// `base_url` is the server's public HTTP root, rendered into this
+    /// session's Spawn directives once a socket attaches.
+    pub(crate) fn new(record: OperatorSessionRecord, base_url: Option<Arc<str>>) -> Arc<Self> {
+        let dispatch_target = Arc::new(WSOperatorSession::disconnected_with_base_url(
+            record.sid.clone(),
+            base_url,
+        ));
+        Arc::new(Self {
+            record,
+            dispatch_target,
+        })
+    }
+
+    /// The durable login record this session was minted (or restored) from.
+    pub fn record(&self) -> &OperatorSessionRecord {
+        &self.record
+    }
+
+    /// The WS session the engine dispatches to for this sid.
+    ///
+    /// Held inline rather than as a registry id: `mlua_swarm::OperatorSession`
+    /// persists ids and rebuilds its handles at dispatch time, which does not
+    /// work here — a route that upgraded a socket must keep observing this
+    /// same object after a teardown removed the sid from
+    /// `AppState.operator_sessions`, when a registry lookup would resolve to
+    /// nothing.
+    pub fn dispatch_target(&self) -> &Arc<WSOperatorSession> {
+        &self.dispatch_target
+    }
+
+    /// Constant-time check of a presented bearer against this session's
+    /// stored token digest.
     pub fn verify_bearer(&self, bearer: &str) -> bool {
-        mlua_swarm::types::ct_eq(
-            self.token_digest.as_bytes(),
-            OperatorSessionRecord::digest_of(bearer).as_bytes(),
-        )
+        self.record.verify_bearer(bearer)
     }
 }
 
@@ -174,10 +183,10 @@ pub struct OperatorsCreateResp {
 /// # The bearer exists only inside this function
 ///
 /// The response below is the one and only place the plaintext leaves the
-/// server: everything retained afterwards — the `operator_sessions` entry
+/// server: everything retained afterwards — the `operator_sessions` value
 /// and the persisted [`OperatorSessionRecord`] — holds
 /// `hex(SHA-256(bearer))` instead, and every later check runs
-/// [`OperatorSessionEntry::verify_bearer`] against that digest.
+/// [`OperatorSessionRecord::verify_bearer`] against that digest.
 pub async fn operators_create(
     State(state): State<AppState>,
     Json(req): Json<OperatorsCreateReq>,
@@ -254,6 +263,10 @@ pub async fn operators_create(
         }
     }
 
+    // A clock that cannot answer yields `0`, which `GET /v1/operators`
+    // reads as the oldest possible mint — so such a session is the one a
+    // recovery driver picking "the oldest stale session" always picks,
+    // permanently.
     let joined_at_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -266,12 +279,12 @@ pub async fn operators_create(
     // reserved above are released so the names stay claimable.
     let record = OperatorSessionRecord {
         sid: sid.clone(),
-        token_digest: token_digest.clone(),
+        token_digest,
         roles: roles.clone(),
-        capability_manifest: capability_manifest.clone(),
+        capability_manifest,
         joined_at_secs,
     };
-    if let Err(error) = state.operator_session_store.put(record).await {
+    if let Err(error) = state.operator_session_store.put(record.clone()).await {
         tracing::error!(%sid, %error, "operators_create: session persist failed");
         let mut map = state.roles_to_sid.lock().await;
         for r in &roles {
@@ -287,7 +300,7 @@ pub async fn operators_create(
     }
 
     // Registered here, at mint — the same shape the restore path uses at
-    // boot (see [`restored_operator_session_entry`], which carries the
+    // boot (see [`restored_login_session`], which carries the
     // full "registered is not reachable" rationale). The session starts
     // disconnected: anything sent to it before the client attaches a
     // socket fails loud with `"ws operator disconnected"`.
@@ -309,32 +322,21 @@ pub async fn operators_create(
     // write-through note above), so registration sits on the same side of
     // it as the map insert below, and the failure path above stays exactly
     // as it was: release the roles, answer `500`, leave nothing behind.
-    let ws_session = Arc::new(WSOperatorSession::disconnected_with_base_url(
-        sid.clone(),
-        state.base_url.clone(),
-    ));
+    let live = LoginSession::new(record, state.base_url.clone());
     register_operator_session(
         &state.engine,
         state.ws_operator_factory.as_ref(),
         &sid,
         &roles,
-        &ws_session,
+        live.dispatch_target(),
     )
     .await;
 
-    let entry = Arc::new(OperatorSessionEntry {
-        sid: sid.clone(),
-        token_digest,
-        roles: roles.clone(),
-        capability_manifest,
-        joined_at_secs,
-        ws_session: Mutex::new(Some(ws_session)),
-    });
     state
         .operator_sessions
         .lock()
         .await
-        .insert(sid.clone(), entry);
+        .insert(sid.clone(), live);
 
     (
         StatusCode::OK,
@@ -380,38 +382,39 @@ pub async fn operators_ws_connect(
         return (StatusCode::NOT_FOUND, "unknown sid").into_response();
     };
 
-    let entry = {
+    let live = {
         let map = state.operator_sessions.lock().await;
         map.get(&sid).cloned()
     };
-    let entry = match entry {
+    let live = match live {
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "unknown sid").into_response(),
     };
-    if !entry.verify_bearer(&bearer) {
+    if !live.verify_bearer(&bearer) {
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
-    ws.on_upgrade(move |socket| handle_operator_socket(socket, entry))
+    ws.on_upgrade(move |socket| handle_operator_socket(socket, live))
 }
 
-/// Binds `ws_session` into every registry an Operator session must be
-/// reachable through: the engine's three (`senior_bridge` / `spawn_hook` /
-/// `operator`) under `sid`, the `OperatorSpawnerFactory` when one is wired,
-/// and the operator registries again under each of `roles`.
+/// Binds a session's dispatch target into every registry an Operator
+/// session must be reachable through: the engine's three (`senior_bridge` /
+/// `spawn_hook` / `operator`) under `sid`, the `OperatorSpawnerFactory` when
+/// one is wired, and the operator registries again under each of `roles`.
 ///
 /// The single spelling of that registration, and — since the mint path
 /// took it over from the first-connect arm — the only one. Two callers
 /// reach it, a mint ([`operators_create`]) and the boot-time restore of a
-/// persisted record ([`restored_operator_session_entry`]), and they have to
+/// persisted record ([`restored_login_session`]), and they have to
 /// leave identical registry state, or a session ends up resolvable on one
 /// axis (`GET /v1/operators/:sid`) and missing on another (an
 /// `operator_sid` pin, a role-aliased spawn).
 ///
-/// Both callers run **before** their entry reaches `operator_sessions`, so
-/// every entry is registered by the time anything can look it up. Nothing
-/// on the WS connect path calls this: a connect that races a teardown must
-/// not be able to put a registration back.
+/// Both callers run **before** their [`LoginSession`] reaches
+/// `operator_sessions`, so every one of them is registered by the time
+/// anything can look it up. Nothing on the WS connect path calls this: a
+/// connect that races a teardown must not be able to put a registration
+/// back.
 ///
 /// Role exclusivity is settled at mint time (`operators_create`); this only
 /// binds the aliases it granted.
@@ -420,19 +423,22 @@ async fn register_operator_session(
     ws_operator_factory: Option<&Arc<OperatorSpawnerFactory>>,
     sid: &SessionId,
     roles: &[OperatorRef],
-    ws_session: &Arc<WSOperatorSession>,
+    dispatch_target: &Arc<WSOperatorSession>,
 ) {
     engine
-        .register_senior_bridge(sid.clone(), ws_session.clone() as Arc<dyn SeniorBridge>)
+        .register_senior_bridge(
+            sid.clone(),
+            dispatch_target.clone() as Arc<dyn SeniorBridge>,
+        )
         .await;
     engine
-        .register_spawn_hook(sid.clone(), ws_session.clone() as Arc<dyn SpawnHook>)
+        .register_spawn_hook(sid.clone(), dispatch_target.clone() as Arc<dyn SpawnHook>)
         .await;
     engine
-        .register_operator(sid.clone(), ws_session.clone() as Arc<dyn Operator>)
+        .register_operator(sid.clone(), dispatch_target.clone() as Arc<dyn Operator>)
         .await;
     if let Some(factory) = ws_operator_factory {
-        factory.register_operator(sid.clone(), ws_session.clone() as Arc<dyn Operator>);
+        factory.register_operator(sid.clone(), dispatch_target.clone() as Arc<dyn Operator>);
     }
     for role in roles {
         // The registries are keyed by plain strings (a sid and a role alias
@@ -441,20 +447,20 @@ async fn register_operator_session(
         if let Some(factory) = ws_operator_factory {
             factory.register_operator(
                 role.as_str().to_string(),
-                ws_session.clone() as Arc<dyn Operator>,
+                dispatch_target.clone() as Arc<dyn Operator>,
             );
         }
         engine
             .register_operator(
                 role.as_str().to_string(),
-                ws_session.clone() as Arc<dyn Operator>,
+                dispatch_target.clone() as Arc<dyn Operator>,
             )
             .await;
     }
 }
 
-/// Builds the `operator_sessions` entry for a persisted login record and
-/// registers it — the boot-time half of session persistence, called from
+/// Builds the [`LoginSession`] for a persisted login record and registers
+/// it — the boot-time half of session persistence, called from
 /// [`crate::OperatorSessionPersistence::restore`].
 ///
 /// Restoring the login maps alone leaves a window between boot and the
@@ -474,32 +480,22 @@ async fn register_operator_session(
 ///
 /// [`operators_create`] does the same thing at mint time, so this is the
 /// restore half of one shared shape rather than a special case.
-pub(crate) async fn restored_operator_session_entry(
+pub(crate) async fn restored_login_session(
     engine: &Engine,
     ws_operator_factory: Option<&Arc<OperatorSpawnerFactory>>,
     base_url: Option<Arc<str>>,
     record: OperatorSessionRecord,
-) -> Arc<OperatorSessionEntry> {
-    let ws_session = Arc::new(WSOperatorSession::disconnected_with_base_url(
-        record.sid.clone(),
-        base_url,
-    ));
+) -> Arc<LoginSession> {
+    let live = LoginSession::new(record, base_url);
     register_operator_session(
         engine,
         ws_operator_factory,
-        &record.sid,
-        &record.roles,
-        &ws_session,
+        &live.record().sid,
+        &live.record().roles,
+        live.dispatch_target(),
     )
     .await;
-    Arc::new(OperatorSessionEntry {
-        sid: record.sid,
-        token_digest: record.token_digest,
-        roles: record.roles,
-        capability_manifest: record.capability_manifest,
-        joined_at_secs: record.joined_at_secs,
-        ws_session: Mutex::new(Some(ws_session)),
-    })
+    live
 }
 
 /// Reason handed to a torn-down session's parked replies *and* put on the
@@ -535,8 +531,8 @@ async fn close_requested(signal: &mut watch::Receiver<Option<Arc<str>>>) -> Arc<
     }
 }
 
-/// Bidirectional pump for a single WS connection, bound to an
-/// `OperatorSessionEntry`. Owns the full wire protocol pump (write task /
+/// Bidirectional pump for a single WS connection, bound to a
+/// [`LoginSession`]. Owns the full wire protocol pump (write task /
 /// read task / `ClientMsg` dispatch / disconnect) for this session.
 ///
 /// Both halves also watch the session's close signal
@@ -544,29 +540,20 @@ async fn close_requested(signal: &mut watch::Receiver<Option<Arc<str>>>) -> Arc<
 /// Close frame, the read half stops waiting on a client that may never
 /// reply to one. Without that the local `tx` below outlives the session's
 /// own sender, keeping the channel — and the socket — alive after teardown.
-async fn handle_operator_socket(socket: WebSocket, entry: Arc<OperatorSessionEntry>) {
+async fn handle_operator_socket(socket: WebSocket, live: Arc<LoginSession>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
 
-    // Attach to the session this entry has carried since it was built —
-    // mint and restore both register one up front, and teardown leaves it
-    // in place (see [`OperatorSessionEntry`]'s type doc). First connect and
-    // reconnect are therefore the same operation: swap `tx` in, touch no
-    // registry.
+    // Attach to the dispatch target this session has carried since it was
+    // built (see [`LoginSession`]'s type doc). First connect and reconnect
+    // are therefore the same operation: swap `tx` in, touch no registry.
     //
     // A socket whose upgrade completed just before its session was torn
-    // down arrives here too, holding the removed entry. It finds the
-    // closed session, swaps its sender in, and is answered below with the
-    // Close frame teardown latched — instead of minting a replacement
-    // session and registering it behind teardown's back.
-    let Some(session) = entry.ws_session.lock().await.clone() else {
-        // Unreachable by the invariant above; refuse rather than
-        // re-introduce the registration site that made it necessary.
-        tracing::error!(
-            sid = %entry.sid,
-            "operator ws: session entry carried no WSOperatorSession; dropping the socket"
-        );
-        return;
-    };
+    // down arrives here too, holding a value that has already left
+    // `operator_sessions`. It finds the closed session, swaps its sender
+    // in, and is answered below with the Close frame teardown latched —
+    // instead of minting a replacement session and registering it behind
+    // teardown's back.
+    let session = live.dispatch_target();
     session.replace_tx(tx.clone()).await;
 
     let (mut ws_sink, mut ws_stream) = socket.split();
@@ -722,7 +709,7 @@ async fn handle_operator_socket(socket: WebSocket, entry: Arc<OperatorSessionEnt
 async fn teardown_operator_session(
     state: &AppState,
     sid: &SessionId,
-    entry: &Arc<OperatorSessionEntry>,
+    live: &Arc<LoginSession>,
 ) -> Result<(), OperatorSessionStoreError> {
     match state.operator_session_store.delete(sid).await {
         Ok(()) | Err(OperatorSessionStoreError::NotFound(_)) => {}
@@ -742,50 +729,52 @@ async fn teardown_operator_session(
     if let Some(factory) = &state.ws_operator_factory {
         factory.unregister_operator(sid.as_str());
     }
-    for role in &entry.roles {
+    // The role key unregister above is unconditional, while the
+    // `roles_to_sid` release below is guarded by ownership. That asymmetry
+    // is reachable today — a role re-minted to another sid between this
+    // teardown's start and here loses its registry binding to a teardown
+    // that no longer owns the name. Making the two predicates symmetric
+    // belongs to the RoleGrant lifecycle work, not here: this teardown's
+    // call shapes are deliberately frozen.
+    for role in &live.record().roles {
         state.engine.unregister_operator(role.as_str()).await;
         if let Some(factory) = &state.ws_operator_factory {
             factory.unregister_operator(role.as_str());
         }
     }
 
-    // Cloned out, not taken. Taking it would put `None` back on an entry
-    // that a socket may still be holding — a socket that upgraded before
-    // this teardown and has not reached `handle_operator_socket` yet. That
-    // socket would then find an empty slot, which is precisely the state
-    // the old first-connect arm answered by registering a fresh session
-    // nothing could unregister. Leaving the session in place means it
-    // finds the closed one instead and is shut down by the latch below.
+    // Closed in place, never detached. A socket that upgraded before this
+    // teardown and has not reached `handle_operator_socket` yet still holds
+    // this `LoginSession`, and must find the closed session rather than an
+    // empty slot — an empty slot is precisely the state the old
+    // first-connect arm answered by registering a fresh session nothing
+    // could unregister. It finds the closed one instead and is shut down by
+    // the latch below.
     //
-    // Idempotent w.r.t. a repeat teardown on the same entry: `fail_pending`
-    // drains an already-empty map, `close` re-latches the same reason, and
-    // `clear_tx` is a plain `None` write.
-    let session = {
-        let guard = entry.ws_session.lock().await;
-        guard.clone()
-    };
-    if let Some(session) = session {
-        // B-2: fail every parked spawn/ask/hook_before on this session
-        // right away. Teardown removes the session from `operator_sessions`
-        // below (no reconnect can find it again), so unlike a plain WS
-        // disconnect there is no reconnect/resend contract to preserve —
-        // an in-flight spawn parked in `send_and_await` would otherwise
-        // orphan until the run's sync timeout (up to 300s) fires.
-        session.fail_pending(TEARDOWN_REASON).await;
-        // Same reasoning one step further out: with no reconnect possible,
-        // the socket itself has no future either. Clearing `tx` alone left
-        // the client parked on a live WebSocket that nothing would ever be
-        // routed to again — `close` is what actually ends it (a WS Close
-        // frame, sent by the pump; see `handle_operator_socket`).
-        session.close(TEARDOWN_REASON);
-        session.clear_tx().await;
-    }
+    // Idempotent w.r.t. a repeat teardown on the same session:
+    // `fail_pending` drains an already-empty map, `close` re-latches the
+    // same reason, and `clear_tx` is a plain `None` write.
+    let session = live.dispatch_target();
+    // B-2: fail every parked spawn/ask/hook_before on this session right
+    // away. Teardown removes the session from `operator_sessions` below (no
+    // reconnect can find it again), so unlike a plain WS disconnect there
+    // is no reconnect/resend contract to preserve — an in-flight spawn
+    // parked in `send_and_await` would otherwise orphan until the run's
+    // sync timeout (up to 300s) fires.
+    session.fail_pending(TEARDOWN_REASON).await;
+    // Same reasoning one step further out: with no reconnect possible, the
+    // socket itself has no future either. Clearing `tx` alone left the
+    // client parked on a live WebSocket that nothing would ever be routed
+    // to again — `close` is what actually ends it (a WS Close frame, sent
+    // by the pump; see `handle_operator_socket`).
+    session.close(TEARDOWN_REASON);
+    session.clear_tx().await;
 
     state.operator_sessions.lock().await.remove(sid);
 
     {
         let mut map = state.roles_to_sid.lock().await;
-        for role in &entry.roles {
+        for role in &live.record().roles {
             if map.get(role.as_str()) == Some(sid) {
                 map.remove(role.as_str());
             }
@@ -817,19 +806,19 @@ pub async fn operators_delete(
         return (StatusCode::NOT_FOUND, "unknown sid").into_response();
     };
 
-    let entry = {
+    let live = {
         let map = state.operator_sessions.lock().await;
         map.get(&sid).cloned()
     };
-    let entry = match entry {
+    let live = match live {
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "unknown sid").into_response(),
     };
-    if !entry.verify_bearer(&bearer) {
+    if !live.verify_bearer(&bearer) {
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
-    if let Err(error) = teardown_operator_session(&state, &sid, &entry).await {
+    if let Err(error) = teardown_operator_session(&state, &sid, &live).await {
         return teardown_failed_response(&sid, &error);
     }
 
@@ -865,7 +854,7 @@ pub struct OperatorsListEntry {
     /// Role aliases held by this session.
     pub roles: Vec<OperatorRef>,
     /// Unix epoch seconds when the session minted (from
-    /// [`OperatorSessionEntry::joined_at_secs`]).
+    /// [`OperatorSessionRecord::joined_at_secs`]).
     pub joined_at_secs: u64,
     /// Whether a WS is currently attached to this session (matches the
     /// `connected` field on `GET /v1/operators/:sid`).
@@ -887,21 +876,17 @@ pub struct OperatorsListResp {
 /// without probing every sid individually via `GET /v1/operators/:sid`,
 /// which was the pre-#81 recovery gap.
 pub async fn operators_list(State(state): State<AppState>) -> Response {
-    let entries: Vec<(SessionId, Arc<OperatorSessionEntry>)> = {
+    let entries: Vec<(SessionId, Arc<LoginSession>)> = {
         let map = state.operator_sessions.lock().await;
         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     };
     let mut operators = Vec::with_capacity(entries.len());
-    for (sid, entry) in entries {
-        let session = entry.ws_session.lock().await.clone();
-        let connected = match session {
-            Some(session) => session.is_connected().await,
-            None => false,
-        };
+    for (sid, live) in entries {
+        let connected = live.dispatch_target().is_connected().await;
         operators.push(OperatorsListEntry {
             sid,
-            roles: entry.roles.clone(),
-            joined_at_secs: entry.joined_at_secs,
+            roles: live.record().roles.clone(),
+            joined_at_secs: live.record().joined_at_secs,
             connected,
         });
     }
@@ -966,11 +951,11 @@ pub async fn operators_delete_by_role(
             }
         }
     };
-    let entry = {
+    let live = {
         let map = state.operator_sessions.lock().await;
         map.get(&sid).cloned()
     };
-    let entry = match entry {
+    let live = match live {
         Some(e) => e,
         None => {
             // The role was mapped to a sid that has no matching
@@ -990,7 +975,7 @@ pub async fn operators_delete_by_role(
             //
             // That residue is bounded rather than permanent. The persisted
             // row survives it (`put` had succeeded and no `delete` ran), so
-            // the next boot's `restored_operator_session_entry` registers
+            // the next boot's `restored_login_session` registers
             // the same sid and roles over the stale keys and this time
             // publishes a real entry. Until then nothing outside the
             // process can name the sid: the response carrying it was never
@@ -1049,7 +1034,7 @@ pub async fn operators_delete_by_role(
             }
         }
     }
-    if let Err(error) = teardown_operator_session(&state, &sid, &entry).await {
+    if let Err(error) = teardown_operator_session(&state, &sid, &live).await {
         return teardown_failed_response(&sid, &error);
     }
     StatusCode::NO_CONTENT.into_response()
@@ -1114,29 +1099,25 @@ pub async fn operators_info(
         return (StatusCode::NOT_FOUND, "unknown sid").into_response();
     };
 
-    let entry = {
+    let live = {
         let map = state.operator_sessions.lock().await;
         map.get(&sid).cloned()
     };
-    let entry = match entry {
+    let live = match live {
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "unknown sid").into_response(),
     };
-    if !entry.verify_bearer(&bearer) {
+    if !live.verify_bearer(&bearer) {
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
 
-    let session = entry.ws_session.lock().await.clone();
-    let connected = match session {
-        Some(session) => session.is_connected().await,
-        None => false,
-    };
+    let connected = live.dispatch_target().is_connected().await;
     (
         StatusCode::OK,
         Json(OperatorsInfoResp {
-            sid: entry.sid.clone(),
-            roles: entry.roles.clone(),
-            capability_manifest: entry.capability_manifest.clone(),
+            sid: live.record().sid.clone(),
+            roles: live.record().roles.clone(),
+            capability_manifest: live.record().capability_manifest.clone(),
             connected,
         }),
     )
@@ -1147,6 +1128,7 @@ pub async fn operators_info(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use tokio::sync::Mutex;
 
     fn headers_with_bearer(token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -1251,24 +1233,27 @@ mod tests {
             }
         }
 
-        /// Seed one live session holding `role` (no WS attached — teardown
-        /// and the guard both work off the login record).
+        /// Seed one live session holding `role`. Its dispatch target has
+        /// never seen a socket; teardown and the guard both work off the
+        /// login record.
         async fn seed_session(state: &AppState, role: &str) -> SessionId {
             let role = OperatorRef::new(role).expect("test role literal is never empty");
             let sid = SessionId::new();
-            let entry = Arc::new(OperatorSessionEntry {
-                sid: sid.clone(),
-                token_digest: OperatorSessionRecord::digest_of("token"),
-                roles: vec![role.clone()],
-                capability_manifest: None,
-                joined_at_secs: 0,
-                ws_session: Mutex::new(None),
-            });
+            let live = LoginSession::new(
+                OperatorSessionRecord {
+                    sid: sid.clone(),
+                    token_digest: OperatorSessionRecord::digest_of("token"),
+                    roles: vec![role.clone()],
+                    capability_manifest: None,
+                    joined_at_secs: 0,
+                },
+                None,
+            );
             state
                 .operator_sessions
                 .lock()
                 .await
-                .insert(sid.clone(), entry);
+                .insert(sid.clone(), live);
             state.roles_to_sid.lock().await.insert(role, sid.clone());
             sid
         }
@@ -1413,9 +1398,10 @@ mod tests {
     /// Driving that interleaving through a live server is not something a
     /// test can order (the gap is between hyper writing `101` and running
     /// the upgrade callback), so it is pinned structurally instead: mint
-    /// publishes an entry that already carries a registered session, and
-    /// teardown leaves that session on the entry. A late socket therefore
-    /// always finds one, and the only thing it can do is `replace_tx`.
+    /// publishes a [`LoginSession`] whose dispatch target is already
+    /// registered, and teardown closes that target in place. A late socket
+    /// therefore always finds it, and the only thing it can do is
+    /// `replace_tx`.
     mod registration_is_owned_by_mint {
         use super::by_role_in_flight::{body_json, test_state};
         use super::*;
@@ -1437,8 +1423,10 @@ mod tests {
             SessionId::parse(body["sid"].as_str().expect("sid").to_string()).expect("parse sid")
         }
 
-        /// Half 1: minting registers, and publishes an entry that already
-        /// carries the session. Nothing is left for a connect to do.
+        /// Half 1: minting registers, and publishes a session whose
+        /// dispatch target is already attached. Nothing is left for a
+        /// connect to do. That the target is present is carried by the type
+        /// now, so what is checked here is the registry membership.
         #[tokio::test]
         async fn mint_publishes_an_entry_that_already_carries_a_registered_session() {
             let state = test_state();
@@ -1455,43 +1443,38 @@ mod tests {
                 "mint must register the role alias too: {registered:?}"
             );
 
-            let entry = state
-                .operator_sessions
-                .lock()
-                .await
-                .get(&sid)
-                .cloned()
-                .expect("mint must insert the entry");
             assert!(
-                entry.ws_session.lock().await.is_some(),
-                "the entry must be published with its session already attached — \
-                 a `None` here is the state the deleted first-connect arm existed \
-                 to answer, and it answered it by registering a second session"
+                state.operator_sessions.lock().await.contains_key(&sid),
+                "mint must publish the session it registered"
             );
         }
 
-        /// Half 2: teardown closes the session but leaves it on the entry,
-        /// so a socket still holding that entry finds it and is answered
-        /// with the latched Close — rather than finding an empty slot.
+        /// Half 2: teardown closes the dispatch target but leaves it on the
+        /// session, so a socket still holding that session finds the very
+        /// same object and is answered with the latched Close — rather than
+        /// finding an empty slot.
         #[tokio::test]
         async fn teardown_leaves_the_closed_session_on_the_entry() {
             let state = test_state();
             let sid = mint(&state).await;
-            let entry = state
+            let live = state
                 .operator_sessions
                 .lock()
                 .await
                 .get(&sid)
                 .cloned()
-                .expect("mint must insert the entry");
+                .expect("mint must publish the session");
+            // Stands in for the handle a socket grabbed in
+            // `operators_ws_connect` before the teardown ran.
+            let captured = live.dispatch_target().clone();
 
-            teardown_operator_session(&state, &sid, &entry)
+            teardown_operator_session(&state, &sid, &live)
                 .await
                 .expect("teardown must succeed against a healthy store");
 
             assert!(
                 !state.operator_sessions.lock().await.contains_key(&sid),
-                "teardown must remove the entry from the map"
+                "teardown must remove the session from the map"
             );
             let registered = state.engine.list_operator_ids().await;
             assert!(
@@ -1499,13 +1482,13 @@ mod tests {
                 "teardown must unregister both the sid and its role: {registered:?}"
             );
 
-            // This `entry` clone stands in for the one a socket grabbed in
-            // `operators_ws_connect` before the teardown ran.
-            let session = entry.ws_session.lock().await.clone().expect(
-                "teardown must leave the session on the entry: a socket that \
-                 upgraded before it would otherwise reach `handle_operator_socket` \
-                 with nothing to attach to",
+            assert!(
+                Arc::ptr_eq(&captured, live.dispatch_target()),
+                "teardown must leave the same dispatch target in place: a socket \
+                 that upgraded before it observes the close through the handle it \
+                 already holds, so a replacement object would be invisible to it"
             );
+            let session = captured;
             let mut signal = session.close_signal();
             assert!(
                 signal.borrow_and_update().is_some(),
@@ -1518,25 +1501,25 @@ mod tests {
             );
         }
 
-        /// A repeat teardown on the same entry stays a no-op. Keeping the
-        /// session in place (rather than taking it) must not turn the
-        /// second call into a second round of side effects.
+        /// A repeat teardown on the same session stays a no-op. Keeping the
+        /// dispatch target in place (rather than detaching it) must not turn
+        /// the second call into a second round of side effects.
         #[tokio::test]
         async fn a_repeated_teardown_is_still_idempotent() {
             let state = test_state();
             let sid = mint(&state).await;
-            let entry = state
+            let live = state
                 .operator_sessions
                 .lock()
                 .await
                 .get(&sid)
                 .cloned()
-                .expect("mint must insert the entry");
+                .expect("mint must publish the session");
 
-            teardown_operator_session(&state, &sid, &entry)
+            teardown_operator_session(&state, &sid, &live)
                 .await
                 .expect("first teardown");
-            teardown_operator_session(&state, &sid, &entry)
+            teardown_operator_session(&state, &sid, &live)
                 .await
                 .expect("a repeat teardown must still report success");
 

@@ -4,7 +4,7 @@
 //! The provider returns untrusted receipts; validation and digest ownership
 //! remain in `mlua-swarm` Core.
 
-use crate::operator_ws::login::OperatorSessionEntry;
+use crate::operator_ws::login::LoginSession;
 use async_trait::async_trait;
 use mlua_swarm::{
     AgentBindingProvider, BindOutcome, BindReceipt, BindRequest, BindingBackend,
@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 
 /// Binding provider backed by live Operator login records.
 pub struct OperatorSessionBindingProvider {
-    operator_sessions: Arc<Mutex<HashMap<SessionId, Arc<OperatorSessionEntry>>>>,
+    operator_sessions: Arc<Mutex<HashMap<SessionId, Arc<LoginSession>>>>,
     roles_to_sid: Arc<Mutex<HashMap<OperatorRef, SessionId>>>,
     /// Run-scoped session pin (`operator_sid` on the launch). `Some`
     /// resolves manifests through this session and never consults
@@ -29,7 +29,7 @@ impl OperatorSessionBindingProvider {
     /// Bind the provider to the same session and role maps used by the
     /// Operator REST/WebSocket login flow.
     pub fn new(
-        operator_sessions: Arc<Mutex<HashMap<SessionId, Arc<OperatorSessionEntry>>>>,
+        operator_sessions: Arc<Mutex<HashMap<SessionId, Arc<LoginSession>>>>,
         roles_to_sid: Arc<Mutex<HashMap<OperatorRef, SessionId>>>,
     ) -> Self {
         Self {
@@ -96,13 +96,13 @@ impl OperatorSessionBindingProvider {
             Some(_) => format!("run-scoped pin (declared binding target '{target}')"),
             None => format!("binding target '{target}'"),
         };
-        let Some(entry) = self.operator_sessions.lock().await.get(&sid).cloned() else {
+        let Some(live) = self.operator_sessions.lock().await.get(&sid).cloned() else {
             return Ok(BindOutcome::Unbound {
                 agent: request.agent.clone(),
                 reason: format!("Operator session '{sid}' for {via} disappeared"),
             });
         };
-        let Some(manifest) = entry.capability_manifest.as_ref() else {
+        let Some(manifest) = live.record().capability_manifest.as_ref() else {
             return Ok(BindOutcome::Unbound {
                 agent: request.agent.clone(),
                 reason: format!(
@@ -200,15 +200,17 @@ mod tests {
 
     async fn provider(manifest: Option<AgentProviderManifest>) -> OperatorSessionBindingProvider {
         let sid = SessionId::new();
-        let entry = Arc::new(OperatorSessionEntry {
-            sid: sid.clone(),
-            token_digest: OperatorSessionRecord::digest_of("token"),
-            roles: vec![role("main-ai")],
-            capability_manifest: manifest,
-            joined_at_secs: 0,
-            ws_session: Mutex::new(None),
-        });
-        let sessions = Arc::new(Mutex::new(HashMap::from([(sid.clone(), entry)])));
+        let live = LoginSession::new(
+            OperatorSessionRecord {
+                sid: sid.clone(),
+                token_digest: OperatorSessionRecord::digest_of("token"),
+                roles: vec![role("main-ai")],
+                capability_manifest: manifest,
+                joined_at_secs: 0,
+            },
+            None,
+        );
+        let sessions = Arc::new(Mutex::new(HashMap::from([(sid.clone(), live)])));
         let roles = Arc::new(Mutex::new(HashMap::from([(role("main-ai"), sid)])));
         OperatorSessionBindingProvider::new(sessions, roles)
     }
@@ -301,22 +303,26 @@ mod tests {
         };
         let role_holder_sid = SessionId::new();
         let pinned_sid = SessionId::new();
-        let role_holder = Arc::new(OperatorSessionEntry {
-            sid: role_holder_sid.clone(),
-            token_digest: OperatorSessionRecord::digest_of("token"),
-            roles: vec![role("main-ai")],
-            capability_manifest: None,
-            joined_at_secs: 0,
-            ws_session: Mutex::new(None),
-        });
-        let pinned = Arc::new(OperatorSessionEntry {
-            sid: pinned_sid.clone(),
-            token_digest: OperatorSessionRecord::digest_of("token"),
-            roles: Vec::new(),
-            capability_manifest: Some(manifest),
-            joined_at_secs: 0,
-            ws_session: Mutex::new(None),
-        });
+        let role_holder = LoginSession::new(
+            OperatorSessionRecord {
+                sid: role_holder_sid.clone(),
+                token_digest: OperatorSessionRecord::digest_of("token"),
+                roles: vec![role("main-ai")],
+                capability_manifest: None,
+                joined_at_secs: 0,
+            },
+            None,
+        );
+        let pinned = LoginSession::new(
+            OperatorSessionRecord {
+                sid: pinned_sid.clone(),
+                token_digest: OperatorSessionRecord::digest_of("token"),
+                roles: Vec::new(),
+                capability_manifest: Some(manifest),
+                joined_at_secs: 0,
+            },
+            None,
+        );
         let sessions = Arc::new(Mutex::new(HashMap::from([
             (role_holder_sid.clone(), role_holder),
             (pinned_sid.clone(), pinned),

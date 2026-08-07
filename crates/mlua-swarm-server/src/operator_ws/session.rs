@@ -60,7 +60,7 @@ impl WSOperatorSession {
     /// Production has no such constructor any more: every session is born
     /// disconnected via [`Self::disconnected_with_base_url`] — at mint
     /// (`login::operators_create`) or at boot
-    /// (`login::restored_operator_session_entry`) — and acquires its sender
+    /// (`login::restored_login_session`) — and acquires its sender
     /// through [`Self::replace_tx`] when a socket attaches. This used to be
     /// the first-connect constructor in `login::handle_operator_socket`;
     /// that arm registered the session it built, which is exactly what a
