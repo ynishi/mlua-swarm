@@ -132,8 +132,38 @@ pub trait OperatorSessionStore: Send + Sync {
     /// Delete the row for `sid`. `NotFound` when no such row exists.
     async fn delete(&self, sid: &SessionId) -> Result<(), OperatorSessionStoreError>;
 
-    /// List every persisted session, ascending by `joined_at_secs` (mint
-    /// order, stable for deterministic rehydration).
+    /// List the sessions this store can decode, ascending by
+    /// `joined_at_secs` (mint order, stable for deterministic rehydration).
+    ///
+    /// # Contract: per row, not all-or-nothing
+    ///
+    /// A backend that decodes at-rest bytes back into
+    /// [`OperatorSessionRecord`] **must not** let one undecodable row fail
+    /// the whole call. Such a row is skipped and reported with a
+    /// `tracing::warn!` naming the row and the field that failed; the
+    /// intact rows are still returned. An `Err` from this method therefore
+    /// means the *backend* failed (the file is unreadable, the connection
+    /// is gone) — never that one stored session went bad.
+    ///
+    /// This matters because the sole caller is boot-time rehydration, and
+    /// its own error path is fatal: an `Err` here takes `mse serve` down
+    /// and every healthy session with it. Undecodable rows are reachable
+    /// in practice — an older build could persist shapes a newer one
+    /// rejects (`roles: [""]` predates the [`OperatorRef`] typing) — so
+    /// all-or-nothing decoding means one stale row bricks the boot.
+    ///
+    /// Skipping the row rather than defaulting the field is deliberate: a
+    /// session restored minus its role aliases would come back claiming
+    /// less than it was minted with, and would fail later, elsewhere, and
+    /// quietly. Dropping it is the observable choice.
+    ///
+    /// # Backends that never decode
+    ///
+    /// [`InMemoryOperatorSessionStore`] holds live
+    /// [`OperatorSessionRecord`]s, so no row of its can be undecodable and
+    /// it never skips anything. That is consistent with the contract, not
+    /// an exemption from it: "the sessions this store can decode" is every
+    /// session it holds.
     async fn list(&self) -> Result<Vec<OperatorSessionRecord>, OperatorSessionStoreError>;
 }
 
