@@ -1172,8 +1172,7 @@ async fn tasks_start(
 /// therefore drops the *wait*, not the run — before this, dropping the
 /// request future dropped the driver with it, and any `/v1/worker/submit`
 /// that arrived afterwards was written into `EngineState` with no reader
-/// left to fold it (the Run then sat `Running` until the stale-run
-/// sweeper reaped it).
+/// left to fold it (the Run then sat `Running` until the next boot sweep).
 ///
 /// # GH #37 — detached launch (`detach: true`)
 ///

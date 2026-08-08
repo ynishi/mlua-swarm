@@ -167,54 +167,36 @@ not yet attached would have its handle burn out while the Run
 waits for it, so the actual resume kick is the operator's
 responsibility (see the "Deferred" note below).
 
-## Stale run sweep
+## A `Running` Run without an attached client
 
-The boot sweep only fires at process start, and the shutdown
-drain only when the server exits cleanly. Neither covers a run
-driver that stops advancing its Run without ever reaching a
-terminal write — a driver task killed outside the panic guard, for
-instance. Such a Run stays `Running` with nobody left to advance
-it, and until the next restart it was not even resumable (resume
-only accepts `Interrupted`).
+A Run that sits in `Running` with nobody watching it is the normal
+shape of a detached run, not an orphan. Client disconnect does not
+stall it: every launch / rekick driver runs on its own spawned
+task, so dropping the request future (a `curl` timeout, an aborted
+tool call) drops only the handler's wait for the result. The run
+keeps going to its terminal status, and a `/v1/worker/submit` that
+lands after the disconnect is folded normally. A driver that panics
+is caught by the panic guard and finalized `Interrupted` rather
+than left `Running`.
 
-Client disconnect is **not** one of those cases: every launch /
-rekick driver runs on its own spawned task, so dropping the
-request future (a `curl` timeout, an aborted tool call) drops only
-the handler's wait for the result. The run itself keeps going to
-its terminal status, and a `/v1/worker/submit` that lands after
-the disconnect is folded normally.
+So a Run needs outside help only once it has lost the driver that
+owns it, and the two paths above cover the ordinary way that
+happens — the process went away: the boot sweep marks the
+leftovers `Interrupted` on the next start, and
+`POST /v1/runs/<id>/resume` picks any `Interrupted` Run back up.
+Nothing reaps a live Run on an idle timer — idle time is not
+evidence that a Run has lost its driver.
 
-`mse serve` therefore runs a periodic sweep alongside the server:
-
-1. Every 60s it walks `RunStore::list_running` and computes each
-   Run's idle time from `updated_at`. Every store write on the
-   live path (step-entry append, status update, result write)
-   bumps that column, so it tracks actual driver progress.
-2. A Run idle for longer than `stale_run_sweep_secs` is
-   transitioned `Running -> Interrupted` with a **compare-and-set**,
-   its `result_ref` set to
-   `{"error":"orphaned: no driver progress for <n>s"}`, its owning
-   Task marked `Interrupted`, and a `core.run_finished` event
-   (`{"status":"interrupted","reason":"stale run sweep"}`) appended
-   to the trace stream. The owning Run is then resumable through the
-   ordinary `POST /v1/runs/<id>/resume` endpoint — no restart
-   involved.
-3. Losing the compare-and-set means the Run left `Running` between
-   the scan and the write (it finalized on its own), so the sweep
-   leaves it untouched. A Run that reached a terminal status can
-   never be clobbered by the sweep.
-
-The threshold defaults to `max(sync_timeout_secs, run ttl) + 300`
-= 3900s out of the box: those two are the structural ceilings on
-how long a live Run can legitimately stay quiet, so anything past
-them plus a margin has no driver left. Set
-`stale_run_sweep_secs` (config file or `--stale-run-sweep-secs`)
-to tune it, or `0` to disable the sweep entirely. Worst-case
-detection latency is the threshold plus one 60s period.
-
-Every store error inside a sweep tick is logged and swallowed —
-a persistence hiccup must not take the server down — and the
-sweep, like the boot one, never re-dispatches on its own.
+A driver that is alive but stuck bounds itself: every launch and
+rekick driver carries its own ceiling (`sync_timeout_secs` for a
+sync launch, the run TTL for a detached one) and finalizes the Run
+`Failed` when it expires. And if a row is somehow left `Running`
+with no driver behind it at all — a store fault on the resume /
+rerun-from path can leave that shape — `POST /v1/runs/<id>/cancel`
+is the manual terminalizer; it moves the row to `Cancelled`, which
+`rerun_from` accepts as a starting point. Reach for it only for a
+run you know has lost its driver, never to hurry a healthy long
+one along.
 
 ## Deferred pieces
 
@@ -247,5 +229,6 @@ out of scope of the initial land:
   server side.
 - `crates/mlua-swarm-cli/src/serve.rs::recover_interrupted_runs`
   — the boot-time sweep and the resumable-log emission point.
-- `crates/mlua-swarm-cli/src/serve.rs::sweep_stale_running_runs`
-  — the periodic stale-run sweep and its compare-and-set guard.
+- `crates/mlua-swarm-cli/src/serve.rs::interrupt_running_on_shutdown`
+  — the shutdown drain that marks still-`Running` Runs
+  `Interrupted` on a clean exit.

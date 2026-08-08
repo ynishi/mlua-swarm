@@ -7,7 +7,7 @@
 //! runs on a drop — the panic guard only intercepts unwinds and the
 //! timeout ceiling lived inside the very future that went away — so the
 //! Run stayed `Running` with no reader left for any late worker output,
-//! until the stale-run sweeper reaped it ~3900s later.
+//! until the next boot sweep reclaimed it.
 //!
 //! The flow here:
 //!
