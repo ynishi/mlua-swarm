@@ -118,7 +118,7 @@ pub use login::{
 };
 pub use protocol::{ClientMsg, ServerMsg};
 pub use router::{
-    AssigneeRouter, AssigneeRouterResolver, OperatorAdapter, OperatorAdapterRegistry,
+    AssigneeRouter, AssigneeRouterResolver, Liveness, OperatorAdapter, OperatorAdapterRegistry,
     WsOperatorWiring,
 };
 pub use session::WSOperatorSession;

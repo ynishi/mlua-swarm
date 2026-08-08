@@ -254,6 +254,59 @@ pub struct Assignee {
     pub gen: u64,
 }
 
+/// What [`RunStore::vacate_assignee`] did — it releases a seat only while
+/// that seat still holds the generation the caller observed, so "released"
+/// and "someone else got there first" are two answers, not one.
+///
+/// # Why a release has to name a generation
+///
+/// A release is issued by a caller that *read* the holder earlier and then
+/// decided it should go: **A7** reads a holder, asks its adapter for
+/// `T-ALIVE`, and releases on `Disconnected`; **O8**'s cascade reads a
+/// holder, matches it against a deleted operator's names, and releases.
+/// Both decisions are about the `Assignee` that was read, and both have
+/// `.await` points between the read and the write, during which an
+/// `acquire` (which never excludes — **A8**) can seat somebody else.
+///
+/// Addressed at `(run, slot)` alone, such a release would delete whatever
+/// holder happened to be there — a holder whose liveness was never asked
+/// for and whose deletion no premise in the model supports. That is a lost
+/// update, not **A8**: the acquirer was answered `200` with its generation
+/// (**Q4**) and has no channel to learn it was undone. Carrying the
+/// observed generation turns the write back into the decision that was
+/// actually made.
+///
+/// `gen` alone identifies the holder because `G` is Run-wide and advances
+/// on every assignment event, so a generation is never reused — a seat
+/// holding `expected_gen` is holding the very instance the caller read,
+/// including when a re-acquire put the *same* operator back (**A8**).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VacateOutcome {
+    /// The seat still held the observed generation, so it was released and
+    /// the slot is now `Vacant`.
+    Released {
+        /// The Run-wide counter `G` after this event (**A4**: a `Vacant`
+        /// advances it exactly like an `Assign` does).
+        generation: u64,
+        /// The holder that was released — the instance the caller read.
+        released: Assignee,
+    },
+    /// The seat did not hold the observed generation, so **nothing was
+    /// written**: no holder removed, `G` not advanced, `updated_at`
+    /// untouched.
+    ///
+    /// The caller's reading is stale — either an `acquire` moved the seat
+    /// on (**A8** already decided that contest, and the newer holder
+    /// stands) or the seat was released by someone else in between. Either
+    /// way the release is not re-issued against the new state: the
+    /// decision behind it was made about a holder that is no longer there.
+    Stale {
+        /// Who holds the seat now, for the message the caller reports.
+        /// `None` = the slot is already `Vacant`.
+        current: Option<Assignee>,
+    },
+}
+
 /// One persisted `Run` row — one kick of a [`crate::store::task::TaskRecord`].
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunRecord {
@@ -855,25 +908,42 @@ pub trait RunStore: Send + Sync {
     ) -> Result<(u64, Option<Assignee>), RunStoreError>;
 
     /// Release the holder of this Run's `slot` — the model's `Vacant`
-    /// event (§4.3). Other slots keep their holders.
+    /// event (§4.3) — **but only while that seat still holds the
+    /// generation the caller observed**. Other slots keep their holders.
     ///
-    /// **A4**: `Vacant` bumps the Run-wide generation counter exactly like
-    /// `Assign` does; it just mints no [`Assignee`]. A subsequent
-    /// [`Self::acquire_assignee`] — on this slot or any other — therefore
-    /// continues from the bumped value rather than reusing the generation
-    /// the released holder had. `updated_at` is bumped to now.
+    /// `expected_gen` is the `gen` of the [`Assignee`] the caller read and
+    /// decided about. The comparison and the write happen in one critical
+    /// section (the same transaction / lock `acquire_assignee` uses), so a
+    /// concurrent `acquire` either lands before the check — and the
+    /// release becomes a no-op — or after the write, which is an ordinary
+    /// **A8** takeover of an already-Vacant seat. There is no window in
+    /// which a stale reader deletes a newer holder. See [`VacateOutcome`]
+    /// for why the generation has to travel with the call at all; this is
+    /// the only release verb, because both production callers (**A7** at
+    /// `AssigneeRouter::execute` and **O8**'s cascade) are stale readers,
+    /// and an unconditional sibling would exist only to be picked by
+    /// mistake.
     ///
-    /// Vacating an already-vacant slot is not an error — it is a real
-    /// event and still bumps the counter. An empty `slot` returns
-    /// [`RunStoreError::AssigneeSlotRequired`] and an unknown `id`
-    /// returns [`RunStoreError::NotFound`].
+    /// **A4**: a release that actually happens bumps the Run-wide
+    /// generation counter exactly like `Assign` does; it just mints no
+    /// [`Assignee`]. A subsequent [`Self::acquire_assignee`] — on this slot
+    /// or any other — therefore continues from the bumped value rather than
+    /// reusing the generation the released holder had. `updated_at` is
+    /// bumped to now. A [`VacateOutcome::Stale`] result is **not** an
+    /// assignment event and writes nothing at all: the counter counts
+    /// events, and a release that did not release is not one.
     ///
-    /// Returns `(new generation, the holder this call released)`.
+    /// An already-Vacant slot therefore answers
+    /// `Stale { current: None }` rather than burning a generation — no
+    /// generation can match an absent holder. An empty `slot` returns
+    /// [`RunStoreError::AssigneeSlotRequired`] and an unknown `id` returns
+    /// [`RunStoreError::NotFound`].
     async fn vacate_assignee(
         &self,
         id: &RunId,
         slot: &str,
-    ) -> Result<(u64, Option<Assignee>), RunStoreError>;
+        expected_gen: u64,
+    ) -> Result<VacateOutcome, RunStoreError>;
 
     /// Set a Run's terminal `result_ref`, bumping `updated_at` to now.
     async fn set_result(

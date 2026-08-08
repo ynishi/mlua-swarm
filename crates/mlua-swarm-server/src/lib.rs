@@ -101,14 +101,15 @@ pub use enhance_settings::build_enhance_settings_router;
 pub use issues::{build_issues_router, GetIssueResponse, PostIssueRequest, PostIssueResponse};
 pub use operator_ws::{
     operators_create, operators_delete, operators_delete_by_role, operators_info, operators_list,
-    operators_ws_connect, AssigneeRouter, AssigneeRouterResolver, ClientMsg, LoginSession,
-    OperatorAdapter, OperatorAdapterRegistry, OperatorsListEntry, OperatorsListResp, ServerMsg,
-    WSOperatorSession, WsOperatorWiring,
+    operators_ws_connect, AssigneeRouter, AssigneeRouterResolver, ClientMsg, Liveness,
+    LoginSession, OperatorAdapter, OperatorAdapterRegistry, OperatorsListEntry, OperatorsListResp,
+    ServerMsg, WSOperatorSession, WsOperatorWiring,
 };
 pub use projection::{McpQueryAdapter, ProjectionSource, StepList, StepPathQuery, StepSummary};
 pub use tasks::{
-    RunBindingDifference, RunBindingExplainEntry, RunBindingStatus, RunBindingsExplainResponse,
-    RunKickRequest, RunKickResponse, RunResumeResponse, RunStepsResponse, TaskDetailResponse,
+    RunAcquireRequest, RunAcquireResponse, RunBindingDifference, RunBindingExplainEntry,
+    RunBindingStatus, RunBindingsExplainResponse, RunKickRequest, RunKickResponse,
+    RunResumeResponse, RunStepsResponse, TaskDetailResponse,
 };
 pub use worker::{
     worker_artifact, worker_prompt, worker_result, ArtifactQuery, DegradationBody, PromptQuery,
@@ -686,6 +687,11 @@ pub fn build_router_full_with_operator_session_persistence(
         .route("/v1/runs/:id/steps", get(tasks::run_steps))
         .route("/v1/runs/:id/trace", get(tasks::run_trace))
         .route("/v1/runs/:id/bindings", get(tasks::run_bindings_explain))
+        // Take one of the Run's Operator seats (model §4.5 acquire). The
+        // only route that changes a holder from outside the engine — and
+        // deliberately the only one: `Vacant` is reached by A7 / O8 / a
+        // competing acquire, never by asking. See `tasks::run_acquire`.
+        .route("/v1/runs/:id/acquire", post(tasks::run_acquire))
         // Resume an Interrupted Run under the SAME run_id (replay cursor +
         // stored launch-input snapshot); see `tasks::run_resume`.
         .route("/v1/runs/:id/resume", post(tasks::run_resume))

@@ -65,9 +65,44 @@
 //! the type that method accepts. Keep it that way: never write a blanket
 //! `impl<T: Operator> OperatorAdapter for T`, which would hand the
 //! guarantee back.
+//!
+//! # Why nothing here subscribes to connect / disconnect
+//!
+//! Model §4.7 defines `T-CONNECT.indication(operator)` and
+//! `T-DISCONNECT.indication(operator, reason?)` as provider-initiated
+//! events, and this layer subscribes to **neither**. That is not an
+//! omission — it is what **T6** ("`T-CONNECT` is not used to decide the
+//! holder") and **A7** ("the judgment is made at reference time; nothing
+//! monitors periodically") ask for, read together.
+//!
+//! An event stream would only be worth carrying if some verdict were kept
+//! between references. None is. [`AssigneeRouter::execute`] pulls
+//! [`OperatorAdapter::liveness`] on the dispatch it is about to make and
+//! acts on that answer immediately, so there is no cached state for an
+//! indication to correct and nothing to invalidate. Subscribing would mean
+//! keeping a second copy of connectivity up here — a copy that can only
+//! ever be staler than the pull, and whose staleness would show up as a
+//! dispatch delivered to an operator this layer still believed was
+//! connected. **T7**: the layer above the SAP does not infer liveness, and
+//! a remembered indication is exactly such an inference.
+//!
+//! The connectivity signal that *is* consumed lives below the boundary:
+//! `WSOperatorSession` watches its own `ConnState` to unpark a send it
+//! parked during a disconnect. That is `T-DELIVER` taking its time to
+//! deliver, which **T2** leaves to the adapter's discretion, and it is
+//! invisible from here — the router sees one `execute` call, however long
+//! the socket took to come back.
+//!
+//! The one consequence worth naming: a dispatch that passes the liveness
+//! check and *then* loses its socket is not released by **A7**, because
+//! **A7** fires where it is read and this dispatch has already read it. It
+//! parks below the boundary until the operator returns or the session is
+//! torn down. Releasing it early would take a push subscription **and** a
+//! deadline up here — the timer **T7** forbids. It is the next reference
+//! that finds the seat Disconnected and vacates it.
 
 use async_trait::async_trait;
-use mlua_swarm::store::run::RunStore;
+use mlua_swarm::store::run::{RunStore, VacateOutcome};
 use mlua_swarm::{
     CapToken, Ctx, Operator, OperatorSlotResolver, OperatorSpawnerFactory, RunId, WorkerBinding,
     WorkerError, WorkerResult,
@@ -89,6 +124,25 @@ use super::session::WSOperatorSession;
 /// does not export it.
 const RUN_ID_KEY: &str = "run_id";
 
+/// The `state` of a `T-ALIVE.confirm` — the two values model §4.7 gives
+/// that primitive, and the whole of what the layer above the SAP is told
+/// about connectivity.
+///
+/// **T4**: this is a *projection* of whatever the adapter tracks
+/// internally, not a copy of it. [`WSOperatorSession`] holds three states
+/// (its `ConnState` adds a terminal `TornDown`); an adapter that grows a
+/// fourth still answers here with one of these two. The primitive does not
+/// widen when the implementation does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// The operator can be reached right now.
+    Connected,
+    /// It cannot. Says nothing about whether it will be again — that is
+    /// the adapter's business (**T2**), and **O7**: this value is not the
+    /// Operator's registration state.
+    Disconnected,
+}
+
 /// A **terminal** Operator backend: something a dispatch can actually be
 /// delivered to (a WS session, and in tests a double), as opposed to
 /// something that decides where to deliver it.
@@ -99,11 +153,68 @@ const RUN_ID_KEY: &str = "run_id";
 /// terminate a dispatch; never for a type that resolves another
 /// `Arc<dyn Operator>` and forwards to it, and never as a blanket impl
 /// over [`Operator`].
-pub trait OperatorAdapter: Operator {}
+///
+/// # The SAP surface (model §4.7)
+///
+/// Two of the model's four primitive pairs cross this trait, and two do
+/// not:
+///
+/// - **`T-DELIVER`** is [`Operator::execute`], which the supertrait
+///   already provides. It is not redeclared here — one primitive, one
+///   method.
+/// - **`T-ALIVE`** is [`Self::liveness`], added because nothing else on
+///   the boundary could answer it.
+/// - **`T-CONNECT` / `T-DISCONNECT`** are provider-initiated indications
+///   with no subscriber above the boundary; see the module doc.
+/// - **`T-DISCARD`** is **deliberately absent**. It is defined over a
+///   `run`, and no adapter can currently select by one (the WS session's
+///   `pending` map is keyed by `req_id` alone and the wire carries no
+///   `run_id`), so a method here could not be honoured. An unhonourable
+///   primitive that merely *exists* reads, to whoever implements the rest
+///   of the handover, as one already wired up. Adding it belongs with the
+///   `pending` rework that can actually satisfy it.
+#[async_trait]
+pub trait OperatorAdapter: Operator {
+    /// `T-ALIVE.request(operator)` → `T-ALIVE.confirm(operator, state)`.
+    ///
+    /// **T3 — this answers immediately.** It reports the state the adapter
+    /// already holds; it must not probe the peer, await a round trip, or
+    /// block on anything but its own lock. A caller reads this on the
+    /// dispatch path (see [`AssigneeRouter::execute`]), where a wait would
+    /// be indistinguishable from the delivery it is deciding whether to
+    /// attempt.
+    ///
+    /// The answer is a fact about *this instant* and carries no promise
+    /// about the next one. **T7**: nothing above the SAP may extrapolate
+    /// from it — no cached verdict, no timer, no retry budget built on a
+    /// previous answer.
+    async fn liveness(&self) -> Liveness;
+}
 
 /// The one WS-side implementor: a session is exactly "the socket a spawn
 /// is written to", the terminal case this marker describes.
-impl OperatorAdapter for WSOperatorSession {}
+#[async_trait]
+impl OperatorAdapter for WSOperatorSession {
+    /// Projects the session's connectivity onto the primitive's two values
+    /// (**T4**).
+    ///
+    /// `is_connected` reads `tx` — `Some` exactly when a live sender is
+    /// installed — under a `tokio::sync::Mutex` held for the read alone,
+    /// which is the immediacy **T3** asks for.
+    ///
+    /// A torn-down session collapses into `Disconnected` rather than
+    /// getting a value of its own: teardown clears `tx`, and from above
+    /// the boundary "gone for good" and "away right now" call for the same
+    /// decision (**T5** — release the seat). The distinction still exists
+    /// below, where it decides whether a parked send may keep waiting.
+    async fn liveness(&self) -> Liveness {
+        if self.is_connected().await {
+            Liveness::Connected
+        } else {
+            Liveness::Disconnected
+        }
+    }
+}
 
 /// `OperatorId` → the adapter that currently answers for it.
 ///
@@ -176,6 +287,38 @@ pub struct AssigneeRouter {
     adapters: Arc<OperatorAdapterRegistry>,
 }
 
+/// The tail of the Vacant failure when the seat was simply never taken —
+/// the launch seated nobody here and no handover has since.
+const NEVER_SEATED: &str = "The launch seated every declared seat that had an operator registered \
+     under its own name, and this one had none — nor did an operator_sid pin name it. Log in an \
+     operator holding that role before launching, or pin the launch with operator_sid + \
+     operator_desc (plus operator_slot when the Blueprint declares several seats). This used to \
+     fail earlier, at compile time, with 'not registered in factory'; it now fails here, at the \
+     first dispatch that needs the seat.";
+
+/// The one Vacant failure, worded once and reached two ways: the seat was
+/// already unheld when this dispatch read it, or **A7** released it a
+/// moment ago because its holder was Disconnected.
+///
+/// They converge deliberately. From the dispatch's side the two are one
+/// condition — this seat has nobody to deliver to — and **A8** gives them
+/// one remedy, an acquire. Splitting them into two failure shapes would
+/// invite a caller to handle one and not the other, when the difference is
+/// only in how recently the seat emptied. `because` carries that history
+/// in the message, where it informs without branching.
+///
+/// Model §4.3 **A6** calls this a service-unavailable condition;
+/// [`WorkerError`] carries no status code, so it surfaces as a failure
+/// whose message names the slot that has no holder. Note **R2**: the Run
+/// itself is not stopped by being Vacant — only a dispatch that needs
+/// *this* slot's holder is, and other slots keep dispatching.
+fn vacant_failure(agent: &str, run_id: &RunId, slot: &str, because: &str) -> WorkerError {
+    WorkerError::Failed(format!(
+        "agent '{agent}': run {run_id} has no current holder for operator slot '{slot}' \
+         (Vacant). {because}"
+    ))
+}
+
 impl AssigneeRouter {
     /// Build a router for one slot, over a Run store and an adapter
     /// registry.
@@ -205,9 +348,10 @@ impl AssigneeRouter {
 
 #[async_trait]
 impl Operator for AssigneeRouter {
-    /// Resolve this Run's holder and delegate to its adapter.
+    /// Resolve this Run's holder, check it is reachable, delegate, and
+    /// check the answer is still this generation's to give.
     ///
-    /// Four ways this returns without delivering, all loud:
+    /// Six ways this returns without a delivered result, all loud:
     ///
     /// 1. **No `run_id` on the dispatch.** A dispatch with no Run identity
     ///    has no `current` to read, so there is no holder to resolve — and
@@ -222,20 +366,91 @@ impl Operator for AssigneeRouter {
     ///    adapter" or "the last one registered" would invent an
     ///    addressing rule the model does not have.
     /// 2. **The Run is not readable** (unknown id, store failure).
-    /// 3. **This router's slot is `Vacant`.** Model §4.3 **A6** calls this
-    ///    a service-unavailable condition; [`WorkerError`] carries no
-    ///    status code, so it surfaces as a failure whose message names the
-    ///    slot that has no holder. Note **R2**: the Run itself is not
-    ///    stopped by being Vacant — only a dispatch that needs *this*
-    ///    slot's holder is, and other slots keep dispatching.
+    /// 3. **This router's slot is `Vacant`** — see [`vacant_failure`].
     /// 4. **The holder names no registered adapter.** The holder is a
     ///    fact; an adapter for it is not. Rather than fall through to
     ///    somewhere else, say which `OperatorId` could not be delivered to
     ///    and what was registered at the time.
     ///
+    ///    This case is **not** folded into `Vacant`, tempting as the
+    ///    resemblance is. A registry miss is a fact about wiring, not
+    ///    about liveness: `T-ALIVE` cannot even be requested without an
+    ///    adapter, so **A7**'s premise (`ALIVE(a.op) = Disconnected`) is
+    ///    never established, and treating the miss as though it were is
+    ///    the inference **T7** forbids. The model already has a path for
+    ///    "that operator is gone" — **O8**, the cascade on `delete(op)`,
+    ///    which runs where the deletion is known rather than guessing from
+    ///    a lookup. And the guess would not be free: vacating burns a
+    ///    generation and drops the holder, so an adapter that is merely
+    ///    *not registered yet* (boot restores sessions before their
+    ///    clients reconnect) would lose a valid assignment permanently,
+    ///    where this failure merely fails the dispatch and lets the next
+    ///    one succeed.
+    /// 5. **The holder is `Disconnected`** (**A7**) — below.
+    /// 6. **The generation moved while the adapter was answering**
+    ///    (**A6**) — below.
+    ///
+    /// # A7 — the seat is released where it is read
+    ///
+    /// Between resolving the adapter and handing it the dispatch, this
+    /// pulls `T-ALIVE`. `Disconnected` means **A5** forbids the delivery
+    /// (`DELIVER` needs `current = Assigned(a) ∧ ALIVE(a.op) = Connected`),
+    /// and **T5** says what to do about it, unconditionally: the seat
+    /// becomes Vacant. So the seat is vacated and the dispatch fails as
+    /// Vacant — no grace window, no retry, no second look, all of which
+    /// would be this layer guessing that the operator is about to return
+    /// (**T7**).
+    ///
+    /// The judgment happens here and nowhere else. **A7** says the state
+    /// is examined *at reference time*; there is no sweeper walking Runs
+    /// looking for disconnected holders, and adding one would be a second
+    /// place where seats change hands, running on a timer, against
+    /// operators nobody is dispatching to.
+    ///
+    /// **What is released is the holder, not the seat.** Two `.await`
+    /// points separate the read of `current[slot]` from the release — the
+    /// adapter lookup and `T-ALIVE` itself — and `POST /v1/runs/:id/acquire`
+    /// never excludes (**A8**/**Q2**), so a seat can change hands inside
+    /// that window. The release therefore carries the generation that was
+    /// read
+    /// ([`RunStore::vacate_assignee`](mlua_swarm::store::run::RunStore::vacate_assignee)),
+    /// and the store applies it only while the seat still holds that exact
+    /// [`Assignee`](mlua_swarm::store::run::Assignee). A
+    /// [`VacateOutcome::Stale`] answer means the reading is out of date:
+    /// nothing is written, the newer holder stands (**A8** already decided
+    /// that contest), and the dispatch fails with a message naming who
+    /// holds the seat now. Vacating unconditionally here would delete an
+    /// assignment whose `T-ALIVE` was never requested — outside **A7**'s
+    /// own premise, which names the `a` that was read — and the displaced
+    /// acquirer would never learn it: it was answered `200` with its
+    /// generation (**Q4**) and has no channel back.
+    ///
+    /// # A6 — a reply belongs to the generation that asked
+    ///
+    /// The generation the dispatch was addressed under is noted before
+    /// delegating and `current` is read again after the adapter answers.
+    /// If the seat has since been re-acquired — by anyone, **including the
+    /// same operator** — the answer is the displaced holder's and is not
+    /// accepted.
+    ///
+    /// This is why `gen` and not `from`: **A8** lets a seat be re-acquired
+    /// by the operator that already held it, so a matching `from` proves
+    /// nothing about *which* acquisition asked. `from` is already
+    /// structurally guaranteed here — the reply comes back from the very
+    /// adapter `assignee.op` resolved to, and no other — which leaves
+    /// `gen` as the only one of **A6**'s three terms this position can
+    /// still get wrong. Its third term, `ALIVE(a.op) = Connected`, is the
+    /// check above.
+    ///
+    /// The check gates the `Ok` arm only. An `Err` is not a reply to be
+    /// accepted or refused; it is the delivery itself having failed, and
+    /// its diagnosis is worth more to the caller than a generic
+    /// service-unavailable would be.
+    ///
     /// On the success path the five arguments are forwarded verbatim. The
     /// [`Assignee`](mlua_swarm::store::run::Assignee) does not travel with
-    /// them (**T1**).
+    /// them (**T1**) — neither `gen` nor `desc` is handed down, so an
+    /// adapter cannot tell which generation addressed it.
     async fn execute(
         &self,
         ctx: &Ctx,
@@ -264,17 +479,12 @@ impl Operator for AssigneeRouter {
             ))
         })?;
         let Some(assignee) = record.current.get(&self.slot) else {
-            return Err(WorkerError::Failed(format!(
-                "agent '{}': run {run_id} has no current holder for operator slot '{}' \
-                 (Vacant). The launch seated every declared seat that had an operator \
-                 registered under its own name, and this one had none — nor did an \
-                 operator_sid pin name it. Log in an operator holding the role '{}' before \
-                 launching, or pin the launch with operator_sid + operator_desc (plus \
-                 operator_slot when the Blueprint declares several seats). This used to \
-                 fail earlier, at compile time, with 'not registered in factory'; it now \
-                 fails here, at the first dispatch that needs the seat.",
-                ctx.agent, self.slot, self.slot
-            )));
+            return Err(vacant_failure(
+                &ctx.agent,
+                &run_id,
+                &self.slot,
+                NEVER_SEATED,
+            ));
         };
         let Some(adapter) = self.adapters.get(&assignee.op).await else {
             let registered = self.adapters.ids().await;
@@ -286,9 +496,114 @@ impl Operator for AssigneeRouter {
                 registered.join(", ")
             )));
         };
-        adapter
+
+        // A7 / T5. Read once, act on that reading — and release exactly the
+        // holder that was read, never whoever occupies the seat by the time
+        // the release lands.
+        if adapter.liveness().await == Liveness::Disconnected {
+            let outcome = self
+                .run_store
+                .vacate_assignee(&run_id, &self.slot, assignee.gen)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        slot = %self.slot,
+                        op = %assignee.op,
+                        error = %e,
+                        "A7: holder is Disconnected but the seat could not be released"
+                    );
+                    WorkerError::Failed(format!(
+                        "agent '{}': run {run_id} is held by operator '{}' for operator slot \
+                         '{}', which is Disconnected; the seat could not be released (A7) \
+                         and the dispatch was not delivered: {e}",
+                        ctx.agent, assignee.op, self.slot
+                    ))
+                })?;
+            if let VacateOutcome::Stale { current } = outcome {
+                // Somebody acquired the seat between the read above and
+                // this write, so the holder that was found Disconnected is
+                // no longer the holder — releasing now would delete an
+                // assignment whose liveness was never asked for, which is
+                // outside A7's premise and is a lost update rather than
+                // A8's last-writer-wins. Nothing was written; the dispatch
+                // still fails, because it resolved its adapter from the
+                // holder that has since been displaced.
+                let now = current
+                    .as_ref()
+                    .map(|c| format!("operator '{}' at generation {}", c.op, c.gen))
+                    .unwrap_or_else(|| "nobody (Vacant)".to_string());
+                tracing::info!(
+                    run_id = %run_id,
+                    slot = %self.slot,
+                    op = %assignee.op,
+                    addressed_gen = assignee.gen,
+                    "A7: the seat changed hands before the release landed; left alone"
+                );
+                return Err(WorkerError::Failed(format!(
+                    "agent '{}': run {run_id} was resolved to operator '{}' at generation {} for \
+                     operator slot '{}', which was Disconnected — but the seat now holds {}, so \
+                     it was left alone (A7 releases the holder it read, not the seat) and the \
+                     dispatch was not delivered. Dispatch again to address the current holder.",
+                    ctx.agent, assignee.op, assignee.gen, self.slot, now
+                )));
+            }
+            tracing::info!(
+                run_id = %run_id,
+                slot = %self.slot,
+                op = %assignee.op,
+                addressed_gen = assignee.gen,
+                "A7: holder was Disconnected at reference time; seat released"
+            );
+            return Err(vacant_failure(
+                &ctx.agent,
+                &run_id,
+                &self.slot,
+                &format!(
+                    "Its holder, operator '{}', was Disconnected when this dispatch read it, so \
+                     the seat was released (A7 — the state is examined at reference time, and \
+                     nothing scans for this in the background). Acquire the seat for a \
+                     reachable operator to dispatch again.",
+                    assignee.op
+                ),
+            ));
+        }
+
+        // A6: which acquisition this dispatch is speaking on behalf of.
+        let addressed_gen = assignee.gen;
+        let result = adapter
             .execute(ctx, system, prompt, worker, worker_token)
-            .await
+            .await?;
+
+        let after = self.run_store.get(&run_id).await.map_err(|e| {
+            tracing::warn!(
+                run_id = %run_id,
+                slot = %self.slot,
+                error = %e,
+                "A6: the reply could not be checked against the current generation"
+            );
+            WorkerError::Failed(format!(
+                "agent '{}': run {run_id} could not be re-read to check whether the reply for \
+                 operator slot '{}' is still generation {addressed_gen}'s, so it was not \
+                 accepted (A6): {e}",
+                ctx.agent, self.slot
+            ))
+        })?;
+        match after.current.get(&self.slot) {
+            Some(current) if current.gen == addressed_gen => Ok(result),
+            Some(current) => Err(WorkerError::Failed(format!(
+                "agent '{}': run {run_id} answered for operator slot '{}' under generation \
+                 {addressed_gen} (operator '{}'), but the seat is now generation {} (operator \
+                 '{}'). The reply is the displaced holder's and is not accepted (A6).",
+                ctx.agent, self.slot, assignee.op, current.gen, current.op
+            ))),
+            None => Err(WorkerError::Failed(format!(
+                "agent '{}': run {run_id} answered for operator slot '{}' under generation \
+                 {addressed_gen} (operator '{}'), but the seat is now Vacant, so the reply is \
+                 not accepted (A6).",
+                ctx.agent, self.slot, assignee.op
+            ))),
+        }
     }
 
     /// `true`, matching the backends this router fronts: it exists to sit
@@ -397,6 +712,10 @@ mod tests {
     struct RecordingAdapter {
         name: &'static str,
         seen: Arc<StdMutex<Vec<String>>>,
+        /// What this double answers `T-ALIVE` with. Fixed per instance:
+        /// the router reads it once per dispatch, so a test that wants a
+        /// disconnected holder wants it disconnected for that read.
+        liveness: Liveness,
     }
 
     #[async_trait]
@@ -421,13 +740,112 @@ mod tests {
         }
     }
 
-    impl OperatorAdapter for RecordingAdapter {}
+    #[async_trait]
+    impl OperatorAdapter for RecordingAdapter {
+        async fn liveness(&self) -> Liveness {
+            self.liveness
+        }
+    }
 
     fn adapter(name: &'static str, seen: &Arc<StdMutex<Vec<String>>>) -> Arc<dyn OperatorAdapter> {
         Arc::new(RecordingAdapter {
             name,
             seen: seen.clone(),
+            liveness: Liveness::Connected,
         })
+    }
+
+    /// A registered adapter whose operator is away — the A7 condition.
+    fn away_adapter(
+        name: &'static str,
+        seen: &Arc<StdMutex<Vec<String>>>,
+    ) -> Arc<dyn OperatorAdapter> {
+        Arc::new(RecordingAdapter {
+            name,
+            seen: seen.clone(),
+            liveness: Liveness::Disconnected,
+        })
+    }
+
+    /// Answers normally, but re-acquires the seat for `next_op` first —
+    /// the shape of another acquire landing while the holder it displaces
+    /// is still composing its reply. Deterministic where a real race is
+    /// not: the handover is guaranteed to be committed before this
+    /// `execute` returns, which is exactly the window **A6** is about.
+    struct HandsOverWhileAnswering {
+        store: Arc<dyn RunStore>,
+        run_id: RunId,
+        next_op: &'static str,
+    }
+
+    #[async_trait]
+    impl Operator for HandsOverWhileAnswering {
+        async fn execute(
+            &self,
+            _ctx: &Ctx,
+            _system: Option<String>,
+            _prompt: Value,
+            _worker: Option<WorkerBinding>,
+            _worker_token: CapToken,
+        ) -> Result<WorkerResult, WorkerError> {
+            self.store
+                .acquire_assignee(&self.run_id, SLOT, self.next_op, "took over mid-answer")
+                .await
+                .expect("the interleaved acquire");
+            Ok(WorkerResult {
+                value: serde_json::json!({ "delivered_to": "answered-late" }),
+                ok: true,
+                stats: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl OperatorAdapter for HandsOverWhileAnswering {
+        async fn liveness(&self) -> Liveness {
+            Liveness::Connected
+        }
+    }
+
+    /// Answers `T-ALIVE` with `Disconnected` — the **A7** condition — but
+    /// re-acquires the seat for `next_op` while doing so. That is the
+    /// window between the router's read of `current[slot]` and its release:
+    /// two `.await` points wide in production (the adapter lookup and this
+    /// call), and `acquire` never excludes (**A8**/**Q2**). Deterministic
+    /// where the real race is not — the handover is committed before the
+    /// router can issue its release.
+    struct HandsOverWhileAnsweringAlive {
+        store: Arc<dyn RunStore>,
+        run_id: RunId,
+        next_op: &'static str,
+    }
+
+    #[async_trait]
+    impl Operator for HandsOverWhileAnsweringAlive {
+        async fn execute(
+            &self,
+            _ctx: &Ctx,
+            _system: Option<String>,
+            _prompt: Value,
+            _worker: Option<WorkerBinding>,
+            _worker_token: CapToken,
+        ) -> Result<WorkerResult, WorkerError> {
+            Err(WorkerError::Failed(
+                "A5 forbids delivering to a Disconnected holder; this must never be called"
+                    .to_string(),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl OperatorAdapter for HandsOverWhileAnsweringAlive {
+        async fn liveness(&self) -> Liveness {
+            self.store
+                .acquire_assignee(&self.run_id, SLOT, self.next_op, "took over mid-check")
+                .await
+                .expect("the interleaved acquire");
+            Liveness::Disconnected
+        }
     }
 
     fn ctx_for(run_id: Option<&RunId>) -> Ctx {
@@ -555,7 +973,7 @@ mod tests {
         let router = AssigneeRouter::new(store.clone(), SLOT, adapters);
         let ctx = ctx_for(Some(&run_id));
 
-        store
+        let (held_gen, _) = store
             .acquire_assignee(&run_id, SLOT, "S-holder", "holds it")
             .await
             .expect("acquire");
@@ -564,7 +982,10 @@ mod tests {
             .await
             .expect("dispatch while held");
 
-        store.vacate_assignee(&run_id, SLOT).await.expect("vacate");
+        store
+            .vacate_assignee(&run_id, SLOT, held_gen)
+            .await
+            .expect("vacate");
         let err = router
             .execute(&ctx, None, serde_json::json!("go"), None, cap_token())
             .await
@@ -841,5 +1262,250 @@ mod tests {
         let store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
         let router = AssigneeRouter::new(store, SLOT, Arc::new(OperatorAdapterRegistry::new()));
         assert!(router.requires_worker_binding());
+    }
+
+    /// **A7 / T5.** Dispatching to a holder that is Disconnected does not
+    /// deliver, does not wait for it to come back, and does not leave the
+    /// seat held: the seat is released at the moment it was read, and the
+    /// next reference finds it Vacant — so getting this Run moving again
+    /// takes an acquire, not a reconnect.
+    #[tokio::test]
+    async fn a_disconnected_holder_is_released_at_reference_time_and_stays_released() {
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = seeded_run(&store).await;
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let adapters = Arc::new(OperatorAdapterRegistry::new());
+        adapters
+            .register("S-away", away_adapter("away", &seen))
+            .await;
+        let router = AssigneeRouter::new(store.clone(), SLOT, adapters);
+        let ctx = ctx_for(Some(&run_id));
+
+        store
+            .acquire_assignee(&run_id, SLOT, "S-away", "held by a client that went quiet")
+            .await
+            .expect("acquire");
+
+        let err = router
+            .execute(&ctx, None, serde_json::json!("go"), None, cap_token())
+            .await
+            .expect_err("A5 forbids delivering to a Disconnected holder");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no current holder"),
+            "it fails as Vacant, the same condition an unheld seat fails as: {msg}"
+        );
+        assert!(
+            msg.contains("S-away") && msg.contains("Disconnected"),
+            "and says which holder was away: {msg}"
+        );
+
+        let record = store.get(&run_id).await.expect("run get");
+        assert!(
+            !record.current.contains_key(SLOT),
+            "T5: the seat is Vacant, not merely undeliverable-to"
+        );
+
+        // The judgment stuck. A second reference does not re-derive a
+        // holder from anywhere, so the Run needs an acquire to move.
+        let err = router
+            .execute(&ctx, None, serde_json::json!("go"), None, cap_token())
+            .await
+            .expect_err("the released seat is still Vacant");
+        assert!(
+            err.to_string().contains("no current holder"),
+            "the release persisted: {err}"
+        );
+
+        assert!(
+            seen.lock().expect("seen").is_empty(),
+            "no dispatch reached the away operator's adapter"
+        );
+    }
+
+    /// **A7 releases the holder it read, not the seat.** An acquire lands
+    /// between the read of `current[slot]` and the release, so the release
+    /// names a generation the seat no longer holds: it must write nothing
+    /// and leave the new holder standing. Vacating unconditionally here
+    /// would destroy a live assignment whose `T-ALIVE` was never requested
+    /// — a lost update, and invisible to the acquirer, which was answered
+    /// `200` with its generation (**Q4**).
+    #[tokio::test]
+    async fn a_stale_a7_release_does_not_disturb_the_current_holder() {
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = seeded_run(&store).await;
+        let adapters = Arc::new(OperatorAdapterRegistry::new());
+        adapters
+            .register(
+                "S-away",
+                Arc::new(HandsOverWhileAnsweringAlive {
+                    store: store.clone(),
+                    run_id: run_id.clone(),
+                    next_op: "S-fresh",
+                }) as Arc<dyn OperatorAdapter>,
+            )
+            .await;
+        let router = AssigneeRouter::new(store.clone(), SLOT, adapters);
+
+        store
+            .acquire_assignee(&run_id, SLOT, "S-away", "held by a client that went quiet")
+            .await
+            .expect("acquire");
+
+        let err = router
+            .execute(
+                &ctx_for(Some(&run_id)),
+                None,
+                serde_json::json!("go"),
+                None,
+                cap_token(),
+            )
+            .await
+            .expect_err("the dispatch resolved a holder that has since been displaced");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("(A7 releases the holder it read, not the seat)"),
+            "the failure says why nothing was released: {msg}"
+        );
+        assert!(
+            msg.contains("S-fresh") && msg.contains("generation 2"),
+            "and names who holds the seat now: {msg}"
+        );
+        assert!(
+            !msg.contains("no current holder"),
+            "it must NOT report the seat as Vacant — the seat is held: {msg}"
+        );
+
+        let record = store.get(&run_id).await.expect("run get");
+        let held = record
+            .current
+            .get(SLOT)
+            .expect("the acquirer's seat survived the stale release");
+        assert_eq!(
+            held.op, "S-fresh",
+            "A8 already decided this contest; the newer holder stands"
+        );
+        assert_eq!(held.gen, 2);
+        assert_eq!(
+            record.next_generation, 2,
+            "the refused release burned no generation"
+        );
+    }
+
+    /// **A6.** A reply that arrives after the seat has been re-acquired is
+    /// the displaced holder's, and is refused rather than returned as this
+    /// dispatch's result.
+    #[tokio::test]
+    async fn a_reply_is_refused_when_the_generation_moved_while_it_was_answering() {
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = seeded_run(&store).await;
+        let adapters = Arc::new(OperatorAdapterRegistry::new());
+        adapters
+            .register(
+                "S-first",
+                Arc::new(HandsOverWhileAnswering {
+                    store: store.clone(),
+                    run_id: run_id.clone(),
+                    next_op: "S-second",
+                }) as Arc<dyn OperatorAdapter>,
+            )
+            .await;
+        let router = AssigneeRouter::new(store.clone(), SLOT, adapters);
+
+        store
+            .acquire_assignee(&run_id, SLOT, "S-first", "the first holder")
+            .await
+            .expect("acquire");
+
+        let err = router
+            .execute(
+                &ctx_for(Some(&run_id)),
+                None,
+                serde_json::json!("go"),
+                None,
+                cap_token(),
+            )
+            .await
+            .expect_err("the answer belongs to a generation that no longer holds the seat");
+        let msg = err.to_string();
+        assert!(msg.contains("(A6)"), "the refusal names the rule: {msg}");
+        assert!(
+            msg.contains("generation 1") && msg.contains("S-second"),
+            "and both generations it compared: {msg}"
+        );
+    }
+
+    /// **A6 + A8, the reason the check is on `gen` and not on `from`.**
+    /// The same operator re-acquires the seat mid-answer: every identity
+    /// term still matches, and the reply is refused anyway, because it was
+    /// the *previous* acquisition that asked.
+    #[tokio::test]
+    async fn a_reply_is_refused_even_when_the_same_operator_re_acquired() {
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = seeded_run(&store).await;
+        let adapters = Arc::new(OperatorAdapterRegistry::new());
+        adapters
+            .register(
+                "S-same",
+                Arc::new(HandsOverWhileAnswering {
+                    store: store.clone(),
+                    run_id: run_id.clone(),
+                    next_op: "S-same",
+                }) as Arc<dyn OperatorAdapter>,
+            )
+            .await;
+        let router = AssigneeRouter::new(store.clone(), SLOT, adapters);
+
+        store
+            .acquire_assignee(&run_id, SLOT, "S-same", "took the seat")
+            .await
+            .expect("acquire");
+
+        let err = router
+            .execute(
+                &ctx_for(Some(&run_id)),
+                None,
+                serde_json::json!("go"),
+                None,
+                cap_token(),
+            )
+            .await
+            .expect_err("a matching `from` does not make the reply this generation's");
+        assert!(
+            err.to_string().contains("(A6)"),
+            "refused on the generation, with the operator identical on both sides: {err}"
+        );
+
+        let record = store.get(&run_id).await.expect("run get");
+        assert_eq!(
+            record.current[SLOT].op, "S-same",
+            "Q7 / A8: the re-acquire stands — refusing the reply does not undo it"
+        );
+        assert_eq!(record.current[SLOT].gen, 2);
+    }
+
+    /// **T4.** The session's three internal states project onto the
+    /// primitive's two, and the terminal one is not smuggled out as a
+    /// third value: a torn-down session is `Disconnected`, which is the
+    /// answer the seat-releasing decision above needs.
+    #[tokio::test]
+    async fn a_sessions_liveness_is_the_two_valued_projection_of_its_state() {
+        use mlua_swarm::SessionId;
+        use tokio::sync::mpsc;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session =
+            WSOperatorSession::new_with_base_url(SessionId::parse("S-alive").unwrap(), tx, None);
+        assert_eq!(session.liveness().await, Liveness::Connected);
+
+        session.clear_tx().await;
+        assert_eq!(session.liveness().await, Liveness::Disconnected);
+
+        session.fail_pending("torn down in a test").await;
+        assert_eq!(
+            session.liveness().await,
+            Liveness::Disconnected,
+            "TornDown is a distinction below the SAP; above it there are two values"
+        );
     }
 }

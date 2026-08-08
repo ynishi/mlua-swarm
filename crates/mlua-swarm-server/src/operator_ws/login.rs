@@ -28,7 +28,9 @@
 //!
 //! DELETE /v1/operators/:sid   (Bearer required)
 //!   → unregisters the 3 registries + role aliases + `operator_sessions`
-//!     entry + releases `roles_to_sid` ownership.
+//!     entry + releases `roles_to_sid` ownership, then vacates every Run
+//!     seat still held under this sid or one of its roles (model O8 —
+//!     `cascade_vacate_seats`; a delete leaves no holder behind).
 //!
 //! GET /v1/operators/:sid   (Bearer required)
 //!   → { sid, roles, connected }
@@ -59,6 +61,7 @@ use axum::{
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use mlua_swarm::store::operator_session::{OperatorSessionRecord, OperatorSessionStoreError};
+use mlua_swarm::store::run::{RunListFilter, RunStatus, VacateOutcome};
 use mlua_swarm::{
     AgentProviderManifest, Engine, Operator, OperatorRef, SeniorBridge, SessionId, SpawnHook,
 };
@@ -529,6 +532,13 @@ async fn register_operator_session(
 /// `"ws operator disconnected"`. The client's connect is then a plain
 /// `replace_tx` in [`handle_operator_socket`] — no second registration.
 ///
+/// That park applies to the paths that address this session **by sid**
+/// (`SeniorBridge` / `SpawnHook`), not to a dispatch routed through the
+/// assignee: `AssigneeRouter::execute` pulls `T-ALIVE` first, and a
+/// registered-but-unreconnected session answers `Disconnected`, so **A7**
+/// releases the seat before the send would have parked. See
+/// [`WSOperatorSession::disconnected_with_base_url`] for the full split.
+///
 /// [`operators_create`] does the same thing at mint time, so this is the
 /// restore half of one shared shape rather than a special case.
 pub(crate) async fn restored_login_session(
@@ -737,10 +747,13 @@ async fn handle_operator_socket(socket: WebSocket, live: Arc<LoginSession>) {
 /// `DELETE /v1/operators/by-role/:role` (`operators_delete_by_role` — GH #81
 /// Layer 2 (c)): drops the persisted row, the 3 engine registries + role
 /// aliases + the adapter-registry bindings + `operator_sessions` entry,
-/// releases the sid's ownership in `roles_to_sid`, and closes the session's
-/// socket. Idempotent w.r.t. a concurrent delete — every `remove` /
-/// `unregister` is a no-op when the entry is already gone, and the socket
-/// close is latched (see [`WSOperatorSession::close`]).
+/// releases the sid's ownership in `roles_to_sid`, closes the session's
+/// socket, and finally releases every Run seat the operator still held
+/// (**O8** — see [`cascade_vacate_seats`]). Idempotent w.r.t. a concurrent
+/// delete — every `remove` / `unregister` is a no-op when the entry is
+/// already gone, the socket close is latched (see
+/// [`WSOperatorSession::close`]), and a repeated cascade finds the seats
+/// already vacant.
 ///
 /// # The persisted row goes first
 ///
@@ -828,14 +841,204 @@ async fn teardown_operator_session(
         }
     }
 
+    // O8, last: by here the operator is unreachable under every name it
+    // answered to, so no dispatch can re-establish what this releases.
+    cascade_vacate_seats(state, sid, &live.record().roles).await;
+
     Ok(())
+}
+
+/// The Run statuses **O8**'s cascade walks — every status except the two
+/// that mean the Run reached its own end.
+///
+/// The model says `∀run`, and the scan is narrower than that on purpose;
+/// this is where the reason lives.
+///
+/// **Why not every Run.** There is no way to ask for "Runs whose `current`
+/// holds `op`": `RunListFilter` filters on `task_id` / `status` only, the
+/// sole index on `runs` is `ix_runs_task_id`, and `current_json` is a JSON
+/// text column no `WHERE` can reach into. So the cascade is a scan, and a
+/// scan is bounded by whatever it enumerates. `runs` is append-only —
+/// pruning is a manual `DELETE /v1/runs/:id` — so "every Run" grows without
+/// limit. Filtering by status pushes the predicate into SQL, so each pass
+/// materialises only rows of that status rather than every `RunRecord`
+/// (`step_entries` and launch snapshot included) ever written.
+///
+/// **What that actually bounds it by — non-terminal Runs, which also
+/// accumulate.** Only `Running` tracks live work. A `Cancelled` Run stays
+/// `Cancelled`; an `Interrupted` one leaves that status only if a human
+/// calls `POST /v1/runs/:id/resume`; a `Pending` one that never kicked
+/// stays `Pending`. So three of these four statuses grow with history too,
+/// just more slowly than the whole table. And the filter does not make the
+/// pass cheap: there is no index on `status`, so each of the four `list()`
+/// calls is a full table scan, `limit` is `None`, and every surviving row
+/// is deserialized into a complete `RunRecord` — step trace included —
+/// only for its `current` map to be read. The cost of a leave (every
+/// `mse-mcp` shutdown, and `DELETE /v1/operators/by-role/:role`) is
+/// therefore linear in accumulated non-terminal Runs, not in live ones.
+/// Measured against a workstation database of hundreds of Runs that is
+/// nothing; it is written down because the next reader would otherwise
+/// extend "bounded by live work" to a bigger scan. The fix, when the store
+/// surface is next opened, is a narrow query returning `id` +
+/// `current_json` (or a holder filter on `RunListFilter`) rather than an
+/// index alone — the per-row deserialization is the larger term.
+///
+/// **Why these four.** `Pending` and `Running` are plainly live.
+/// `Interrupted` is resumable in place (`POST /v1/runs/:id/resume`), so its
+/// seats will be dispatched through again. `Cancelled` is a marker, not a
+/// stop — in-flight abort is still a carry, so a cancelled Run's driver may
+/// well be dispatching right now.
+///
+/// **Why `Done` / `Failed` are left alone.** Their `current` is no longer a
+/// live pointer but the record of who held the seat when the Run ended,
+/// which is worth more to a reader than an empty map — and vacating would
+/// destroy it while bumping `G` on a finished row.
+///
+/// The one path that revives such a Run
+/// (`POST /v1/runs/:id/rerun-from`) then dispatches against the preserved
+/// holder, and what happens next depends on **which name** that holder is.
+/// A sid is never re-minted, so it resolves to nothing and the dispatch
+/// fails loudly at the registry lookup, fixed by an acquire (**A8**). A
+/// **role alias does not fail**: teardown re-opens the role names it held
+/// for a future mint, and the next session to claim one registers under it
+/// — so the lookup succeeds and the dispatch reaches whoever holds that
+/// role now. That is what a role alias means (`seat_declared_operators`
+/// seats role names for exactly this reason), so the outcome is correct,
+/// but it is a live re-route rather than a loud failure and should not be
+/// read as one. Either way the repair is the same acquire, which is why
+/// **O8** is described as nice-to-have rather than load-bearing.
+const CASCADE_STATUSES: [RunStatus; 4] = [
+    RunStatus::Pending,
+    RunStatus::Running,
+    RunStatus::Interrupted,
+    RunStatus::Cancelled,
+];
+
+/// **O8**: `delete(op) ⟹ ∀run. current = Assigned(a) ∧ a.op = op ⟹
+/// current := Vacant`.
+///
+/// # Both names, not just the sid
+///
+/// A session answers to its sid *and* to every role it holds — the login
+/// path registers the adapter under all of them, and a launch seats a role
+/// name as readily as a sid — so `current[slot].op` may be either. The
+/// cascade therefore matches against the whole set; releasing only the sid
+/// would leave the role-aliased seats pointing at the operator that was
+/// just deleted, which is precisely the lie **O8** exists to prevent.
+///
+/// # Best effort, and why that is right here
+///
+/// Called last, after the persisted row and every in-memory registration
+/// are gone, and it never fails the teardown: at that point the session is
+/// already released and there is nothing to roll back to, so refusing
+/// would report a failure the caller cannot act on while leaving the
+/// session torn down anyway. A seat this could not release stays held by a
+/// name nothing resolves — loud at the next dispatch, and overwritten by
+/// the next acquire (**A8**). Every failure is logged with the Run and slot
+/// it could not release.
+///
+/// # Each release names the holder it read
+///
+/// The scan is a snapshot: a `list()` per status, then one release per
+/// matching seat, with every earlier release an `.await` an `acquire` can
+/// land inside. So each release carries the generation the scan observed
+/// and the store applies it only while the seat still holds that exact
+/// holder ([`VacateOutcome`]). A seat that changed hands in between is
+/// left alone and logged — the holder **O8** judged is gone, and the one
+/// there now is by definition not the deleted operator's, so releasing it
+/// would destroy a live assignment on the strength of a stale reading.
+///
+/// # No timer
+///
+/// This fires at delete time and nowhere else. Nothing scans for
+/// deleted-operator holders in the background — the sibling judgment
+/// (**A7**) is likewise made where the seat is read. A periodic sweeper
+/// would be a second place where seats change hands, running against Runs
+/// nobody is dispatching to.
+async fn cascade_vacate_seats(state: &AppState, sid: &SessionId, roles: &[OperatorRef]) {
+    let mut names: Vec<&str> = Vec::with_capacity(roles.len() + 1);
+    names.push(sid.as_str());
+    names.extend(roles.iter().map(|role| role.as_str()));
+
+    let mut released = 0usize;
+    for status in CASCADE_STATUSES {
+        let runs = match state
+            .run_store
+            .list(&RunListFilter {
+                status: Some(status),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(runs) => runs,
+            Err(error) => {
+                tracing::warn!(
+                    %sid, ?status, %error,
+                    "O8 cascade: runs of this status could not be listed; seats held by the \
+                     deleted operator may remain in their current"
+                );
+                continue;
+            }
+        };
+        for run in runs {
+            // Collected first: `vacate_assignee` rewrites the very map
+            // being read, and the borrow ends here either way. The
+            // generation travels with each entry because the release
+            // below is conditional on it — this snapshot is taken before
+            // the `list()` round trip has even finished being consumed,
+            // and every prior release is an `.await` an acquire can land
+            // inside.
+            let held: Vec<(String, String, u64)> = run
+                .current
+                .iter()
+                .filter(|(_, assignee)| names.contains(&assignee.op.as_str()))
+                .map(|(slot, assignee)| (slot.clone(), assignee.op.clone(), assignee.gen))
+                .collect();
+            for (slot, op, observed_gen) in held {
+                match state
+                    .run_store
+                    .vacate_assignee(&run.id, &slot, observed_gen)
+                    .await
+                {
+                    Ok(VacateOutcome::Released { .. }) => {
+                        released += 1;
+                        tracing::info!(
+                            run_id = %run.id, %slot, %op, %sid,
+                            "O8 cascade: seat released because its operator was deleted"
+                        );
+                    }
+                    // The seat moved on after this scan read it, so the
+                    // holder the cascade judged is gone and the one there
+                    // now was never this operator's. O8 has no claim on
+                    // it: releasing would destroy a live assignment on the
+                    // strength of a stale reading.
+                    Ok(VacateOutcome::Stale { current }) => tracing::info!(
+                        run_id = %run.id, %slot, %op, %sid,
+                        observed_gen,
+                        current_op = current.as_ref().map(|c| c.op.as_str()).unwrap_or("<vacant>"),
+                        "O8 cascade: seat changed hands after the scan read it; left alone"
+                    ),
+                    Err(error) => tracing::warn!(
+                        run_id = %run.id, %slot, %op, %sid, %error,
+                        "O8 cascade: seat could not be released; its current still names a \
+                         deleted operator"
+                    ),
+                }
+            }
+        }
+    }
+    if released > 0 {
+        tracing::info!(%sid, released, "O8 cascade: seats released on operator delete");
+    }
 }
 
 /// `DELETE /v1/operators/:sid`. Bearer mandatory. `404` on unknown sid, `401`
 /// on token mismatch. Drops the persisted row, the 3 engine registries +
 /// role aliases + the adapter-registry bindings + `operator_sessions`
 /// entry, releases this sid's ownership in `roles_to_sid` (re-opening the
-/// role names for a future mint), and closes the session's socket.
+/// role names for a future mint), closes the session's socket, and vacates
+/// every Run seat this operator still held under its sid or any of its
+/// roles (**O8**).
 ///
 /// `500` when the persisted row cannot be dropped: the session is then
 /// still live and fully intact (see [`teardown_operator_session`]), and the
@@ -1425,6 +1628,251 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    // ── O8: a delete leaves no holder behind ─────────────────────────────
+
+    /// **O8** exists for the sake of the handover list: a `current` that
+    /// names an Operator nobody can reach makes the material a joining AI
+    /// reads to answer "is this mine, and is anyone on it?" lie to it.
+    /// These tests are written against that reading — they assert on what
+    /// `GET /v1/runs/:id` shows, not on the store call underneath.
+    mod o8_cascade {
+        use super::by_role_in_flight::test_state;
+        use super::*;
+        use mlua_swarm::store::run::{RunRecord, RunStatus};
+        use mlua_swarm::{RunId, TaskId};
+
+        /// The seat names in play. Neither is a role word — an Operator
+        /// seat is a lane of the flow, not a job title.
+        const SEAT_A: &str = "phase-a-op";
+        const SEAT_B: &str = "phase-b-op";
+        /// The role alias the session under test holds, and therefore the
+        /// second name its seats can be filed under.
+        const ROLE: &str = "ws-relay-one";
+        /// The bearer every seeded session answers to.
+        const TOKEN: &str = "token";
+
+        async fn seed_session(state: &AppState, role: &str) -> SessionId {
+            let role = OperatorRef::new(role).expect("test role literal is never empty");
+            let sid = SessionId::new();
+            let live = LoginSession::new(
+                OperatorSessionRecord {
+                    sid: sid.clone(),
+                    token_digest: OperatorSessionRecord::digest_of(TOKEN),
+                    roles: vec![role.clone()],
+                    capability_manifest: None,
+                    joined_at_secs: 0,
+                },
+                None,
+            );
+            state
+                .operator_sessions
+                .lock()
+                .await
+                .insert(sid.clone(), live);
+            state.roles_to_sid.lock().await.insert(role, sid.clone());
+            sid
+        }
+
+        async fn seed_run(state: &AppState, status: RunStatus) -> RunId {
+            let run_id = RunId::new();
+            state
+                .run_store
+                .create(RunRecord {
+                    id: run_id.clone(),
+                    task_id: TaskId::new(),
+                    status,
+                    step_entries: Vec::new(),
+                    degradations: Vec::new(),
+                    operator_sid: None,
+                    current: Default::default(),
+                    next_generation: 0,
+                    result_ref: None,
+                    input_json: None,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .await
+                .expect("seed run");
+            run_id
+        }
+
+        async fn seat(state: &AppState, run_id: &RunId, slot: &str, op: &str) {
+            state
+                .run_store
+                .acquire_assignee(run_id, slot, op, "seated by the cascade test")
+                .await
+                .expect("seed the holder");
+        }
+
+        /// Who `GET /v1/runs/:id` reports holding `slot` — the read the
+        /// cascade exists to keep honest.
+        async fn holder_on_the_wire(
+            state: &AppState,
+            run_id: &RunId,
+            slot: &str,
+        ) -> Option<String> {
+            crate::tasks::run_get(State(state.clone()), Path(run_id.to_string()))
+                .await
+                .expect("run get")
+                .0
+                .current
+                .get(slot)
+                .map(|assignee| assignee.op.clone())
+        }
+
+        async fn delete_session(state: &AppState, sid: &SessionId) {
+            let response = operators_delete(
+                State(state.clone()),
+                Path(sid.to_string()),
+                headers_with_bearer(TOKEN),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        /// **O8, both names.** A session answers to its sid *and* to every
+        /// role it holds, and a seat can be filed under either. Deleting
+        /// it releases both — and leaves a seat held by an unrelated
+        /// operator exactly where it was, because O8 is scoped to the
+        /// operator that was deleted, not to the Run.
+        #[tokio::test]
+        async fn deleting_an_operator_releases_every_seat_it_held_under_either_name() {
+            let state = test_state();
+            let sid = seed_session(&state, ROLE).await;
+
+            let by_sid = seed_run(&state, RunStatus::Running).await;
+            seat(&state, &by_sid, SEAT_A, sid.as_str()).await;
+
+            let by_role = seed_run(&state, RunStatus::Running).await;
+            seat(&state, &by_role, SEAT_A, ROLE).await;
+            seat(&state, &by_role, SEAT_B, "S-somebody-else").await;
+
+            delete_session(&state, &sid).await;
+
+            assert_eq!(
+                holder_on_the_wire(&state, &by_sid, SEAT_A).await,
+                None,
+                "the seat held under the sid must not survive the delete"
+            );
+            assert_eq!(
+                holder_on_the_wire(&state, &by_role, SEAT_A).await,
+                None,
+                "nor the seat held under one of its role aliases"
+            );
+            assert_eq!(
+                holder_on_the_wire(&state, &by_role, SEAT_B).await,
+                Some("S-somebody-else".to_string()),
+                "another operator's seat on the same Run is none of this delete's business"
+            );
+        }
+
+        /// **A4.** `Vacant` is an assignment event like any other, so the
+        /// cascade advances `G`: the next acquire continues from the
+        /// bumped counter rather than reusing the released holder's
+        /// generation, which is what keeps a late reply from the deleted
+        /// operator from matching (**A6**).
+        #[tokio::test]
+        async fn the_cascade_counts_as_an_assignment_event() {
+            let state = test_state();
+            let sid = seed_session(&state, ROLE).await;
+            let run_id = seed_run(&state, RunStatus::Running).await;
+            seat(&state, &run_id, SEAT_A, sid.as_str()).await;
+            assert_eq!(
+                state.run_store.get(&run_id).await.expect("run").current[SEAT_A].gen,
+                1
+            );
+
+            delete_session(&state, &sid).await;
+
+            let after = state.run_store.get(&run_id).await.expect("run");
+            assert!(after.current.is_empty(), "T5 / O8: the seat is released");
+            assert_eq!(
+                after.next_generation, 2,
+                "A4: releasing the seat is an event and bumps G"
+            );
+        }
+
+        /// The scan covers every status a Run can still be dispatched
+        /// under — including the two that read as finished but are not:
+        /// `Interrupted` (resumable in place) and `Cancelled` (a marker;
+        /// in-flight abort is still a carry).
+        #[tokio::test]
+        async fn every_dispatchable_status_is_swept() {
+            let state = test_state();
+            let sid = seed_session(&state, ROLE).await;
+
+            let mut runs = Vec::new();
+            for status in [
+                RunStatus::Pending,
+                RunStatus::Running,
+                RunStatus::Interrupted,
+                RunStatus::Cancelled,
+            ] {
+                let run_id = seed_run(&state, status).await;
+                seat(&state, &run_id, SEAT_A, sid.as_str()).await;
+                runs.push((status, run_id));
+            }
+
+            delete_session(&state, &sid).await;
+
+            for (status, run_id) in runs {
+                assert_eq!(
+                    holder_on_the_wire(&state, &run_id, SEAT_A).await,
+                    None,
+                    "a {status:?} run can still dispatch, so its seat must be released"
+                );
+            }
+        }
+
+        /// `Done` / `Failed` are left alone on purpose: their `current` is
+        /// no longer a live pointer but the record of who held the seat
+        /// when the Run ended, and that is worth more to a reader than an
+        /// empty map. The scan is bounded by live work rather than by
+        /// history — see [`super::super::CASCADE_STATUSES`].
+        #[tokio::test]
+        async fn a_finished_run_keeps_its_record_of_who_held_the_seat() {
+            let state = test_state();
+            let sid = seed_session(&state, ROLE).await;
+            let done = seed_run(&state, RunStatus::Done).await;
+            let failed = seed_run(&state, RunStatus::Failed).await;
+            seat(&state, &done, SEAT_A, sid.as_str()).await;
+            seat(&state, &failed, SEAT_A, sid.as_str()).await;
+
+            delete_session(&state, &sid).await;
+
+            assert_eq!(
+                holder_on_the_wire(&state, &done, SEAT_A).await,
+                Some(sid.to_string()),
+                "a Done run records who finished it"
+            );
+            assert_eq!(
+                holder_on_the_wire(&state, &failed, SEAT_A).await,
+                Some(sid.to_string()),
+                "and a Failed one records who was holding it when it failed"
+            );
+        }
+
+        /// The by-role recovery route shares `teardown_operator_session`,
+        /// so it cascades identically — the seats do not depend on which
+        /// door the delete came through.
+        #[tokio::test]
+        async fn the_by_role_route_cascades_too() {
+            let state = test_state();
+            let sid = seed_session(&state, ROLE).await;
+            let run_id = seed_run(&state, RunStatus::Running).await;
+            seat(&state, &run_id, SEAT_A, sid.as_str()).await;
+
+            let response = operators_delete_by_role(
+                State(state.clone()),
+                Path(ROLE.to_string()),
+                axum::extract::Query(OperatorsDeleteByRoleQuery { force: true }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(holder_on_the_wire(&state, &run_id, SEAT_A).await, None);
         }
     }
 

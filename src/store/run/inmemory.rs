@@ -3,7 +3,7 @@
 
 use super::{
     Assignee, DegradationEntry, Inner, RunId, RunListFilter, RunRecord, RunStatus, RunStore,
-    RunStoreError, SharedInner, StepEntry, TaskId,
+    RunStoreError, SharedInner, StepEntry, TaskId, VacateOutcome,
 };
 use async_trait::async_trait;
 use std::sync::Mutex;
@@ -168,7 +168,8 @@ impl RunStore for InMemoryRunStore {
         &self,
         id: &RunId,
         slot: &str,
-    ) -> Result<(u64, Option<Assignee>), RunStoreError> {
+        expected_gen: u64,
+    ) -> Result<VacateOutcome, RunStoreError> {
         if slot.is_empty() {
             return Err(RunStoreError::AssigneeSlotRequired);
         }
@@ -177,13 +178,33 @@ impl RunStore for InMemoryRunStore {
             .records
             .get_mut(id)
             .ok_or_else(|| RunStoreError::NotFound(id.clone()))?;
-        // A4: Vacant bumps `G` exactly like Assign does; it just mints no
-        // Assignee, so the next acquire continues from the bumped value.
+        // The compare and the removal are both under the single `inner`
+        // mutex with no await between them, so an acquire cannot slip in
+        // after the generation matched and before the holder is dropped.
+        match record.current.get(slot) {
+            Some(held) if held.gen == expected_gen => {}
+            other => {
+                return Ok(VacateOutcome::Stale {
+                    current: other.cloned(),
+                });
+            }
+        }
+        // Only this slot's key leaves the map — a Vacant is per seat. The
+        // `else` cannot be reached while the lock is held (the key was just
+        // matched), and it is written as data rather than a panic: nothing
+        // was removed, so nothing was released.
+        let Some(released) = record.current.remove(slot) else {
+            return Ok(VacateOutcome::Stale { current: None });
+        };
+        // A4: a release that happens bumps `G` exactly like Assign does; it
+        // just mints no Assignee, so the next acquire continues from the
+        // bumped value. A Stale answer returned above wrote nothing.
         record.next_generation += 1;
-        // Only this slot's key leaves the map — a Vacant is per seat.
-        let previous = record.current.remove(slot);
         record.updated_at = crate::types::now_unix();
-        Ok((record.next_generation, previous))
+        Ok(VacateOutcome::Released {
+            generation: record.next_generation,
+            released,
+        })
     }
 
     async fn set_result(
@@ -720,9 +741,19 @@ mod tests {
         s.acquire_assignee(&id, SLOT_A, "S-a1", "first hold")
             .await
             .unwrap();
-        let (gen, released) = s.vacate_assignee(&id, SLOT_A).await.unwrap();
-        assert_eq!(gen, 2, "A4: Vacant is an event and advances G");
-        assert_eq!(released.expect("released holder").op, "S-a1");
+        let outcome = s.vacate_assignee(&id, SLOT_A, 1).await.unwrap();
+        assert_eq!(
+            outcome,
+            VacateOutcome::Released {
+                generation: 2,
+                released: Assignee {
+                    op: "S-a1".into(),
+                    desc: "first hold".into(),
+                    gen: 1,
+                },
+            },
+            "A4: a Vacant that happens is an event and advances G"
+        );
 
         let got = s.get(&id).await.unwrap();
         assert!(
@@ -757,8 +788,11 @@ mod tests {
             .await
             .unwrap();
 
-        let (_, released) = s.vacate_assignee(&id, SLOT_A).await.unwrap();
-        assert_eq!(released.expect("released holder").op, "S-a1");
+        let outcome = s.vacate_assignee(&id, SLOT_A, 1).await.unwrap();
+        assert!(
+            matches!(&outcome, VacateOutcome::Released { released, .. } if released.op == "S-a1"),
+            "got: {outcome:?}"
+        );
 
         let got = s.get(&id).await.unwrap();
         assert!(!got.current.contains_key(SLOT_A));
@@ -768,15 +802,66 @@ mod tests {
         );
     }
 
-    /// A4: vacating an already-Vacant slot is a real event, not a no-op.
+    /// An already-Vacant slot holds no generation, so no release can match
+    /// it: the call is refused as stale and writes nothing — not even the
+    /// counter bump the unconditional verb used to make.
     #[tokio::test]
-    async fn vacate_on_a_vacant_run_still_advances_generation() {
+    async fn vacate_on_a_vacant_run_is_stale_and_writes_nothing() {
         let s = InMemoryRunStore::new();
         s.create(mk("R-1", "T-1", 100)).await.unwrap();
         let id = RunId::parse("R-1").unwrap();
-        let (gen, released) = s.vacate_assignee(&id, SLOT_A).await.unwrap();
-        assert_eq!(gen, 1);
-        assert_eq!(released, None);
+        let outcome = s.vacate_assignee(&id, SLOT_A, 1).await.unwrap();
+        assert_eq!(outcome, VacateOutcome::Stale { current: None });
+        assert_eq!(
+            s.get(&id).await.unwrap().next_generation,
+            0,
+            "a release that did not release is not an assignment event"
+        );
+    }
+
+    /// The defect this verb exists for: a release issued against a
+    /// generation the seat no longer holds must leave the current holder
+    /// exactly where it is. A7 and O8's cascade both read a holder, await,
+    /// and only then release — an acquire landing in that window must win.
+    #[tokio::test]
+    async fn a_stale_release_does_not_disturb_the_current_holder() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        // What the releasing caller read.
+        let (observed_gen, _) = s
+            .acquire_assignee(&id, SLOT_A, "S-away", "the holder that went quiet")
+            .await
+            .unwrap();
+        // What landed while it was deciding (A8: acquire never excludes).
+        s.acquire_assignee(&id, SLOT_A, "S-fresh", "took the seat mid-decision")
+            .await
+            .unwrap();
+
+        let outcome = s.vacate_assignee(&id, SLOT_A, observed_gen).await.unwrap();
+        assert_eq!(
+            outcome,
+            VacateOutcome::Stale {
+                current: Some(Assignee {
+                    op: "S-fresh".into(),
+                    desc: "took the seat mid-decision".into(),
+                    gen: 2,
+                }),
+            },
+            "the stale reader is told who holds the seat now, and nothing is released"
+        );
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(
+            got.current[SLOT_A].op, "S-fresh",
+            "the newer holder stands — A8 already decided this contest"
+        );
+        assert_eq!(got.current[SLOT_A].gen, 2);
+        assert_eq!(
+            got.next_generation, 2,
+            "the refused release burned no generation"
+        );
     }
 
     /// A3 / Q3: an acquire mints a NEW `Assignee`; a handle taken before it
@@ -863,7 +948,7 @@ mod tests {
             matches!(err, RunStoreError::AssigneeSlotRequired),
             "got: {err:?}"
         );
-        let err = s.vacate_assignee(&id, "").await.unwrap_err();
+        let err = s.vacate_assignee(&id, "", 1).await.unwrap_err();
         assert!(
             matches!(err, RunStoreError::AssigneeSlotRequired),
             "got: {err:?}"
@@ -922,7 +1007,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RunStoreError::NotFound(_)), "got: {err:?}");
-        let err = s.vacate_assignee(&missing, SLOT_A).await.unwrap_err();
+        let err = s.vacate_assignee(&missing, SLOT_A, 1).await.unwrap_err();
         assert!(matches!(err, RunStoreError::NotFound(_)), "got: {err:?}");
     }
 

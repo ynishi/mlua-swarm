@@ -147,10 +147,34 @@ impl WSOperatorSession {
     /// `login::handle_operator_socket`'s existing reconnect arm and only
     /// swaps the sender in ([`Self::replace_tx`]).
     ///
-    /// Parking is the wanted shape here: a run pinned to a restored
-    /// session waits for its operator to come back rather than failing on
-    /// the gap between boot and reconnect. `send_oneway` (`after`) still
-    /// drops during that gap, as it does on any disconnect.
+    /// # What the park still covers, and what **A7** took out of it
+    ///
+    /// A reply-expecting send issued while `tx` is `None` parks rather than
+    /// failing, and that is still the wanted shape for the paths that reach
+    /// this object **directly by sid**: the `SeniorBridge` and `SpawnHook`
+    /// registrations (`login::register_operator_session`) hand the engine
+    /// this session itself, so a dispatch through them waits for the
+    /// client's first connect instead of failing on the gap between boot
+    /// and reconnect. It also covers a dispatch that was already admitted —
+    /// once a holder answered `Connected` at reference time, a socket lost
+    /// *afterwards* parks the in-flight send below the boundary (**T2**)
+    /// until the client returns or teardown publishes
+    /// [`ConnState::TornDown`].
+    ///
+    /// It does **not** cover a dispatch routed through the assignee. That
+    /// path (`AssigneeRouter::execute`) pulls `T-ALIVE` before delegating,
+    /// and a restored session is registered while disconnected — so **A7**
+    /// releases the seat and fails the dispatch as Vacant *before* anything
+    /// reaches this object. A Run whose seat is held by a restored session
+    /// therefore does not wait for its operator to come back: its first
+    /// dispatch empties the seat, and an `acquire`
+    /// (`POST /v1/runs/:id/acquire`, **A8**) is what puts a reachable
+    /// holder back. That is **A7** as specified — the state is examined at
+    /// reference time, with no grace window (**T7**) — and it is the reason
+    /// this paragraph no longer promises parking for pinned runs.
+    ///
+    /// `send_oneway` (`after`) still drops during the gap, as it does on
+    /// any disconnect.
     pub(super) fn disconnected_with_base_url(
         sid: SessionId,
         base_url: Option<std::sync::Arc<str>>,

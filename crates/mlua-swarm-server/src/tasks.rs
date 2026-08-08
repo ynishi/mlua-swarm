@@ -21,6 +21,18 @@
 //!   the SAME `run_id`; physically truncates the replay log at the cut
 //!   point so re-dispatch does not collide with the pre-rerun rows. See
 //!   [`run_rerun_from`] for the full contract + Known Limitations.
+//! - `POST /v1/runs/:id/acquire` — take one of the Run's Operator seats
+//!   (model §4.5). Never refuses a held seat (**A8**), and reports the
+//!   generation and the holder it displaced. See [`run_acquire`] for the
+//!   contract and for the one rule of §4.5 this build cannot honour.
+//!
+//! There is deliberately no route that empties a seat. The model reaches
+//! `Vacant` three ways — the holder is found `Disconnected` at reference
+//! time (**A7**), its Operator is deleted (**O8**), or someone else
+//! acquires (**A8**) — and none of them is a request to release. An
+//! operator that wants out of a Run leaves (`DELETE /v1/operators/:sid`),
+//! which cascades. Publishing a `vacate` verb would add a fourth way that
+//! the model does not have and that nothing above needs.
 //!
 //! `POST /v1/tasks` itself (the flow-eval entry point, `tasks_start` /
 //! `run_flow_form`) stays in `crate::lib` — it is the pre-existing
@@ -49,7 +61,8 @@ use mlua_swarm::service::merge_init_ctx_3layer;
 use mlua_swarm::service::TaskLaunchError;
 use mlua_swarm::store::replay::ReplayCursor;
 use mlua_swarm::store::run::{
-    RunContext, RunListFilter, RunRecord, RunStatus, RunStoreError, SnapshotOrigin, StepEntry,
+    Assignee, RunContext, RunListFilter, RunRecord, RunStatus, RunStoreError, SnapshotOrigin,
+    StepEntry,
 };
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStoreError};
 use mlua_swarm::store::trace::{kind as trace_kind, TraceEvent, TraceHandle, TraceQuery};
@@ -203,76 +216,112 @@ pub(crate) fn resolve_launch_assign(
     Ok(Some((op.to_string(), desc.to_string())))
 }
 
-/// Which Blueprint-declared Operator seat a launch pin's `Assign` lands
-/// in.
+/// Which of a Blueprint's declared Operator seats a request named — the
+/// decision shared by [`resolve_launch_slot`] (a launch pin) and
+/// [`resolve_acquire_slot`] (a handover).
 ///
 /// `Run.current` is keyed by slot (`operator_ref`): a Blueprint declares N
 /// Operator seats in `operators[]` and each agent picks the one it
 /// dispatches through (`AgentDef.spec.operator_ref`), so "assign this Run
 /// to that operator" is only half an instruction — the other half is
-/// *which seat*. The rule, in launch-request terms:
+/// *which seat*. That half is decided the same way whoever is asking,
+/// which is why it is decided once, here:
 ///
-/// 1. `operator_slot` given → that seat, provided the Blueprint declares
-///    it. A name no `OperatorDef` carries is a `400`, not a new seat:
-///    accepting it would file a holder under a key no router ever reads,
-///    and the run would dispatch into a `Vacant` seat with the pin looking
-///    like it took.
-/// 2. `operator_slot` absent and the Blueprint declares exactly one
-///    Operator → that one. Nothing to disambiguate, so nothing to ask for
-///    (this is the shape every bundled Blueprint has today).
-/// 3. `operator_slot` absent and the Blueprint declares two or more →
-///    `400`, listing the candidates. Picking one (the first, say) would be
-///    an addressing rule the model does not have, and would silently
+/// 1. A seat is named and the Blueprint declares it → that seat.
+/// 2. No seat is named and the Blueprint declares exactly one → that one.
+///    Nothing to disambiguate, so nothing to ask for (this is the shape
+///    every bundled Blueprint has today).
+/// 3. A seat is named that no `OperatorDef` carries → refuse rather than
+///    invent it. A holder filed under a key no router ever reads would
+///    leave the Run dispatching into a `Vacant` seat with the request
+///    looking like it took.
+/// 4. No seat is named and the Blueprint declares two or more → refuse and
+///    list the candidates. Picking one (the first, say) would be an
+///    addressing rule the model does not have, and would silently
 ///    mis-address every multi-Operator Blueprint — the exact failure the
 ///    per-lane split (`phase_a_op` / `phase_b_op`) exists to keep visible.
-/// 4. The Blueprint declares no Operator at all → `400`. There is no seat
-///    to assign, so the pin cannot be honored.
+/// 5. The Blueprint declares no Operator at all → refuse. There is no seat
+///    to hold.
 ///
 /// The comparison is literal (no trimming): a padded or empty name is a
-/// name nothing declares, and gets the same candidate-listing `400` as any
-/// other typo.
+/// name nothing declares, and lands in [`Self::Undeclared`] like any other
+/// typo.
+///
+/// What a caller *says* about a refusal is deliberately not shared. Both
+/// callers answer `400`, but a launch pin and a handover are refused for
+/// reasons the reader has to act on differently, so each writes its own
+/// sentence: the rule is common, the wording is not.
+pub(crate) enum SlotChoice<'a> {
+    /// The request named a seat the Blueprint declares.
+    Named(&'a str),
+    /// The request named none and the Blueprint declares exactly one.
+    Sole(&'a str),
+    /// The request named a seat no `OperatorDef` carries, on a Blueprint
+    /// that does declare others.
+    Undeclared(&'a str),
+    /// The Blueprint declares no seat at all. Carries the requested name
+    /// when there was one, so the refusal can quote it.
+    NoSeats(Option<&'a str>),
+    /// The request named none and the Blueprint declares several.
+    Ambiguous,
+}
+
+/// Apply the [`SlotChoice`] rule. Pure, and every refusal is a variant
+/// rather than an error — the wording belongs to the caller that has the
+/// context for it.
+pub(crate) fn choose_slot<'a>(
+    requested: Option<&'a str>,
+    operators: &'a [OperatorDef],
+) -> SlotChoice<'a> {
+    match (requested, operators) {
+        (Some(slot), ops) if ops.iter().any(|o| o.name == slot) => SlotChoice::Named(slot),
+        (Some(slot), []) => SlotChoice::NoSeats(Some(slot)),
+        (Some(slot), _) => SlotChoice::Undeclared(slot),
+        (None, [only]) => SlotChoice::Sole(&only.name),
+        (None, []) => SlotChoice::NoSeats(None),
+        (None, _) => SlotChoice::Ambiguous,
+    }
+}
+
+/// The declared seats, quoted and comma-joined, for a refusal that lists
+/// the candidates.
+fn declared_seats(operators: &[OperatorDef]) -> String {
+    operators
+        .iter()
+        .map(|o| format!("'{}'", o.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Which Blueprint-declared Operator seat a launch pin's `Assign` lands
+/// in — [`choose_slot`] in launch-request terms, where every refusal is a
+/// `400` phrased about `operator_slot` / `operator_sid`.
 pub(crate) fn resolve_launch_slot(
     operator_slot: Option<&str>,
     operators: &[OperatorDef],
 ) -> Result<String, ApiError> {
-    let declared = || {
-        operators
-            .iter()
-            .map(|o| format!("'{}'", o.name))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    if let Some(slot) = operator_slot {
-        return if operators.iter().any(|o| o.name == slot) {
-            Ok(slot.to_string())
-        } else if operators.is_empty() {
-            Err(ApiError::bad_request(format!(
-                "operator_slot '{slot}': this Blueprint declares no operators[], so there is \
-                 no seat to assign a launch pin to"
-            )))
-        } else {
-            Err(ApiError::bad_request(format!(
-                "operator_slot '{slot}': this Blueprint declares no such operator (declared: \
-                 {})",
-                declared()
-            )))
-        };
-    }
-
-    match operators {
-        [only] => Ok(only.name.clone()),
-        [] => Err(ApiError::bad_request(
+    match choose_slot(operator_slot, operators) {
+        SlotChoice::Named(slot) | SlotChoice::Sole(slot) => Ok(slot.to_string()),
+        SlotChoice::NoSeats(Some(slot)) => Err(ApiError::bad_request(format!(
+            "operator_slot '{slot}': this Blueprint declares no operators[], so there is \
+             no seat to assign a launch pin to"
+        ))),
+        SlotChoice::Undeclared(slot) => Err(ApiError::bad_request(format!(
+            "operator_slot '{slot}': this Blueprint declares no such operator (declared: \
+             {})",
+            declared_seats(operators)
+        ))),
+        SlotChoice::NoSeats(None) => Err(ApiError::bad_request(
             "operator_sid assigns this Run to an operator, but the Blueprint declares no \
              operators[] — there is no seat to assign it to. Declare the Operator the agents \
              dispatch through, or launch without operator_sid."
                 .to_string(),
         )),
-        _ => Err(ApiError::bad_request(format!(
+        SlotChoice::Ambiguous => Err(ApiError::bad_request(format!(
             "operator_slot is required: this Blueprint declares {} Operator seats ({}), so a \
              launch pin has to name the one it assigns",
             operators.len(),
-            declared()
+            declared_seats(operators)
         ))),
     }
 }
@@ -2045,6 +2094,306 @@ pub async fn run_delete(
         tracing::warn!(%run_id, error = %e, "run_delete: trace delete_run failed (run row already deleted)");
     }
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// POST /v1/runs/:id/acquire — model §4.5, "becoming the Assignee"
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Body of `POST /v1/runs/:id/acquire` — the model's `acquire(op, desc)`
+/// (§4.5), addressed at one Run.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct RunAcquireRequest {
+    /// Who takes the seat: the `OperatorId` written into
+    /// [`Assignee::op`]. A session id (`S-<hex>`) or a role alias
+    /// (`main-ai`) — the two share one key space, and the router resolves
+    /// an adapter out of it at dispatch time.
+    ///
+    /// Stored verbatim, and **not checked against the operator registry**.
+    /// **Q2**: acquire does not negotiate and does not enquire. Requiring
+    /// the operator to be registered *now* would also refuse the one case
+    /// the registry is legitimately empty for — a restored session whose
+    /// client has not reconnected yet — and the model has a path for a
+    /// holder that names nobody (a loud failure at the next dispatch, and
+    /// **O8** when the operator is actually deleted), which is a better
+    /// answer than refusing the handover.
+    ///
+    /// Whitespace-only is refused: it names nobody, and would file a
+    /// holder no adapter can ever match while making `current` read as
+    /// held.
+    pub op: String,
+    /// Why this operator is taking the seat — **A9** / **Q1**, the
+    /// human-readable record of the assignment. Trimmed, and an empty
+    /// (or whitespace-only) value is a `400`.
+    ///
+    /// This is the one field a reader of the handover list has to tell
+    /// two concurrent takeovers apart by, so it is mandatory at both this
+    /// boundary and the store's.
+    pub desc: String,
+    /// Which Blueprint-declared seat to take. Optional under the same rule
+    /// a launch pin uses (see [`choose_slot`]): omit it when the Blueprint
+    /// declares exactly one Operator, name it when the Blueprint declares
+    /// several (omitting it then is a `400` that lists the candidates).
+    #[serde(default)]
+    pub slot: Option<String>,
+}
+
+/// Response body of `POST /v1/runs/:id/acquire` — **Q4**: "the requester
+/// is told the generation and the previous holder", so that taking a seat
+/// from someone is visible to whoever took it.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct RunAcquireResponse {
+    /// The Run whose seat was taken — echoes the path param.
+    #[schemars(with = "String")]
+    pub run_id: RunId,
+    /// The seat that was taken. Always spelled out, including when the
+    /// request omitted it and the sole declared Operator was used, so the
+    /// caller never has to guess which one it got.
+    pub slot: String,
+    /// The generation stamped on the new holder — the Run counter `G`
+    /// after this event (**A4**). Every subsequent reply for this seat is
+    /// accepted only under this number (**A6**), so it is the value the
+    /// acquirer dispatches under.
+    pub gen: u64,
+    /// The holder this acquire displaced, or `null` when the seat was
+    /// `Vacant`.
+    ///
+    /// Serialized either way — never skipped. `null` is the answer to "did
+    /// I take this from someone?", and a field that vanishes would leave
+    /// that answer indistinguishable from an older server that did not
+    /// report it.
+    pub previous: Option<Assignee>,
+    /// **Q5 is not honoured by this build**, and this says so rather than
+    /// letting the omission pass silently. Present exactly when
+    /// [`Self::previous`] is — the rule has no premise when nobody was
+    /// displaced. See [`t_discard_not_sent`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_discard_not_sent: Option<String>,
+}
+
+/// The **Q5** shortfall, in the response and in the caller's hands.
+///
+/// The model's acquire throws `T-DISCARD(old op, R)` at the transport when
+/// it displaces a live holder (§4.5), so the requests already sent to the
+/// displaced operator for this Run are cancelled at the far end. This
+/// build cannot: `T-DISCARD` is defined over a `run`, and the operator
+/// session's pending map is keyed by `req_id` alone with no `run_id` on
+/// the wire, so there is nothing to select the Run's requests by. The
+/// primitive is therefore absent from `OperatorAdapter` as well (see that
+/// trait's doc) rather than present and unimplementable.
+///
+/// What that costs, precisely: the displaced holder keeps whatever was
+/// already in flight and may still answer it. Those answers do not reach
+/// the flow — the router re-reads `current` after the adapter returns and
+/// refuses a reply whose generation has moved (**A6**) — so the failure
+/// mode is a wasted round trip and a stale request the far end never
+/// hears is dead, not a double answer.
+fn t_discard_not_sent(displaced: &Assignee, run_id: &RunId) -> String {
+    format!(
+        "T-DISCARD was not sent to the displaced holder '{}': this build cannot address a \
+         discard at one Run (the operator session's pending map is keyed by req_id alone and \
+         the wire carries no run_id), so requests already dispatched to it for run {run_id} \
+         are still outstanding and it may still answer them. Such an answer is refused on \
+         arrival because the generation has moved (A6), but nothing was cancelled at the far \
+         end.",
+        displaced.op
+    )
+}
+
+/// The Operator seats a Run can be acquired into — [`choose_slot`] over
+/// the Blueprint the Run's Task was launched with, with one addition.
+///
+/// **A seat the Run already holds is accepted without consulting the
+/// Blueprint at all**, and is checked first. Two reasons, one practical
+/// and one about which fact outranks which: a takeover — the common case —
+/// then costs no Blueprint resolve, and a held seat is a fact about *this
+/// Run*, whereas `operators[]` is a fact about what the Blueprint says
+/// *now*. A store-backed Blueprint that dropped a seat since launch would
+/// otherwise make the Run's own `current` unacquirable while
+/// `GET /v1/runs/:id` still shows it held, which is the sort of
+/// disagreement the handover list exists not to have.
+async fn resolve_acquire_slot(
+    state: &AppState,
+    run: &RunRecord,
+    requested: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(slot) = requested {
+        if run.current.contains_key(slot) {
+            return Ok(slot.to_string());
+        }
+    }
+
+    let run_id = &run.id;
+    let task = state
+        .task_store
+        .get(&run.task_id)
+        .await
+        .map_err(map_task_store_err)?;
+    let blueprint_ref: BlueprintRef =
+        serde_json::from_value(task.blueprint_ref.clone()).map_err(|e| {
+            ApiError::unprocessable(format!(
+                "run {run_id}: the stored blueprint_ref of task {} failed to decode, so this \
+                 Run's declared Operator seats cannot be read: {e}. Name an already-held seat \
+                 in `slot` to acquire without it.",
+                run.task_id
+            ))
+        })?;
+    let (blueprint, _version) = state
+        .task_app
+        .resolve(&blueprint_ref)
+        .await
+        .map_err(|e| ApiError::from_task_resolve(&e, &format!("run {run_id}: bp resolve")))?;
+    let operators = &blueprint.operators;
+
+    match choose_slot(requested, operators) {
+        SlotChoice::Named(slot) | SlotChoice::Sole(slot) => Ok(slot.to_string()),
+        SlotChoice::NoSeats(_) => Err(ApiError::bad_request(format!(
+            "run {run_id} has no Operator seat to acquire: its Blueprint declares no \
+             operators[], so there is no `current` key any dispatch would read"
+        ))),
+        SlotChoice::Undeclared(slot) => Err(ApiError::bad_request(format!(
+            "slot '{slot}': run {run_id} neither holds that seat nor does its Blueprint \
+             declare it (declared: {}). Acquiring it would file a holder under a key no \
+             dispatch reads.",
+            declared_seats(operators)
+        ))),
+        SlotChoice::Ambiguous => Err(ApiError::bad_request(format!(
+            "slot is required: run {run_id}'s Blueprint declares {} Operator seats ({}), so \
+             an acquire has to name the one it takes",
+            operators.len(),
+            declared_seats(operators)
+        ))),
+    }
+}
+
+/// `POST /v1/runs/:id/acquire` — take one of this Run's Operator seats,
+/// the model's §4.5 in HTTP form. The one way a holder changes from
+/// outside the engine.
+///
+/// # It does not refuse a held seat
+///
+/// **A8**: an acquire succeeds whatever `current` says — last writer wins.
+/// There is no exclusion here, no `409` for a contended seat, and no
+/// `force` flag to override one, because there is nothing to override.
+/// (model-v6's "refuse when `Assigned`" was withdrawn in v9; `force` is
+/// explicitly deferred until real mix-ups are observed, §4.5.) **Q6**: the
+/// route does not distinguish "I am returning to my own work" from
+/// "I am taking someone else's" — same request, same effect, and the
+/// operator that was displaced keeps existing (**Q7**).
+///
+/// What prevents a mix-up is therefore *not* this endpoint. It is the step
+/// before it: reading the handover list and recognising the work
+/// (§4.2 **D4** — the description is for telling jobs apart, never for a
+/// match test). This route is the part that is deliberately dumb.
+///
+/// # Known limitation — Q5 (`T-DISCARD`) is not sent
+///
+/// When this acquire displaces a live holder, the model also discards that
+/// holder's outstanding requests for this Run. **This build does not**:
+/// there is no way to select one Run's pending requests (see
+/// [`t_discard_not_sent`], which is returned in the response body whenever
+/// a holder was displaced, so a caller learns it without reading this
+/// doc). Displacing a busy operator therefore leaves its in-flight
+/// requests outstanding; their answers are refused on arrival by **A6**
+/// rather than accepted, so the seat is genuinely handed over — what is
+/// missing is the cancellation, not the handover.
+///
+/// # Status codes
+///
+/// - `400` — empty `desc` (**Q1**) or `op`; a `slot` this Run neither
+///   holds nor its Blueprint declares; no `slot` on a Blueprint declaring
+///   several.
+/// - `404` — no Run with this id.
+/// - `200` — acquired. Body: the generation and the displaced holder
+///   (**Q4**).
+///
+/// # Authorization
+///
+/// None, like every other route in this module. **B2** is the reason and
+/// not merely the precedent: the bearer guards calls *to* an Operator
+/// (**B1**) and takes no part in who holds a seat, so gating this route on
+/// one would make the bearer decide assignment. **B3** ("acquire does not
+/// need the previous holder's bearer") is satisfied a fortiori. The same
+/// loopback-bind trust tier as `DELETE /v1/runs/:id` applies; note that
+/// the handover *list*, which is what actually prevents taking the wrong
+/// Run, is Bearer-gated (**D3**).
+pub async fn run_acquire(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RunAcquireRequest>,
+) -> Result<Json<RunAcquireResponse>, ApiError> {
+    let run_id =
+        RunId::parse(id).map_err(|e| ApiError::bad_request(format!("invalid run id: {e}")))?;
+
+    // Q1 / A9 at the HTTP boundary, before the store is touched: a request
+    // that can never be honoured should not cost a round trip, and this is
+    // where the status code lives (the store refuses the same thing again
+    // but deliberately names no status — see `RunStoreError`).
+    let desc = req.desc.trim();
+    if desc.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "desc is required: taking a seat on run {run_id} records why it happened (A9), and \
+             that record is what a later reader tells two takeovers apart by (e.g. \"resuming \
+             the compile fix after a restart\")"
+        )));
+    }
+    // Not in the model's Q list, because an OperatorId that is not an
+    // OperatorId is not a case it entertains. The store does not guard it
+    // either, so it is guarded here: an empty holder would make `current`
+    // read as held while naming nobody any adapter can answer for, which is
+    // exactly the lie O8 exists to prevent.
+    if req.op.trim().is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "op is required: run {run_id}'s seat is taken *by* an operator — pass the session \
+             id (S-<hex>) or the role alias that will hold it"
+        )));
+    }
+
+    // 404 before anything else reads the Run, and the record the seat rule
+    // consults below.
+    let run = state
+        .run_store
+        .get(&run_id)
+        .await
+        .map_err(map_run_store_err)?;
+    let slot = resolve_acquire_slot(&state, &run, req.slot.as_deref()).await?;
+
+    let (gen, previous) = state
+        .run_store
+        .acquire_assignee(&run_id, &slot, &req.op, desc)
+        .await
+        .map_err(|e| match e {
+            RunStoreError::NotFound(id) => ApiError::not_found(format!("run not found: {id}")),
+            // Reachable only if this handler's checks and the store's ever
+            // disagree; a 500 would then blame the server for a bad
+            // request. The store's own doc directs callers to 400 these.
+            e @ (RunStoreError::AssigneeDescRequired | RunStoreError::AssigneeSlotRequired) => {
+                ApiError::bad_request(format!("run {run_id}: the acquire was refused: {e}"))
+            }
+            other => ApiError::engine(other),
+        })?;
+
+    match &previous {
+        Some(displaced) => tracing::info!(
+            %run_id, %slot, op = %req.op, gen,
+            displaced_op = %displaced.op, displaced_gen = displaced.gen,
+            "acquire: seat taken over (A8 — last writer wins; T-DISCARD not sent, Q5)"
+        ),
+        None => tracing::info!(
+            %run_id, %slot, op = %req.op, gen,
+            "acquire: vacant seat taken"
+        ),
+    }
+
+    Ok(Json(RunAcquireResponse {
+        run_id: run_id.clone(),
+        slot,
+        gen,
+        t_discard_not_sent: previous
+            .as_ref()
+            .map(|displaced| t_discard_not_sent(displaced, &run_id)),
+        previous,
+    }))
 }
 
 /// Whether a Run-scoped binding has only a declaration or also carries a
@@ -4246,6 +4595,380 @@ mod tests {
             vec![SLOT_B],
             "the kick filled the seat it named"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // POST /v1/runs/:id/acquire — model §4.5
+    // ──────────────────────────────────────────────────────────────────
+
+    /// A launched Run over a Blueprint declaring `seats`, with nothing
+    /// registered under any of their names — so every seat starts Vacant
+    /// (`seat_declared_operators` fills only seats that have a registered
+    /// holder) and an acquire is the only thing that can fill one.
+    async fn launched_run(state: &AppState, goal: &str, seats: &[&str]) -> RunId {
+        crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req_declaring(goal, seats)),
+        )
+        .await
+        .expect("tasks_start")
+        .0
+        .run_id
+    }
+
+    fn acquire_req(op: &str, desc: &str, slot: Option<&str>) -> RunAcquireRequest {
+        RunAcquireRequest {
+            op: op.to_string(),
+            desc: desc.to_string(),
+            slot: slot.map(str::to_string),
+        }
+    }
+
+    async fn acquire(
+        state: &AppState,
+        run_id: &RunId,
+        req: RunAcquireRequest,
+    ) -> Result<RunAcquireResponse, ApiError> {
+        run_acquire(State(state.clone()), Path(run_id.to_string()), Json(req))
+            .await
+            .map(|json| json.0)
+    }
+
+    /// The seat this Run's `current` shows as held, read back the way a
+    /// client reads it.
+    async fn seat_on_the_wire(state: &AppState, run_id: &RunId, slot: &str) -> Option<Assignee> {
+        run_get(State(state.clone()), Path(run_id.to_string()))
+            .await
+            .expect("run get")
+            .0
+            .current
+            .get(slot)
+            .cloned()
+    }
+
+    /// **Q4 on an empty seat.** The Blueprint declares one Operator, so
+    /// the request need not name it; the response says which seat it got,
+    /// under which generation, and that it took the seat from nobody.
+    #[tokio::test]
+    async fn an_acquire_fills_a_vacant_seat_and_reports_no_predecessor() {
+        let state = test_state();
+        let run_id = launched_run(&state, "vacant seat goal", &[SLOT_A]).await;
+
+        let resp = acquire(
+            &state,
+            &run_id,
+            acquire_req("S-taker", "picking up the stalled compile fix", None),
+        )
+        .await
+        .expect("an acquire on a Vacant seat must succeed");
+
+        assert_eq!(resp.slot, SLOT_A, "the sole declared seat was resolved");
+        assert_eq!(
+            resp.gen, 1,
+            "A4: the first assignment event is generation 1"
+        );
+        assert!(
+            resp.previous.is_none(),
+            "the seat was Vacant, so nobody was displaced"
+        );
+        assert!(
+            resp.t_discard_not_sent.is_none(),
+            "Q5 has no premise when no holder was displaced"
+        );
+
+        let seat = seat_on_the_wire(&state, &run_id, SLOT_A)
+            .await
+            .expect("GET /v1/runs/:id must show the seat held");
+        assert_eq!(seat.op, "S-taker");
+        assert_eq!(seat.desc, "picking up the stalled compile fix");
+        assert_eq!(seat.gen, 1);
+    }
+
+    /// **A8 — the seat is not defended.** A second acquire lands on a seat
+    /// that is held, and it succeeds: no `409`, no `force`, no enquiry
+    /// about the incumbent. **Q4**: the response names the holder it
+    /// displaced, so taking the seat from someone is visible to whoever
+    /// took it.
+    #[tokio::test]
+    async fn an_acquire_displaces_a_live_holder_and_says_whose_seat_it_took() {
+        let state = test_state();
+        let run_id = launched_run(&state, "handover goal", &[SLOT_A]).await;
+
+        acquire(
+            &state,
+            &run_id,
+            acquire_req("S-incumbent", "holding the seat", None),
+        )
+        .await
+        .expect("the first acquire");
+
+        let resp = acquire(
+            &state,
+            &run_id,
+            acquire_req(
+                "S-successor",
+                "taking over after the incumbent went quiet",
+                None,
+            ),
+        )
+        .await
+        .expect("A8: a held seat does not refuse an acquire");
+
+        assert_eq!(resp.gen, 2, "A4: every assignment event bumps G");
+        let displaced = resp.previous.expect("Q4: the displaced holder is reported");
+        assert_eq!(displaced.op, "S-incumbent");
+        assert_eq!(displaced.gen, 1, "A3: its stamp is what it always was");
+
+        let notice = resp
+            .t_discard_not_sent
+            .expect("Q5 is unmet here and must be said so in the response");
+        assert!(
+            notice.contains("T-DISCARD") && notice.contains("S-incumbent"),
+            "the notice must name the primitive and the holder it was not sent to: {notice}"
+        );
+
+        assert_eq!(
+            seat_on_the_wire(&state, &run_id, SLOT_A)
+                .await
+                .expect("still held")
+                .op,
+            "S-successor",
+            "last writer wins"
+        );
+    }
+
+    /// **Q6.** "Returning to my own work" is not a different operation
+    /// from "taking someone else's": the same operator re-acquiring is an
+    /// assignment event like any other, bumping `G` and minting a fresh
+    /// `Assignee` (**Q3**) rather than being recognised as a no-op.
+    #[tokio::test]
+    async fn re_acquiring_your_own_seat_is_the_same_operation() {
+        let state = test_state();
+        let run_id = launched_run(&state, "same holder goal", &[SLOT_A]).await;
+
+        acquire(
+            &state,
+            &run_id,
+            acquire_req("S-self", "first pass over the flow", None),
+        )
+        .await
+        .expect("the first acquire");
+        let resp = acquire(
+            &state,
+            &run_id,
+            acquire_req("S-self", "back after a reconnect", None),
+        )
+        .await
+        .expect("Q6: taking your own seat is not a special case");
+
+        assert_eq!(resp.gen, 2, "A4: the counter counts events, not changes");
+        let displaced = resp
+            .previous
+            .expect("its own earlier instance is still a displaced holder");
+        assert_eq!(displaced.op, "S-self");
+        assert_eq!(displaced.desc, "first pass over the flow");
+        assert_eq!(
+            seat_on_the_wire(&state, &run_id, SLOT_A)
+                .await
+                .expect("still held")
+                .desc,
+            "back after a reconnect",
+            "Q3: a new instance, not the old one edited"
+        );
+    }
+
+    /// **Q1 / A9.** The description is what a later reader tells two
+    /// takeovers apart by, so an empty one is refused at the boundary
+    /// rather than stored as `""` — whitespace included, since a space is
+    /// not a description.
+    #[tokio::test]
+    async fn an_acquire_without_a_desc_is_refused() {
+        let state = test_state();
+        let run_id = launched_run(&state, "no desc goal", &[SLOT_A]).await;
+
+        for desc in ["", "   "] {
+            let err = acquire(&state, &run_id, acquire_req("S-taker", desc, None))
+                .await
+                .expect_err("Q1: an acquire without a desc must be refused");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert!(err.message.contains("desc"), "{}", err.message);
+        }
+        assert!(
+            seat_on_the_wire(&state, &run_id, SLOT_A).await.is_none(),
+            "a refused acquire must not have taken the seat anyway"
+        );
+    }
+
+    /// An `OperatorId` that names nobody would make `current` read as held
+    /// while no adapter could ever answer for it — the exact lie **O8**
+    /// exists to prevent. The store does not guard this, so the route does.
+    #[tokio::test]
+    async fn an_acquire_without_an_op_is_refused() {
+        let state = test_state();
+        let run_id = launched_run(&state, "no op goal", &[SLOT_A]).await;
+
+        let err = acquire(&state, &run_id, acquire_req("  ", "taking the seat", None))
+            .await
+            .expect_err("a blank holder must be refused");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("op is required"), "{}", err.message);
+    }
+
+    /// The seat rule is the launch pin's, reused: several declared seats
+    /// and no name is a `400` that lists the candidates, and a name
+    /// nothing declares is a typo rather than a new seat.
+    #[tokio::test]
+    async fn an_acquire_resolves_its_seat_by_the_same_rule_a_launch_pin_does() {
+        let state = test_state();
+        let run_id = launched_run(&state, "two seat goal", &[SLOT_A, SLOT_B]).await;
+
+        let err = acquire(
+            &state,
+            &run_id,
+            acquire_req("S-taker", "taking a lane", None),
+        )
+        .await
+        .expect_err("two seats cannot be guessed between");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains(SLOT_A) && err.message.contains(SLOT_B),
+            "the candidates must be listed: {}",
+            err.message
+        );
+
+        let err = acquire(
+            &state,
+            &run_id,
+            acquire_req("S-taker", "taking a lane", Some("phase-c-op")),
+        )
+        .await
+        .expect_err("an undeclared seat must not be filed");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("phase-c-op"), "{}", err.message);
+
+        let resp = acquire(
+            &state,
+            &run_id,
+            acquire_req("S-taker", "taking lane B", Some(SLOT_B)),
+        )
+        .await
+        .expect("a declared seat is nameable");
+        assert_eq!(resp.slot, SLOT_B);
+        assert!(
+            seat_on_the_wire(&state, &run_id, SLOT_A).await.is_none(),
+            "A1 is per seat: filling B leaves A alone"
+        );
+    }
+
+    /// A seat the Run **already holds** is acquirable without consulting
+    /// the Blueprint at all — proved by taking one on a Run whose Task row
+    /// does not exist, so any Blueprint read would fail. The second half
+    /// is the control: an unheld seat on the same Run does need the
+    /// Blueprint, and says so instead of guessing.
+    #[tokio::test]
+    async fn a_held_seat_is_acquirable_without_reading_the_blueprint() {
+        let state = test_state();
+        let run_id = RunId::new();
+        state
+            .run_store
+            .create(RunRecord {
+                id: run_id.clone(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
+                result_ref: None,
+                input_json: None,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .await
+            .expect("seed a run whose Task row is absent");
+        state
+            .run_store
+            .acquire_assignee(
+                &run_id,
+                SLOT_A,
+                "S-incumbent",
+                "seated before the task vanished",
+            )
+            .await
+            .expect("seed the holder");
+
+        let resp = acquire(
+            &state,
+            &run_id,
+            acquire_req(
+                "S-successor",
+                "taking over a seat the run holds",
+                Some(SLOT_A),
+            ),
+        )
+        .await
+        .expect("a held seat is a fact about this Run, not about today's Blueprint");
+        assert_eq!(resp.slot, SLOT_A);
+        assert_eq!(resp.previous.expect("displaced").op, "S-incumbent");
+
+        let err = acquire(
+            &state,
+            &run_id,
+            acquire_req("S-successor", "taking a seat nobody holds", Some(SLOT_B)),
+        )
+        .await
+        .expect_err("an unheld seat has to be checked against the Blueprint");
+        assert_ne!(
+            err.status,
+            StatusCode::OK,
+            "an unresolvable Blueprint must not silently accept any name"
+        );
+    }
+
+    /// The wire shape of "the seat was Vacant": `previous` is present and
+    /// `null`, not absent. A field that vanished would be
+    /// indistinguishable from a server that does not report predecessors,
+    /// which is the one thing **Q4** is for.
+    #[tokio::test]
+    async fn a_vacant_predecessor_is_null_on_the_wire_rather_than_absent() {
+        let state = test_state();
+        let run_id = launched_run(&state, "wire shape goal", &[SLOT_A]).await;
+        let resp = acquire(
+            &state,
+            &run_id,
+            acquire_req("S-taker", "first holder", None),
+        )
+        .await
+        .expect("acquire");
+
+        let body = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(body["previous"], Value::Null);
+        assert!(
+            body.get("previous").is_some(),
+            "`previous` must be emitted even when null: {body}"
+        );
+        assert!(
+            body.get("t_discard_not_sent").is_none(),
+            "nothing was displaced, so the Q5 notice must not appear: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_acquire_on_an_unknown_run_is_404() {
+        let state = test_state();
+        let err = run_acquire(
+            State(state),
+            Path("R-does-not-exist".to_string()),
+            Json(acquire_req(
+                "S-taker",
+                "taking a seat that is not there",
+                None,
+            )),
+        )
+        .await
+        .expect_err("an unknown Run has no seat");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
     /// A snapshot written before the pin field existed still decodes, and
