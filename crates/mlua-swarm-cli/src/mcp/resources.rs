@@ -426,6 +426,15 @@ pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Er
     let stats_body = serde_json::to_value(&stats_body_schema)?;
     let degradation_body_schema = schemars::schema_for!(mlua_swarm_server::DegradationBody);
     let degradation_body = serde_json::to_value(&degradation_body_schema)?;
+    let run_assignees_response_schema =
+        schemars::schema_for!(mlua_swarm_server::handover::RunAssigneesResp);
+    let run_assignees_response = serde_json::to_value(&run_assignees_response_schema)?;
+    let run_handover_response_schema =
+        schemars::schema_for!(mlua_swarm_server::handover::RunHandoverResp);
+    let run_handover_response = serde_json::to_value(&run_handover_response_schema)?;
+    let run_material_response_schema =
+        schemars::schema_for!(mlua_swarm_server::handover::StepMaterialResp);
+    let run_material_response = serde_json::to_value(&run_material_response_schema)?;
 
     Ok(serde_json::json!({
         "endpoints": {
@@ -467,6 +476,21 @@ pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Er
             },
             "GET /v1/runs": {
                 "$comment": "Filtered Run collection, newest-first. Query: `task_id` / `status` (pending|running|done|failed|interrupted) / `limit` / `offset`, all optional. Response body is {\"runs\": [<the GET /v1/runs/:id response>, ...]} — the element schema is not restated here.",
+            },
+            "GET /v1/runs/:id/assignees": {
+                "$comment": "Who holds each of the Run's Operator seats, and which seats nobody holds. Auth: `Authorization: Bearer <token>` of ANY live Operator session (mint one with POST /v1/operators). A seat with no holder is present with `vacant: true` and `holder: null` — it is never omitted, so \"nobody is on this Run\" and \"this response did not report holders\" are different bytes. `seats_source: \"run_current_only\"` means the Blueprint could not be resolved, so declared-but-vacant seats are missing from the list; `note` says why. Read it together with GET /v1/operators before acquiring a seat.",
+                "response": run_assignees_response,
+            },
+            "GET /v1/runs/:id/handover": {
+                "$comment": "The four things an Assignee needs to read to decide what to do next, in one call — whether or not it is taking over from anybody. Auth: Bearer of ANY live Operator session, same rule as /assignees. `trace` is a REFERENCE ({route, latest_seq}), not the events: `latest_seq` is the watermark separating what is in this snapshot from what happened after it. `seats` / `seats_source` / `note` are exactly the /assignees body, taken from the same RunRecord read. `unanswered[]` is every request a current holder still owes this Run, each listed ONCE: `slot` / `op` / `generation` name the Operator seat the request was dispatched through and whoever holds it now, and all three are `null` for a request that belongs to no seat (a `hook_before` never passes through a seat, so naming one would be a guess). Each entry carries `final_present` / `final_ok` — whether that (step_id, attempt) ALREADY produced a Final, which is the difference between re-running a step and doubling its side effect — plus a `material_route` pointing at the route below. `unread_seats[]` names a held seat whose holder could not be asked; an empty `unanswered` means every holder was asked and owed nothing, never that nobody was asked. This is a read: no resume, no skip, no retry, and nothing here empties a seat.",
+                "response": run_handover_response,
+            },
+            "GET /v1/runs/:id/material": {
+                "$comment": "What one step of a Run needs in order to be run — the second half of \"what do I do next\", pointed at by each `unanswered[].material_route`. Query: `step_id=<StepId>` (required). Auth: Bearer of ANY live Operator session; note that this is a weaker credential than the per-task worker CapToken the same payload is normally fetched with, and minting an Operator session needs no credential at all, so treat the gate as a shape check rather than as confidentiality. Body: `payload` is the same WorkerPayload GET /v1/worker/prompt serves; `run_link` is `confirmed` when the payload's own context names the Run in the path and `unconfirmed` when the payload carries no Run identity to check against (`note` says why); `final_present` / `final_ok` repeat axis 4's first half so this route answers \"what do I do next\" on its own. The Final's VALUE is deliberately not here — presence and the ok flag are what the decision needs, and the value is unbounded. 404 when the step is unknown to the engine or belongs to a different Run.",
+                "response": run_material_response,
+            },
+            "GET /v1/operators": {
+                "$comment": "Every live Operator session with its 記名: `sid` / `roles` / `joined_at_secs` / `connected`, the join-time `desc` the session wrote about itself (null when it wrote none — the key is always present), and `observed[]`, one entry per Operator seat it has been assigned ({run_id, slot, goal, project_root, work_dir, task_metadata, task_metadata_omitted, text_truncated, at_secs}). Every entry field is bounded so the ring has a stated size: `task_metadata` over 4 KiB is dropped with `task_metadata_omitted: true`, and `goal` / `project_root` / `work_dir` over 1 KiB are cut to fit, ending in `…` with `text_truncated: true`. Auth: Bearer of any live session — this route was unauthenticated before and is now gated. Ordered by `last_activity_secs` descending, then by sid. Query: `limit` (default 50, clamped to 200). Response body is {\"operators\": [...], \"total\": N, \"limit\": N}; `total` is the count before the page cut, and `observed_total > observed.length` means older entries have aged out of the per-session ring. No token or capability manifest is ever on this surface.",
             },
             "POST /v1/worker/stats": {
                 "$comment": "Worker self-reported per-attempt stats. Auth: `Authorization: Bearer <worker_handle>` (short handle from the Spawn frame, or full capability_token). `worker_kind` defaults to \"operator\". Every field is optional and an all-empty body is accepted and dropped. Call it BEFORE the attempt's final `POST /v1/worker/submit`: the dispatcher folds the recorded stats into the step's StepEntry at outcome time, so stats arriving after that fold never reach the Run record. 204 on success; 410 once the addressed Run is terminal. Also reachable via `mse_worker_submit`'s `stats` object, which POSTs here before its own submit; aggregate a run's reports with the `swarm_run_stats` tool.",
@@ -613,6 +637,10 @@ mod tests {
             "GET /v1/runs/:id",
             "GET /v1/runs/:id/steps",
             "GET /v1/runs",
+            "GET /v1/runs/:id/assignees",
+            "GET /v1/runs/:id/handover",
+            "GET /v1/runs/:id/material",
+            "GET /v1/operators",
             "POST /v1/worker/stats",
             "POST /v1/worker/degradation",
         ] {

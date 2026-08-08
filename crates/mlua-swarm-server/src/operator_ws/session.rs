@@ -40,7 +40,7 @@ use mlua_swarm::core::projection::{
 };
 use mlua_swarm::core::projection_placement::ProjectionPlacement;
 use mlua_swarm::{
-    CapToken, Ctx, Operator, SeniorBridge, SessionId, SpawnHook, StepId, WorkerBinding,
+    CapToken, Ctx, Operator, RunId, SeniorBridge, SessionId, SpawnHook, StepId, WorkerBinding,
     WorkerError, WorkerResult,
 };
 use serde_json::Value;
@@ -73,6 +73,186 @@ enum ConnState {
     TornDown,
 }
 
+/// Which reply-expecting verb parked a [`PendingEntry`].
+///
+/// The `req_id` already spells this out in an infix (`-ask-` / `-hb-` /
+/// `-spawn-`), but that is a string built for the wire's benefit, and
+/// reading a scope decision back out of it would make the format
+/// load-bearing. The verb is known at the call site; it is recorded there.
+///
+/// Public because it rides out on
+/// [`OperatorAdapter::pending_for_run`](crate::operator_ws::OperatorAdapter::pending_for_run):
+/// the un-answered list names the verb that is waiting, and **W3** is the
+/// reason that is safe to publish — it distinguishes *which question was
+/// asked*, never how far along the answering is. There is no
+/// "sent" / "not yet sent" axis here to leak.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingKind {
+    /// [`SeniorBridge::ask`] — an escalation question. The one verb with
+    /// no `Ctx`, hence no Run (see [`PendingEntry::run_id`]).
+    Ask,
+    /// [`SpawnHook::before`] — the pre-spawn ack.
+    HookBefore,
+    /// [`Operator::execute`] — the Spawn itself.
+    Spawn,
+}
+
+/// One in-flight request awaiting its `ClientMsg`: the reply channel plus
+/// the scope needed to select it later.
+///
+/// # Why there is no `generation` here
+///
+/// The obvious fourth scope field would be the generation the dispatch was
+/// addressed under, and it is deliberately absent. A generation is an
+/// `Assignee` field, and **T1** stops the `Assignee` at the SAP: the
+/// delegation into this object passes exactly [`Operator::execute`]'s five
+/// arguments, so nothing below the boundary is ever *told* which
+/// generation addressed it (see the `router` module doc). Recording one
+/// here would require inventing a way to smuggle it down, which is the one
+/// thing that layering forbids.
+///
+/// Nothing is lost by the omission: **A6** — the rule a generation would
+/// serve — is enforced above the boundary, where
+/// `AssigneeRouter::execute` re-reads `Run.current` after the adapter
+/// answers and refuses a reply whose generation has moved. A reader that
+/// needs a generation next to one of these entries (the "what is in
+/// flight" view) joins it from `Run.current`, which is where the fact
+/// lives.
+///
+/// # Why there is no `OperatorId` here either
+///
+/// The only value this side could record is `self.sid` — the insert point
+/// knows nothing else. But `Assignee.op` shares one key space with role
+/// aliases (`main-ai`), so a holder assigned by role would never match a
+/// session's own sid and a discard addressed by string would silently miss
+/// exactly the entries it was aimed at. Hence `T-DISCARD` is addressed to
+/// the **adapter instance** ([`crate::operator_ws::OperatorAdapter`]),
+/// resolved from `Assignee.op` by the caller: from below the boundary
+/// there is only ever one operator — this one.
+pub(super) struct PendingEntry {
+    /// Resolved by [`WSOperatorSession::resolve_pending`] when the
+    /// matching `answer` / `hook_ack` / `spawn_ack` arrives; dropped
+    /// (which fails the waiter) by [`WSOperatorSession::fail_pending`] and
+    /// [`WSOperatorSession::discard_pending_requests`].
+    reply: oneshot::Sender<PendingReply>,
+    /// The Run this request belongs to, when the calling verb carried a
+    /// `Ctx` to read it off (`ctx.meta.runtime["run_id"]`).
+    ///
+    /// `None` for [`PendingKind::Ask`], whose trait method takes no `Ctx`
+    /// at all — and for a `Ctx` that carries no `RunContext`. An entry
+    /// with no Run cannot be selected by one, which is what
+    /// [`WSOperatorSession::discard_pending_requests`] documents as its
+    /// shortfall.
+    run_id: Option<RunId>,
+    /// The step this request is for. Always known: every one of the three
+    /// verbs is addressed at a step.
+    step_id: StepId,
+    /// The attempt number, from the `Ctx`. `None` for
+    /// [`PendingKind::Ask`], same reason as [`Self::run_id`].
+    attempt: Option<u32>,
+    /// Which verb parked this entry.
+    kind: PendingKind,
+}
+
+impl PendingKind {
+    /// Wire/log label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::HookBefore => "hook_before",
+            Self::Spawn => "spawn",
+        }
+    }
+}
+
+impl PendingEntry {
+    /// One-line "what this request was" label — verb, step, and attempt.
+    ///
+    /// Every scope field the entry carries is legible from a log line
+    /// this way, which is what makes a discard or a teardown say *what*
+    /// it dropped rather than only how many. The Run is not repeated
+    /// here: both callers already log it as its own field (a discard is
+    /// addressed at one Run, and a teardown drops every Run at once).
+    fn label(&self) -> String {
+        match self.attempt {
+            Some(attempt) => format!("{}:{} attempt {attempt}", self.kind.as_str(), self.step_id),
+            None => format!("{}:{}", self.kind.as_str(), self.step_id),
+        }
+    }
+}
+
+/// Comma-joined [`PendingEntry::label`]s, for the one log line a drop
+/// (teardown or discard) writes about what it took down.
+fn labels(entries: &[(String, PendingEntry)]) -> String {
+    entries
+        .iter()
+        .map(|(_, entry)| entry.label())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The scope half of a [`PendingEntry`], assembled by each verb before it
+/// hands its message to [`WSOperatorSession::send_and_await`].
+///
+/// Separate from the entry itself because the reply channel is created
+/// inside `send_and_await` and never travels: a caller supplies what only
+/// it knows (its `Ctx`), and the send path supplies the rest.
+pub(super) struct PendingScope {
+    /// See [`PendingEntry::run_id`].
+    run_id: Option<RunId>,
+    /// See [`PendingEntry::step_id`].
+    step_id: StepId,
+    /// See [`PendingEntry::attempt`].
+    attempt: Option<u32>,
+    /// See [`PendingEntry::kind`].
+    kind: PendingKind,
+}
+
+impl PendingScope {
+    /// The scope of a request issued with a `Ctx` in hand
+    /// ([`SpawnHook::before`] / [`Operator::execute`]).
+    ///
+    /// `run_id` comes off `ctx.meta.runtime["run_id"]`, the same key the
+    /// router resolves a holder by, and a value that is missing or not a
+    /// `RunId` degrades to `None` rather than failing the send: a dispatch
+    /// launched without a `RunContext` is legal (see
+    /// `Engine::dispatch_attempt_with`), and the only cost of not knowing
+    /// its Run is that a Run-scoped discard cannot select it.
+    fn from_ctx(ctx: &Ctx, kind: PendingKind) -> Self {
+        Self {
+            run_id: ctx
+                .meta
+                .runtime
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .and_then(|raw| RunId::parse(raw).ok()),
+            step_id: ctx.task_id.clone(),
+            attempt: Some(ctx.attempt),
+            kind,
+        }
+    }
+
+    /// The scope of a [`SeniorBridge::ask`], which is handed a `StepId`
+    /// and nothing else.
+    ///
+    /// The trait signature is **not** widened to take a `Ctx`: it belongs
+    /// to the engine, and changing it to give this map one more field
+    /// would be a contract change for every `SeniorBridge` implementor,
+    /// paid for a discard the model does not address at `ask` in the first
+    /// place.
+    fn from_step(step_id: StepId) -> Self {
+        Self {
+            run_id: None,
+            step_id,
+            attempt: None,
+            kind: PendingKind::Ask,
+        }
+    }
+}
+
 /// 1 sid = 1 session. Looked up by sid in the `operator_sessions` store on reconnect.
 pub struct WSOperatorSession {
     sid: SessionId,
@@ -83,9 +263,16 @@ pub struct WSOperatorSession {
     /// Written only via [`Self::publish_conn`], always while the `tx` lock
     /// is held, so the pair stays consistent for a parked reader.
     conn: watch::Sender<ConnState>,
-    /// `req_id` → pending oneshot. Resolved when `answer` / `hook_ack` /
-    /// `spawn_ack` arrives.
-    pending: Mutex<HashMap<String, oneshot::Sender<PendingReply>>>,
+    /// `req_id` → the in-flight request it identifies. Resolved when
+    /// `answer` / `hook_ack` / `spawn_ack` arrives.
+    ///
+    /// The key stays the `req_id` — that is what the wire carries back
+    /// ([`super::protocol::ClientMsg`] has no other correlator, and
+    /// `ServerMsg::Spawn` sends no `run_id` out) — and the scope needed to
+    /// select entries by anything else rides in the value. Recording it at
+    /// insert time is the only opportunity there is: nothing on the ack
+    /// path could tell a reader which Run a `req_id` belonged to.
+    pending: Mutex<HashMap<String, PendingEntry>>,
     /// Server-initiated close signal for whichever socket is pumping this
     /// session. `None` = none requested; `Some(reason)` is latched by
     /// [`Self::close`] and never cleared — a session is torn down once.
@@ -307,12 +494,12 @@ impl WSOperatorSession {
     pub(crate) async fn fail_pending(&self, reason: &str) {
         // Wake the pre-send parks before draining the post-send ones.
         self.publish_conn(ConnState::TornDown);
-        let drained: Vec<(String, oneshot::Sender<PendingReply>)> =
-            self.pending.lock().await.drain().collect();
+        let drained: Vec<(String, PendingEntry)> = self.pending.lock().await.drain().collect();
         if !drained.is_empty() {
             tracing::warn!(
                 sid = %self.sid,
                 count = drained.len(),
+                requests = %labels(&drained),
                 reason,
                 "ws operator session: failing in-flight pending replies"
             );
@@ -321,11 +508,160 @@ impl WSOperatorSession {
         // unparking the corresponding `send_and_await` with an `Err`.
     }
 
+    /// `T-DISCARD.request(operator, run)` → `T-DISCARD.confirm(run,
+    /// discarded)` (model §4.7), as the session performs it: drop the
+    /// in-flight requests `req_ids` names, and answer with how many there
+    /// were.
+    ///
+    /// # Why a list of names and not a Run
+    ///
+    /// This used to select on `run_id` alone, which is one step coarser
+    /// than what an acquire takes. A Run has several Operator seats, one
+    /// session can hold more than one of them (its sid *and* each of its
+    /// roles resolve to this same object — `login::register_operator_session`),
+    /// and an acquire displaces exactly one. Selecting by Run therefore
+    /// dropped the reply channels of work still in flight on a seat this
+    /// session had not lost — and **A6** does not catch that afterwards,
+    /// because it is enforced per slot and the untouched seat's generation
+    /// never moved.
+    ///
+    /// The seat is not knowable from here — it is an `Assignee` term, and
+    /// **T1** keeps those above the SAP — so the caller makes the
+    /// selection and names it in this session's own correlator space. See
+    /// [`OperatorAdapter::discard_requests`](crate::operator_ws::OperatorAdapter::discard_requests)
+    /// for why that is the narrow way round.
+    ///
+    /// **`run_id` is still checked**, per name: a request is dropped only
+    /// if it is *both* named and recorded against `run_id`. The caller
+    /// selected from a read that has since had time to go stale, and a
+    /// `req_id` that has moved on is not a licence to drop whatever now
+    /// answers to it.
+    ///
+    /// # This is not a teardown
+    ///
+    /// [`Self::fail_pending`] drains the whole map and publishes
+    /// [`ConnState::TornDown`], because it is called when the session is
+    /// being removed and can never be reconnected. This is the opposite
+    /// situation: the operator was displaced from one seat (**A8**) and
+    /// goes on holding whatever else it holds, so nothing is published,
+    /// no unnamed entry is touched, and a send parked waiting for a
+    /// reconnect on another seat or another Run stays parked. What the
+    /// displaced holder loses is exactly the work that is no longer its
+    /// own.
+    ///
+    /// Each dropped `oneshot::Sender` closes its channel, so the matching
+    /// `send_and_await` unparks from `orx.await` with an `Err` — the same
+    /// mechanism teardown uses, and the reason a discarded spawn surfaces
+    /// promptly as a failed step rather than orphaning until the launch
+    /// ceiling fires.
+    ///
+    /// # What it cannot reach
+    ///
+    /// Entries with no Run — [`PendingKind::Ask`], whose trait method is
+    /// handed no `Ctx` (see [`PendingScope::from_step`]), and any dispatch
+    /// launched without a `RunContext` — fail the `run_id` re-check and
+    /// are **not** discarded, whatever the caller names. Selecting them
+    /// would mean guessing, and an escalation question dropped because it
+    /// *might* have belonged to the Run is worse than one that outlives
+    /// it: the far end is still free to answer, and an answer that
+    /// arrives for a seat since re-acquired is refused above the boundary
+    /// by **A6**. So the shortfall is a stale question, not a double one.
+    pub(crate) async fn discard_pending_requests(
+        &self,
+        run_id: &RunId,
+        req_ids: &[String],
+    ) -> usize {
+        let discarded: Vec<(String, PendingEntry)> = {
+            let mut pending = self.pending.lock().await;
+            let mut taken = Vec::new();
+            for req_id in req_ids {
+                let belongs = pending
+                    .get(req_id)
+                    .is_some_and(|entry| entry.run_id.as_ref() == Some(run_id));
+                if belongs {
+                    if let Some(entry) = pending.remove(req_id) {
+                        taken.push((req_id.clone(), entry));
+                    }
+                }
+            }
+            taken
+        };
+        if !discarded.is_empty() {
+            tracing::info!(
+                sid = %self.sid,
+                %run_id,
+                count = discarded.len(),
+                named = req_ids.len(),
+                requests = %labels(&discarded),
+                "T-DISCARD: dropping this session's in-flight requests for a seat it no longer holds"
+            );
+        }
+        discarded.len()
+        // `discarded` drops here — outside the `pending` lock, as in
+        // `fail_pending`: waking a waiter that immediately re-locks the
+        // map while the lock is still held would be a self-inflicted
+        // stall.
+    }
+
+    /// The set [`Self::discard_pending_requests`] is selected from,
+    /// answered instead of acted on: every request this session still owes
+    /// `run_id` a reply for. Backs
+    /// [`OperatorAdapter::pending_for_run`](crate::operator_ws::OperatorAdapter::pending_for_run)
+    /// and, through it, the un-answered Step list (model §4.6 **W5**, axis
+    /// 3).
+    ///
+    /// # Why the reply channel does not come out with it
+    ///
+    /// The map's value owns a `oneshot::Sender`, which is the *capability
+    /// to answer*. What crosses the boundary is a description of the
+    /// request — `req_id`, verb, step, attempt — and nothing that could be
+    /// used to complete or cancel it. A reader of the list is meant to
+    /// decide what to do next (**W1**: the server resolves nothing on its
+    /// own); handing it the sender would make "read the list" and "answer
+    /// on the operator's behalf" the same call.
+    ///
+    /// # Waiting is not a state
+    ///
+    /// Every entry here is waiting, and there is deliberately no field
+    /// saying *how* — parked for a reconnect and written to a live socket
+    /// are the same value of the same variable (**W3**: 未送信と送信済みを
+    /// 別状態にしない). Nor is there a timestamp to compute an age from:
+    /// **R5** sets no upper bound on the wait, so an age would exist only
+    /// to be compared against a threshold nothing here defines.
+    ///
+    /// Ordering is by `req_id`, which is stable across reads of an
+    /// unchanged map; the map itself is a `HashMap` and would otherwise
+    /// answer in a different order every time.
+    pub(crate) async fn pending_for_run(
+        &self,
+        run_id: &RunId,
+    ) -> Vec<super::router::PendingRequest> {
+        let mut requests: Vec<super::router::PendingRequest> = self
+            .pending
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, entry)| entry.run_id.as_ref() == Some(run_id))
+            .map(|(req_id, entry)| super::router::PendingRequest {
+                req_id: req_id.clone(),
+                kind: entry.kind,
+                step_id: entry.step_id.clone(),
+                attempt: entry.attempt,
+            })
+            .collect();
+        requests.sort_by(|a, b| a.req_id.cmp(&b.req_id));
+        requests
+    }
+
     /// Resolves the pending oneshot when a `ClientMsg` arrives on the handler's
     /// read task. If `req_id` is not registered, no-op (= silently drops unknown acks).
+    ///
+    /// An ack for a request [`Self::discard_pending_requests`] has already
+    /// dropped lands in that same no-op arm: the entry is gone, so the late
+    /// answer is discarded exactly like an unknown one.
     pub(super) async fn resolve_pending(&self, req_id: &str, reply: PendingReply) {
-        if let Some(otx) = self.pending.lock().await.remove(req_id) {
-            let _ = otx.send(reply);
+        if let Some(entry) = self.pending.lock().await.remove(req_id) {
+            let _ = entry.reply.send(reply);
         }
     }
 
@@ -337,9 +673,28 @@ impl WSOperatorSession {
     /// is kept across the park, so a reply that arrives right after the
     /// reconnect still finds its slot; it is removed only when the send
     /// itself fails and no reply can ever arrive.
-    async fn send_and_await(&self, req_id: String, msg: ServerMsg) -> Result<PendingReply, String> {
+    ///
+    /// `scope` is what the entry is selectable by afterwards (see
+    /// [`PendingEntry`]). It is supplied by the caller because this is the
+    /// last place the caller's `Ctx` is still in reach — the ack path that
+    /// resolves the entry carries a `req_id` and nothing more.
+    async fn send_and_await(
+        &self,
+        req_id: String,
+        msg: ServerMsg,
+        scope: PendingScope,
+    ) -> Result<PendingReply, String> {
         let (otx, orx) = oneshot::channel::<PendingReply>();
-        self.pending.lock().await.insert(req_id.clone(), otx);
+        self.pending.lock().await.insert(
+            req_id.clone(),
+            PendingEntry {
+                reply: otx,
+                run_id: scope.run_id,
+                step_id: scope.step_id,
+                attempt: scope.attempt,
+                kind: scope.kind,
+            },
+        );
 
         if let Err(e) = self.send_when_connected(msg).await {
             self.pending.lock().await.remove(&req_id);
@@ -422,7 +777,10 @@ impl SeniorBridge for WSOperatorSession {
             task_id: task_id.clone(),
             question,
         };
-        match self.send_and_await(req_id, msg).await? {
+        match self
+            .send_and_await(req_id, msg, PendingScope::from_step(task_id.clone()))
+            .await?
+        {
             PendingReply::Answer(v) => Ok(v),
             PendingReply::HookAck { .. } => {
                 Err("ws operator: unexpected hook_ack reply to ask".into())
@@ -448,7 +806,14 @@ impl SpawnHook for WSOperatorSession {
             agent: ctx.agent.clone(),
             attempt: ctx.attempt,
         };
-        match self.send_and_await(req_id, msg).await? {
+        match self
+            .send_and_await(
+                req_id,
+                msg,
+                PendingScope::from_ctx(ctx, PendingKind::HookBefore),
+            )
+            .await?
+        {
             PendingReply::HookAck { ok: true, .. } => Ok(()),
             PendingReply::HookAck { ok: false, reason } => {
                 Err(reason.unwrap_or_else(|| "ws operator: spawn rejected".into()))
@@ -597,7 +962,10 @@ impl Operator for WSOperatorSession {
             worker: Some(worker),
             directive,
         };
-        match self.send_and_await(req_id, msg).await {
+        match self
+            .send_and_await(req_id, msg, PendingScope::from_ctx(ctx, PendingKind::Spawn))
+            .await
+        {
             Ok(PendingReply::SpawnAck {
                 value,
                 ok,
@@ -2565,6 +2933,361 @@ mod tests {
         assert!(
             !unexpected_file.exists(),
             "declared root_preference=ProjectRoot must not fall back to work_dir: {unexpected_file:?}"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // T-DISCARD: the Run-scoped drop (model §4.7)
+    // ──────────────────────────────────────────────────────────────
+
+    /// A `Ctx` carrying the Run identity a dispatch is launched under —
+    /// the same `ctx.meta.runtime["run_id"]` key the router resolves a
+    /// holder by.
+    fn test_ctx_in_run(task_id: &str, run_id: &RunId) -> mlua_swarm::Ctx {
+        let mut ctx = test_ctx(task_id);
+        ctx.meta
+            .runtime
+            .insert("run_id".to_string(), Value::String(run_id.to_string()));
+        ctx
+    }
+
+    /// Park a spawn on `session` for `ctx` and return its `req_id` once
+    /// the frame is on the wire — i.e. once the pending entry exists.
+    /// The join handle is dropped: these tests are about what happens to
+    /// the entry, and a discarded spawn's waiter is expected to fail.
+    async fn park_spawn(
+        session: &std::sync::Arc<WSOperatorSession>,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
+        ctx: mlua_swarm::Ctx,
+    ) -> String {
+        use mlua_swarm::Operator;
+
+        let session_bg = session.clone();
+        tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &ctx,
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+        match rx.recv().await.expect("Spawn sent") {
+            ServerMsg::Spawn { req_id, .. } => req_id,
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    /// What a caller does when it means "everything this session owes this
+    /// Run": read the outstanding requests, then name them all.
+    ///
+    /// In production one filter sits between those two steps — the seat
+    /// the acquire took (`SeatLedger::slot_of`, above the SAP). It is
+    /// absent here on purpose: these tests are about what the session does
+    /// with the names it is handed, and the seat is not a fact this layer
+    /// has or should have.
+    async fn discard_all_for_run(session: &WSOperatorSession, run_id: &RunId) -> usize {
+        let named: Vec<String> = session
+            .pending_for_run(run_id)
+            .await
+            .into_iter()
+            .map(|request| request.req_id)
+            .collect();
+        session.discard_pending_requests(run_id, &named).await
+    }
+
+    /// **The spine of (d) axis 3.** The read answers exactly what a
+    /// discard is selected from — same Run scope, same entries — and
+    /// describes each one with the three fields that exist below the SAP.
+    #[tokio::test]
+    async fn the_unanswered_read_describes_what_a_discard_would_drop() {
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-pending-read").unwrap(),
+            tx,
+            None,
+        ));
+        let watched = RunId::new();
+        let other_run = RunId::new();
+
+        let first = park_spawn(&session, &mut rx, test_ctx_in_run("ST-read-1", &watched)).await;
+        let second = park_spawn(&session, &mut rx, test_ctx_in_run("ST-read-2", &watched)).await;
+        park_spawn(
+            &session,
+            &mut rx,
+            test_ctx_in_run("ST-elsewhere", &other_run),
+        )
+        .await;
+
+        let waiting = session.pending_for_run(&watched).await;
+        assert_eq!(
+            waiting.len(),
+            2,
+            "the read is scoped to one Run, exactly as the discard is"
+        );
+        let req_ids: Vec<&str> = waiting.iter().map(|r| r.req_id.as_str()).collect();
+        assert!(req_ids.contains(&first.as_str()) && req_ids.contains(&second.as_str()));
+        let steps: Vec<String> = waiting.iter().map(|r| r.step_id.to_string()).collect();
+        assert!(steps.contains(&"ST-read-1".to_string()));
+        for request in &waiting {
+            assert_eq!(request.kind, PendingKind::Spawn);
+            assert_eq!(
+                request.attempt,
+                Some(1),
+                "a verb with a Ctx always has an attempt"
+            );
+        }
+
+        // Reading does not resolve, drop, or otherwise disturb them: the
+        // discard that follows still finds both (**W1** — the server acts
+        // on nothing of its own accord).
+        assert_eq!(
+            discard_all_for_run(&session, &watched).await,
+            2,
+            "the read left the entries where they were"
+        );
+        assert!(
+            session.pending_for_run(&watched).await.is_empty(),
+            "and after the discard there is nothing left to describe"
+        );
+        assert_eq!(
+            session.pending_for_run(&other_run).await.len(),
+            1,
+            "the other Run's request was never in scope for either call"
+        );
+    }
+
+    /// The `ask` shortfall, from the read side: an entry with no Run is
+    /// invisible to a Run-scoped read for the same reason it is invisible
+    /// to a Run-scoped discard.
+    #[tokio::test]
+    async fn an_ask_is_not_described_by_a_run_scoped_read() {
+        use mlua_swarm::SeniorBridge;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-ask-read").unwrap(),
+            tx,
+            None,
+        ));
+        let run_id = RunId::new();
+        let step = StepId::parse("ST-ask-read").unwrap();
+
+        let session_bg = session.clone();
+        tokio::spawn(async move { session_bg.ask(&step, "which lane?".into()).await });
+        match rx.recv().await.expect("Ask sent") {
+            ServerMsg::Ask { .. } => {}
+            other => panic!("expected Ask, got {other:?}"),
+        }
+
+        assert!(
+            session.pending_for_run(&run_id).await.is_empty(),
+            "an entry with no Run cannot be selected by one, so the un-answered list \
+             cannot name it either"
+        );
+    }
+
+    /// **The spine of (c).** A discard addressed at one Run drops exactly
+    /// that Run's in-flight requests, reports how many, and leaves every
+    /// other Run's alone — the whole difference between `T-DISCARD` and
+    /// the teardown drain `fail_pending` performs.
+    #[tokio::test]
+    async fn a_run_scoped_discard_drops_only_that_runs_requests() {
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-discard").unwrap(),
+            tx,
+            None,
+        ));
+        let displaced_run = RunId::new();
+        let other_run = RunId::new();
+
+        park_spawn(
+            &session,
+            &mut rx,
+            test_ctx_in_run("ST-discard-1", &displaced_run),
+        )
+        .await;
+        park_spawn(
+            &session,
+            &mut rx,
+            test_ctx_in_run("ST-discard-2", &displaced_run),
+        )
+        .await;
+        let survivor = park_spawn(&session, &mut rx, test_ctx_in_run("ST-keep", &other_run)).await;
+
+        assert_eq!(
+            discard_all_for_run(&session, &displaced_run).await,
+            2,
+            "T-DISCARD.confirm(run, discarded) counts what it dropped"
+        );
+        assert_eq!(
+            discard_all_for_run(&session, &displaced_run).await,
+            0,
+            "a repeat discard has nothing left to drop"
+        );
+
+        // The untouched Run's entry is still resolvable, which is the
+        // proof it was never dropped: `resolve_pending` on a missing
+        // req_id is a silent no-op, so a surviving waiter is the only
+        // observable difference.
+        assert_eq!(
+            discard_all_for_run(&session, &other_run).await,
+            1,
+            "the other Run's request was not collateral"
+        );
+        assert!(
+            !survivor.is_empty(),
+            "sanity: the survivor's req_id was captured"
+        );
+    }
+
+    /// The `run` re-check the discard applies to every name it is handed.
+    /// A caller selects from a read that has had time to go stale, so a
+    /// `req_id` naming another Run's request is refused rather than
+    /// honoured — the selection is made above the SAP, but it is not
+    /// trusted blindly below it.
+    #[tokio::test]
+    async fn a_named_request_of_another_run_is_not_dropped() {
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-cross-run").unwrap(),
+            tx,
+            None,
+        ));
+        let displaced_run = RunId::new();
+        let other_run = RunId::new();
+
+        park_spawn(
+            &session,
+            &mut rx,
+            test_ctx_in_run("ST-mine", &displaced_run),
+        )
+        .await;
+        let elsewhere =
+            park_spawn(&session, &mut rx, test_ctx_in_run("ST-theirs", &other_run)).await;
+
+        assert_eq!(
+            session
+                .discard_pending_requests(&displaced_run, std::slice::from_ref(&elsewhere))
+                .await,
+            0,
+            "the name belongs to another Run, so it is not this discard's to drop"
+        );
+        assert_eq!(
+            session.pending_for_run(&other_run).await.len(),
+            1,
+            "and the request is still outstanding"
+        );
+    }
+
+    /// The session is **not** torn down by a discard: the operator was
+    /// displaced from one Run, not deleted. A send parked waiting for a
+    /// reconnect must therefore still be parked (`TornDown` is what would
+    /// have failed it), and the session still reports itself connectable.
+    #[tokio::test]
+    async fn a_discard_does_not_tear_the_session_down() {
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-discard-live").unwrap(),
+            tx,
+            None,
+        ));
+        let run_id = RunId::new();
+        park_spawn(&session, &mut rx, test_ctx_in_run("ST-live", &run_id)).await;
+
+        assert_eq!(discard_all_for_run(&session, &run_id).await, 1);
+
+        assert!(
+            session.is_connected().await,
+            "a discard must not clear the sender"
+        );
+        assert_eq!(
+            *session.conn.borrow(),
+            ConnState::Connected,
+            "a discard must not publish TornDown — the session outlives the handover"
+        );
+    }
+
+    /// The documented shortfall, asserted rather than only described: an
+    /// `ask` carries no `Ctx`, so its entry has no Run and no Run-scoped
+    /// discard can select it.
+    #[tokio::test]
+    async fn an_ask_is_not_discardable_by_run_because_it_has_no_run() {
+        use mlua_swarm::SeniorBridge;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-ask-scope").unwrap(),
+            tx,
+            None,
+        ));
+        let run_id = RunId::new();
+
+        let session_bg = session.clone();
+        tokio::spawn(async move {
+            session_bg
+                .ask(
+                    &mlua_swarm::StepId::parse("ST-ask").unwrap(),
+                    serde_json::json!({"q": "which branch?"}),
+                )
+                .await
+        });
+        let req_id = match rx.recv().await.expect("Ask sent") {
+            ServerMsg::Ask { req_id, .. } => req_id,
+            other => panic!("expected Ask, got {other:?}"),
+        };
+
+        assert_eq!(
+            discard_all_for_run(&session, &run_id).await,
+            0,
+            "an entry with no Run cannot be selected by one"
+        );
+
+        // Still live: the far end may answer it, and that answer still
+        // resolves. What A6 does with a stale answer is a question for
+        // the layer above the SAP.
+        session
+            .resolve_pending(&req_id, PendingReply::Answer(serde_json::json!("main")))
+            .await;
+        assert_eq!(
+            discard_all_for_run(&session, &run_id).await,
+            0,
+            "and it was resolved, not left behind"
+        );
+    }
+
+    /// A dispatch launched without a `RunContext` (`ctx.meta.runtime` has
+    /// no `run_id`) parks an entry with no Run — the same unreachable
+    /// case as `ask`, reached from the verb that normally does carry one.
+    #[tokio::test]
+    async fn a_spawn_without_a_run_context_is_not_discardable_either() {
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-no-run").unwrap(),
+            tx,
+            None,
+        ));
+        park_spawn(&session, &mut rx, test_ctx("ST-no-run")).await;
+
+        assert_eq!(
+            discard_all_for_run(&session, &RunId::new()).await,
+            0,
+            "no run_id on the dispatch means no Run to select it by"
         );
     }
 }

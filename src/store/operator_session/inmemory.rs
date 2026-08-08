@@ -83,7 +83,39 @@ mod tests {
             roles: vec![role("main-ai")],
             capability_manifest: None,
             joined_at_secs,
+            desc: None,
+            observed: Vec::new(),
+            observed_total: 0,
         }
+    }
+
+    /// The in-memory backend holds live records, so the 記名 an `Assign`
+    /// wrote is what the next `list()` reports — no encode/decode in
+    /// between to lose it.
+    #[tokio::test]
+    async fn the_kimei_round_trips() {
+        let s = InMemoryOperatorSessionStore::new();
+        let mut rec = mk("S-1", 100);
+        rec.desc = Some("rewriting the seat resolver in mlua-swarm-server".to_string());
+        rec.record_observed(super::super::ObservedAssignment::new(
+            "R-1".to_string(),
+            "phase-a-op".to_string(),
+            Some("resolve issue #10".to_string()),
+            Some("/repo".to_string()),
+            None,
+            None,
+            140,
+        ));
+        s.put(rec).await.unwrap();
+
+        let list = s.list().await.unwrap();
+        assert_eq!(
+            list[0].desc.as_deref(),
+            Some("rewriting the seat resolver in mlua-swarm-server")
+        );
+        assert_eq!(list[0].observed.len(), 1);
+        assert_eq!(list[0].observed_total, 1);
+        assert_eq!(list[0].last_activity_secs(), 140);
     }
 
     #[tokio::test]

@@ -33,8 +33,28 @@
 //!     `cascade_vacate_seats`; a delete leaves no holder behind).
 //!
 //! GET /v1/operators/:sid   (Bearer required)
-//!   → { sid, roles, connected }
+//!   → { sid, roles, connected, desc, observed, observed_total }
+//!
+//! GET /v1/operators   (Bearer required — any live session's token)
+//!   → the 記名 list (model §4.2): every live session's identity, its
+//!     join-time description (D1) and the seats it has been assigned (D2),
+//!     newest activity first with a count limit (D5).
 //! ```
+//!
+//! ## 記名 (model §4.2)
+//!
+//! A session carries two halves, and this module owns both:
+//!
+//! - the **confirmed part** — `desc`, written by the joining AI, fixed at
+//!   join (**D1**), stored on [`OperatorSessionRecord::desc`];
+//! - the **observed part** — one entry per `Assign`, written by the server
+//!   from what it can actually read at that moment, appended only
+//!   (**D2**). It lives on [`LoginSession::observed`] while the process
+//!   runs and is written through to the session store on every append.
+//!
+//! Neither half is ever compared against anything (**D4**). A dispatch
+//! resolves its destination from `Run.current` alone; the 記名 is for a
+//! reader deciding "is this my work".
 //!
 //! ## Four types spell "session"; only the first belongs to this module
 //!
@@ -60,8 +80,11 @@ use axum::{
     Json,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use mlua_swarm::store::operator_session::{OperatorSessionRecord, OperatorSessionStoreError};
-use mlua_swarm::store::run::{RunListFilter, RunStatus, VacateOutcome};
+use mlua_swarm::store::operator_session::{
+    ObservedAssignment, OperatorSessionRecord, OperatorSessionStoreError,
+};
+use mlua_swarm::store::run::{Assignee, RunListFilter, RunStatus, VacateOutcome};
+use mlua_swarm::store::trace::TraceHandle;
 use mlua_swarm::{
     AgentProviderManifest, Engine, Operator, OperatorRef, SeniorBridge, SessionId, SpawnHook,
 };
@@ -74,6 +97,7 @@ use tokio::sync::{mpsc, watch};
 use super::protocol::{ClientMsg, PendingReply, ServerMsg};
 use super::router::{OperatorAdapter, OperatorAdapterRegistry};
 use super::session::WSOperatorSession;
+use crate::assignee_trace::{append_released, ReleaseReason};
 use crate::AppState;
 
 /// A minted Operator login session: the durable record plus the WS session
@@ -86,14 +110,46 @@ use crate::AppState;
 /// the closed session and is answered with the Close frame the teardown
 /// latched, rather than minting a replacement nothing could unregister.
 pub struct LoginSession {
-    /// Read-only snapshot of the persisted row: a later update replaces the
-    /// whole `LoginSession` in the map rather than writing through this
-    /// field. Its `token_digest` is never read directly —
-    /// [`Self::verify_bearer`] is the one predicate over it.
+    /// Read-only snapshot of the persisted row's **immutable** half: the
+    /// identity, the roles, the manifest, the mint time, and the 記名's
+    /// confirmed part (**D1** — written at join and never rewritten). Its
+    /// `token_digest` is never read directly — [`Self::verify_bearer`] is
+    /// the one predicate over it.
+    ///
+    /// `record.observed` is **not** kept in step here; [`Self::observed`]
+    /// is the live copy. See that field.
     record: OperatorSessionRecord,
+    /// The 記名's observed part (**D2**), live.
+    ///
+    /// Split out of [`Self::record`] because the two halves of the 記名
+    /// have opposite lifetimes and the split says so in the type: the
+    /// confirmed part is a plain immutable field, the observed part is the
+    /// only thing an `Assign` may touch. Rebuilding the whole
+    /// `LoginSession` on each append is not an option — `LoginSession::new`
+    /// mints a *new* [`WSOperatorSession`], and the old one is what the
+    /// engine's registries and every upgraded socket already hold.
+    ///
+    /// A `tokio::sync::Mutex` rather than a `std` one because
+    /// [`Self::record_observed`] holds it across the store write, which is
+    /// what makes append-then-persist atomic per session: two concurrent
+    /// `Assign`s cannot interleave into a `put` that writes back a log
+    /// missing one of them. It is a leaf lock — nothing is acquired while
+    /// it is held except the store's own internals — so there is no order
+    /// to invert.
+    observed: tokio::sync::Mutex<ObservedLog>,
     /// Shared, not owned — the same object the engine's registries hold and a
     /// teardown latches.
     dispatch_target: Arc<WSOperatorSession>,
+}
+
+/// The mutable half of a session's 記名: the observed entries plus the
+/// monotone count of how many `Assign`s produced them.
+#[derive(Debug, Clone, Default)]
+pub struct ObservedLog {
+    /// Oldest first, bounded by `OBSERVED_CAP`.
+    pub entries: Vec<ObservedAssignment>,
+    /// Every `Assign` ever recorded, including folded and aged-out ones.
+    pub total: u64,
 }
 
 impl LoginSession {
@@ -102,20 +158,75 @@ impl LoginSession {
     ///
     /// `base_url` is the server's public HTTP root, rendered into this
     /// session's Spawn directives once a socket attaches.
+    ///
+    /// The record's observed part is lifted into [`Self::observed`], so a
+    /// session restored at boot resumes with the log it was persisted with
+    /// (**D2**: nothing removes entries, and a restart is not a removal).
     pub(crate) fn new(record: OperatorSessionRecord, base_url: Option<Arc<str>>) -> Arc<Self> {
         let dispatch_target = Arc::new(WSOperatorSession::disconnected_with_base_url(
             record.sid.clone(),
             base_url,
         ));
+        let observed = ObservedLog {
+            entries: record.observed.clone(),
+            total: record.observed_total,
+        };
         Arc::new(Self {
             record,
+            observed: tokio::sync::Mutex::new(observed),
             dispatch_target,
         })
     }
 
     /// The durable login record this session was minted (or restored) from.
+    ///
+    /// Its `observed` / `observed_total` are the values as of that mint or
+    /// restore. For the live 記名 use [`Self::kimei`].
     pub fn record(&self) -> &OperatorSessionRecord {
         &self.record
+    }
+
+    /// The full persisted record as it stands now — [`Self::record`] with
+    /// the live observed part folded back in. This is what a `put` writes
+    /// and what a read surface reports.
+    pub async fn kimei(&self) -> OperatorSessionRecord {
+        let observed = self.observed.lock().await;
+        let mut record = self.record.clone();
+        record.observed = observed.entries.clone();
+        record.observed_total = observed.total;
+        record
+    }
+
+    /// Append one `Assign` to this session's observed part (**D2**) and
+    /// write the session through to `store`.
+    ///
+    /// Best-effort on the persistence side: a store failure is logged and
+    /// swallowed, leaving the in-memory 記名 updated and the durable copy
+    /// one entry behind. The alternative — failing the `Assign` — would let
+    /// an observability write decide whether a seat changes hands, which is
+    /// the tail wagging the dog (the same call
+    /// [`crate::assignee_trace`] makes for the trace rail).
+    pub async fn record_observed(
+        &self,
+        store: &Arc<dyn mlua_swarm::store::operator_session::OperatorSessionStore>,
+        entry: ObservedAssignment,
+    ) {
+        // Held across the write on purpose — see the field doc.
+        let mut observed = self.observed.lock().await;
+        let mut record = self.record.clone();
+        record.observed = std::mem::take(&mut observed.entries);
+        record.observed_total = observed.total;
+        record.record_observed(entry);
+        observed.entries = record.observed.clone();
+        observed.total = record.observed_total;
+        if let Err(error) = store.put(record).await {
+            tracing::warn!(
+                sid = %self.record.sid,
+                %error,
+                "record_observed: the 記名's observed part could not be persisted; \
+                 it is live in this process but one entry behind on disk"
+            );
+        }
     }
 
     /// The WS session the engine dispatches to for this sid.
@@ -158,6 +269,39 @@ pub struct OperatorsCreateReq {
     /// Effective execution capabilities supplied by the Operator/MainAI.
     #[serde(default)]
     pub capability_manifest: Option<AgentProviderManifest>,
+    /// The 記名's confirmed part (model §4.2, **D1**) — what this session
+    /// is here to do, in about 50 characters, fixed at join.
+    ///
+    /// The instruction the joining AI is written for, verbatim from the
+    /// model:
+    ///
+    /// > 担当している内容を **50 字程度**で書いてください。用途は、**同じ
+    /// > repo / 同じ worktree で並行している別タスクと自分を見分けること**
+    /// > です。あとであなた自身、または引き継ぐ相手が記名一覧を見て「これは
+    /// > 自分の仕事か」を判断します。
+    /// >
+    /// > **以下は自動で記録されるので書かないでください** — repo path /
+    /// > worktree path / Run id / goal / 開始時刻。
+    /// >
+    /// > 書くのは、いま触っている対象と、そこで何をしているか。直前の経緯が
+    /// > あれば 1 つ足してください。
+    ///
+    /// # Why this is not required
+    ///
+    /// **A9** rejects an `Assign` without a `desc`; **D1-D5** name no such
+    /// refusal, and the reason is in **D3**'s own rationale — join is
+    /// deliberately the one unguarded step so that an incoming Assignee can
+    /// always get in. A `400` here would put a gate on exactly that step.
+    /// So a missing description is recorded as missing (the list reports
+    /// `desc: null`) rather than refused, and the place it is *insisted*
+    /// on is the tool an AI actually joins through (`mse_operator_join`),
+    /// where the caller has the sentence for free.
+    ///
+    /// Blank input (`""`, whitespace) is stored as absent: it is the same
+    /// state, and keeping two spellings of it would make every reader
+    /// handle both.
+    #[serde(default)]
+    pub desc: Option<String>,
 }
 
 /// Response for `POST /v1/operators`.
@@ -218,6 +362,13 @@ pub async fn operators_create(
         }
     };
     let capability_manifest = req.capability_manifest;
+    // D1's value, normalised once at the boundary: blank is absent.
+    let desc = req
+        .desc
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     // The sid is the operator-session identity, so it mints in the same
     // `SessionId` shape (`S-<hex>`) as the engine-side session id — one
     // session-id form across the system (issue #11 observation 2; the old
@@ -286,6 +437,11 @@ pub async fn operators_create(
         roles: roles.clone(),
         capability_manifest,
         joined_at_secs,
+        desc,
+        // D2: the observed part starts empty and only ever grows, from the
+        // `Assign` sites. A mint has assigned nothing yet.
+        observed: Vec::new(),
+        observed_total: 0,
     };
     if let Err(error) = state.operator_session_store.put(record.clone()).await {
         tracing::error!(%sid, %error, "operators_create: session persist failed");
@@ -948,6 +1104,16 @@ const CASCADE_STATUSES: [RunStatus; 4] = [
 /// there now is by definition not the deleted operator's, so releasing it
 /// would destroy a live assignment on the strength of a stale reading.
 ///
+/// # Each release is recorded on the Run's trace
+///
+/// A seat emptied here was not emptied by its holder, so the next thing
+/// that happens to that Run is a dispatch failing as `Vacant` some time
+/// later, far from the cause. **W4** puts the cause on the same rail as
+/// the step events: one `core.assignee_released` row per seat actually
+/// released, carrying the holder and `reason: o8_operator_deleted` (see
+/// [`crate::assignee_trace`]). Only the `Released` arm writes one — a
+/// stale release changed nothing and must not claim otherwise.
+///
 /// # No timer
 ///
 /// This fires at delete time and nowhere else. Nothing scans for
@@ -988,13 +1154,15 @@ async fn cascade_vacate_seats(state: &AppState, sid: &SessionId, roles: &[Operat
             // the `list()` round trip has even finished being consumed,
             // and every prior release is an `.await` an acquire can land
             // inside.
-            let held: Vec<(String, String, u64)> = run
+            let held: Vec<(String, Assignee)> = run
                 .current
                 .iter()
                 .filter(|(_, assignee)| names.contains(&assignee.op.as_str()))
-                .map(|(slot, assignee)| (slot.clone(), assignee.op.clone(), assignee.gen))
+                .map(|(slot, assignee)| (slot.clone(), assignee.clone()))
                 .collect();
-            for (slot, op, observed_gen) in held {
+            for (slot, holder) in held {
+                let op = &holder.op;
+                let observed_gen = holder.gen;
                 match state
                     .run_store
                     .vacate_assignee(&run.id, &slot, observed_gen)
@@ -1006,6 +1174,18 @@ async fn cascade_vacate_seats(state: &AppState, sid: &SessionId, roles: &[Operat
                             run_id = %run.id, %slot, %op, %sid,
                             "O8 cascade: seat released because its operator was deleted"
                         );
+                        // W4: a seat emptied by the system goes on the
+                        // Run's own trace, next to its step events. Only
+                        // on this arm — the `Stale` arm below released
+                        // nothing, and a row there would report a
+                        // handover that did not happen.
+                        append_released(
+                            &TraceHandle::new(run.id.clone(), state.run_trace_store.clone()),
+                            &slot,
+                            &holder,
+                            ReleaseReason::O8OperatorDeleted,
+                        )
+                        .await;
                     }
                     // The seat moved on after this scan read it, so the
                     // holder the cascade judged is gone and the one there
@@ -1093,10 +1273,11 @@ fn teardown_failed_response(sid: &SessionId, error: &OperatorSessionStoreError) 
 
 // ─── GH #81 Layer 2: GET /v1/operators + DELETE /v1/operators/by-role/:role
 
-/// GH #81 Layer 2 (b): one entry in the `GET /v1/operators` list response.
-/// Bare identity fields (no token, no capability manifest — those live
-/// behind Bearer on `GET /v1/operators/:sid`); this list surface is
-/// read-only observability, on the same trust tier as `GET /v1/status`.
+/// One entry in the `GET /v1/operators` list response — a live session's
+/// identity plus its 記名 (model §4.2).
+///
+/// Still carries no token and no capability manifest: the former is the
+/// bearer secret, and the latter is what `GET /v1/operators/:sid` is for.
 #[derive(Debug, Serialize)]
 pub struct OperatorsListEntry {
     /// Session id (`S-<hex>`) — safe to expose; token is the sole bearer secret.
@@ -1109,39 +1290,168 @@ pub struct OperatorsListEntry {
     /// Whether a WS is currently attached to this session (matches the
     /// `connected` field on `GET /v1/operators/:sid`).
     pub connected: bool,
+    /// The 記名's confirmed part (**D1**) — what this session wrote about
+    /// itself at join. `null` when it joined without one, and never
+    /// omitted: "nobody wrote a description" is the fact a reader needs
+    /// most, because such a session is the one it cannot tell apart.
+    pub desc: Option<String>,
+    /// The 記名's observed part (**D2**) — every seat this session has been
+    /// assigned, oldest first, up to
+    /// [`OBSERVED_CAP`](mlua_swarm::store::operator_session::OBSERVED_CAP).
+    pub observed: Vec<ObservedAssignment>,
+    /// How many `Assign`s produced [`Self::observed`], including entries
+    /// the ring has aged out and re-assignments folded into an existing
+    /// one. Greater than `observed.len()` means this is a window.
+    pub observed_total: u64,
+    /// Unix epoch seconds of this session's newest observed activity, or
+    /// its join time when it has never been assigned anything. **D5**'s
+    /// default sort key, reported so a reader can see the order it was
+    /// sorted by.
+    pub last_activity_secs: u64,
 }
 
-/// Response body for `GET /v1/operators` (GH #81 Layer 2 (b)).
+/// Response body for `GET /v1/operators`.
 #[derive(Debug, Serialize)]
 pub struct OperatorsListResp {
-    /// One entry per live session, ordered by `sid` (deterministic —
-    /// callers can `.iter().find(...)` without probing the map order).
+    /// One entry per live session, newest activity first (**D5**).
     pub operators: Vec<OperatorsListEntry>,
+    /// How many live sessions there are in total, before
+    /// [`Self::limit`] cut the list. `total > operators.len()` means the
+    /// page is short of the whole.
+    pub total: usize,
+    /// The page size actually applied — **D5** requires the list to have
+    /// one, and reporting it saves the caller guessing whether it hit the
+    /// cap or the end.
+    pub limit: usize,
 }
 
-/// `GET /v1/operators`. Read-only enumeration of every live session's
-/// `{sid, roles, joined_at_secs, connected}` (GH #81 Layer 2 (b)). Same
-/// trust tier as `GET /v1/status` — no Bearer required; sids are
-/// identifiers, not secrets. Answers "which sid holds `main-ai`?"
-/// without probing every sid individually via `GET /v1/operators/:sid`,
-/// which was the pre-#81 recovery gap.
-pub async fn operators_list(State(state): State<AppState>) -> Response {
-    let entries: Vec<(SessionId, Arc<LoginSession>)> = {
+/// Query string of `GET /v1/operators`.
+#[derive(Debug, Deserialize, Default)]
+pub struct OperatorsListQuery {
+    /// Page size. Absent = [`OPERATORS_LIST_DEFAULT_LIMIT`]; clamped to
+    /// [`OPERATORS_LIST_MAX_LIMIT`].
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// **D5**'s count limit, applied when the caller names none.
+pub const OPERATORS_LIST_DEFAULT_LIMIT: usize = 50;
+
+/// The ceiling a caller-supplied `?limit=` is clamped to. **D5** asks the
+/// list to *have* a limit; an unbounded opt-out would give that back.
+pub const OPERATORS_LIST_MAX_LIMIT: usize = 200;
+
+/// Accept any live Operator session's bearer.
+///
+/// **D3** ("一覧の取得は bearer 必須") gates the 記名 list, and **W5** says
+/// the reader is an Assignee — which is any logged-in Operator, not
+/// specifically the session being read. There is no single sid to check
+/// against on a collection route, so the presented bearer is matched
+/// against every live session and one match is enough. Each comparison is
+/// [`OperatorSessionRecord::verify_bearer`], i.e. constant-time over the
+/// digests.
+///
+/// This is what makes the list a *handover* device: an incoming Assignee
+/// joins (unguarded, **D3**'s own carve-out), and its fresh bearer is
+/// immediately good enough to read who else is here.
+pub(crate) async fn authorize_any_operator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let bearer = extract_bearer_token_required(headers).map_err(|resp| *resp)?;
+    let sessions: Vec<Arc<LoginSession>> = {
         let map = state.operator_sessions.lock().await;
-        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        map.values().cloned().collect()
     };
-    let mut operators = Vec::with_capacity(entries.len());
-    for (sid, live) in entries {
+    if sessions.iter().any(|live| live.verify_bearer(&bearer)) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "token matches no live operator session",
+            "hint": "join with POST /v1/operators (no Bearer needed) and present the token it \
+                     mints; any live session's token opens this list (model D3/W5)",
+        })),
+    )
+        .into_response())
+}
+
+/// `GET /v1/operators`. The 記名 list (model §4.2) — every live session's
+/// identity, its join-time description (**D1**) and the seats it has been
+/// assigned (**D2**).
+///
+/// # Breaking change: Bearer is now mandatory
+///
+/// This route was unauthenticated (GH #81 Layer 2 (b), same trust tier as
+/// `GET /v1/status`). **D3** makes it Bearer-gated, and it now carries the
+/// 記名, which is a description of what someone is working on rather than
+/// a bare sid. Any live session's token is accepted — see
+/// [`authorize_any_operator`]. Callers that used to read this anonymously
+/// (`mse mcp`'s `mse_operator_list`, recovery scripts) must present one.
+///
+/// # Order and size (**D5**)
+///
+/// Newest activity first — the newest [`ObservedAssignment::at_secs`], or
+/// the join time for a session that has never held a seat — with the sid
+/// as a tie-break so equal-second sessions still order deterministically.
+/// The page is capped at [`OPERATORS_LIST_DEFAULT_LIMIT`], overridable up
+/// to [`OPERATORS_LIST_MAX_LIMIT`] with `?limit=`.
+///
+/// # **D4**
+///
+/// Nothing here is a matching key. The server does not compare `desc`,
+/// `project_root` or anything else in the 記名 against anything; a
+/// dispatch is addressed by `Run.current`'s `OperatorId` alone. The 記名
+/// exists so a human or an AI can tell two sessions apart by eye.
+pub async fn operators_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<OperatorsListQuery>,
+) -> Response {
+    if let Err(resp) = authorize_any_operator(&state, &headers).await {
+        return resp;
+    }
+    let limit = query
+        .limit
+        .unwrap_or(OPERATORS_LIST_DEFAULT_LIMIT)
+        .min(OPERATORS_LIST_MAX_LIMIT);
+
+    let entries: Vec<Arc<LoginSession>> = {
+        let map = state.operator_sessions.lock().await;
+        map.values().cloned().collect()
+    };
+    let total = entries.len();
+    let mut operators = Vec::with_capacity(total);
+    for live in entries {
         let connected = live.dispatch_target().is_connected().await;
+        let record = live.kimei().await;
         operators.push(OperatorsListEntry {
-            sid,
-            roles: live.record().roles.clone(),
-            joined_at_secs: live.record().joined_at_secs,
+            sid: record.sid.clone(),
+            roles: record.roles.clone(),
+            joined_at_secs: record.joined_at_secs,
             connected,
+            desc: record.desc.clone(),
+            last_activity_secs: record.last_activity_secs(),
+            observed: record.observed,
+            observed_total: record.observed_total,
         });
     }
-    operators.sort_by(|a, b| a.sid.as_str().cmp(b.sid.as_str()));
-    (StatusCode::OK, Json(OperatorsListResp { operators })).into_response()
+    operators.sort_by(|a, b| {
+        b.last_activity_secs
+            .cmp(&a.last_activity_secs)
+            .then_with(|| a.sid.as_str().cmp(b.sid.as_str()))
+    });
+    operators.truncate(limit);
+    (
+        StatusCode::OK,
+        Json(OperatorsListResp {
+            operators,
+            total,
+            limit,
+        }),
+    )
+        .into_response()
 }
 
 /// `DELETE /v1/operators/by-role/:role`. Releases the session currently
@@ -1331,6 +1641,14 @@ pub struct OperatorsInfoResp {
     pub capability_manifest: Option<AgentProviderManifest>,
     /// Whether a WS is currently attached (not merely that the session ever connected).
     pub connected: bool,
+    /// This session's 記名, confirmed part (**D1**). `null`, never omitted
+    /// — same reason as on [`OperatorsListEntry::desc`].
+    pub desc: Option<String>,
+    /// This session's 記名, observed part (**D2**), oldest first.
+    pub observed: Vec<ObservedAssignment>,
+    /// Every `Assign` recorded onto [`Self::observed`], including folded
+    /// and aged-out ones.
+    pub observed_total: u64,
 }
 
 /// `GET /v1/operators/:sid`. Bearer mandatory. `404` on unknown sid, `401` on
@@ -1362,13 +1680,17 @@ pub async fn operators_info(
     }
 
     let connected = live.dispatch_target().is_connected().await;
+    let record = live.kimei().await;
     (
         StatusCode::OK,
         Json(OperatorsInfoResp {
-            sid: live.record().sid.clone(),
-            roles: live.record().roles.clone(),
-            capability_manifest: live.record().capability_manifest.clone(),
+            sid: record.sid.clone(),
+            roles: record.roles.clone(),
+            capability_manifest: record.capability_manifest.clone(),
             connected,
+            desc: record.desc,
+            observed: record.observed,
+            observed_total: record.observed_total,
         }),
     )
         .into_response()
@@ -1468,6 +1790,7 @@ mod tests {
                 sessions: Arc::new(Mutex::new(crate::SessionStore::default())),
                 task_app: Arc::new(mlua_swarm::TaskApplication::new_inline_only(launch)),
                 operator_adapters: Arc::new(OperatorAdapterRegistry::new()),
+                seat_ledger: Arc::new(crate::operator_ws::SeatLedger::new()),
                 data_store: Arc::new(InMemoryOutputStore::new()),
                 operator_sessions: Arc::new(Mutex::new(HashMap::new())),
                 roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
@@ -1496,6 +1819,9 @@ mod tests {
                     roles: vec![role.clone()],
                     capability_manifest: None,
                     joined_at_secs: 0,
+                    desc: None,
+                    observed: Vec::new(),
+                    observed_total: 0,
                 },
                 None,
             );
@@ -1664,6 +1990,9 @@ mod tests {
                     roles: vec![role.clone()],
                     capability_manifest: None,
                     joined_at_secs: 0,
+                    desc: None,
+                    observed: Vec::new(),
+                    observed_total: 0,
                 },
                 None,
             );
@@ -1855,6 +2184,51 @@ mod tests {
             );
         }
 
+        /// **R7 / W4.** A seat emptied by the cascade was not emptied by
+        /// its holder, so the loss goes on the Run's own trace next to
+        /// its step events — naming the seat, the holder that was
+        /// released, and that an operator delete is what did it. Without
+        /// the row the only evidence is a dispatch failing as `Vacant`
+        /// some time later.
+        ///
+        /// A `Done` Run is the control: nothing was released there, so
+        /// nothing is recorded there either.
+        #[tokio::test]
+        async fn the_cascade_records_each_release_on_the_runs_trace() {
+            use mlua_swarm::store::trace::{kind as trace_kind, TraceQuery};
+
+            let state = test_state();
+            let sid = seed_session(&state, ROLE).await;
+            let live = seed_run(&state, RunStatus::Running).await;
+            let finished = seed_run(&state, RunStatus::Done).await;
+            seat(&state, &live, SEAT_A, sid.as_str()).await;
+            seat(&state, &finished, SEAT_A, sid.as_str()).await;
+
+            delete_session(&state, &sid).await;
+
+            let events = state
+                .run_trace_store
+                .list(&live, &TraceQuery::default())
+                .await
+                .expect("trace list");
+            assert_eq!(events.len(), 1, "one row per seat released: {events:?}");
+            assert_eq!(events[0].kind, trace_kind::ASSIGNEE_RELEASED);
+            assert_eq!(events[0].payload["slot"], SEAT_A);
+            assert_eq!(events[0].payload["assignee"]["op"], sid.to_string());
+            assert_eq!(events[0].payload["assignee"]["gen"], 1);
+            assert_eq!(events[0].payload["reason"], "o8_operator_deleted");
+
+            assert!(
+                state
+                    .run_trace_store
+                    .list(&finished, &TraceQuery::default())
+                    .await
+                    .expect("trace list")
+                    .is_empty(),
+                "a Done run keeps its holder, so there is no release to record"
+            );
+        }
+
         /// The by-role recovery route shares `teardown_operator_session`,
         /// so it cascades identically — the seats do not depend on which
         /// door the delete came through.
@@ -1912,6 +2286,7 @@ mod tests {
                 Json(OperatorsCreateReq {
                     roles: vec![ROLE.to_string()],
                     capability_manifest: None,
+                    desc: None,
                 }),
             )
             .await;
@@ -2092,6 +2467,7 @@ mod tests {
                 Json(OperatorsCreateReq {
                     roles: vec![ROLE.to_string()],
                     capability_manifest: None,
+                    desc: None,
                 }),
             )
             .await;
@@ -2161,6 +2537,7 @@ mod tests {
                 Json(OperatorsCreateReq {
                     roles,
                     capability_manifest: None,
+                    desc: None,
                 }),
             )
             .await
@@ -2326,6 +2703,7 @@ mod tests {
                 Json(OperatorsCreateReq {
                     roles: vec![role.to_string()],
                     capability_manifest: None,
+                    desc: None,
                 }),
             )
             .await;
@@ -2374,13 +2752,37 @@ mod tests {
                 .expect("a two-seat Blueprint must compile with no session registered anywhere");
         }
 
-        async fn seeded_run(state: &AppState) -> RunId {
+        /// A `Running` Run and the Task row it belongs to.
+        ///
+        /// The Task is real rather than a bare id because the 記名's
+        /// observed part is written from it (`goal` + `task_input_spec`),
+        /// so a seating test exercises the whole write.
+        async fn seeded_run(state: &AppState) -> (RunId, TaskId) {
             let run_id = RunId::new();
+            let task_id = TaskId::new();
+            state
+                .task_store
+                .create(mlua_swarm::store::task::TaskRecord {
+                    id: task_id.clone(),
+                    goal: "resolve issue #10".to_string(),
+                    blueprint_ref: serde_json::json!({"inline": {}}),
+                    input_ctx: serde_json::json!({}),
+                    task_input_spec: Some(serde_json::json!({
+                        "project_root": "/repo",
+                        "work_dir": "/repo/.worktrees/topic",
+                        "task_metadata": {"issue": 10},
+                    })),
+                    status: mlua_swarm::store::task::TaskRecordStatus::Running,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .await
+                .expect("seed task");
             state
                 .run_store
                 .create(RunRecord {
                     id: run_id.clone(),
-                    task_id: TaskId::new(),
+                    task_id: task_id.clone(),
                     status: RunStatus::Running,
                     step_entries: Vec::new(),
                     degradations: Vec::new(),
@@ -2394,7 +2796,7 @@ mod tests {
                 })
                 .await
                 .expect("seed run");
-            run_id
+            (run_id, task_id)
         }
 
         fn ctx_for(run_id: &RunId, agent: &str) -> Ctx {
@@ -2500,7 +2902,7 @@ mod tests {
 
             let mut first = mint_client(&state, "ws-relay-one", "first").await;
             let mut second = mint_client(&state, "ws-relay-two", "second").await;
-            let run_id = seeded_run(&state).await;
+            let (run_id, _task_id) = seeded_run(&state).await;
 
             // The one `Arc<dyn Operator>` under test: the same lookup
             // `OperatorSpawnerFactory::build` performs for `AGENT_A`, kept
@@ -2575,7 +2977,7 @@ mod tests {
 
             let mut first = mint_client(&state, "ws-relay-one", "first").await;
             let mut second = mint_client(&state, "ws-relay-two", "second").await;
-            let run_id = seeded_run(&state).await;
+            let (run_id, _task_id) = seeded_run(&state).await;
 
             let router_a = factory
                 .resolve_operator(SEAT_A, AGENT_A)
@@ -2646,7 +3048,7 @@ mod tests {
             let factory = wire_operator_axis(&mut state);
             let mut first = mint_client(&state, "ws-relay-one", "first").await;
             let mut second = mint_client(&state, "ws-relay-two", "second").await;
-            let run_id = seeded_run(&state).await;
+            let (run_id, _task_id) = seeded_run(&state).await;
 
             state
                 .run_store
@@ -2694,12 +3096,13 @@ mod tests {
             // what `mse_operator_join(roles=["phase-a-op"])` produces.
             let mut a = mint_client(&state, SEAT_A, "lane-a-driver").await;
             let mut b = mint_client(&state, SEAT_B, "lane-b-driver").await;
-            let run_id = seeded_run(&state).await;
+            let (run_id, task_id) = seeded_run(&state).await;
 
             // The launch. No `operator_sid`, so no pinned seat to exclude.
             crate::tasks::seat_declared_operators(
                 &state,
                 &run_id,
+                &task_id,
                 &two_seat_blueprint().operators,
                 None,
             )
@@ -2771,7 +3174,7 @@ mod tests {
             // Nobody claims seat B's.
             let mut pinned = mint_client(&state, "ws-relay-one", "pinned").await;
             let mut role_holder = mint_client(&state, SEAT_A, "role-holder").await;
-            let run_id = seeded_run(&state).await;
+            let (run_id, task_id) = seeded_run(&state).await;
 
             // A launch carrying `operator_sid` + `operator_desc`, in the
             // order the handlers run them: the pin first, then the rest of
@@ -2779,6 +3182,7 @@ mod tests {
             crate::tasks::assign_launch_operator(
                 &state,
                 &run_id,
+                &task_id,
                 SEAT_A,
                 pinned.sid.as_str(),
                 "pinned by the launch request",
@@ -2788,6 +3192,7 @@ mod tests {
             crate::tasks::seat_declared_operators(
                 &state,
                 &run_id,
+                &task_id,
                 &two_seat_blueprint().operators,
                 Some(SEAT_A),
             )
@@ -2851,6 +3256,856 @@ mod tests {
                 role_holder.inbox.try_recv().is_err(),
                 "no other session may absorb the Vacant lane's dispatch"
             );
+        }
+    }
+
+    // ── 記名 (§4.2) and the holder list (§4.3) ───────────────────────────
+
+    /// The two devices §4.5 leaves standing once **A8** removed
+    /// exclusivity, from the read end.
+    mod kimei {
+        use super::by_role_in_flight::{body_json, test_state};
+        use super::*;
+        use mlua_swarm::blueprint::Blueprint;
+        use mlua_swarm::store::run::{RunRecord, RunStatus};
+        use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus};
+        use mlua_swarm::{BlueprintRef, RunId, TaskId};
+
+        pub(super) const SEAT_A: &str = "phase-a-op";
+        pub(super) const SEAT_B: &str = "phase-b-op";
+
+        pub(super) async fn mint(
+            state: &AppState,
+            role: &str,
+            desc: Option<&str>,
+        ) -> (SessionId, String) {
+            let response = operators_create(
+                State(state.clone()),
+                Json(OperatorsCreateReq {
+                    roles: vec![role.to_string()],
+                    capability_manifest: None,
+                    desc: desc.map(str::to_string),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "mint must succeed");
+            let body = body_json(response).await;
+            let sid = SessionId::parse(body["sid"].as_str().expect("sid").to_string())
+                .expect("parse sid");
+            let token = body["token"].as_str().expect("token").to_string();
+            (sid, token)
+        }
+
+        /// A Blueprint declaring two Operator seats and nothing else worth
+        /// resolving — enough for the holder list to enumerate them.
+        fn two_seat_blueprint() -> Blueprint {
+            serde_json::from_value(serde_json::json!({
+                "schema_version": mlua_swarm::blueprint::current_schema_version(),
+                "id": "kimei-two-seat-bp",
+                "flow": {
+                    "kind": "step",
+                    "ref": "agent-a",
+                    "in": { "op": "path", "at": "$.input" },
+                    "out": { "op": "path", "at": "$.output" }
+                },
+                "agents": [
+                    {
+                        "name": "agent-a",
+                        "kind": "operator",
+                        "spec": { "operator_ref": SEAT_A },
+                        "profile": { "worker_binding": "mse-worker" }
+                    }
+                ],
+                "operators": [{ "name": SEAT_A }, { "name": SEAT_B }],
+                "strategy": { "strict_refs": false }
+            }))
+            .expect("test Blueprint literal")
+        }
+
+        /// A Task carrying a goal and Task-level paths, plus its Run.
+        pub(super) async fn seed_task_and_run(state: &AppState) -> (RunId, TaskId) {
+            let task_id = TaskId::new();
+            let run_id = RunId::new();
+            state
+                .task_store
+                .create(TaskRecord {
+                    id: task_id.clone(),
+                    goal: "resolve issue #10".to_string(),
+                    blueprint_ref: serde_json::to_value(BlueprintRef::Inline {
+                        value: Box::new(two_seat_blueprint()),
+                    })
+                    .expect("encode blueprint_ref"),
+                    input_ctx: serde_json::json!({}),
+                    task_input_spec: Some(serde_json::json!({
+                        "project_root": "/repo",
+                        "work_dir": "/repo/.worktrees/topic",
+                        "task_metadata": {"issue": 10},
+                    })),
+                    status: TaskRecordStatus::Running,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .await
+                .expect("seed task");
+            state
+                .run_store
+                .create(RunRecord {
+                    id: run_id.clone(),
+                    task_id: task_id.clone(),
+                    status: RunStatus::Running,
+                    step_entries: Vec::new(),
+                    degradations: Vec::new(),
+                    operator_sid: None,
+                    current: Default::default(),
+                    next_generation: 0,
+                    result_ref: None,
+                    input_json: None,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .await
+                .expect("seed run");
+            (run_id, task_id)
+        }
+
+        /// **D2**: what the server could actually read at the moment of the
+        /// `Assign` lands on the assigned session, addressed by role alias
+        /// as well as by sid.
+        #[tokio::test]
+        async fn an_assign_writes_what_the_task_row_says_onto_the_holders_kimei() {
+            let state = test_state();
+            let (sid, _token) = mint(&state, SEAT_A, Some("seating lane A")).await;
+            let (run_id, task_id) = seed_task_and_run(&state).await;
+
+            // Addressed by the role alias, which is what an auto-seat uses.
+            crate::handover::record_observed_assignment(&state, &run_id, &task_id, SEAT_A, SEAT_A)
+                .await;
+
+            let live = state
+                .operator_sessions
+                .lock()
+                .await
+                .get(&sid)
+                .cloned()
+                .expect("the minted session");
+            let record = live.kimei().await;
+            assert_eq!(record.observed.len(), 1);
+            assert_eq!(record.observed_total, 1);
+            let entry = &record.observed[0];
+            assert_eq!(entry.run_id, run_id.to_string());
+            assert_eq!(entry.slot, SEAT_A);
+            assert_eq!(entry.goal.as_deref(), Some("resolve issue #10"));
+            assert_eq!(entry.project_root.as_deref(), Some("/repo"));
+            assert_eq!(entry.work_dir.as_deref(), Some("/repo/.worktrees/topic"));
+            assert_eq!(entry.task_metadata, Some(serde_json::json!({"issue": 10})));
+            assert!(!entry.task_metadata_omitted);
+
+            // And it is durable: the store holds the same log.
+            let persisted = state
+                .operator_session_store
+                .list()
+                .await
+                .expect("list the store");
+            let row = persisted
+                .iter()
+                .find(|r| r.sid == sid)
+                .expect("the session's row");
+            assert_eq!(row.observed, record.observed);
+            assert_eq!(row.desc.as_deref(), Some("seating lane A"));
+        }
+
+        /// An `op` no live session answers to writes nothing and fails
+        /// nothing — **Q2**, a seat can be taken for a role nobody holds.
+        #[tokio::test]
+        async fn an_assign_to_nobody_records_nothing_and_does_not_fail() {
+            let state = test_state();
+            let (run_id, task_id) = seed_task_and_run(&state).await;
+            crate::handover::record_observed_assignment(
+                &state,
+                &run_id,
+                &task_id,
+                SEAT_A,
+                "nobody-holds-this",
+            )
+            .await;
+            assert!(state
+                .operator_session_store
+                .list()
+                .await
+                .expect("list")
+                .is_empty());
+        }
+
+        /// A session that joined long ago and has never held a seat — the
+        /// old end of **D5**'s ordering.
+        ///
+        /// Seeded rather than minted so its `joined_at_secs` is *strictly*
+        /// older than the busy session's. Minting both lands them in the
+        /// same wall-clock second, and `last_activity_secs` counts in
+        /// seconds, so the comparison would fall through to the sid
+        /// tie-break — which `uid_hex` (a random per-process salt XOR a
+        /// counter) makes a coin flip. The assertion below is about
+        /// activity order; it must not be decided by which random sid came
+        /// out smaller.
+        async fn seed_idle_session(state: &AppState, role: &str, desc: &str) -> SessionId {
+            let sid = SessionId::new();
+            let live = LoginSession::new(
+                OperatorSessionRecord {
+                    sid: sid.clone(),
+                    token_digest: OperatorSessionRecord::digest_of("idle-token"),
+                    roles: vec![OperatorRef::new(role).expect("test role literal is never empty")],
+                    capability_manifest: None,
+                    joined_at_secs: 0,
+                    desc: Some(desc.to_string()),
+                    observed: Vec::new(),
+                    observed_total: 0,
+                },
+                None,
+            );
+            state
+                .operator_sessions
+                .lock()
+                .await
+                .insert(sid.clone(), live);
+            sid
+        }
+
+        /// **D5**: newest activity first, and the page has a limit.
+        #[tokio::test]
+        async fn the_list_is_ordered_by_last_activity_and_capped() {
+            let state = test_state();
+            let idle_sid = seed_idle_session(&state, "idle-op", "has done nothing yet").await;
+            let (busy_sid, token) = mint(&state, SEAT_A, Some("seating lane A")).await;
+            let (run_id, task_id) = seed_task_and_run(&state).await;
+            crate::handover::record_observed_assignment(&state, &run_id, &task_id, SEAT_A, SEAT_A)
+                .await;
+
+            let body = body_json(
+                operators_list(
+                    State(state.clone()),
+                    headers_with_bearer(&token),
+                    axum::extract::Query(OperatorsListQuery { limit: None }),
+                )
+                .await,
+            )
+            .await;
+            let ops = body["operators"].as_array().expect("operators");
+            assert_eq!(ops.len(), 2);
+            assert_eq!(
+                ops[0]["sid"].as_str().expect("sid"),
+                busy_sid.to_string(),
+                "the session that just took a seat sorts first"
+            );
+            assert_eq!(ops[1]["sid"].as_str().expect("sid"), idle_sid.to_string());
+            assert_eq!(ops[0]["observed_total"], 1);
+            assert_eq!(body["total"], 2);
+            assert_eq!(body["limit"], OPERATORS_LIST_DEFAULT_LIMIT);
+
+            // The limit cuts the page and `total` still reports the whole.
+            let body = body_json(
+                operators_list(
+                    State(state.clone()),
+                    headers_with_bearer(&token),
+                    axum::extract::Query(OperatorsListQuery { limit: Some(1) }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(body["operators"].as_array().expect("operators").len(), 1);
+            assert_eq!(body["total"], 2);
+            assert_eq!(body["limit"], 1);
+
+            // And a caller cannot opt out of having one.
+            let body = body_json(
+                operators_list(
+                    State(state.clone()),
+                    headers_with_bearer(&token),
+                    axum::extract::Query(OperatorsListQuery {
+                        limit: Some(usize::MAX),
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(body["limit"], OPERATORS_LIST_MAX_LIMIT);
+        }
+
+        /// **D3**: no token, or one no session answers to, is a `401`.
+        #[tokio::test]
+        async fn the_list_refuses_without_a_live_session_bearer() {
+            let state = test_state();
+            let (_sid, _token) = mint(&state, SEAT_A, None).await;
+
+            let anonymous = operators_list(
+                State(state.clone()),
+                HeaderMap::new(),
+                axum::extract::Query(OperatorsListQuery { limit: None }),
+            )
+            .await;
+            assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+            let wrong = operators_list(
+                State(state.clone()),
+                headers_with_bearer("not-a-minted-token"),
+                axum::extract::Query(OperatorsListQuery { limit: None }),
+            )
+            .await;
+            assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        /// §4.3 from the Run's end: the declared seat nobody holds is in
+        /// the list, saying so.
+        #[tokio::test]
+        async fn the_holder_list_reports_a_declared_but_unheld_seat_as_vacant() {
+            let state = test_state();
+            let (_sid, token) = mint(&state, SEAT_A, Some("seating lane A")).await;
+            let (run_id, _task_id) = seed_task_and_run(&state).await;
+            state
+                .run_store
+                .acquire_assignee(&run_id, SEAT_A, SEAT_A, "took lane A")
+                .await
+                .expect("seat lane A");
+
+            let response = crate::handover::run_assignees(
+                State(state.clone()),
+                axum::extract::Path(run_id.to_string()),
+                headers_with_bearer(&token),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+
+            assert_eq!(body["seats_source"], "blueprint");
+            assert!(body["note"].is_null());
+            assert_eq!(body["generation"], 1);
+            let seats = body["seats"].as_array().expect("seats");
+            assert_eq!(seats.len(), 2, "both declared seats are listed");
+            assert_eq!(seats[0]["slot"], SEAT_A);
+            assert_eq!(seats[0]["vacant"], false);
+            assert_eq!(seats[0]["holder"]["op"], SEAT_A);
+            assert_eq!(seats[0]["holder"]["gen"], 1);
+            assert_eq!(seats[1]["slot"], SEAT_B);
+            assert_eq!(seats[1]["vacant"], true);
+            assert!(
+                seats[1]["holder"].is_null(),
+                "an unheld seat says so with a null holder rather than by not appearing: {body}"
+            );
+        }
+
+        /// **D3** again, on the holder list — and note that the *acquire*
+        /// on the same Run stays unguarded (**B2**).
+        #[tokio::test]
+        async fn the_holder_list_refuses_without_a_bearer() {
+            let state = test_state();
+            let (run_id, _task_id) = seed_task_and_run(&state).await;
+            let response = crate::handover::run_assignees(
+                State(state.clone()),
+                axum::extract::Path(run_id.to_string()),
+                HeaderMap::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        /// A Run holding nothing still answers with its seats rather than
+        /// with an empty object — the `skip_serializing_if` objection, in
+        /// its per-seat form.
+        #[tokio::test]
+        async fn a_run_holding_nothing_still_names_its_seats() {
+            let state = test_state();
+            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (run_id, _task_id) = seed_task_and_run(&state).await;
+
+            let body = body_json(
+                crate::handover::run_assignees(
+                    State(state.clone()),
+                    axum::extract::Path(run_id.to_string()),
+                    headers_with_bearer(&token),
+                )
+                .await,
+            )
+            .await;
+            let seats = body["seats"].as_array().expect("seats");
+            assert_eq!(seats.len(), 2);
+            assert!(seats.iter().all(|s| s["vacant"] == true));
+            assert_eq!(body["generation"], 0);
+        }
+
+        /// And the Run row itself now serializes an empty `current` rather
+        /// than dropping the key.
+        #[test]
+        fn an_empty_current_is_written_out_not_skipped() {
+            let record = RunRecord {
+                id: RunId::new(),
+                task_id: TaskId::new(),
+                status: RunStatus::Running,
+                step_entries: Vec::new(),
+                degradations: Vec::new(),
+                operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
+                result_ref: None,
+                input_json: None,
+                created_at: 0,
+                updated_at: 0,
+            };
+            let value = serde_json::to_value(&record).expect("serialize");
+            assert_eq!(
+                value["current"],
+                serde_json::json!({}),
+                "an empty holder map must reach the wire as {{}}: {value}"
+            );
+        }
+    }
+
+    // ── W5's four axes (§4.6) ────────────────────────────────────────────
+
+    /// `GET /v1/runs/:id/handover` and `GET /v1/runs/:id/material` — what
+    /// **W5** says an Assignee must be able to read *"前任者の有無に
+    /// 関わらず"*, and what **W1** / **W2** / **W3** / **R5** say must not
+    /// appear alongside it.
+    mod w5_four_axes {
+        use super::by_role_in_flight::{body_json, test_state};
+        use super::kimei::{mint, seed_task_and_run, SEAT_A, SEAT_B};
+        use super::*;
+        use crate::operator_ws::router::{Liveness, OperatorAdapter, PendingRequest};
+        use crate::operator_ws::PendingKind;
+        use mlua_swarm::core::state::SubmitOutcome;
+        use mlua_swarm::{RunId, StepId};
+
+        /// The step ids the waiting requests are addressed at.
+        const STEP_ONE: &str = "ST-scout";
+        const STEP_TWO: &str = "ST-drafter";
+
+        /// An adapter that owes a fixed set of replies. It stands in for a
+        /// `WSOperatorSession` whose `pending` map is non-empty — the map
+        /// itself is exercised in `session`'s own tests; what is under test
+        /// here is what the read surface does with the answer.
+        struct OwesReplies {
+            requests: Vec<PendingRequest>,
+        }
+
+        #[async_trait::async_trait]
+        impl mlua_swarm::Operator for OwesReplies {
+            async fn execute(
+                &self,
+                _ctx: &mlua_swarm::Ctx,
+                _system: Option<String>,
+                _prompt: serde_json::Value,
+                _worker: Option<mlua_swarm::WorkerBinding>,
+                _worker_token: mlua_swarm::CapToken,
+            ) -> Result<mlua_swarm::WorkerResult, mlua_swarm::WorkerError> {
+                Err(mlua_swarm::WorkerError::Failed(
+                    "this double exists to be read, never dispatched to".to_string(),
+                ))
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl OperatorAdapter for OwesReplies {
+            async fn liveness(&self) -> Liveness {
+                Liveness::Connected
+            }
+
+            async fn discard_requests(&self, _run: &RunId, req_ids: &[String]) -> usize {
+                req_ids.len()
+            }
+
+            async fn pending_for_run(&self, _run: &RunId) -> Vec<PendingRequest> {
+                self.requests.clone()
+            }
+        }
+
+        fn waiting(kind: PendingKind, req_id: &str, step: &str, attempt: u32) -> PendingRequest {
+            PendingRequest {
+                req_id: req_id.to_string(),
+                kind,
+                step_id: StepId::parse(step).expect("test step id literal"),
+                attempt: Some(attempt),
+            }
+        }
+
+        /// Register `op` as an adapter owing `requests`.
+        async fn seat_owes(state: &AppState, op: &str, requests: Vec<PendingRequest>) {
+            state
+                .operator_adapters
+                .register(op, Arc::new(OwesReplies { requests }))
+                .await;
+        }
+
+        /// Register **one** adapter under several `OperatorId`s, owing
+        /// `requests` — the shape `register_operator_session` produces for a
+        /// session that claimed more than one role, and the shape a Run
+        /// reaches when two of its seats are auto-seated from it.
+        async fn one_adapter_seats(state: &AppState, ops: &[&str], requests: Vec<PendingRequest>) {
+            let adapter = Arc::new(OwesReplies { requests });
+            for op in ops {
+                state
+                    .operator_adapters
+                    .register(*op, adapter.clone() as Arc<dyn OperatorAdapter>)
+                    .await;
+            }
+        }
+
+        async fn handover(state: &AppState, run_id: &RunId, token: &str) -> serde_json::Value {
+            let response = crate::handover::run_handover(
+                State(state.clone()),
+                Path(run_id.to_string()),
+                headers_with_bearer(token),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            body_json(response).await
+        }
+
+        /// Axis 3 with axis 2 joined onto it: the adapter supplies the
+        /// request, the seat ledger says which seat it went out through,
+        /// and `Run.current` supplies the `op` and the `generation` neither
+        /// the wire nor the `pending` map can carry (**T1**).
+        ///
+        /// The `hook_before` alongside it is the case with no seat: it is
+        /// dispatched through the sid-registered hook, never through a
+        /// router, so nothing recorded a seat for it and none is invented.
+        #[tokio::test]
+        async fn the_unanswered_list_joins_the_holder_onto_each_waiting_request() {
+            let state = test_state();
+            let (_sid, token) = mint(&state, SEAT_A, Some("seating lane A")).await;
+            let (run_id, _task_id) = seed_task_and_run(&state).await;
+            state
+                .run_store
+                .acquire_assignee(&run_id, SEAT_A, SEAT_A, "took lane A")
+                .await
+                .expect("seat lane A");
+            seat_owes(
+                &state,
+                SEAT_A,
+                vec![
+                    waiting(PendingKind::Spawn, "S-1-spawn-aaa", STEP_ONE, 1),
+                    waiting(PendingKind::HookBefore, "S-1-hb-bbb", STEP_TWO, 2),
+                ],
+            )
+            .await;
+            // The spawn went out through lane A; the router's record of
+            // that is what the join reads.
+            let _seat = state.seat_ledger.record(
+                &run_id,
+                &StepId::parse(STEP_ONE).expect("step id"),
+                1,
+                SEAT_A,
+            );
+
+            let body = handover(&state, &run_id, &token).await;
+
+            // Axis 2 rides along, from the same RunRecord read.
+            let seats = body["seats"].as_array().expect("seats");
+            assert_eq!(seats.len(), 2);
+            assert_eq!(seats[0]["slot"], SEAT_A);
+            assert_eq!(seats[0]["holder"]["op"], SEAT_A);
+            assert_eq!(seats[1]["slot"], SEAT_B);
+            assert_eq!(seats[1]["vacant"], true);
+
+            // Axis 3. Seat-attributed rows first, then the ones that
+            // belong to no seat.
+            let waiting = body["unanswered"].as_array().expect("unanswered");
+            assert_eq!(waiting.len(), 2);
+            assert_eq!(waiting[0]["req_id"], "S-1-spawn-aaa");
+            assert_eq!(waiting[0]["kind"], "spawn");
+            assert_eq!(waiting[0]["step_id"], STEP_ONE);
+            assert_eq!(waiting[0]["attempt"], 1);
+            assert_eq!(waiting[0]["slot"], SEAT_A);
+            assert_eq!(
+                waiting[0]["op"], SEAT_A,
+                "the OperatorId is joined from the seat, not read from below the SAP"
+            );
+            assert_eq!(
+                waiting[0]["generation"], 1,
+                "and so is the generation, for the same reason"
+            );
+
+            assert_eq!(waiting[1]["kind"], "hook_before");
+            assert_eq!(waiting[1]["attempt"], 2);
+            assert!(
+                waiting[1]["slot"].is_null()
+                    && waiting[1]["op"].is_null()
+                    && waiting[1]["generation"].is_null(),
+                "a hook_before never reaches a router, so no seat can be named for it — and \
+                 naming the seat that happened to answer would be a guess: {}",
+                waiting[1]
+            );
+
+            for entry in waiting {
+                assert!(entry["material_route"]
+                    .as_str()
+                    .expect("a material route")
+                    .starts_with(&format!("/v1/runs/{run_id}/material?step_id=")));
+            }
+
+            // Axis 4's first half: neither attempt has produced anything.
+            assert_eq!(waiting[0]["final_present"], false);
+            assert!(waiting[0]["final_ok"].is_null());
+
+            // Axis 1 is a reference, and an empty rail says so with `null`
+            // rather than by pretending to a seq.
+            assert_eq!(body["trace"]["route"], format!("/v1/runs/{run_id}/trace"));
+            assert!(body["trace"]["latest_seq"].is_null());
+            assert!(body["unread_seats"].as_array().expect("unread").is_empty());
+        }
+
+        /// **Each waiting request appears once.** Two seats of one Run can
+        /// resolve to the same adapter — a session is registered under its
+        /// sid *and* under each of its roles, and a launch auto-seats each
+        /// declared slot from the adapter answering to that slot's name.
+        /// Asking per seat asked that one object twice and stamped the two
+        /// copies with two different `slot` / `op` / `generation` triples,
+        /// at most one of which was true.
+        #[tokio::test]
+        async fn a_request_owed_through_two_seats_is_listed_once() {
+            let state = test_state();
+            let (_sid, token) = mint(&state, SEAT_A, Some("driving both lanes")).await;
+            let (run_id, _task_id) = seed_task_and_run(&state).await;
+            for seat in [SEAT_A, SEAT_B] {
+                state
+                    .run_store
+                    .acquire_assignee(&run_id, seat, seat, "one driver, both lanes")
+                    .await
+                    .expect("seat");
+            }
+            one_adapter_seats(
+                &state,
+                &[SEAT_A, SEAT_B],
+                vec![
+                    waiting(PendingKind::Spawn, "S-1-spawn-aaa", STEP_ONE, 1),
+                    waiting(PendingKind::Spawn, "S-1-spawn-bbb", STEP_TWO, 1),
+                ],
+            )
+            .await;
+            let _on_a = state.seat_ledger.record(
+                &run_id,
+                &StepId::parse(STEP_ONE).expect("step id"),
+                1,
+                SEAT_A,
+            );
+            let _on_b = state.seat_ledger.record(
+                &run_id,
+                &StepId::parse(STEP_TWO).expect("step id"),
+                1,
+                SEAT_B,
+            );
+
+            let body = handover(&state, &run_id, &token).await;
+            let waiting = body["unanswered"].as_array().expect("unanswered");
+
+            assert_eq!(
+                waiting.len(),
+                2,
+                "two requests are outstanding, and one adapter backing two seats must not \
+                 turn them into four: {waiting:?}"
+            );
+            let mut named: Vec<(&str, &str)> = waiting
+                .iter()
+                .map(|entry| {
+                    (
+                        entry["req_id"].as_str().expect("req_id"),
+                        entry["slot"].as_str().expect("an attributed seat"),
+                    )
+                })
+                .collect();
+            named.sort_unstable();
+            assert_eq!(
+                named,
+                vec![("S-1-spawn-aaa", SEAT_A), ("S-1-spawn-bbb", SEAT_B)],
+                "and each is attributed to the seat it was actually dispatched through"
+            );
+        }
+
+        /// **W3** / **R5** / **W2**, as a shape assertion: an un-answered
+        /// entry has no field that could grade the wait. If one is ever
+        /// added — `parked`, `sent_at`, `age_ms`, `stuck`, `resumable` —
+        /// this fails, which is the point.
+        #[tokio::test]
+        async fn an_unanswered_entry_carries_nothing_that_grades_the_wait() {
+            let state = test_state();
+            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (run_id, _task_id) = seed_task_and_run(&state).await;
+            state
+                .run_store
+                .acquire_assignee(&run_id, SEAT_A, SEAT_A, "took lane A")
+                .await
+                .expect("seat lane A");
+            seat_owes(
+                &state,
+                SEAT_A,
+                vec![waiting(PendingKind::Spawn, "S-1-spawn-aaa", STEP_ONE, 1)],
+            )
+            .await;
+
+            let body = handover(&state, &run_id, &token).await;
+            let entry = body["unanswered"][0].as_object().expect("one entry");
+            let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "attempt",
+                    "final_ok",
+                    "final_present",
+                    "generation",
+                    "kind",
+                    "material_route",
+                    "op",
+                    "req_id",
+                    "slot",
+                    "step_id",
+                ],
+                "a waiting step is waiting, not broken: no age, no deadline, and no \
+                 sent/unsent split (W3 / R5)"
+            );
+        }
+
+        /// Axis 4's first half against a real tail: the attempt already
+        /// produced a `Final`, so re-running it would double the side
+        /// effect (`model.md:378-379`).
+        #[tokio::test]
+        async fn an_attempt_that_already_has_a_final_says_so_without_the_value() {
+            let state = test_state();
+            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (run_id, _task_id) = seed_task_and_run(&state).await;
+            state
+                .run_store
+                .acquire_assignee(&run_id, SEAT_A, SEAT_A, "took lane A")
+                .await
+                .expect("seat lane A");
+            seat_owes(
+                &state,
+                SEAT_A,
+                vec![waiting(PendingKind::Spawn, "S-1-spawn-aaa", STEP_ONE, 1)],
+            )
+            .await;
+            state
+                .engine
+                .submit_worker_result_trusted(
+                    &StepId::parse(STEP_ONE).expect("step id"),
+                    1,
+                    serde_json::json!({ "verdict": "pass" }),
+                    SubmitOutcome::Pass,
+                )
+                .await
+                .expect("submit a Final for the attempt that is still awaited");
+
+            let entry = &handover(&state, &run_id, &token).await["unanswered"][0];
+            assert_eq!(entry["final_present"], true);
+            assert_eq!(entry["final_ok"], true, "the flag the dispatch path reads");
+            assert!(
+                entry.get("final_value").is_none() && entry.get("final_content").is_none(),
+                "presence and the ok flag decide the next action; the body does not: {entry}"
+            );
+            // And it is still listed as un-answered — a `Final` on the tail
+            // is not an ack, and the server does not close the request on
+            // the operator's behalf (**W1**).
+            assert_eq!(entry["req_id"], "S-1-spawn-aaa");
+        }
+
+        /// A held seat whose holder names no registered adapter is named,
+        /// not silently dropped: an `unanswered` that quietly omitted it
+        /// would read as "nothing is in flight", which is the answer that
+        /// invites a re-run.
+        #[tokio::test]
+        async fn a_held_seat_with_no_adapter_is_reported_rather_than_skipped() {
+            let state = test_state();
+            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (run_id, _task_id) = seed_task_and_run(&state).await;
+            state
+                .run_store
+                .acquire_assignee(
+                    &run_id,
+                    SEAT_A,
+                    "an-operator-that-never-registered",
+                    "took it",
+                )
+                .await
+                .expect("seat lane A");
+
+            let body = handover(&state, &run_id, &token).await;
+            assert!(body["unanswered"]
+                .as_array()
+                .expect("unanswered")
+                .is_empty());
+            let unread = body["unread_seats"].as_array().expect("unread");
+            assert_eq!(unread.len(), 1);
+            assert_eq!(unread[0]["slot"], SEAT_A);
+            assert_eq!(unread[0]["op"], "an-operator-that-never-registered");
+            assert!(unread[0]["reason"]
+                .as_str()
+                .expect("a reason")
+                .contains("not registered in the adapter registry"));
+        }
+
+        /// A vacant seat is not an unread one — there is nobody to ask, and
+        /// the seat list on the same response already says so.
+        #[tokio::test]
+        async fn a_vacant_seat_is_not_reported_as_unread() {
+            let state = test_state();
+            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (run_id, _task_id) = seed_task_and_run(&state).await;
+
+            let body = handover(&state, &run_id, &token).await;
+            assert!(body["unanswered"]
+                .as_array()
+                .expect("unanswered")
+                .is_empty());
+            assert!(body["unread_seats"].as_array().expect("unread").is_empty());
+            assert!(body["seats"]
+                .as_array()
+                .expect("seats")
+                .iter()
+                .all(|seat| seat["vacant"] == true));
+        }
+
+        /// **D3** / **W5**: the reader is an Assignee, which is someone who
+        /// has joined.
+        #[tokio::test]
+        async fn both_reads_refuse_without_a_bearer() {
+            let state = test_state();
+            let (run_id, _task_id) = seed_task_and_run(&state).await;
+
+            let snapshot = crate::handover::run_handover(
+                State(state.clone()),
+                Path(run_id.to_string()),
+                HeaderMap::new(),
+            )
+            .await;
+            assert_eq!(snapshot.status(), StatusCode::UNAUTHORIZED);
+
+            let material = crate::handover::run_step_material(
+                State(state.clone()),
+                Path(run_id.to_string()),
+                axum::extract::Query(crate::handover::StepMaterialQuery {
+                    step_id: StepId::parse(STEP_ONE).expect("step id"),
+                }),
+                HeaderMap::new(),
+            )
+            .await;
+            assert_eq!(material.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        /// A step the engine never dispatched has no material, and that is
+        /// a miss rather than an empty payload.
+        #[tokio::test]
+        async fn material_for_a_step_the_engine_does_not_know_is_a_miss() {
+            let state = test_state();
+            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (run_id, _task_id) = seed_task_and_run(&state).await;
+
+            let response = crate::handover::run_step_material(
+                State(state.clone()),
+                Path(run_id.to_string()),
+                axum::extract::Query(crate::handover::StepMaterialQuery {
+                    step_id: StepId::parse(STEP_ONE).expect("step id"),
+                }),
+                headers_with_bearer(&token),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
     }
 }

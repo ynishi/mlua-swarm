@@ -431,10 +431,17 @@ impl OperatorClientState {
     /// `POST /v1/operators` (mint sid+token) then `WS /v1/operators/:sid/ws`
     /// (Bearer). The token stays in-process (`SessionEntry.token`) — never
     /// returned to the caller. Returns `(sid, roles)`.
+    ///
+    /// `desc` is the session's 記名 (server model §4.2 **D1**): what this
+    /// session is here to do, fixed at join and read back off
+    /// [`Self::list_operators`]. The server accepts a join without one, so
+    /// this is an `Option`; the tool that AIs join through makes it
+    /// mandatory instead.
     pub async fn join(
         &self,
         roles: Vec<mlua_swarm::OperatorRef>,
         capability_manifest: Option<mlua_swarm::AgentProviderManifest>,
+        desc: Option<String>,
     ) -> Result<(String, Vec<mlua_swarm::OperatorRef>), ClientError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -445,6 +452,7 @@ impl OperatorClientState {
             .json(&serde_json::json!({
                 "roles": roles,
                 "capability_manifest": capability_manifest,
+                "desc": desc,
             }))
             .send()
             .await
@@ -737,6 +745,60 @@ impl OperatorClientState {
             )));
         }
         Ok(())
+    }
+
+    /// `GET /v1/operators` (Bearer) — the 記名 list, returned verbatim.
+    ///
+    /// # Why this needs a sid at all
+    ///
+    /// The route used to be unauthenticated and is now Bearer-gated
+    /// (server model **D3**), so a caller has to present *some* live
+    /// session's token; any one opens the list. This process only has
+    /// tokens for the sessions it minted, so `sid` selects which one to
+    /// present. `None` means "the sole live session", the same auto-pin
+    /// rule [`Self::sole_live_sid`] applies elsewhere — and it fails
+    /// loudly with [`ClientError::UnknownSid`] rather than guessing when
+    /// this process holds none or several.
+    pub async fn list_operators(
+        &self,
+        sid: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Value, ClientError> {
+        let sid = match sid {
+            Some(sid) => sid.to_string(),
+            None => self.sole_live_sid().await.ok_or_else(|| {
+                ClientError::UnknownSid(
+                    "no sid given and this process does not hold exactly one live session; \
+                     pass the sid whose Bearer token should be presented"
+                        .to_string(),
+                )
+            })?,
+        };
+        let entry = self.get_entry(&sid).await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        let mut url = format!("{}/v1/operators", self.http_base);
+        if let Some(limit) = limit {
+            url.push_str(&format!("?limit={limit}"));
+        }
+        let resp = client
+            .get(&url)
+            .bearer_auth(&entry.token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Http(format!(
+                "GET {url} failed: {status} {body}"
+            )));
+        }
+        resp.json()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))
     }
 
     /// `DELETE /v1/operators/:sid` (Bearer) + abort the reader task + drop
@@ -1228,7 +1290,7 @@ mod tests {
     #[tokio::test]
     async fn join_unreachable_host_returns_http_error_not_panic() {
         let state = OperatorClientState::with_http_base("http://127.0.0.1:1");
-        let err = state.join(vec![], None).await.unwrap_err();
+        let err = state.join(vec![], None, None).await.unwrap_err();
         assert!(matches!(err, ClientError::Http(_)), "got: {err:?}");
     }
 
@@ -1278,7 +1340,7 @@ mod tests {
 
         let state = OperatorClientState::with_http_base(base);
         let error = state
-            .join(vec![role("main-ai")], None)
+            .join(vec![role("main-ai")], None, None)
             .await
             .expect_err("missing WS route must fail the upgrade");
 
@@ -1478,7 +1540,10 @@ mod tests {
     async fn pending_wait_reconnects_when_the_reader_task_has_finished() {
         let stub = StubServer::start(vec![WsBehavior::CloseImmediately, WsBehavior::Hold]).await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state.join(vec![role("main-ai")], None).await.expect("join");
+        let (sid, _) = state
+            .join(vec![role("main-ai")], None, None)
+            .await
+            .expect("join");
         await_reader_finished(&state, &sid).await;
 
         let frame = state
@@ -1508,7 +1573,10 @@ mod tests {
     async fn reconnect_declines_without_a_ws_attempt_when_healthz_is_down() {
         let stub = StubServer::start(vec![WsBehavior::CloseImmediately]).await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state.join(vec![role("main-ai")], None).await.expect("join");
+        let (sid, _) = state
+            .join(vec![role("main-ai")], None, None)
+            .await
+            .expect("join");
         await_reader_finished(&state, &sid).await;
         stub.set_healthy(false);
 
@@ -1544,7 +1612,10 @@ mod tests {
         ])
         .await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state.join(vec![role("main-ai")], None).await.expect("join");
+        let (sid, _) = state
+            .join(vec![role("main-ai")], None, None)
+            .await
+            .expect("join");
         await_reader_finished(&state, &sid).await;
         let entry = state.get_entry(&sid).await.expect("session kept");
         assert_eq!(
@@ -1576,7 +1647,10 @@ mod tests {
         ])
         .await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state.join(vec![role("main-ai")], None).await.expect("join");
+        let (sid, _) = state
+            .join(vec![role("main-ai")], None, None)
+            .await
+            .expect("join");
         await_reader_finished(&state, &sid).await;
         let entry = state.get_entry(&sid).await.expect("session kept");
 

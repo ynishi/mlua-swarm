@@ -825,12 +825,13 @@ Two surfaces close the pre-#81 recovery gap where a driver that crashed
 after minting a session could only be recovered by a full `mse serve`
 restart (which also dropped every OTHER live session):
 
-- **`GET /v1/operators`** — read-only enumeration of every live session's
-  `{sid, roles, joined_at_secs, connected}`. Same trust tier as
-  `GET /v1/status` (no Bearer required — sids are identifiers, not
-  secrets; the token is the sole Bearer credential and never surfaces
-  here). Answers "which sid holds `main-ai`?" without probing every sid
-  individually.
+- **`GET /v1/operators`** — every live session's
+  `{sid, roles, joined_at_secs, connected}` plus its 記名 (see below).
+  Answers "which sid holds `main-ai`?" without probing every sid
+  individually. **Bearer required** — any live session's token opens it.
+  This is a breaking change: the route answered anonymously up to
+  v0.24.0. The token itself never surfaces in the response.
+  MCP counterpart: `mse_operator_list(sid?, limit?)`.
 - **`DELETE /v1/operators/by-role/:role`** — release the session
   currently holding `role` without knowing the sid or its Bearer token.
   `404` when no session holds the role, `204` on successful teardown.
@@ -856,6 +857,115 @@ The pre-#81 `DELETE /v1/operators/:sid` (Bearer required) is unchanged
 and remains the correct path for a session's own driver to leave
 cleanly. `by-role` is the recovery escape hatch when the sid is
 unknown, not a replacement for the sid-scoped route.
+
+### Telling parallel sessions apart: the 記名 and the holder list
+
+Taking a Run's Operator seat does not exclude anyone — the last acquire
+wins. Two things are therefore what stand between an incoming Assignee
+and somebody else's Run, and both are Bearer-gated (any live session's
+token):
+
+- **`GET /v1/operators`** — the 記名 list. Each session carries a
+  **confirmed part** and an **observed part**.
+  - *Confirmed*: the `desc` the session wrote at join, fixed for its
+    lifetime. Pass it as `desc` on `POST /v1/operators`, or as the
+    mandatory `desc` argument of `mse_operator_join`. About 50
+    characters, describing what you are touching and what you are doing
+    to it — *not* the repo path, worktree path, Run id, goal or start
+    time, all of which are recorded automatically. A session that wrote
+    none reports `desc: null`.
+  - *Observed*: one `observed[]` entry per Operator seat the session has
+    been assigned, written by the server at the moment of the assignment
+    — `{run_id, slot, goal, project_root, work_dir, task_metadata,
+    at_secs}`. The paths come from the launch's Task-level input and are
+    `null` when the launch carried none; nothing is substituted. There
+    is no route that deletes an entry. The list is a bounded window: the
+    newest 32 per session, with `observed_total` reporting how many
+    assignments there really were. Every field of an entry is bounded
+    too — `task_metadata` above 4 KiB is dropped with
+    `task_metadata_omitted: true`, and `goal` / `project_root` /
+    `work_dir` above 1 KiB are cut to fit, ending in `…` with
+    `text_truncated: true`. That keeps the ring's serialized size a
+    number rather than a hope.
+
+  The confirmed part is what the observed part cannot supply: two
+  drivers in the same worktree produce identical paths, and only the
+  sentence one of them wrote at join exists nowhere else.
+
+  Ordered by most recent activity first, capped (`?limit=`, default 50,
+  ceiling 200), with `total` reporting the count before the cut.
+
+- **`GET /v1/runs/:id/assignees`** — the holder list of one Run. Every
+  Operator seat the Blueprint declares plus any the Run holds, each with
+  `vacant` and `holder`. A seat nobody holds is **present** and says so
+  (`vacant: true`, `holder: null`) rather than being left out, so
+  "nobody is on this" is distinguishable from "this response did not
+  report holders". `GET /v1/runs/:id` answers the same question in its
+  own shape: `current` is now written out as `{}` on a Run holding
+  nothing, where it used to vanish from the wire.
+
+  Note the asymmetry with `POST /v1/runs/:id/acquire`, which needs no
+  Bearer at all: taking a seat is deliberately ungated (a Bearer must
+  not decide assignment), and it is *reading who is on it* that
+  requires one.
+
+### Deciding what to do next: the four-axis read
+
+Recognising the Run is one question; knowing what state it is in is
+another, and it is the one an Assignee asks constantly rather than only
+at a handover. Two more Bearer-gated reads answer it.
+
+- **`GET /v1/runs/:id/handover`** — four axes in one call:
+
+  | axis | where it is in the body |
+  |---|---|
+  | what has been done | `trace` — a `{route, latest_seq}` reference, not the events |
+  | who holds what | `seats` / `seats_source` / `note`, the `/assignees` body verbatim |
+  | what is in the air | `unanswered[]` |
+  | what to do next | `unanswered[].final_present` / `final_ok`, plus `material_route` |
+
+  `latest_seq` is a watermark: a trace event with a higher `seq` happened
+  after this snapshot was taken, so "the picture moved while I was
+  reading it" is detectable rather than silent.
+
+  Each `unanswered[]` entry is one request a current holder has been given
+  and has not answered, listed **once**. `slot` / `op` / `generation` name
+  the Operator seat it was dispatched through and whoever holds that seat
+  now. All three are `null` when the request belongs to no seat — a
+  `hook_before` goes to the session directly rather than through a seat,
+  so there is none to name, and naming the one that happened to answer
+  would be a guess. (One driver can hold several seats of a Run: a session
+  is registered under its sid *and* under each of its roles, and a launch
+  seats each declared slot from whoever answers to that slot's name.)
+
+  Nothing on an entry grades the wait — no age, no deadline, no
+  sent/unsent split. A step whose driver went away is *waiting*, not
+  broken, and the next action is an ordinary acquire followed by an
+  ordinary dispatch. There is no resume, skip or retry verb anywhere on
+  this surface.
+
+  `final_present` is the field that prevents the two mistakes worth
+  preventing: re-running an attempt that already produced a value (and
+  doubling its side effect), or treating an attempt with no value as
+  finished. `unread_seats[]` names a held seat whose holder could not be
+  asked, so an empty `unanswered` always means "everyone was asked and
+  owed nothing".
+
+- **`GET /v1/runs/:id/material?step_id=<id>`** — the material for one
+  step: the same `WorkerPayload` a SubAgent self-fetches, plus that
+  attempt's `final_present` / `final_ok`. `run_link` is `confirmed` when
+  the payload's own context names the Run in the path, `unconfirmed` when
+  it carries no Run identity to check against. The `Final`'s **value** is
+  not here on purpose — presence and the `ok` flag are what the decision
+  needs, and the value is unbounded.
+
+  This route exists next to `GET /v1/worker/prompt` because the gate
+  differs, not the payload: the worker route is held by a per-task
+  CapToken an Assignee does not have and must not be issued. Note what
+  that makes the operator Bearer worth here — `POST /v1/operators` needs
+  no credential, so any caller that can reach the server can mint one.
+  The gate is a shape check, not confidentiality; bind the server
+  accordingly.
 
 ### Capability manifest at join
 

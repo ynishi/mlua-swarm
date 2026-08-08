@@ -23,7 +23,10 @@
 //! new kinds without a schema migration. Current namespaces:
 //!
 //! - `core.*` — engine/dispatcher (`run_started` / `step_dispatched` /
-//!   `step_completed` / `cancel_requested` / `run_finished`)
+//!   `step_completed` / `cancel_requested` / `run_finished`) and the
+//!   Run-level assignment axis (`assignee_assigned` /
+//!   `assignee_released`), which the server appends where a seat changes
+//!   hands
 //! - `mw.*` — middleware (`long_hold_warn`, …)
 //! - `worker.*` — adapter / worker self-reports
 //! - `ext.*` — future external writers (Lua flow, enhance flow, tools)
@@ -223,6 +226,26 @@ pub mod kind {
     pub const RUN_FINISHED: &str = "core.run_finished";
     /// Cancellation was requested for the Run.
     pub const CANCEL_REQUESTED: &str = "core.cancel_requested";
+    /// One of the Run's Operator seats gained a holder (a launch pin, a
+    /// launch-time auto-seat, or `POST /v1/runs/:id/acquire`). Payload:
+    /// `{"slot", "assignee": {op, desc, gen}, "source", "previous":
+    /// {…}|null}`.
+    ///
+    /// Step-less, like [`CANCEL_REQUESTED`]: who holds a seat is a fact
+    /// about the Run, not about one step — but it rides the SAME rail the
+    /// step events do, deliberately, so a reader reconstructing "what
+    /// happened here" never has to line two streams up against each other.
+    pub const ASSIGNEE_ASSIGNED: &str = "core.assignee_assigned";
+    /// One of the Run's Operator seats lost its holder: the holder was
+    /// found Disconnected at dispatch time, its Operator was deleted, or
+    /// an acquire displaced it. Payload: `{"slot", "assignee": {op, desc,
+    /// gen}, "reason"}`.
+    ///
+    /// A seat emptied by the system rather than by its holder is the case
+    /// worth reading later — a restart that dropped every socket leaves
+    /// exactly these rows behind, which is what makes the loss visible
+    /// after the fact instead of only as a failed dispatch.
+    pub const ASSIGNEE_RELEASED: &str = "core.assignee_released";
     /// `LongHoldMiddleware` observed a completion above its threshold.
     pub const LONG_HOLD_WARN: &str = "mw.long_hold_warn";
     /// A worker reported a degradation (mirrors the `DegradationEntry`

@@ -27,12 +27,20 @@
 //!   token_digest              TEXT NOT NULL,  -- hex(SHA-256(bearer)), never the bearer
 //!   roles_json                TEXT NOT NULL,  -- JSON-encoded `Vec<String>`
 //!   capability_manifest_json  TEXT,           -- JSON-encoded manifest, NULL when unset
-//!   joined_at_secs            INTEGER NOT NULL
+//!   joined_at_secs            INTEGER NOT NULL,
+//!   join_desc                 TEXT,           -- 記名 confirmed part (D1), NULL when unwritten
+//!   observed_json             TEXT,           -- 記名 observed part (D2), JSON array
+//!   observed_total            INTEGER NOT NULL DEFAULT 0
 //! );
 //! ```
+//!
+//! The last three columns arrived with the 記名 (model §4.2) and are added
+//! to an older file by [`migrate_add_column_if_missing`], the same way the
+//! `runs` table grows a column.
 
 use super::{
-    OperatorRef, OperatorSessionRecord, OperatorSessionStore, OperatorSessionStoreError, SessionId,
+    ObservedAssignment, OperatorRef, OperatorSessionRecord, OperatorSessionStore,
+    OperatorSessionStoreError, SessionId,
 };
 use crate::AgentProviderManifest;
 use async_trait::async_trait;
@@ -46,9 +54,51 @@ CREATE TABLE IF NOT EXISTS operator_sessions (\
   token_digest              TEXT NOT NULL, \
   roles_json                TEXT NOT NULL, \
   capability_manifest_json  TEXT, \
-  joined_at_secs            INTEGER NOT NULL\
+  joined_at_secs            INTEGER NOT NULL, \
+  join_desc                 TEXT, \
+  observed_json             TEXT, \
+  observed_total            INTEGER NOT NULL DEFAULT 0\
 );\
 ";
+
+/// Idempotently ensure a column exists on `operator_sessions`, adding it
+/// via `ALTER TABLE … ADD COLUMN` when the file predates it.
+///
+/// Same shape as `crate::store::run::sqlite`'s namesake, and the same
+/// reason: [`SCHEMA_SQL`] only runs `CREATE TABLE IF NOT EXISTS`, so a file
+/// created before a column existed never gains it otherwise. Unlike
+/// [`purge_legacy_plaintext_table`] this migrates rather than drops — these
+/// columns hold no secret and an existing session losing its 記名 would be
+/// a session nobody can identify, which is the opposite of the point.
+fn migrate_add_column_if_missing(
+    conn: &rusqlite::Connection,
+    column: &str,
+    decl: &str,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(operator_sessions)")?;
+    let has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<String>, _>>()?
+        .iter()
+        .any(|name| name == column);
+    if !has_column {
+        conn.execute_batch(&format!(
+            "ALTER TABLE operator_sessions ADD COLUMN {column} {decl};"
+        ))?;
+    }
+    Ok(())
+}
+
+/// The open-time schema work, shared by the file and in-memory
+/// constructors so the two can never drift apart.
+fn init_schema(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
+    purge_legacy_plaintext_table(conn)?;
+    conn.execute_batch(SCHEMA_SQL)?;
+    migrate_add_column_if_missing(conn, "join_desc", "TEXT")?;
+    migrate_add_column_if_missing(conn, "observed_json", "TEXT")?;
+    migrate_add_column_if_missing(conn, "observed_total", "INTEGER NOT NULL DEFAULT 0")
+}
 
 /// Drop a pre-release `operator_sessions` table that still carries the
 /// plaintext `token` column, so the upgrade leaves no bearer on disk.
@@ -123,13 +173,9 @@ impl SqliteOperatorSessionStore {
         path: impl AsRef<Path>,
     ) -> Result<(Self, AsyncIsleDriver), OperatorSessionStoreError> {
         let path = path.as_ref().to_path_buf();
-        let (isle, driver) = AsyncIsle::spawn(path.clone(), |conn| {
-            conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
-            purge_legacy_plaintext_table(conn)?;
-            conn.execute_batch(SCHEMA_SQL)
-        })
-        .await
-        .map_err(map_isle_err)?;
+        let (isle, driver) = AsyncIsle::spawn(path.clone(), init_schema)
+            .await
+            .map_err(map_isle_err)?;
         // After the open: SQLite creates the file with umask-derived
         // permissions, so the tightening has to follow it.
         harden_file_permissions(&path);
@@ -138,13 +184,9 @@ impl SqliteOperatorSessionStore {
 
     /// Open an ephemeral in-memory database (tests, doctests).
     pub async fn open_in_memory() -> Result<(Self, AsyncIsleDriver), OperatorSessionStoreError> {
-        let (isle, driver) = AsyncIsle::open_in_memory(|conn| {
-            conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
-            purge_legacy_plaintext_table(conn)?;
-            conn.execute_batch(SCHEMA_SQL)
-        })
-        .await
-        .map_err(map_isle_err)?;
+        let (isle, driver) = AsyncIsle::open_in_memory(init_schema)
+            .await
+            .map_err(map_isle_err)?;
         Ok((Self { isle }, driver))
     }
 }
@@ -154,11 +196,21 @@ fn map_isle_err(e: IsleError) -> OperatorSessionStoreError {
 }
 
 /// One `operator_sessions` SELECT row in column order: sid, token_digest,
-/// roles_json, capability_manifest_json, joined_at_secs.
-type SessionRow = (String, String, String, Option<String>, i64);
+/// roles_json, capability_manifest_json, joined_at_secs, join_desc,
+/// observed_json, observed_total.
+type SessionRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+    i64,
+);
 
-const SESSION_SELECT_COLUMNS: &str =
-    "sid, token_digest, roles_json, capability_manifest_json, joined_at_secs";
+const SESSION_SELECT_COLUMNS: &str = "sid, token_digest, roles_json, capability_manifest_json, \
+     joined_at_secs, join_desc, observed_json, observed_total";
 
 /// Why one `operator_sessions` row could not be turned into an
 /// [`OperatorSessionRecord`].
@@ -171,15 +223,24 @@ struct RowDecodeError {
     /// The row's `sid` column verbatim — the only handle on a row whose sid
     /// is itself what failed to decode, so it is kept as the raw string.
     raw_sid: String,
-    /// Which column's decode failed: `sid`, `roles`, or
-    /// `capability_manifest`.
+    /// Which column's decode failed: `sid`, `roles`,
+    /// `capability_manifest`, or `observed`.
     column: &'static str,
     /// The decoder's own message.
     detail: String,
 }
 
 fn row_to_record(row: SessionRow) -> Result<OperatorSessionRecord, RowDecodeError> {
-    let (raw_sid, token_digest, roles_json, capability_manifest_json, joined_at_secs) = row;
+    let (
+        raw_sid,
+        token_digest,
+        roles_json,
+        capability_manifest_json,
+        joined_at_secs,
+        desc,
+        observed_json,
+        observed_total,
+    ) = row;
     // All three decodes below fail the same way and get the same treatment.
     // `roles` is the one an older build is known to have poisoned, but the
     // sid and the manifest are no more trustworthy for having been quiet so
@@ -200,12 +261,23 @@ fn row_to_record(row: SessionRow) -> Result<OperatorSessionRecord, RowDecodeErro
         ),
         None => None,
     };
+    // The observed part decodes under the same regime as the other three:
+    // a log that will not decode drops the session rather than coming back
+    // silently emptied, which would read as "this operator has handled
+    // nothing" — the one thing the 記名 exists to answer.
+    let observed: Vec<ObservedAssignment> = match observed_json {
+        Some(text) => serde_json::from_str(&text).map_err(|e| fail("observed", e.to_string()))?,
+        None => Vec::new(),
+    };
     Ok(OperatorSessionRecord {
         sid,
         token_digest,
         roles,
         capability_manifest,
         joined_at_secs: joined_at_secs as u64,
+        desc,
+        observed,
+        observed_total: observed_total.max(0) as u64,
     })
 }
 
@@ -229,19 +301,27 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
                 OperatorSessionStoreError::Other(format!("encode capability_manifest: {e}"))
             })?;
         let joined_at_secs = record.joined_at_secs as i64;
+        let desc = record.desc.clone();
+        let observed_json = serde_json::to_string(&record.observed)
+            .map_err(|e| OperatorSessionStoreError::Other(format!("encode observed: {e}")))?;
+        let observed_total = record.observed_total as i64;
 
         self.isle
             .call(move |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO operator_sessions \
-                     (sid, token_digest, roles_json, capability_manifest_json, joined_at_secs) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                     (sid, token_digest, roles_json, capability_manifest_json, joined_at_secs, \
+                      join_desc, observed_json, observed_total) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         sid,
                         token_digest,
                         roles_json,
                         capability_manifest_json,
-                        joined_at_secs
+                        joined_at_secs,
+                        desc,
+                        observed_json,
+                        observed_total
                     ],
                 )
             })
@@ -287,6 +367,9 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
                     ))
                 })?;
                 let mut out = Vec::new();
@@ -345,6 +428,9 @@ mod tests {
             roles: vec![role("main-ai")],
             capability_manifest: None,
             joined_at_secs,
+            desc: None,
+            observed: Vec::new(),
+            observed_total: 0,
         }
     }
 
@@ -461,6 +547,117 @@ mod tests {
         assert!(
             haystack.contains(&OperatorSessionRecord::digest_of(bearer)),
             "the digest is what should be stored"
+        );
+    }
+
+    /// The 記名 survives the encode/decode round trip: the confirmed part
+    /// (**D1**), the observed log (**D2**) and the monotone counter.
+    #[tokio::test]
+    async fn the_kimei_round_trips() {
+        let (s, driver) = SqliteOperatorSessionStore::open_in_memory().await.unwrap();
+        let mut rec = mk("S-1", 100);
+        rec.desc = Some("rewriting the seat resolver in mlua-swarm-server".to_string());
+        rec.record_observed(ObservedAssignment::new(
+            "R-1".to_string(),
+            "phase-a-op".to_string(),
+            Some("resolve issue #10".to_string()),
+            Some("/repo".to_string()),
+            Some("/repo/.worktrees/topic".to_string()),
+            Some(serde_json::json!({"issue": 10})),
+            140,
+        ));
+        s.put(rec.clone()).await.unwrap();
+
+        let list = s.list().await.unwrap();
+        assert_eq!(list, vec![rec]);
+        assert_eq!(list[0].last_activity_secs(), 140);
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// A file created before the 記名 columns existed gains them on open
+    /// and keeps its rows — the sessions in it stay logged in, with an
+    /// empty 記名 rather than none at all.
+    #[tokio::test]
+    async fn a_pre_kimei_file_is_migrated_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operator_session.db");
+
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open pre-記名 db");
+            conn.execute_batch(
+                "CREATE TABLE operator_sessions (\
+                   sid                       TEXT PRIMARY KEY, \
+                   token_digest              TEXT NOT NULL, \
+                   roles_json                TEXT NOT NULL, \
+                   capability_manifest_json  TEXT, \
+                   joined_at_secs            INTEGER NOT NULL\
+                 );",
+            )
+            .expect("create the pre-記名 table");
+            conn.execute(
+                "INSERT INTO operator_sessions VALUES (?1, ?2, ?3, NULL, ?4)",
+                params![
+                    "S-old",
+                    OperatorSessionRecord::digest_of("bearer-S-old"),
+                    r#"["main-ai"]"#,
+                    7i64
+                ],
+            )
+            .expect("seed the pre-記名 row");
+        }
+
+        let (s, driver) = SqliteOperatorSessionStore::open(&path).await.unwrap();
+        let list = s.list().await.unwrap();
+        assert_eq!(list.len(), 1, "the row survives the column addition");
+        assert_eq!(list[0].desc, None);
+        assert!(list[0].observed.is_empty());
+        assert_eq!(list[0].observed_total, 0);
+        assert!(list[0].verify_bearer("bearer-S-old"));
+
+        // And the migrated file is writable in the new shape.
+        let mut updated = list[0].clone();
+        updated.desc = Some("picked this session back up after a restart".to_string());
+        s.put(updated).await.unwrap();
+        let list = s.list().await.unwrap();
+        assert_eq!(
+            list[0].desc.as_deref(),
+            Some("picked this session back up after a restart")
+        );
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// An observed log that will not decode drops the session rather than
+    /// restoring it as "has handled nothing" — same regime as `roles`.
+    #[tokio::test]
+    async fn undecodable_observed_row_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operator_session.db");
+        seed_healthy(&path).await;
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open db for the raw seed");
+            conn.execute(
+                "INSERT OR REPLACE INTO operator_sessions \
+                 (sid, token_digest, roles_json, capability_manifest_json, joined_at_secs, \
+                  join_desc, observed_json, observed_total) \
+                 VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, 1)",
+                params![
+                    "S-bad-observed",
+                    OperatorSessionRecord::digest_of("bearer-S-bad-observed"),
+                    r#"["main-ai"]"#,
+                    2i64,
+                    r#"[{"run_id": 42}]"#
+                ],
+            )
+            .expect("seed the raw row");
+        }
+
+        let (list, logged) = list_capturing_warnings(&path).await;
+        assert_only_healthy_survived(&list);
+        assert!(
+            logged.contains("S-bad-observed") && logged.contains(r#"column="observed""#),
+            "the warn must name the row and the column that failed: {logged}"
         );
     }
 

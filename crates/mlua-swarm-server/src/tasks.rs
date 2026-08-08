@@ -76,6 +76,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::assignee_trace::{append_assigned, append_released, AssignSource, ReleaseReason};
 use crate::{ApiError, AppState};
 
 /// Current Unix time in whole seconds. `TaskRecord` / `RunRecord` timestamps
@@ -340,23 +341,79 @@ pub(crate) fn resolve_launch_slot(
 /// caller never named (or, with the router in place, nowhere at all).
 /// Degrading to an unassigned run would be the silent-fallback this whole
 /// axis exists to remove.
+///
+/// **W4**: the assignment lands on the Run's trace as well as in
+/// `current`, so the seat's whole history reads off one rail (see
+/// [`crate::assignee_trace`]). `current` holds only the holder of the
+/// moment — the launch pin would otherwise be invisible the instant
+/// anyone acquired over it.
+///
+/// **D2**: it also lands on the pinned operator's own 記名, so the same
+/// event is answerable from the operator's end ("which Runs am I on") as
+/// well as the Run's — see [`crate::handover::record_observed_assignment`],
+/// which is why `task_id` is a parameter here (the goal and the Task-level
+/// paths live on that row).
 pub(crate) async fn assign_launch_operator(
+    state: &AppState,
+    run_id: &RunId,
+    task_id: &TaskId,
+    slot: &str,
+    op: &str,
+    desc: &str,
+) -> Result<(), ApiError> {
+    let (gen, previous) = state
+        .run_store
+        .acquire_assignee(run_id, slot, op, desc)
+        .await
+        .map_err(|e| {
+            ApiError::engine(format!(
+                "run {run_id}: assigning launch operator '{op}' to slot '{slot}' failed: {e}"
+            ))
+        })?;
+    trace_assigned(
+        state,
+        run_id,
+        slot,
+        op,
+        desc,
+        gen,
+        AssignSource::LaunchPin,
+        previous.as_ref(),
+    )
+    .await;
+    crate::handover::record_observed_assignment(state, run_id, task_id, slot, op).await;
+    Ok(())
+}
+
+/// Append a `core.assignee_assigned` event for a seat this handler just
+/// filled — [`crate::assignee_trace::append_assigned`] with the
+/// `Assignee` rebuilt from the parts `RunStore::acquire_assignee` reports
+/// back (it answers with the generation and the holder it displaced, not
+/// with the instance it wrote).
+#[allow(clippy::too_many_arguments)]
+async fn trace_assigned(
     state: &AppState,
     run_id: &RunId,
     slot: &str,
     op: &str,
     desc: &str,
-) -> Result<(), ApiError> {
-    state
-        .run_store
-        .acquire_assignee(run_id, slot, op, desc)
-        .await
-        .map(|_| ())
-        .map_err(|e| {
-            ApiError::engine(format!(
-                "run {run_id}: assigning launch operator '{op}' to slot '{slot}' failed: {e}"
-            ))
-        })
+    gen: u64,
+    source: AssignSource,
+    previous: Option<&Assignee>,
+) {
+    let holder = Assignee {
+        op: op.to_string(),
+        desc: desc.to_string(),
+        gen,
+    };
+    append_assigned(
+        &TraceHandle::new(run_id.clone(), state.run_trace_store.clone()),
+        slot,
+        &holder,
+        source,
+        previous,
+    )
+    .await;
 }
 
 /// The `Assign.desc` written for a seat filled from its own declared name
@@ -428,6 +485,7 @@ pub(crate) fn auto_seat_desc(slot: &str) -> String {
 pub(crate) async fn seat_declared_operators(
     state: &AppState,
     run_id: &RunId,
+    task_id: &TaskId,
     operators: &[OperatorDef],
     pinned_slot: Option<&str>,
 ) -> Result<(), ApiError> {
@@ -439,9 +497,10 @@ pub(crate) async fn seat_declared_operators(
         if state.operator_adapters.get(slot).await.is_none() {
             continue;
         }
-        state
+        let desc = auto_seat_desc(slot);
+        let (gen, previous) = state
             .run_store
-            .acquire_assignee(run_id, slot, slot, &auto_seat_desc(slot))
+            .acquire_assignee(run_id, slot, slot, &desc)
             .await
             .map_err(|e| {
                 ApiError::engine(format!(
@@ -449,6 +508,25 @@ pub(crate) async fn seat_declared_operators(
                      {e}"
                 ))
             })?;
+        // W4, and the one place the `source` label earns its keep: an
+        // auto-seat is the server choosing a holder nobody named, so a
+        // reader should not have to recognise `auto_seat_desc`'s prose to
+        // tell it from a pin.
+        trace_assigned(
+            state,
+            run_id,
+            slot,
+            slot,
+            &desc,
+            gen,
+            AssignSource::AutoSeat,
+            previous.as_ref(),
+        )
+        .await;
+        // D2, and the case the 記名 was written for: an auto-seat names
+        // nobody, so the operator that ends up holding this lane learns it
+        // has the Run only by finding it on its own list.
+        crate::handover::record_observed_assignment(state, run_id, task_id, slot, slot).await;
     }
     Ok(())
 }
@@ -1077,7 +1155,7 @@ pub async fn task_rekick(
 
     // The kick's `Assign` (**A4**: generation 1 on a freshly created Run).
     if let Some((slot, op, desc)) = &launch_assign {
-        assign_launch_operator(&state, &run_id, slot, op, desc).await?;
+        assign_launch_operator(&state, &run_id, &task_id, slot, op, desc).await?;
     }
     // Every other declared seat that has a holder under its own name. The
     // pinned seat above is excluded, so a pin is never displaced by the
@@ -1085,6 +1163,7 @@ pub async fn task_rekick(
     seat_declared_operators(
         &state,
         &run_id,
+        &task_id,
         &resolved_bp.operators,
         launch_assign.as_ref().map(|(slot, _, _)| slot.as_str()),
     )
@@ -2163,39 +2242,85 @@ pub struct RunAcquireResponse {
     /// that answer indistinguishable from an older server that did not
     /// report it.
     pub previous: Option<Assignee>,
-    /// **Q5 is not honoured by this build**, and this says so rather than
-    /// letting the omission pass silently. Present exactly when
-    /// [`Self::previous`] is — the rule has no premise when nobody was
-    /// displaced. See [`t_discard_not_sent`].
+    /// **Q5**: what the `T-DISCARD` thrown at the displaced holder did.
+    /// Present exactly when [`Self::previous`] is — the rule has no
+    /// premise when nobody was displaced. See [`TDiscardReport`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub t_discard_not_sent: Option<String>,
+    pub t_discard: Option<TDiscardReport>,
 }
 
-/// The **Q5** shortfall, in the response and in the caller's hands.
+/// `T-DISCARD.confirm(run, discarded)` as the acquirer is told it
+/// (model §4.5 **Q5**).
 ///
-/// The model's acquire throws `T-DISCARD(old op, R)` at the transport when
-/// it displaces a live holder (§4.5), so the requests already sent to the
-/// displaced operator for this Run are cancelled at the far end. This
-/// build cannot: `T-DISCARD` is defined over a `run`, and the operator
-/// session's pending map is keyed by `req_id` alone with no `run_id` on
-/// the wire, so there is nothing to select the Run's requests by. The
-/// primitive is therefore absent from `OperatorAdapter` as well (see that
-/// trait's doc) rather than present and unimplementable.
+/// The model's acquire throws `T-DISCARD(old op, R)` at the transport
+/// when it displaces a holder, so the requests already sent to that
+/// operator for this Run stop being outstanding. This build now does
+/// that: the pending map records each request's Run at insert time, and
+/// the discard is addressed at the displaced holder's **adapter** (see
+/// [`crate::operator_ws::OperatorAdapter::discard_requests`]) rather than
+/// at its `OperatorId`, because that id may be a role alias no session's
+/// own sid equals.
 ///
-/// What that costs, precisely: the displaced holder keeps whatever was
-/// already in flight and may still answer it. Those answers do not reach
-/// the flow — the router re-reads `current` after the adapter returns and
-/// refuses a reply whose generation has moved (**A6**) — so the failure
-/// mode is a wasted round trip and a stale request the far end never
-/// hears is dead, not a double answer.
-fn t_discard_not_sent(displaced: &Assignee, run_id: &RunId) -> String {
+/// One narrowing of the model's own wording: `R` names a Run, but an
+/// acquire takes a **seat**, and one operator can hold several seats of
+/// one Run. The requests dropped are this seat's — joined from
+/// [`crate::operator_ws::SeatLedger`], which records which seat each
+/// in-flight dispatch went out through. See [`entries_not_discarded`] for
+/// what that leaves standing and why.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct TDiscardReport {
+    /// How many of the displaced holder's in-flight requests for the seat
+    /// this acquire took were dropped.
+    ///
+    /// `null` means the discard could not be **addressed**: the displaced
+    /// `OperatorId` resolves no registered adapter (it left, or it is a
+    /// role nobody currently holds). That is not a failure of the acquire
+    /// — **Q2**, an acquire does not enquire and does not refuse — and it
+    /// is reported rather than smoothed into `0`, which would claim the
+    /// far end was asked and had nothing.
+    pub discarded: Option<usize>,
+    /// What the discard does not reach even when it is delivered — see
+    /// [`entries_not_discarded`]. Always present, because the shortfall is
+    /// structural rather than situational.
+    pub not_discarded: String,
+}
+
+/// The parts of **Q5** still unmet, narrowed to what is actually true.
+///
+/// The discard selects the requests of one *seat* — this Run's `slot`,
+/// which is what the acquire took — and two classes of request fall
+/// outside that selection:
+///
+/// - **Requests with no Run.** `SeniorBridge::ask` is handed a `StepId`
+///   and no `Ctx` (widening the trait would be an engine-wide contract
+///   change), and a dispatch launched without a `RunContext` has none
+///   either. Nothing can select them by Run, let alone by seat.
+/// - **Requests with no seat.** `SpawnHook::before` is dispatched through
+///   the sid-registered hook rather than through a router, so no seat is
+///   ever recorded for it and none can be attributed to it. It is a
+///   question asked of the *session*, and the session is still there
+///   (**Q7**).
+///
+/// What that costs, precisely: the displaced holder may still answer such
+/// a request. The answer does not reach the flow — the router re-reads
+/// `current` after the adapter returns and refuses a reply whose
+/// generation has moved (**A6**) — so the failure mode is a wasted round
+/// trip, not a double answer.
+///
+/// The third thing this does not touch is deliberate rather than a
+/// shortfall: requests in flight on the displaced holder's **other seats**
+/// of this Run. Those were never this acquire's to take.
+fn entries_not_discarded(displaced: &Assignee, run_id: &RunId, slot: &str) -> String {
     format!(
-        "T-DISCARD was not sent to the displaced holder '{}': this build cannot address a \
-         discard at one Run (the operator session's pending map is keyed by req_id alone and \
-         the wire carries no run_id), so requests already dispatched to it for run {run_id} \
-         are still outstanding and it may still answer them. Such an answer is refused on \
-         arrival because the generation has moved (A6), but nothing was cancelled at the far \
-         end.",
+        "The discard sent to the displaced holder '{}' selects the requests it had in flight for \
+         seat '{slot}' of run {run_id}, so two kinds survive it and it may still answer them: \
+         requests carrying no Run (an `ask` — the escalation verb is handed no Ctx, hence no \
+         run_id — or a dispatch launched without a RunContext), and requests carrying no seat (a \
+         `hook_before`, dispatched through the session directly rather than through the seat). \
+         Such an answer is refused on arrival because the generation has moved (A6). Requests on \
+         this operator's OTHER seats of this run are left alone on purpose: this acquire took one \
+         seat, and A6 would not have refused their replies, because it is enforced per seat and \
+         theirs did not change hands.",
         displaced.op
     )
 }
@@ -2286,17 +2411,32 @@ async fn resolve_acquire_slot(
 /// (§4.2 **D4** — the description is for telling jobs apart, never for a
 /// match test). This route is the part that is deliberately dumb.
 ///
-/// # Known limitation — Q5 (`T-DISCARD`) is not sent
+/// # Q5 — the displaced holder's requests for **this seat** are discarded
 ///
-/// When this acquire displaces a live holder, the model also discards that
-/// holder's outstanding requests for this Run. **This build does not**:
-/// there is no way to select one Run's pending requests (see
-/// [`t_discard_not_sent`], which is returned in the response body whenever
-/// a holder was displaced, so a caller learns it without reading this
-/// doc). Displacing a busy operator therefore leaves its in-flight
-/// requests outstanding; their answers are refused on arrival by **A6**
-/// rather than accepted, so the seat is genuinely handed over — what is
-/// missing is the cancellation, not the handover.
+/// When this acquire displaces a holder, the model also discards that
+/// holder's outstanding requests, and this build does: the displaced
+/// `OperatorId` is resolved to an adapter through
+/// [`crate::AppState::operator_adapters`] — the same registry every
+/// dispatch resolves a holder through — and the discard is addressed at
+/// that adapter instance. The count comes back in
+/// [`RunAcquireResponse::t_discard`].
+///
+/// The selection is the **seat's**, not the Run's, which is one step
+/// narrower than the model's `T-DISCARD(op, R)` wording. It has to be: one
+/// adapter can back several seats of one Run, this acquire took one of
+/// them, and dropping the reply channels of work in flight on the others
+/// would destroy dispatches that are still valid — their seats did not
+/// change hands, so **A6** would have accepted their replies. The seat of
+/// each in-flight request comes from [`crate::operator_ws::SeatLedger`].
+///
+/// Two things are deliberately not failures. A displaced holder that
+/// names no registered adapter (it left, or it is a role nobody holds)
+/// discards nothing and is reported as `null` — **Q2**: an acquire does
+/// not enquire, and refusing the handover because the *previous* holder
+/// is unreachable would be exactly backwards. And the requests that carry
+/// no Run, or no seat, cannot be selected at all; see
+/// [`entries_not_discarded`], which rides in the same report so a caller
+/// learns it without reading this doc.
 ///
 /// # Status codes
 ///
@@ -2373,25 +2513,90 @@ pub async fn run_acquire(
             other => ApiError::engine(other),
         })?;
 
-    match &previous {
-        Some(displaced) => tracing::info!(
+    // Q5. Addressed at the displaced holder's adapter, not at its
+    // `OperatorId`: `Assignee.op` may be a role alias, and a session
+    // asked to match that string against its own sid would discard
+    // nothing while reporting success.
+    //
+    // And narrowed to `slot` before it is sent. What this acquire took is
+    // one seat; the displaced holder's adapter may be backing others of
+    // this same Run (one session is registered under its sid and under
+    // every role it claimed, and `seat_declared_operators` seats each
+    // declared slot from the adapter answering to that slot's name), and
+    // work in flight on those seats is not this acquire's to drop. A6 does
+    // not clean up afterwards either: it is enforced per slot, so an
+    // untouched seat's generation never moved and its dispatch was still
+    // valid. The seat of each in-flight request is joined from the ledger
+    // the routers write as they delegate — see `SeatLedger`.
+    let t_discard = match &previous {
+        Some(displaced) => {
+            let discarded = match state.operator_adapters.get(&displaced.op).await {
+                Some(adapter) => {
+                    let outstanding = adapter.pending_for_run(&run_id).await;
+                    let of_this_seat: Vec<String> = outstanding
+                        .iter()
+                        .filter(|request| {
+                            state.seat_ledger.slot_of(&run_id, request).as_deref() == Some(&slot)
+                        })
+                        .map(|request| request.req_id.clone())
+                        .collect();
+                    Some(adapter.discard_requests(&run_id, &of_this_seat).await)
+                }
+                None => None,
+            };
+            Some(TDiscardReport {
+                discarded,
+                not_discarded: entries_not_discarded(displaced, &run_id, &slot),
+            })
+        }
+        None => None,
+    };
+
+    match (&previous, &t_discard) {
+        (Some(displaced), Some(report)) => tracing::info!(
             %run_id, %slot, op = %req.op, gen,
             displaced_op = %displaced.op, displaced_gen = displaced.gen,
-            "acquire: seat taken over (A8 — last writer wins; T-DISCARD not sent, Q5)"
+            discarded = ?report.discarded,
+            "acquire: seat taken over (A8 — last writer wins; T-DISCARD sent, Q5)"
         ),
-        None => tracing::info!(
+        _ => tracing::info!(
             %run_id, %slot, op = %req.op, gen,
             "acquire: vacant seat taken"
         ),
     }
 
+    // W4, both halves. The displaced holder gets a release row of its own
+    // — `reason: displaced` — so "when did this operator lose this Run"
+    // is one kind to filter on however the seat emptied, and the assign
+    // row that follows names it as `previous` so the pair reads as one
+    // handover.
+    let trace = TraceHandle::new(run_id.clone(), state.run_trace_store.clone());
+    if let Some(displaced) = &previous {
+        append_released(&trace, &slot, displaced, ReleaseReason::Displaced).await;
+    }
+    trace_assigned(
+        &state,
+        &run_id,
+        &slot,
+        &req.op,
+        desc,
+        gen,
+        AssignSource::Acquire,
+        previous.as_ref(),
+    )
+    .await;
+    // D2. The displaced holder's 記名 is deliberately left alone: the
+    // observed part is what an operator *was assigned*, and nothing takes
+    // that back (there is no delete path). The handover shows up on the
+    // trace rail (`reason: displaced`) and on the new holder's own list.
+    crate::handover::record_observed_assignment(&state, &run_id, &run.task_id, &slot, &req.op)
+        .await;
+
     Ok(Json(RunAcquireResponse {
         run_id: run_id.clone(),
         slot,
         gen,
-        t_discard_not_sent: previous
-            .as_ref()
-            .map(|displaced| t_discard_not_sent(displaced, &run_id)),
+        t_discard,
         previous,
     }))
 }
@@ -2586,7 +2791,7 @@ pub(crate) fn map_task_store_err(e: TaskStoreError) -> ApiError {
     }
 }
 
-fn map_run_store_err(e: RunStoreError) -> ApiError {
+pub(crate) fn map_run_store_err(e: RunStoreError) -> ApiError {
     match e {
         RunStoreError::NotFound(id) => ApiError::not_found(format!("run not found: {id}")),
         other => ApiError::engine(other),
@@ -2600,6 +2805,7 @@ fn map_run_store_err(e: RunStoreError) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator_ws::{Liveness, OperatorAdapter};
     use mlua_swarm::application::BlueprintRef;
     use mlua_swarm::blueprint::{
         current_schema_version, AgentDef, AgentKind, Blueprint, BlueprintMetadata, CompilerHints,
@@ -2610,6 +2816,7 @@ mod tests {
     use mlua_swarm::store::output::InMemoryOutputStore;
     use mlua_swarm::store::run::InMemoryRunStore;
     use mlua_swarm::store::task::InMemoryTaskStore;
+    use mlua_swarm::StepId;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -2676,6 +2883,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(crate::SessionStore::default())),
             task_app: Arc::new(mlua_swarm::TaskApplication::new_inline_only(launch)),
             operator_adapters: Arc::new(crate::operator_ws::OperatorAdapterRegistry::new()),
+            seat_ledger: Arc::new(crate::operator_ws::SeatLedger::new()),
             data_store: Arc::new(InMemoryOutputStore::new()),
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
@@ -4634,6 +4842,125 @@ mod tests {
             .map(|json| json.0)
     }
 
+    /// An `OperatorAdapter` double standing in for a session's pending
+    /// map: it answers `pending_for_run` with the requests it was built
+    /// with, and a discard drops exactly the ones it names.
+    ///
+    /// It is never dispatched to (`execute` is unreachable in these
+    /// tests), which is the point: the acquire path resolves an adapter
+    /// out of the registry purely to address a discard at it.
+    ///
+    /// It models the map rather than counting calls because the selection
+    /// is now made by the *caller* — the acquire reads what is
+    /// outstanding, keeps the seat's share, and names it — so a double
+    /// that answered a fixed count would agree with any selection at all,
+    /// including the Run-wide one this seat scoping exists to stop.
+    struct OwesRequests {
+        // `std::sync::Mutex` explicitly: this test module's `Mutex` is
+        // tokio's (imported for `AppState`), whose guard is awaited.
+        requests: std::sync::Mutex<Vec<crate::operator_ws::PendingRequest>>,
+        /// Every discard that arrived, as `(run, the names it carried)`.
+        discards: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    impl OwesRequests {
+        fn new(requests: Vec<crate::operator_ws::PendingRequest>) -> Self {
+            Self {
+                requests: std::sync::Mutex::new(requests),
+                discards: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A double that owes nothing — a registered adapter and no more.
+        fn empty() -> Self {
+            Self::new(Vec::new())
+        }
+
+        /// The `req_id`s it still owes, sorted.
+        fn outstanding(&self) -> Vec<String> {
+            let mut ids: Vec<String> = self
+                .requests
+                .lock()
+                .expect("request map")
+                .iter()
+                .map(|request| request.req_id.clone())
+                .collect();
+            ids.sort();
+            ids
+        }
+    }
+
+    /// One waiting spawn, as the adapter would describe it.
+    fn waiting_spawn(
+        req_id: &str,
+        step: &StepId,
+        attempt: u32,
+    ) -> crate::operator_ws::PendingRequest {
+        crate::operator_ws::PendingRequest {
+            req_id: req_id.to_string(),
+            kind: crate::operator_ws::PendingKind::Spawn,
+            step_id: step.clone(),
+            attempt: Some(attempt),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mlua_swarm::Operator for OwesRequests {
+        async fn execute(
+            &self,
+            _ctx: &mlua_swarm::Ctx,
+            _system: Option<String>,
+            _prompt: Value,
+            _worker: Option<mlua_swarm::WorkerBinding>,
+            _worker_token: mlua_swarm::CapToken,
+        ) -> Result<mlua_swarm::WorkerResult, mlua_swarm::WorkerError> {
+            Err(mlua_swarm::WorkerError::Failed(
+                "this double exists to be discarded at, never dispatched to".to_string(),
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OperatorAdapter for OwesRequests {
+        async fn liveness(&self) -> Liveness {
+            Liveness::Connected
+        }
+
+        async fn discard_requests(&self, run: &RunId, req_ids: &[String]) -> usize {
+            self.discards
+                .lock()
+                .expect("discard log")
+                .push((run.to_string(), req_ids.to_vec()));
+            let mut requests = self.requests.lock().expect("request map");
+            let before = requests.len();
+            requests.retain(|request| !req_ids.contains(&request.req_id));
+            before - requests.len()
+        }
+
+        async fn pending_for_run(
+            &self,
+            _run: &RunId,
+        ) -> Vec<crate::operator_ws::router::PendingRequest> {
+            self.requests.lock().expect("request map").clone()
+        }
+    }
+
+    /// Every `core.assignee_*` row on a Run's trace, in `seq` order.
+    async fn assignment_events(state: &AppState, run_id: &RunId) -> Vec<TraceEvent> {
+        run_trace(
+            State(state.clone()),
+            Path(run_id.to_string()),
+            Query(RunTraceQuery {
+                kind: Some("core.assignee_".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("trace read")
+        .0
+        .events
+    }
+
     /// The seat this Run's `current` shows as held, read back the way a
     /// client reads it.
     async fn seat_on_the_wire(state: &AppState, run_id: &RunId, slot: &str) -> Option<Assignee> {
@@ -4672,7 +4999,7 @@ mod tests {
             "the seat was Vacant, so nobody was displaced"
         );
         assert!(
-            resp.t_discard_not_sent.is_none(),
+            resp.t_discard.is_none(),
             "Q5 has no premise when no holder was displaced"
         );
 
@@ -4719,12 +5046,19 @@ mod tests {
         assert_eq!(displaced.op, "S-incumbent");
         assert_eq!(displaced.gen, 1, "A3: its stamp is what it always was");
 
-        let notice = resp
-            .t_discard_not_sent
-            .expect("Q5 is unmet here and must be said so in the response");
+        let report = resp
+            .t_discard
+            .expect("Q5: displacing a holder throws a discard at it");
+        assert_eq!(
+            report.discarded, None,
+            "the incumbent names no registered adapter, so nothing could be addressed — and \
+             that is reported rather than smoothed into 0"
+        );
         assert!(
-            notice.contains("T-DISCARD") && notice.contains("S-incumbent"),
-            "the notice must name the primitive and the holder it was not sent to: {notice}"
+            report.not_discarded.contains("S-incumbent") && report.not_discarded.contains("ask"),
+            "the remaining shortfall must name the holder and what a Run-scoped discard cannot \
+             select: {}",
+            report.not_discarded
         );
 
         assert_eq!(
@@ -4949,9 +5283,301 @@ mod tests {
             "`previous` must be emitted even when null: {body}"
         );
         assert!(
-            body.get("t_discard_not_sent").is_none(),
-            "nothing was displaced, so the Q5 notice must not appear: {body}"
+            body.get("t_discard").is_none(),
+            "nothing was displaced, so the Q5 report must not appear: {body}"
         );
+    }
+
+    /// **Q5, delivered.** A displaced holder that HAS a registered
+    /// adapter is sent the discard, and the count it answers with reaches
+    /// the acquirer. The adapter is addressed as an instance — the double
+    /// below records the Run it was asked about, which is the whole of
+    /// what `T-DISCARD.request` carries once the operator term is `self`.
+    #[tokio::test]
+    async fn an_acquire_discards_the_displaced_holders_requests_for_this_run() {
+        let state = test_state();
+        let run_id = launched_run(&state, "discard goal", &[SLOT_A]).await;
+        let steps: Vec<StepId> = (1..=3)
+            .map(|i| StepId::parse(format!("ST-discard-{i}")).expect("step id"))
+            .collect();
+        let incumbent = Arc::new(OwesRequests::new(
+            steps
+                .iter()
+                .enumerate()
+                .map(|(i, step)| waiting_spawn(&format!("req-{i}"), step, 1))
+                .collect(),
+        ));
+        state
+            .operator_adapters
+            .register("S-incumbent", incumbent.clone() as Arc<dyn OperatorAdapter>)
+            .await;
+        // All three went out through the seat about to be taken, so all
+        // three are this acquire's to drop.
+        let _seats: Vec<_> = steps
+            .iter()
+            .map(|step| state.seat_ledger.record(&run_id, step, 1, SLOT_A))
+            .collect();
+
+        acquire(
+            &state,
+            &run_id,
+            acquire_req("S-incumbent", "holding the seat", None),
+        )
+        .await
+        .expect("the first acquire");
+        let resp = acquire(
+            &state,
+            &run_id,
+            acquire_req("S-successor", "taking over", None),
+        )
+        .await
+        .expect("the takeover");
+
+        assert_eq!(
+            resp.t_discard.expect("Q5 report").discarded,
+            Some(3),
+            "T-DISCARD.confirm(run, discarded) is passed through to the acquirer"
+        );
+        let discards = incumbent.discards.lock().expect("discard log").clone();
+        assert_eq!(discards.len(), 1, "one acquire, one discard: {discards:?}");
+        assert_eq!(
+            discards[0].0,
+            run_id.to_string(),
+            "the discard is addressed at ONE Run — the one whose seat was taken"
+        );
+        let mut named = discards[0].1.clone();
+        named.sort();
+        assert_eq!(
+            named,
+            vec![
+                "req-0".to_string(),
+                "req-1".to_string(),
+                "req-2".to_string()
+            ],
+            "and it names the requests, so the adapter drops those and no others"
+        );
+    }
+
+    /// **The seat is the unit, not the Run.** One session can hold two
+    /// seats of one Run — it is registered under its sid *and* under every
+    /// role it claimed, all resolving to the same adapter — and an acquire
+    /// takes one seat. The work in flight on the other seat must survive
+    /// it.
+    ///
+    /// This is not a hypothetical race: **A6** would not have caught it
+    /// either. A6 is enforced per slot (`AssigneeRouter` is built for one,
+    /// and `acquire_assignee` replaces only its own key of `current`), so
+    /// the untouched seat's generation never moved and its dispatch was
+    /// still valid when a Run-scoped discard killed it.
+    #[tokio::test]
+    async fn a_takeover_on_one_seat_leaves_another_seats_work_alone() {
+        let state = test_state();
+        let run_id = launched_run(&state, "two seat goal", &[SLOT_A, SLOT_B]).await;
+        let on_a = StepId::parse("ST-on-a").expect("step id");
+        let on_b = StepId::parse("ST-on-b").expect("step id");
+
+        // ONE adapter, TWO OperatorIds — exactly what
+        // `register_operator_session` does with a session's sid and each of
+        // its roles.
+        let driver = Arc::new(OwesRequests::new(vec![
+            waiting_spawn("req-a", &on_a, 1),
+            waiting_spawn("req-b", &on_b, 1),
+        ]));
+        for op in [SLOT_A, SLOT_B] {
+            state
+                .operator_adapters
+                .register(op, driver.clone() as Arc<dyn OperatorAdapter>)
+                .await;
+        }
+        let _seat_a = state.seat_ledger.record(&run_id, &on_a, 1, SLOT_A);
+        let _seat_b = state.seat_ledger.record(&run_id, &on_b, 1, SLOT_B);
+
+        acquire(
+            &state,
+            &run_id,
+            acquire_req(SLOT_A, "holding seat A", Some(SLOT_A)),
+        )
+        .await
+        .expect("seat A");
+        acquire(
+            &state,
+            &run_id,
+            acquire_req(SLOT_B, "holding seat B", Some(SLOT_B)),
+        )
+        .await
+        .expect("seat B");
+
+        let resp = acquire(
+            &state,
+            &run_id,
+            acquire_req("S-successor", "taking seat A only", Some(SLOT_A)),
+        )
+        .await
+        .expect("the takeover of seat A");
+
+        assert_eq!(
+            resp.t_discard.expect("Q5 report").discarded,
+            Some(1),
+            "one seat was taken, so one request was dropped"
+        );
+        assert_eq!(
+            driver.outstanding(),
+            vec!["req-b".to_string()],
+            "seat B's dispatch is still in flight: this acquire did not touch its seat, its \
+             generation did not move, and A6 would have accepted its reply"
+        );
+    }
+
+    /// A discard that cannot be addressed does not fail the acquire
+    /// (**Q2**) — proved by taking a seat from a holder that is a role
+    /// alias nobody currently holds, which is the ordinary state of
+    /// affairs after the previous driver left.
+    #[tokio::test]
+    async fn an_unaddressable_discard_does_not_fail_the_acquire() {
+        let state = test_state();
+        let run_id = launched_run(&state, "unaddressable goal", &[SLOT_A]).await;
+
+        acquire(
+            &state,
+            &run_id,
+            acquire_req("main-ai", "the role held it", None),
+        )
+        .await
+        .expect("the first acquire");
+        let resp = acquire(
+            &state,
+            &run_id,
+            acquire_req("S-successor", "taking over from a role nobody holds", None),
+        )
+        .await
+        .expect("Q2: an acquire does not enquire, and does not refuse");
+
+        assert_eq!(resp.previous.expect("displaced").op, "main-ai");
+        assert_eq!(
+            resp.t_discard.expect("Q5 report").discarded,
+            None,
+            "nothing was asked, so nothing is claimed"
+        );
+    }
+
+    /// **W4 / (e).** The three assigning paths and the displacement they
+    /// cause all land on the Run's own trace, next to its step events —
+    /// so "who has held this Run, and when did each of them lose it" is
+    /// answerable from one rail. Read back the way a client reads it
+    /// (`GET /v1/runs/:id/trace`).
+    #[tokio::test]
+    async fn assignment_events_land_on_the_runs_trace() {
+        let state = test_state();
+        let run_id = launched_run(&state, "trace goal", &[SLOT_A]).await;
+
+        acquire(
+            &state,
+            &run_id,
+            acquire_req("S-first", "first holder", None),
+        )
+        .await
+        .expect("the first acquire");
+        acquire(&state, &run_id, acquire_req("S-second", "took over", None))
+            .await
+            .expect("the takeover");
+
+        let events = assignment_events(&state, &run_id).await;
+        let shape: Vec<(String, String, String)> = events
+            .iter()
+            .map(|e| {
+                (
+                    e.kind.clone(),
+                    e.payload["assignee"]["op"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                    e.payload["source"]
+                        .as_str()
+                        .or_else(|| e.payload["reason"].as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (
+                    trace_kind::ASSIGNEE_ASSIGNED.to_string(),
+                    "S-first".to_string(),
+                    "acquire".to_string()
+                ),
+                (
+                    trace_kind::ASSIGNEE_RELEASED.to_string(),
+                    "S-first".to_string(),
+                    "displaced".to_string()
+                ),
+                (
+                    trace_kind::ASSIGNEE_ASSIGNED.to_string(),
+                    "S-second".to_string(),
+                    "acquire".to_string()
+                ),
+            ],
+            "the handover reads as: taken, lost by the incumbent, taken again"
+        );
+        assert_eq!(
+            events[2].payload["previous"]["op"], "S-first",
+            "and the assign row names who it displaced"
+        );
+        assert!(
+            events.iter().all(|e| e.step_ref.is_none()),
+            "a holder belongs to the Run, not to a step"
+        );
+    }
+
+    /// A launch that pins an operator records the pin, and one that
+    /// auto-seats a declared role records that instead — with a `source`
+    /// label a reader does not have to parse English prose to tell apart.
+    #[tokio::test]
+    async fn a_launch_records_which_path_seated_the_operator() {
+        // Pinned: the request named the holder. A launch pin is
+        // fail-fast on an unregistered sid, so the session has to exist
+        // — it is never engaged (the baseline Blueprint does not
+        // delegate), which is why a stalling stand-in suffices.
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-pinned", Arc::new(StallingOperator))
+            .await;
+        let run_id = crate::tasks_start(
+            State(state.clone()),
+            Json(crate::TaskLaunchRequest {
+                operator_sid: Some("S-pinned".to_string()),
+                operator_desc: Some("pinned by the launch request".to_string()),
+                operator_slot: Some(SLOT_A.to_string()),
+                ..post_tasks_req_declaring("pin trace goal", &[SLOT_A])
+            }),
+        )
+        .await
+        .expect("tasks_start")
+        .0
+        .run_id;
+        let pinned = assignment_events(&state, &run_id).await;
+        assert_eq!(pinned.len(), 1, "one assign row: {pinned:?}");
+        assert_eq!(pinned[0].payload["source"], "launch_pin");
+        assert_eq!(pinned[0].payload["assignee"]["op"], "S-pinned");
+        assert!(pinned[0].payload["previous"].is_null());
+
+        // Auto-seated: nobody was named, but an adapter answers to the
+        // seat's own role name.
+        let state = test_state();
+        state
+            .operator_adapters
+            .register(
+                SLOT_A,
+                Arc::new(OwesRequests::empty()) as Arc<dyn OperatorAdapter>,
+            )
+            .await;
+        let run_id = launched_run(&state, "auto seat trace goal", &[SLOT_A]).await;
+        let seated = assignment_events(&state, &run_id).await;
+        assert_eq!(seated.len(), 1, "one assign row: {seated:?}");
+        assert_eq!(seated[0].payload["source"], "auto_seat");
+        assert_eq!(seated[0].payload["assignee"]["op"], SLOT_A);
     }
 
     #[tokio::test]

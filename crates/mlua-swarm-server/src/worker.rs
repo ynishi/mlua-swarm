@@ -165,7 +165,7 @@ pub async fn worker_prompt(
 /// resolved. All three are fail-open, matching this crate's other
 /// best-effort projection hooks (a missing pointer list must never turn a
 /// would-have-succeeded fetch into a failure).
-async fn assemble_step_pointers(state: &AppState, payload: &mut WorkerPayload) {
+pub(crate) async fn assemble_step_pointers(state: &AppState, payload: &mut WorkerPayload) {
     let Some(context) = payload.context.as_mut() else {
         return;
     };
@@ -1442,6 +1442,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(crate::SessionStore::default())),
             task_app: Arc::new(mlua_swarm::TaskApplication::new_inline_only(launch)),
             operator_adapters: Arc::new(crate::operator_ws::OperatorAdapterRegistry::new()),
+            seat_ledger: Arc::new(crate::operator_ws::SeatLedger::new()),
             data_store,
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),

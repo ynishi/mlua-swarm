@@ -27,6 +27,65 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use thiserror::Error;
 
+/// How many [`ObservedAssignment`] entries one session retains.
+///
+/// **D2** says the observed part is appended to on every `Assign` and has
+/// no delete path; it does not say the row grows forever. A session that
+/// re-acquires in a loop would otherwise put an unbounded column behind
+/// every `GET /v1/operators`, so the log is a ring: over the cap, the
+/// **oldest** entry goes. Nothing a reader has is deleted by an API — the
+/// oldest fact simply ages out, and
+/// [`OperatorSessionRecord::observed_total`] stays monotone so the reader
+/// can see that it did.
+///
+/// The value is set for the thing the log is read for: telling apart the
+/// handful of Runs a driver is currently juggling in one repo. 32 is well
+/// past that.
+///
+/// # The size that count multiplies
+///
+/// A depth is only half of a size, and this ring is rewritten whole to
+/// `observed_json` on every `Assign` and returned for up to
+/// `OPERATORS_LIST_MAX_LIMIT` sessions per `GET /v1/operators` read. So
+/// every field of an entry has a ceiling — [`TASK_METADATA_MAX_BYTES`] for
+/// the JSON bag, [`OBSERVED_TEXT_MAX_BYTES`] for each of the three
+/// caller-supplied strings — and the product is what a reader is actually
+/// promised: at most `32 × (4096 + 3 × 1024)` ≈ 224 KiB of variable
+/// content per session, whatever the launch put in them.
+///
+/// That number is the claim, and it is stated rather than asserted because
+/// the alternative was the shape this used to have: a depth with a
+/// reassuring adjective ("still small enough to serialize whole") in front
+/// of four fields, one of which — `goal` — had no bound at all, so the
+/// sentence was true only of launches that happened to be small.
+pub const OBSERVED_CAP: usize = 32;
+
+/// Serialized-size ceiling for a recorded [`ObservedAssignment::task_metadata`].
+///
+/// `task_metadata` is an arbitrary caller-supplied JSON bag, so it is the
+/// one observed field with no natural size. Above this it is dropped and
+/// [`ObservedAssignment::task_metadata_omitted`] says so — an omission the
+/// reader can see beats a session row that inherits someone's payload
+/// 32 times over.
+pub const TASK_METADATA_MAX_BYTES: usize = 4096;
+
+/// Byte ceiling for each of the three caller-supplied strings on an
+/// [`ObservedAssignment`] — `goal`, `project_root` and `work_dir`.
+///
+/// The same rule [`TASK_METADATA_MAX_BYTES`] applies to the fourth
+/// caller-supplied field, differing in what it does when the ceiling is
+/// hit: these three are **cut, not dropped**. A JSON bag half-carried is
+/// not a JSON bag, but a goal's opening clause and a path's leading
+/// components are exactly what the observed part is read for — telling two
+/// of a driver's Runs apart — so keeping the prefix keeps the field doing
+/// its job. [`ObservedAssignment::text_truncated`] says a cut happened, and
+/// the value itself ends in `…`, so a reader is never handed a shortened
+/// path that reads like a whole one.
+///
+/// 1 KiB is generous for both shapes: a goal is a sentence, and a path that
+/// long is already past what most filesystems will hand out.
+pub const OBSERVED_TEXT_MAX_BYTES: usize = 1024;
+
 pub mod inmemory;
 pub mod sqlite;
 pub use inmemory::InMemoryOperatorSessionStore;
@@ -70,9 +129,237 @@ pub struct OperatorSessionRecord {
     pub capability_manifest: Option<AgentProviderManifest>,
     /// Unix epoch seconds when `POST /v1/operators` minted this session.
     pub joined_at_secs: u64,
+    /// The **confirmed part** of this session's 記名 (model §4.2, **D1**):
+    /// roughly 50 characters the joining AI wrote about what it is working
+    /// on, fixed at join and never rewritten afterwards.
+    ///
+    /// It is what the observed part cannot supply. Two drivers in the same
+    /// worktree produce the same `project_root` / `work_dir` and can hold
+    /// Runs of the same Blueprint; the sentence one of them wrote at join
+    /// exists only in that conversation, which is what makes it an
+    /// identifier (§4.2: 観測部分だけでは足りない).
+    ///
+    /// `None` = the session joined without one. Kept as an absence rather
+    /// than an empty string so a reader can tell "nothing was written" from
+    /// "something was written and it was blank" — `POST /v1/operators` does
+    /// not reject a missing `desc` (unlike **A9** on the assignment side,
+    /// **D1-D5** name no `400`), so the absence is a real and readable
+    /// state.
+    ///
+    /// **D4**: nothing matches on this. It is read by humans and AIs to
+    /// tell sessions apart, never by the server to decide identity.
+    ///
+    /// Additive with `#[serde(default)]` — rows persisted before the 記名
+    /// existed decode as `None`.
+    #[serde(default)]
+    pub desc: Option<String>,
+    /// The **observed part** of this session's 記名 (model §4.2, **D2**):
+    /// one entry per seat this session was assigned, appended by the server
+    /// at each `Assign` and never removed by any API.
+    ///
+    /// Oldest first. Bounded by [`OBSERVED_CAP`] and de-duplicated per
+    /// `(run_id, slot)` — see [`Self::record_observed`].
+    ///
+    /// Additive with `#[serde(default)]`.
+    #[serde(default)]
+    pub observed: Vec<ObservedAssignment>,
+    /// How many `Assign`s have been recorded onto [`Self::observed`] over
+    /// this session's life, including the ones the ring has since dropped
+    /// and the re-assignments folded into an existing entry.
+    ///
+    /// Monotone. `observed_total > observed.len()` is the visible signal
+    /// that the reader is looking at a window rather than the whole
+    /// history.
+    ///
+    /// Additive with `#[serde(default)]`.
+    #[serde(default)]
+    pub observed_total: u64,
+}
+
+/// One `Assign` as the assigned Operator session observed it — the
+/// per-entry shape of the 記名's observed part (model §4.2's second row:
+/// 担当した Run と goal / `project_root` / `work_dir` / `task_metadata` /
+/// 最終活動時刻).
+///
+/// # Every field is what the server could actually read
+///
+/// The three path-ish fields come from the Task row's `task_input_spec`
+/// (the persisted `TaskInputSpec` the launch was given, which is also what
+/// `TaskInputMiddleware` is later built from), and `goal` from the same
+/// row. A launch that carried no Task-level input leaves all three `None`,
+/// and nothing is substituted for them: an invented `project_root` would
+/// be read as a fact about where the work is happening.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObservedAssignment {
+    /// The Run whose seat was taken.
+    pub run_id: String,
+    /// Which Blueprint-declared Operator seat (`Run.current`'s key).
+    pub slot: String,
+    /// The owning Task's human-facing goal, when the Task row could be
+    /// read. `None` = the read failed; it is not a claim that the Task has
+    /// no goal (the field is not optional on the Task row).
+    ///
+    /// Cut to [`OBSERVED_TEXT_MAX_BYTES`] — see [`Self::text_truncated`].
+    #[serde(default)]
+    pub goal: Option<String>,
+    /// Task-level project root, from the launch's `TaskInputSpec`. Cut to
+    /// [`OBSERVED_TEXT_MAX_BYTES`] — see [`Self::text_truncated`].
+    #[serde(default)]
+    pub project_root: Option<String>,
+    /// Task-level working directory, from the same spec. Cut to
+    /// [`OBSERVED_TEXT_MAX_BYTES`] — see [`Self::text_truncated`].
+    #[serde(default)]
+    pub work_dir: Option<String>,
+    /// Task-level metadata bag, from the same spec. Dropped when it
+    /// serializes above [`TASK_METADATA_MAX_BYTES`] — see
+    /// [`Self::task_metadata_omitted`].
+    #[serde(default)]
+    pub task_metadata: Option<serde_json::Value>,
+    /// `true` when [`Self::task_metadata`] was present but too large to
+    /// carry, so a reader does not read the `null` as "the launch supplied
+    /// none".
+    #[serde(default)]
+    pub task_metadata_omitted: bool,
+    /// `true` when at least one of [`Self::goal`] / [`Self::project_root`] /
+    /// [`Self::work_dir`] was longer than [`OBSERVED_TEXT_MAX_BYTES`] and
+    /// was cut to fit.
+    ///
+    /// One flag for the three because it answers the one question a cut
+    /// raises — "is what I am reading the whole value?" — and the cut
+    /// values name themselves: each ends in `…`. A flag per field would
+    /// only restate that.
+    ///
+    /// Additive with `#[serde(default)]`: rows written before the ceiling
+    /// existed decode as `false`, which is what they were — nothing had
+    /// been cut.
+    #[serde(default)]
+    pub text_truncated: bool,
+    /// Unix epoch seconds of the `Assign` this entry records — the session's
+    /// last activity when this is its newest entry
+    /// ([`OperatorSessionRecord::last_activity_secs`]).
+    pub at_secs: u64,
+}
+
+impl ObservedAssignment {
+    /// Build an entry, applying the [`TASK_METADATA_MAX_BYTES`] bound to
+    /// `task_metadata` and the [`OBSERVED_TEXT_MAX_BYTES`] bound to each of
+    /// the three caller-supplied strings.
+    ///
+    /// This is the only constructor callers use, which is what makes the
+    /// bounds a property of the type rather than a rule a call site has to
+    /// remember: every entry that reaches the ring came through here.
+    ///
+    /// A metadata value that will not even serialize is treated as an
+    /// oversized one (dropped, flagged) rather than as absent — the failure
+    /// is about carrying it, not about having it.
+    pub fn new(
+        run_id: String,
+        slot: String,
+        goal: Option<String>,
+        project_root: Option<String>,
+        work_dir: Option<String>,
+        task_metadata: Option<serde_json::Value>,
+        at_secs: u64,
+    ) -> Self {
+        let (task_metadata, task_metadata_omitted) = match task_metadata {
+            None => (None, false),
+            Some(value) => match serde_json::to_string(&value) {
+                Ok(text) if text.len() <= TASK_METADATA_MAX_BYTES => (Some(value), false),
+                _ => (None, true),
+            },
+        };
+        let mut text_truncated = false;
+        let goal = cap_text(goal, &mut text_truncated);
+        let project_root = cap_text(project_root, &mut text_truncated);
+        let work_dir = cap_text(work_dir, &mut text_truncated);
+        Self {
+            run_id,
+            slot,
+            goal,
+            project_root,
+            work_dir,
+            task_metadata,
+            task_metadata_omitted,
+            text_truncated,
+            at_secs,
+        }
+    }
+}
+
+/// Cut `value` to the longest prefix that fits in
+/// [`OBSERVED_TEXT_MAX_BYTES`] and mark `truncated`, or hand it back
+/// untouched when it already fits.
+///
+/// The cut lands on a `char` boundary — a byte-sliced `String` would not
+/// be one — and the result carries a trailing `…` so the shortening is
+/// visible in the value and not only in the flag. That marker is why the
+/// output can exceed the ceiling by its own 3 bytes: the bound is on what
+/// a caller can put in, not on the notation this adds.
+fn cap_text(value: Option<String>, truncated: &mut bool) -> Option<String> {
+    let text = value?;
+    if text.len() <= OBSERVED_TEXT_MAX_BYTES {
+        return Some(text);
+    }
+    let mut end = OBSERVED_TEXT_MAX_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    *truncated = true;
+    let mut cut = String::with_capacity(end + '…'.len_utf8());
+    cut.push_str(&text[..end]);
+    cut.push('…');
+    Some(cut)
 }
 
 impl OperatorSessionRecord {
+    /// Append one `Assign` to the observed part (**D2**).
+    ///
+    /// Two shaping rules, both about keeping the log readable rather than
+    /// about deleting anything:
+    ///
+    /// - **One entry per `(run_id, slot)`.** Re-acquiring a seat this
+    ///   session already holds is the same fact with a newer timestamp, so
+    ///   the existing entry is replaced and moved to the newest position
+    ///   instead of accumulating a row per acquire. A driver that
+    ///   re-acquires after every reconnect would otherwise fill the whole
+    ///   window with one Run.
+    /// - **Newest [`OBSERVED_CAP`] kept.** Past the cap the oldest entry is
+    ///   dropped.
+    ///
+    /// [`Self::observed_total`] counts every call regardless, so a reader
+    /// can tell that folding or dropping happened.
+    pub fn record_observed(&mut self, entry: ObservedAssignment) {
+        self.observed_total = self.observed_total.saturating_add(1);
+        if let Some(pos) = self
+            .observed
+            .iter()
+            .position(|e| e.run_id == entry.run_id && e.slot == entry.slot)
+        {
+            self.observed.remove(pos);
+        }
+        self.observed.push(entry);
+        while self.observed.len() > OBSERVED_CAP {
+            self.observed.remove(0);
+        }
+    }
+
+    /// When this session was last seen doing something — the newest
+    /// [`ObservedAssignment::at_secs`], or [`Self::joined_at_secs`] for a
+    /// session that has never been assigned anything.
+    ///
+    /// **D5**'s default ordering key. Derived rather than stored: a
+    /// separate column would be a second thing to keep in step with the
+    /// log, and the ring only ever drops entries older than the newest one,
+    /// so the derivation cannot go stale.
+    pub fn last_activity_secs(&self) -> u64 {
+        self.observed
+            .iter()
+            .map(|e| e.at_secs)
+            .max()
+            .unwrap_or(0)
+            .max(self.joined_at_secs)
+    }
+
     /// Digest a plaintext bearer into the at-rest shape
     /// ([`Self::token_digest`]).
     ///
@@ -179,3 +466,180 @@ pub(crate) struct Inner {
 }
 
 pub(crate) type SharedInner = Mutex<Inner>;
+
+// ──────────────────────────────────────────────────────────────────────────
+// tests — the 記名 shaping rules (D1 / D2 / D5)
+// ──────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn record() -> OperatorSessionRecord {
+        OperatorSessionRecord {
+            sid: SessionId::parse("S-1").expect("a well-formed sid"),
+            token_digest: OperatorSessionRecord::digest_of("bearer"),
+            roles: Vec::new(),
+            capability_manifest: None,
+            joined_at_secs: 100,
+            desc: None,
+            observed: Vec::new(),
+            observed_total: 0,
+        }
+    }
+
+    fn entry(run: &str, slot: &str, at_secs: u64) -> ObservedAssignment {
+        ObservedAssignment::new(
+            run.to_string(),
+            slot.to_string(),
+            Some("resolve issue #10".to_string()),
+            Some("/repo".to_string()),
+            Some("/repo/.worktrees/topic".to_string()),
+            Some(json!({"issue": 10})),
+            at_secs,
+        )
+    }
+
+    /// Re-taking a seat this session already holds refreshes the one entry
+    /// instead of adding a second, and moves it to the newest position.
+    #[test]
+    fn re_assigning_the_same_seat_folds_into_one_entry() {
+        let mut r = record();
+        r.record_observed(entry("R-a", "phase-a-op", 110));
+        r.record_observed(entry("R-b", "phase-a-op", 120));
+        r.record_observed(entry("R-a", "phase-a-op", 130));
+
+        let seen: Vec<(&str, u64)> = r
+            .observed
+            .iter()
+            .map(|e| (e.run_id.as_str(), e.at_secs))
+            .collect();
+        assert_eq!(seen, vec![("R-b", 120), ("R-a", 130)]);
+        assert_eq!(
+            r.observed_total, 3,
+            "the fold is not a deletion: the count still says three Assigns happened"
+        );
+    }
+
+    /// The same Run in a different seat is a different fact.
+    #[test]
+    fn the_same_run_in_another_seat_is_its_own_entry() {
+        let mut r = record();
+        r.record_observed(entry("R-a", "phase-a-op", 110));
+        r.record_observed(entry("R-a", "phase-b-op", 111));
+        assert_eq!(r.observed.len(), 2);
+    }
+
+    /// Past the cap the oldest entry ages out; the counter keeps saying how
+    /// many there really were.
+    #[test]
+    fn the_log_is_a_ring_bounded_by_the_cap() {
+        let mut r = record();
+        for i in 0..(OBSERVED_CAP + 5) {
+            r.record_observed(entry(&format!("R-{i}"), "phase-a-op", 200 + i as u64));
+        }
+        assert_eq!(r.observed.len(), OBSERVED_CAP);
+        assert_eq!(r.observed[0].run_id, "R-5", "the oldest five aged out");
+        assert_eq!(r.observed_total, (OBSERVED_CAP + 5) as u64);
+    }
+
+    /// D5's ordering key: the newest activity, falling back to the join.
+    #[test]
+    fn last_activity_falls_back_to_the_join_time() {
+        let mut r = record();
+        assert_eq!(r.last_activity_secs(), 100);
+        r.record_observed(entry("R-a", "phase-a-op", 140));
+        assert_eq!(r.last_activity_secs(), 140);
+    }
+
+    /// An oversized metadata bag is dropped *and flagged*, so the `null` is
+    /// not read as "the launch supplied none".
+    #[test]
+    fn oversized_task_metadata_is_dropped_and_flagged() {
+        let big = json!({ "blob": "x".repeat(TASK_METADATA_MAX_BYTES) });
+        let e = ObservedAssignment::new(
+            "R-a".to_string(),
+            "phase-a-op".to_string(),
+            None,
+            None,
+            None,
+            Some(big),
+            1,
+        );
+        assert!(e.task_metadata.is_none());
+        assert!(e.task_metadata_omitted);
+
+        let small = ObservedAssignment::new(
+            "R-a".to_string(),
+            "phase-a-op".to_string(),
+            None,
+            None,
+            None,
+            None,
+            1,
+        );
+        assert!(!small.task_metadata_omitted, "absent is not omitted");
+    }
+
+    /// The bound [`OBSERVED_CAP`]'s doc multiplies by 32 has to exist for
+    /// every field, not only for the JSON bag. `goal` is the one a caller
+    /// controls with no natural size, and it used to be copied verbatim.
+    #[test]
+    fn an_oversized_goal_is_cut_and_flagged() {
+        let e = ObservedAssignment::new(
+            "R-a".to_string(),
+            "phase-a-op".to_string(),
+            Some("g".repeat(OBSERVED_TEXT_MAX_BYTES * 4)),
+            Some("/repo".to_string()),
+            None,
+            None,
+            1,
+        );
+        let goal = e.goal.as_deref().expect("the prefix is kept, not dropped");
+        assert!(
+            goal.len() <= OBSERVED_TEXT_MAX_BYTES + '…'.len_utf8(),
+            "a goal must not enter the ring longer than the ceiling (+ the marker), got {}",
+            goal.len()
+        );
+        assert!(goal.ends_with('…'), "the cut names itself in the value");
+        assert!(e.text_truncated, "and in the flag");
+        assert_eq!(
+            e.project_root.as_deref(),
+            Some("/repo"),
+            "a field that fits is untouched"
+        );
+    }
+
+    /// The cut lands on a `char` boundary — a multi-byte goal must not be
+    /// sliced through the middle of one.
+    #[test]
+    fn the_cut_lands_on_a_char_boundary() {
+        // 3 bytes each, so the ceiling falls inside a character.
+        let text = "あ".repeat(OBSERVED_TEXT_MAX_BYTES);
+        let e = ObservedAssignment::new(
+            "R-a".to_string(),
+            "phase-a-op".to_string(),
+            Some(text),
+            None,
+            None,
+            None,
+            1,
+        );
+        let goal = e.goal.as_deref().expect("kept");
+        assert!(e.text_truncated);
+        assert!(
+            goal.trim_end_matches('…').chars().all(|c| c == 'あ'),
+            "the prefix is whole characters"
+        );
+    }
+
+    /// Nothing is flagged when nothing was cut — the flag is a report, not
+    /// a default.
+    #[test]
+    fn a_short_entry_is_not_flagged() {
+        let e = entry("R-a", "phase-a-op", 1);
+        assert!(!e.text_truncated);
+        assert_eq!(e.goal.as_deref(), Some("resolve issue #10"));
+    }
+}

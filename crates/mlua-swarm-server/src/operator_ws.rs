@@ -119,6 +119,6 @@ pub use login::{
 pub use protocol::{ClientMsg, ServerMsg};
 pub use router::{
     AssigneeRouter, AssigneeRouterResolver, Liveness, OperatorAdapter, OperatorAdapterRegistry,
-    WsOperatorWiring,
+    PendingRequest, RunTraceSlot, SeatLedger, SeatTicket, WsOperatorWiring,
 };
-pub use session::WSOperatorSession;
+pub use session::{PendingKind, WSOperatorSession};

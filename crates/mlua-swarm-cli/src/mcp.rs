@@ -2537,6 +2537,38 @@ struct OperatorJoinReq {
     /// Operator/MainAI. Required for fail-closed Runner binding.
     #[serde(default)]
     capability_manifest: Option<mlua_swarm::AgentProviderManifest>,
+    /// Describe what you are working on, in about 50 characters.
+    ///
+    /// It is used to tell you apart from other tasks running in parallel in
+    /// the same repo or the same worktree. Later, you or whoever takes over
+    /// from you will read the operator list and decide "is this my work" by
+    /// this line.
+    ///
+    /// Do NOT write any of these — they are recorded automatically: repo
+    /// path, worktree path, Run id, goal, start time.
+    ///
+    /// Write what you are touching and what you are doing to it. Add one
+    /// piece of immediately preceding context if there is any.
+    ///
+    /// Required here even though `POST /v1/operators` accepts a join
+    /// without one: this is the tool an AI joins through, and the AI
+    /// already knows the answer at that moment, so the only thing an
+    /// optional field would buy is an operator list nobody can read.
+    desc: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct OperatorListReq {
+    /// sid returned by `mse_operator_join` — whose Bearer token this
+    /// process presents. `GET /v1/operators` is Bearer-gated, and any live
+    /// session's token opens it; omitted = this process's sole live
+    /// session, which fails if it holds none or several.
+    #[serde(default)]
+    sid: Option<String>,
+    /// Page size. Omitted = the server default (50); the server clamps to
+    /// its own ceiling (200).
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -3125,7 +3157,7 @@ struct SwarmCancelReq {
 #[tool_router]
 impl MseServer {
     #[tool(
-        description = "Join as an Operator session: POST /v1/operators (mint sid+token and submit capability_manifest) then connect WS /v1/operators/:sid/ws with the returned Bearer token. The token stays process-local (never returned to the caller). Runner-backed launches resolve the manifest fail-closed by logical role, launch_variant, model, and tools. Returns {sid, roles}. Use `sid` with mse_pending_wait / mse_ack / mse_operator_leave. On a `roles conflict` (409), the response body carries both the pre-#81 `conflicts: [<role>]` array and the GH #81 Layer 2 `conflicts_detail: [{role, sid}]` array identifying the holding session — pair with `mse_operator_leave_by_role(role)` to recover from a stale session whose original driver crashed."
+        description = "Join as an Operator session: POST /v1/operators (mint sid+token, submit capability_manifest and the `desc` line that identifies this session) then connect WS /v1/operators/:sid/ws with the returned Bearer token. `desc` is mandatory here — see its schema description; it is what a later reader (you, or whoever takes over) tells your session apart by on mse_operator_list. The token stays process-local (never returned to the caller). Runner-backed launches resolve the manifest fail-closed by logical role, launch_variant, model, and tools. Returns {sid, roles}. Use `sid` with mse_pending_wait / mse_ack / mse_operator_leave. On a `roles conflict` (409), the response body carries both the pre-#81 `conflicts: [<role>]` array and the GH #81 Layer 2 `conflicts_detail: [{role, sid}]` array identifying the holding session — pair with `mse_operator_leave_by_role(role)` to recover from a stale session whose original driver crashed."
     )]
     async fn mse_operator_join(
         &self,
@@ -3145,10 +3177,25 @@ impl MseServer {
             })?;
         let (sid, roles) = self
             .op_client
-            .join(roles, req.capability_manifest)
+            .join(roles, req.capability_manifest, Some(req.desc))
             .await
             .map_err(client_error_to_mcp)?;
         json_result(&serde_json::json!({ "sid": sid, "roles": roles }))
+    }
+
+    #[tool(
+        description = "List every live Operator session with its 記名 (the join-time description each session wrote about itself, plus the seats it has been assigned: Run, goal, project_root, work_dir, task_metadata, time). GET /v1/operators, which is Bearer-gated — this tool presents the token of `sid` (default: this process's sole live session). Read it before acquiring a Run seat: with exclusivity removed, this list and the per-Run holder list (GET /v1/runs/:id/assignees) are what tell two parallel tasks in the same worktree apart. Ordered by most recent activity first; `limit` caps the page (server default 50, ceiling 200). Returns the server's response body verbatim: {operators: [...], total, limit}."
+    )]
+    async fn mse_operator_list(
+        &self,
+        Parameters(req): Parameters<OperatorListReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = self
+            .op_client
+            .list_operators(req.sid.as_deref(), req.limit)
+            .await
+            .map_err(client_error_to_mcp)?;
+        json_result(&body)
     }
 
     #[tool(

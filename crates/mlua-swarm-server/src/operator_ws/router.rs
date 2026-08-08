@@ -103,16 +103,19 @@
 
 use async_trait::async_trait;
 use mlua_swarm::store::run::{RunStore, VacateOutcome};
+use mlua_swarm::store::trace::{RunTraceStore, TraceHandle};
 use mlua_swarm::{
     CapToken, Ctx, Operator, OperatorSlotResolver, OperatorSpawnerFactory, RunId, WorkerBinding,
     WorkerError, WorkerResult,
 };
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
-use super::session::WSOperatorSession;
+use crate::assignee_trace::{append_released, ReleaseReason};
+
+use super::session::{PendingKind, WSOperatorSession};
 
 /// The `ctx.meta.runtime` key a dispatch carries its Run identity in.
 ///
@@ -143,6 +146,217 @@ pub enum Liveness {
     Disconnected,
 }
 
+/// One request an adapter still owes a reply for, as
+/// [`OperatorAdapter::pending_for_run`] describes it.
+///
+/// # What is here, and what is joined on above
+///
+/// Model §4.6's axis 3 names five fields for an un-answered Step —
+/// `step_id` / `attempt` / `req_id` / `OperatorId` / `generation`. The
+/// first three are on this struct because they are facts the adapter
+/// holds. The last two are **not**, and their absence is the same **T1**
+/// statement the `Assignee` makes everywhere else: a generation belongs to
+/// `Run.current` and never crosses the SAP, and an `OperatorId` shares one
+/// key space with role aliases, so the only value this side could name is
+/// its own sid — which is not necessarily the name the seat was assigned
+/// under. Both are joined on above the boundary, from the holder list,
+/// which is where they are true. See
+/// [`crate::handover`](crate::handover) for the join.
+///
+/// # No liveness, no age, no delivery state
+///
+/// Deliberately four fields and no fifth. **W3** makes "parked waiting for
+/// a reconnect" and "written to a live socket" the same condition — both
+/// are a `T-DELIVER` whose confirm has not arrived — so there is nothing
+/// here to tell them apart with. **R5** sets no upper bound on that wait,
+/// so there is no timestamp either: an age would be read as a deadline the
+/// moment it existed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct PendingRequest {
+    /// The correlator the wire carries — the key of the adapter's own
+    /// in-flight map, and the `req_id` the eventual `answer` / `hook_ack` /
+    /// `spawn_ack` will quote.
+    pub req_id: String,
+    /// Which reply-expecting verb is waiting.
+    pub kind: PendingKind,
+    /// The step the request is addressed at.
+    #[schemars(with = "String")]
+    pub step_id: mlua_swarm::StepId,
+    /// The attempt, when the verb that parked this had a `Ctx` to read one
+    /// from. `None` only for [`PendingKind::Ask`] — which, having no `Ctx`,
+    /// also has no Run and therefore cannot be selected by one at all, so
+    /// this is unreachable through [`OperatorAdapter::pending_for_run`]
+    /// today. It stays `Option` because the type is what proves that, not a
+    /// comment, and because inventing an attempt to fill it in would put a
+    /// number the engine never used in front of a reader deciding whether
+    /// to re-run.
+    pub attempt: Option<u32>,
+}
+
+/// Which Operator seat each in-flight dispatch went out through, recorded
+/// above the SAP and keyed by the identity the adapter records for the same
+/// request.
+///
+/// # The unit an operator's work belongs to is the seat, not the Run
+///
+/// One `Arc<dyn OperatorAdapter>` can back **several seats of one Run**.
+/// `login::register_operator_session` files a session under its sid *and*
+/// under every role it claimed, all pointing at the same `Arc`, and
+/// `tasks::seat_declared_operators` auto-seats each declared slot from the
+/// adapter answering to that slot's own name — so a single
+/// `mse_operator_join(roles = ["phase-a-op", "phase-b-op"])` produces one
+/// session holding two seats of one Run.
+///
+/// Everything that acts on "an operator's work on a Run" therefore has to
+/// say *which seat*, or it acts on more than it means to:
+///
+/// - **`T-DISCARD`** (**Q5**) is thrown at the holder one acquire
+///   displaced. Selecting by Run alone drops the reply channels of work
+///   still in flight on a seat the same operator legitimately still holds
+///   — and **A6** does not catch it afterwards, because A6 is enforced per
+///   slot (`AssigneeRouter` is built for one, and `acquire_assignee`
+///   replaces only its own key of `current`), so the untouched seat's
+///   generation never moved and its dispatch was still valid.
+/// - **The un-answered list** (**W5** axis 3) asks each held seat's adapter
+///   what it owes and joins that seat's `op` / `gen` onto every answer. Two
+///   seats backed by one adapter make each waiting request appear twice,
+///   under two different slot / op / generation triples, at most one of
+///   which is true.
+///
+/// # Why the seat is joined here rather than pushed down
+///
+/// The alternative was to carry the slot below the boundary — a field on
+/// the adapter's pending entry, `discard(run, slot)`, `pending(run, slot)`.
+/// That widens the SAP a second time (after `run_id`) with a term **T1**
+/// keeps above it: a slot is where an `Assignee` lives, and an adapter that
+/// were told which seat addressed it could behave differently per seat.
+///
+/// It is not needed, because the join key already exists on both sides. The
+/// router is per-slot and holds `(run_id, step_id, attempt)` at the moment
+/// it dispatches; the adapter's [`PendingRequest`] carries `step_id` and
+/// `attempt` back up. This type is that key, written on the way down and
+/// read on the way back — the same shape `OperatorId` and `generation`
+/// already use, which are also facts the adapter is never told and which
+/// the readers join from `Run.current`.
+///
+/// # What has no seat
+///
+/// Only [`Operator::execute`] passes through a router. `SeniorBridge::ask`
+/// and `SpawnHook::before` are dispatched through the sid-registered bridge
+/// and spawn hook, which resolve a session directly, so neither is ever
+/// recorded here and neither can be attributed to a seat. `ask` was already
+/// outside a Run-scoped selection (it is handed no `Ctx`, hence no
+/// `run_id`); `hook_before` is the one this changes, and it changes it in
+/// the honest direction — it is now listed with no seat rather than
+/// attributed to whichever seat happened to be asked first, and a takeover
+/// no longer drops it. The pre-spawn ack it is waiting for is not the
+/// displaced holder's *work on that seat*; it is a question asked of the
+/// session, and the session is still there (**Q7**).
+///
+/// # Lifetime of an entry
+///
+/// One entry exists for exactly as long as one `execute` delegation, held
+/// by a [`SeatTicket`] whose `Drop` removes it — so an early return, a
+/// failed delivery and a normal answer all clear it, and nothing here
+/// outlives the request it describes. The map is therefore bounded by the
+/// number of dispatches in flight, not by the number ever made.
+///
+/// A `std::sync::Mutex` rather than a `tokio` one for that reason: the
+/// critical sections are a hash lookup with no `await` inside, and `Drop`
+/// cannot await. A poisoned lock is taken over rather than propagated —
+/// losing the seat of every in-flight dispatch because one unrelated thread
+/// panicked would turn a panic into silent mis-attribution.
+#[derive(Default)]
+pub struct SeatLedger {
+    entries: std::sync::Mutex<HashMap<DispatchKey, String>>,
+}
+
+/// What a dispatch and the pending entry it produces have in common: the
+/// Run, the step, and the attempt.
+///
+/// Unique per dispatch — an agent names exactly one `operator_ref`, so one
+/// `(run, step, attempt)` is delivered through one seat. A repeat of the
+/// same attempt (a retry after a failure) is sequential with the first, so
+/// its [`SeatTicket`] is minted after the previous one was dropped.
+type DispatchKey = (RunId, mlua_swarm::StepId, u32);
+
+impl SeatLedger {
+    /// An empty ledger.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take the lock, adopting it when a previous holder panicked. See the
+    /// type doc.
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<DispatchKey, String>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Record that `slot` is dispatching `(run, step, attempt)`, for as
+    /// long as the returned ticket lives.
+    ///
+    /// Public because the recording *is* the contract — a router that did
+    /// not call this would leave every one of its dispatches seatless, and
+    /// a test standing in for one needs the same seam rather than a
+    /// back door into the map.
+    #[must_use = "the seat is recorded only while the ticket is alive"]
+    pub fn record(
+        &self,
+        run: &RunId,
+        step: &mlua_swarm::StepId,
+        attempt: u32,
+        slot: &str,
+    ) -> SeatTicket<'_> {
+        let key = (run.clone(), step.clone(), attempt);
+        self.entries().insert(key.clone(), slot.to_string());
+        SeatTicket { ledger: self, key }
+    }
+
+    /// The seat `request` was dispatched through, or `None` when it was not
+    /// dispatched through one.
+    ///
+    /// `None` covers three things, and they are deliberately one answer:
+    /// a verb that never reaches a router ([`PendingKind::Ask`],
+    /// [`PendingKind::HookBefore`]), a spawn whose delegation has already
+    /// returned (its ticket is gone, so nothing is in flight to attribute),
+    /// and a spawn made through a directly-registered session rather than
+    /// through a seat. In every one of them the same thing is true: this
+    /// layer cannot name a seat, so it names none rather than the nearest.
+    pub fn slot_of(&self, run: &RunId, request: &PendingRequest) -> Option<String> {
+        if request.kind != PendingKind::Spawn {
+            return None;
+        }
+        let attempt = request.attempt?;
+        let key = (run.clone(), request.step_id.clone(), attempt);
+        self.entries().get(&key).cloned()
+    }
+}
+
+impl std::fmt::Debug for SeatLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeatLedger")
+            .field("in_flight", &self.entries().len())
+            .finish()
+    }
+}
+
+/// The lifetime of one [`SeatLedger`] entry, tied to one delegation.
+///
+/// Held across `adapter.execute(..)` and dropped whichever way that call
+/// returns. Nothing reads a ticket; it exists for its `Drop`.
+pub struct SeatTicket<'a> {
+    ledger: &'a SeatLedger,
+    key: DispatchKey,
+}
+
+impl Drop for SeatTicket<'_> {
+    fn drop(&mut self) {
+        self.ledger.entries().remove(&self.key);
+    }
+}
+
 /// A **terminal** Operator backend: something a dispatch can actually be
 /// delivered to (a WS session, and in tests a double), as opposed to
 /// something that decides where to deliver it.
@@ -156,23 +370,64 @@ pub enum Liveness {
 ///
 /// # The SAP surface (model §4.7)
 ///
-/// Two of the model's four primitive pairs cross this trait, and two do
-/// not:
+/// Three of the model's four primitive pairs cross this trait, and one
+/// does not:
 ///
 /// - **`T-DELIVER`** is [`Operator::execute`], which the supertrait
 ///   already provides. It is not redeclared here — one primitive, one
 ///   method.
 /// - **`T-ALIVE`** is [`Self::liveness`], added because nothing else on
 ///   the boundary could answer it.
+/// - **`T-DISCARD`** is [`Self::discard_requests`]. It was deliberately
+///   absent until the `pending` map could satisfy it: the primitive is
+///   defined over a `run`, and while that map was keyed by `req_id` alone
+///   — with no `run_id` anywhere on the wire — a method here could not
+///   have been honoured, and an unhonourable primitive that merely
+///   *exists* reads, to whoever implements the rest of the handover, as
+///   one already wired up. The map now records each request's Run at
+///   insert time (see [`WSOperatorSession`]'s pending entry), which is
+///   what makes the selection real, so the method is here — narrowed, per
+///   [`SeatLedger`], from the Run to the seat the acquire actually took.
 /// - **`T-CONNECT` / `T-DISCONNECT`** are provider-initiated indications
 ///   with no subscriber above the boundary; see the module doc.
-/// - **`T-DISCARD`** is **deliberately absent**. It is defined over a
-///   `run`, and no adapter can currently select by one (the WS session's
-///   `pending` map is keyed by `req_id` alone and the wire carries no
-///   `run_id`), so a method here could not be honoured. An unhonourable
-///   primitive that merely *exists* reads, to whoever implements the rest
-///   of the handover, as one already wired up. Adding it belongs with the
-///   `pending` rework that can actually satisfy it.
+///
+/// # The one addition: [`Self::pending_for_run`]
+///
+/// [`Self::pending_for_run`] is not one of §4.7's primitives. It is a
+/// **read of the selection `T-DISCARD` already defines** — same `run`
+/// argument, same set of entries, answered rather than dropped — and
+/// adding it was a choice between two ways of building model §4.6's axis
+/// 3 (the un-answered Step list). The alternative was to record dispatches
+/// above the boundary, in [`AssigneeRouter`], which would have left §4.7's
+/// surface exactly as it is. It was rejected on the model's own field
+/// list, `step_id` / `attempt` / `req_id` / `OperatorId` / `generation`:
+///
+/// - **`req_id` cannot be produced up there at all.** It is minted inside
+///   the adapter, in `WSOperatorSession::send_and_await`, and never comes
+///   back out: [`Operator::execute`] returns a
+///   [`WorkerResult`](mlua_swarm::WorkerResult), not a correlator. A
+///   router could only mint an id of its own — an id no ack quotes, no
+///   operator-side log mentions, and nothing on the wire can be matched
+///   against. That is a different field wearing the model's name for it.
+/// - **Two of the three waiting verbs never pass through the router.**
+///   Only [`Operator::execute`] is routed; `SeniorBridge::ask` and
+///   `SpawnHook::before` are dispatched through the sid-registered bridge
+///   and spawn hook, which resolve a session directly. A router-side
+///   ledger would list spawns and quietly omit every escalation question
+///   and every pre-spawn ack — a list whose *absences* are wrong, which is
+///   worse than no list, because §4.5 leaves this list standing as one of
+///   the two things preventing a mistaken handover.
+/// - `OperatorId` and `generation` discriminate nothing: neither exists
+///   below the SAP (**T1**), so *both* designs join them from
+///   `Run.current`.
+///
+/// So the choice was between a wider boundary and a list that is wrong
+/// about two verbs and cannot name a request. §4.7's rule is to define
+/// what crosses — and this does cross: the fact lives below, the reader
+/// (**W5**: the Assignee) is above, and no amount of bookkeeping upstairs
+/// synthesizes it. The width is paid back by keeping the *shape* narrow:
+/// [`PendingRequest`] carries no reply channel, no liveness, and no
+/// `Assignee` field, so nothing new travels in either direction.
 #[async_trait]
 pub trait OperatorAdapter: Operator {
     /// `T-ALIVE.request(operator)` → `T-ALIVE.confirm(operator, state)`.
@@ -189,6 +444,99 @@ pub trait OperatorAdapter: Operator {
     /// from it — no cached verdict, no timer, no retry budget built on a
     /// previous answer.
     async fn liveness(&self) -> Liveness;
+
+    /// `T-DISCARD.request(operator, run)` → `T-DISCARD.confirm(run,
+    /// discarded)`. Drop the requests of `run` named by `req_ids`, and
+    /// answer with how many there were.
+    ///
+    /// # Addressed at the adapter, not at an `OperatorId`
+    ///
+    /// The model writes the request as `T-DISCARD(op, R)`, but the
+    /// `operator` term is **`self`** here rather than a parameter, and
+    /// that is not a convenience. `Assignee.op` shares one key space with
+    /// role aliases (`main-ai`), so the displaced holder's name may be a
+    /// role that no session's own sid equals: an adapter comparing a
+    /// passed-in string against its identity would silently discard
+    /// nothing in exactly the alias case the registry exists to support.
+    /// The caller already resolves `Assignee.op` through
+    /// [`OperatorAdapterRegistry`] to reach this method at all, so the
+    /// addressing is done by the time it is called — and **T1** agrees:
+    /// from below the boundary there is only one operator, this one.
+    ///
+    /// # Why `req_ids` and not just `run`
+    ///
+    /// The model's `run` term names a scope one step coarser than the unit
+    /// that changes hands. An acquire takes **one seat**, and one adapter
+    /// can hold several seats of one Run (see [`SeatLedger`]), so a discard
+    /// selected by Run alone drops work on seats nobody touched. The caller
+    /// narrows the selection above the boundary — [`Self::pending_for_run`]
+    /// answers what is outstanding, [`SeatLedger::slot_of`] says which of
+    /// those belong to the seat being taken — and passes back the subset.
+    ///
+    /// What crosses is the adapter's **own correlator space**: a `req_id`
+    /// is minted below the boundary and already travels up on
+    /// [`PendingRequest`], so handing a subset of them back teaches this
+    /// side nothing it did not already say. That is what makes this narrower
+    /// than the obvious alternative of a `slot` parameter, which would put
+    /// an `Assignee` term below the SAP (**T1**).
+    ///
+    /// `run` stays, and is not decoration: an implementor must drop a named
+    /// request **only if it also belongs to `run`**, so a `req_id` selected
+    /// against a stale read of another Run cannot take a live request with
+    /// it.
+    ///
+    /// # Called on displacement, not on teardown
+    ///
+    /// The one caller is `POST /v1/runs/:id/acquire`, on the holder it
+    /// displaced (**Q5**). An adapter must therefore drop only what it was
+    /// asked for and stay usable: the operator has lost one seat, not its
+    /// registration (**Q7**), and may well be holding others — including
+    /// others *of this Run*. Deleting an operator is **O8**, a different
+    /// path.
+    ///
+    /// The count is what the requester is told, so it must be the number
+    /// actually dropped rather than a nominal success — `0` is a truthful
+    /// answer (nothing was in flight, or nothing could be selected) and
+    /// is not an error.
+    async fn discard_requests(&self, run: &RunId, req_ids: &[String]) -> usize;
+
+    /// Every request this adapter still owes `run` a reply for — model
+    /// §4.6's axis 3, *"いま何が宙に浮いているか"*.
+    ///
+    /// This is the read [`Self::discard_requests`] selects from: a discard
+    /// names a subset of exactly what this answers, and both readers —
+    /// the un-answered list and the acquire — narrow it the same way,
+    /// through [`SeatLedger::slot_of`]. Keeping one Run-scoped read below
+    /// the boundary and one seat filter above it is what makes "what an
+    /// acquire is about to displace" and "what it did displace" the same
+    /// selection rather than two that have to be kept in step.
+    ///
+    /// # These are waiting, not stuck
+    ///
+    /// An entry here is a `T-DELIVER` whose confirm has not arrived, and
+    /// that is the whole of what it says. **W1** — the server resolves
+    /// nothing on its own — so nothing in this crate acts on the answer;
+    /// **W2** — there is no recovery procedure to feed it into; the next
+    /// action goes through the ordinary path. Returning a rich enough
+    /// answer to drive one would be building the thing **W2** declines to
+    /// build.
+    ///
+    /// # Not an implicit `T-ALIVE`
+    ///
+    /// A non-empty answer says nothing about whether the operator is
+    /// reachable, and an empty one says nothing about whether it is gone.
+    /// **T7** forbids inferring liveness above the SAP from anything but
+    /// [`Self::liveness`], and a count of outstanding requests is exactly
+    /// such an inference. An adapter must not filter this by its own
+    /// connectivity for the same reason: entries parked through a
+    /// disconnect are still owed (**W3**).
+    ///
+    /// Implementors that keep no per-request state answer with an empty
+    /// vector, which is truthful for them. It is required rather than
+    /// defaulted because a default would let an adapter that *does* track
+    /// requests report none by omission — and "nothing is in flight" is
+    /// the answer that invites a re-run.
+    async fn pending_for_run(&self, run: &RunId) -> Vec<PendingRequest>;
 }
 
 /// The one WS-side implementor: a session is exactly "the socket a spawn
@@ -213,6 +561,23 @@ impl OperatorAdapter for WSOperatorSession {
         } else {
             Liveness::Disconnected
         }
+    }
+
+    /// Drops the named `pending` entries, leaving the session itself — its
+    /// socket, its parks, every other Run's requests, and every request of
+    /// this Run the caller did not name — untouched. See
+    /// [`WSOperatorSession::discard_pending_requests`] for the mechanism
+    /// and for the `run` re-check it applies to each name.
+    async fn discard_requests(&self, run: &RunId, req_ids: &[String]) -> usize {
+        self.discard_pending_requests(run, req_ids).await
+    }
+
+    /// Describes the `pending` entries a [`Self::discard_requests`] can be
+    /// selected from, without dropping any. See
+    /// [`WSOperatorSession::pending_for_run`] for why the reply channel
+    /// stays behind.
+    async fn pending_for_run(&self, run: &RunId) -> Vec<PendingRequest> {
+        WSOperatorSession::pending_for_run(self, run).await
     }
 }
 
@@ -265,6 +630,73 @@ impl OperatorAdapterRegistry {
     }
 }
 
+/// A late-bound handle to the server's trace rail, shared by every router
+/// one [`AssigneeRouterResolver`] builds.
+///
+/// # Why a slot and not a constructor argument
+///
+/// **R7** puts one event on the router: an **A7** release is a seat
+/// emptied by the system, so without a row on the rail the only evidence
+/// of it is a dispatch that failed later. Writing that row needs a
+/// [`RunTraceStore`], and the router is the one assignment site that has
+/// no `AppState` to take it from — it holds stores, by design (**A10**:
+/// it reads `Run.current` and nothing else).
+///
+/// Handing the store to [`WsOperatorWiring::new`] instead would have been
+/// the shorter change and is the wrong one: that constructor runs at boot
+/// *before* the terminal router builder resolves which trace store the
+/// server will actually use (`run_trace_store`, defaulting to a fresh
+/// in-memory one), so the two could differ. They would differ silently —
+/// releases written to a store nothing reads, `GET /v1/runs/:id/trace`
+/// showing every step event and no assignment ones — which is precisely
+/// the failure **R7** exists to prevent, dressed up as a fix for it. The
+/// same argument [`WsOperatorWiring::new`] already makes about the
+/// factory and the adapter registry ("that mismatch would be silent,
+/// which is why it is designed out rather than documented").
+///
+/// So the builder that *decides* the store is the one that supplies it,
+/// through [`WsOperatorWiring::attach_trace_store`]. The slot is shared
+/// (an `Arc`) and read at release time rather than captured at build
+/// time, so a router the resolver hands out before the attach — or after
+/// it — behaves the same. It is write-once: two different stores for one
+/// server is the very confusion this type prevents.
+///
+/// An unattached slot means no trace store is wired at all (a caller that
+/// built the wiring standalone, e.g. a test); the release then proceeds
+/// untraced rather than failing, which is the fail-open contract the
+/// whole rail is on.
+#[derive(Clone, Default)]
+pub struct RunTraceSlot(Arc<OnceLock<Arc<dyn RunTraceStore>>>);
+
+impl RunTraceSlot {
+    /// An empty slot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bind the server's trace store. Answers `false` when the slot was
+    /// already bound — the second store is ignored, and the caller is
+    /// told rather than left to assume it took.
+    pub fn set(&self, store: Arc<dyn RunTraceStore>) -> bool {
+        self.0.set(store).is_ok()
+    }
+
+    /// A handle onto `run_id`'s stream, or `None` when nothing is bound.
+    fn handle(&self, run_id: &RunId) -> Option<TraceHandle> {
+        self.0
+            .get()
+            .map(|store| TraceHandle::new(run_id.clone(), store.clone()))
+    }
+}
+
+impl std::fmt::Debug for RunTraceSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RunTraceSlot")
+            .field(&self.0.get().map(|store| store.name()))
+            .finish()
+    }
+}
+
 /// The `Arc<dyn Operator>` that resolves its destination from
 /// `Run.current` on every dispatch. See the module doc.
 pub struct AssigneeRouter {
@@ -285,6 +717,14 @@ pub struct AssigneeRouter {
     /// `OperatorId` → adapter. Separate from the registry this router is
     /// itself registered in; see the module doc.
     adapters: Arc<OperatorAdapterRegistry>,
+    /// Where an **A7** release is recorded (**R7**). See [`RunTraceSlot`]
+    /// for why this is a shared, late-bound slot rather than a store.
+    trace: RunTraceSlot,
+    /// Where this router writes [`Self::slot`] against each dispatch it has
+    /// in flight, so a discard and the un-answered list can tell this
+    /// seat's work from another seat's on the same adapter. Shared with
+    /// every sibling router and with the two readers; see [`SeatLedger`].
+    seats: Arc<SeatLedger>,
 }
 
 /// The tail of the Vacant failure when the seat was simply never taken —
@@ -321,16 +761,48 @@ fn vacant_failure(agent: &str, run_id: &RunId, slot: &str, because: &str) -> Wor
 
 impl AssigneeRouter {
     /// Build a router for one slot, over a Run store and an adapter
-    /// registry.
+    /// registry, with no trace rail bound — its **A7** releases are not
+    /// recorded — and a private [`SeatLedger`] nobody else reads (see
+    /// [`Self::with_trace`]).
     pub fn new(
         run_store: Arc<dyn RunStore>,
         slot: impl Into<String>,
         adapters: Arc<OperatorAdapterRegistry>,
     ) -> Self {
+        Self::with_trace(
+            run_store,
+            slot,
+            adapters,
+            RunTraceSlot::new(),
+            Arc::new(SeatLedger::new()),
+        )
+    }
+
+    /// [`Self::new`] plus the slot an **A7** release is traced through
+    /// (**R7**) and the [`SeatLedger`] its dispatches are recorded in.
+    /// This is what [`AssigneeRouterResolver`] uses; both are shared with
+    /// every sibling router, and the trace slot may be filled after this
+    /// call (see [`RunTraceSlot`]).
+    ///
+    /// The ledger has to be the same value the readers hold, for the same
+    /// reason the adapter registry does: a router writing seats into a map
+    /// `POST /v1/runs/:id/acquire` and `GET /v1/runs/:id/handover` do not
+    /// read would make every dispatch look seatless, and the two would
+    /// silently go back to being unable to tell one seat's work from
+    /// another's. [`WsOperatorWiring`] is what ties them together.
+    pub fn with_trace(
+        run_store: Arc<dyn RunStore>,
+        slot: impl Into<String>,
+        adapters: Arc<OperatorAdapterRegistry>,
+        trace: RunTraceSlot,
+        seats: Arc<SeatLedger>,
+    ) -> Self {
         Self {
             run_store,
             slot: slot.into(),
             adapters,
+            trace,
+            seats,
         }
     }
 
@@ -343,6 +815,12 @@ impl AssigneeRouter {
     /// handle the login path registers sessions into.
     pub fn adapters(&self) -> &Arc<OperatorAdapterRegistry> {
         &self.adapters
+    }
+
+    /// The ledger this router records its in-flight seats in — the handle
+    /// a discard and the un-answered list join on.
+    pub fn seats(&self) -> &Arc<SeatLedger> {
+        &self.seats
     }
 }
 
@@ -555,6 +1033,14 @@ impl Operator for AssigneeRouter {
                 addressed_gen = assignee.gen,
                 "A7: holder was Disconnected at reference time; seat released"
             );
+            // R7: a seat emptied by the system, on the same rail as the
+            // step events (W4). Written on the `Released` arm only — the
+            // `Stale` arm above returns before reaching here, because it
+            // released nothing. Best-effort, like every trace append: a
+            // release that could not be recorded is still a release.
+            if let Some(trace) = self.trace.handle(&run_id) {
+                append_released(&trace, &self.slot, assignee, ReleaseReason::A7Disconnected).await;
+            }
             return Err(vacant_failure(
                 &ctx.agent,
                 &run_id,
@@ -571,9 +1057,20 @@ impl Operator for AssigneeRouter {
 
         // A6: which acquisition this dispatch is speaking on behalf of.
         let addressed_gen = assignee.gen;
-        let result = adapter
-            .execute(ctx, system, prompt, worker, worker_token)
-            .await?;
+        // Which seat this delegation belongs to, for as long as it is in
+        // flight. Taken *before* delegating, because the adapter's pending
+        // entry is created inside the call below — there is no instant at
+        // which that entry exists and this record does not. Dropped on the
+        // way out of the block, however the call returns (`?` included).
+        // See `SeatLedger`.
+        let result = {
+            let _seat = self
+                .seats
+                .record(&run_id, &ctx.task_id, ctx.attempt, &self.slot);
+            adapter
+                .execute(ctx, system, prompt, worker, worker_token)
+                .await?
+        };
 
         let after = self.run_store.get(&run_id).await.map_err(|e| {
             tracing::warn!(
@@ -634,24 +1131,50 @@ impl Operator for AssigneeRouter {
 pub struct AssigneeRouterResolver {
     run_store: Arc<dyn RunStore>,
     adapters: Arc<OperatorAdapterRegistry>,
+    trace: RunTraceSlot,
+    seats: Arc<SeatLedger>,
 }
 
 impl AssigneeRouterResolver {
-    /// Resolve every seat to a router over `run_store` and `adapters`.
+    /// Resolve every seat to a router over `run_store` and `adapters`,
+    /// with no trace rail bound and a private [`SeatLedger`].
     pub fn new(run_store: Arc<dyn RunStore>, adapters: Arc<OperatorAdapterRegistry>) -> Self {
+        Self::with_trace(
+            run_store,
+            adapters,
+            RunTraceSlot::new(),
+            Arc::new(SeatLedger::new()),
+        )
+    }
+
+    /// [`Self::new`] plus the shared [`RunTraceSlot`] every router it
+    /// builds records its **A7** releases through (**R7**) and the shared
+    /// [`SeatLedger`] every router it builds records its in-flight seats
+    /// in. The trace slot may still be empty at this point — it is read at
+    /// release time, not here.
+    pub fn with_trace(
+        run_store: Arc<dyn RunStore>,
+        adapters: Arc<OperatorAdapterRegistry>,
+        trace: RunTraceSlot,
+        seats: Arc<SeatLedger>,
+    ) -> Self {
         Self {
             run_store,
             adapters,
+            trace,
+            seats,
         }
     }
 }
 
 impl OperatorSlotResolver for AssigneeRouterResolver {
     fn resolve(&self, slot: &str) -> Option<Arc<dyn Operator>> {
-        Some(Arc::new(AssigneeRouter::new(
+        Some(Arc::new(AssigneeRouter::with_trace(
             self.run_store.clone(),
             slot,
             self.adapters.clone(),
+            self.trace.clone(),
+            self.seats.clone(),
         )))
     }
 }
@@ -674,6 +1197,20 @@ pub struct WsOperatorWiring {
     pub factory: Arc<OperatorSpawnerFactory>,
     /// Written by `login::register_operator_session`, read by every router.
     pub adapters: Arc<OperatorAdapterRegistry>,
+    /// Where every router this wiring hands out records an **A7**
+    /// release (**R7**). Filled by the terminal router builder — the one
+    /// place that knows which trace store the server actually serves
+    /// reads from; see [`RunTraceSlot`] and
+    /// [`Self::attach_trace_store`].
+    pub trace: RunTraceSlot,
+    /// Which seat each in-flight dispatch went out through. Written by
+    /// every router this wiring hands out, read by
+    /// `POST /v1/runs/:id/acquire` (to discard one seat's work and not
+    /// another's) and by `GET /v1/runs/:id/handover` (to attribute each
+    /// waiting request to one seat, once). Carried here for the reason
+    /// `adapters` is: the writers and the readers have to be looking at
+    /// one value. See [`SeatLedger`].
+    pub seats: Arc<SeatLedger>,
 }
 
 impl WsOperatorWiring {
@@ -686,11 +1223,32 @@ impl WsOperatorWiring {
     /// and where every dispatch reads it back (**A10** — one place).
     pub fn new(factory: Arc<OperatorSpawnerFactory>, run_store: Arc<dyn RunStore>) -> Self {
         let adapters = Arc::new(OperatorAdapterRegistry::new());
-        factory.set_slot_resolver(Arc::new(AssigneeRouterResolver::new(
+        let trace = RunTraceSlot::new();
+        let seats = Arc::new(SeatLedger::new());
+        factory.set_slot_resolver(Arc::new(AssigneeRouterResolver::with_trace(
             run_store,
             adapters.clone(),
+            trace.clone(),
+            seats.clone(),
         )));
-        Self { factory, adapters }
+        Self {
+            factory,
+            adapters,
+            trace,
+            seats,
+        }
+    }
+
+    /// Bind the server's trace store, so every router this wiring hands
+    /// out records its **A7** releases on the Run's own rail (**R7**).
+    ///
+    /// Called by the terminal router builder rather than by
+    /// [`Self::new`]: the builder is where the store the server serves
+    /// `GET /v1/runs/:id/trace` from is decided, and a release recorded
+    /// anywhere else would be invisible. Answers `false` if a store was
+    /// already bound — see [`RunTraceSlot::set`].
+    pub fn attach_trace_store(&self, store: Arc<dyn RunTraceStore>) -> bool {
+        self.trace.set(store)
     }
 }
 
@@ -744,6 +1302,23 @@ mod tests {
     impl OperatorAdapter for RecordingAdapter {
         async fn liveness(&self) -> Liveness {
             self.liveness
+        }
+
+        /// Records the request the way `execute` records a dispatch, so a
+        /// test can assert a discard was addressed here — and answers `0`,
+        /// which is the honest count for a double that parks nothing.
+        async fn discard_requests(&self, run: &RunId, req_ids: &[String]) -> usize {
+            self.seen
+                .lock()
+                .expect("recording adapter mutex")
+                .push(format!("{}:discard:{run}:{}", self.name, req_ids.len()));
+            0
+        }
+
+        /// Empty for the same reason [`Self::discard_requests`] answers
+        /// `0`: this double parks nothing, so it owes nobody a reply.
+        async fn pending_for_run(&self, _run: &RunId) -> Vec<PendingRequest> {
+            Vec::new()
         }
     }
 
@@ -805,6 +1380,14 @@ mod tests {
         async fn liveness(&self) -> Liveness {
             Liveness::Connected
         }
+
+        async fn discard_requests(&self, _run: &RunId, _req_ids: &[String]) -> usize {
+            0
+        }
+
+        async fn pending_for_run(&self, _run: &RunId) -> Vec<PendingRequest> {
+            Vec::new()
+        }
     }
 
     /// Answers `T-ALIVE` with `Disconnected` — the **A7** condition — but
@@ -846,6 +1429,169 @@ mod tests {
                 .expect("the interleaved acquire");
             Liveness::Disconnected
         }
+
+        async fn discard_requests(&self, _run: &RunId, _req_ids: &[String]) -> usize {
+            0
+        }
+
+        async fn pending_for_run(&self, _run: &RunId) -> Vec<PendingRequest> {
+            Vec::new()
+        }
+    }
+
+    /// Reads the ledger from inside `execute` — the only window in which
+    /// a seat is recorded — so a test can see what the router wrote while
+    /// the dispatch was in flight rather than after it cleared up.
+    struct ChecksItsSeat {
+        seats: Arc<SeatLedger>,
+        run_id: RunId,
+        observed: Arc<StdMutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl Operator for ChecksItsSeat {
+        async fn execute(
+            &self,
+            ctx: &Ctx,
+            _system: Option<String>,
+            _prompt: Value,
+            _worker: Option<WorkerBinding>,
+            _worker_token: CapToken,
+        ) -> Result<WorkerResult, WorkerError> {
+            let as_the_adapter_would_describe_it = PendingRequest {
+                req_id: "req-in-flight".to_string(),
+                kind: PendingKind::Spawn,
+                step_id: ctx.task_id.clone(),
+                attempt: Some(ctx.attempt),
+            };
+            *self.observed.lock().expect("observed") = self
+                .seats
+                .slot_of(&self.run_id, &as_the_adapter_would_describe_it);
+            Ok(WorkerResult {
+                value: serde_json::json!({ "delivered_to": "checks-its-seat" }),
+                ok: true,
+                stats: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl OperatorAdapter for ChecksItsSeat {
+        async fn liveness(&self) -> Liveness {
+            Liveness::Connected
+        }
+
+        async fn discard_requests(&self, _run: &RunId, _req_ids: &[String]) -> usize {
+            0
+        }
+
+        async fn pending_for_run(&self, _run: &RunId) -> Vec<PendingRequest> {
+            Vec::new()
+        }
+    }
+
+    /// **The write side of the seat join.** A dispatch is recorded under
+    /// the router's own slot for exactly as long as the delegation lasts:
+    /// a reader that asks while it is in flight is told which seat it
+    /// belongs to, and one that asks afterwards is told nothing, because
+    /// there is nothing in flight to attribute.
+    #[tokio::test]
+    async fn a_dispatch_names_its_seat_while_it_is_in_flight_and_not_after() {
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = seeded_run(&store).await;
+        let seats = Arc::new(SeatLedger::new());
+        let observed = Arc::new(StdMutex::new(None));
+
+        let adapters = Arc::new(OperatorAdapterRegistry::new());
+        adapters
+            .register(
+                "S-holder",
+                Arc::new(ChecksItsSeat {
+                    seats: seats.clone(),
+                    run_id: run_id.clone(),
+                    observed: observed.clone(),
+                }) as Arc<dyn OperatorAdapter>,
+            )
+            .await;
+        let router = AssigneeRouter::with_trace(
+            store.clone(),
+            SLOT,
+            adapters,
+            RunTraceSlot::new(),
+            seats.clone(),
+        );
+        store
+            .acquire_assignee(&run_id, SLOT, "S-holder", "holds it")
+            .await
+            .expect("acquire");
+
+        let ctx = ctx_for(Some(&run_id));
+        router
+            .execute(&ctx, None, serde_json::json!("go"), None, cap_token())
+            .await
+            .expect("dispatch");
+
+        assert_eq!(
+            observed.lock().expect("observed").as_deref(),
+            Some(SLOT),
+            "while the delegation is in flight the ledger names the seat it went out through"
+        );
+        let after = PendingRequest {
+            req_id: "req-in-flight".to_string(),
+            kind: PendingKind::Spawn,
+            step_id: ctx.task_id.clone(),
+            attempt: Some(ctx.attempt),
+        };
+        assert!(
+            seats.slot_of(&run_id, &after).is_none(),
+            "and the record is gone once the dispatch returned — the map holds what is in \
+             flight, not what has ever been dispatched"
+        );
+    }
+
+    /// The two verbs that never reach a router are never attributed to a
+    /// seat, even when a dispatch for the very same step and attempt is in
+    /// flight. That is the whole reason `slot_of` looks at the kind: a
+    /// `hook_before` shares its `(run, step, attempt)` with the spawn that
+    /// follows it.
+    #[tokio::test]
+    async fn a_verb_that_never_reaches_a_router_is_attributed_to_no_seat() {
+        let seats = SeatLedger::new();
+        let run_id = RunId::new();
+        let step = StepId::parse("ST-shared").expect("step id");
+        let _seat = seats.record(&run_id, &step, 1, SLOT);
+
+        let hook = PendingRequest {
+            req_id: "S-1-hb-aaa".to_string(),
+            kind: PendingKind::HookBefore,
+            step_id: step.clone(),
+            attempt: Some(1),
+        };
+        assert!(
+            seats.slot_of(&run_id, &hook).is_none(),
+            "a hook_before is dispatched through the session, not through the seat — sharing \
+             a step with a routed spawn must not lend it that spawn's seat"
+        );
+
+        let ask = PendingRequest {
+            req_id: "S-1-ask-bbb".to_string(),
+            kind: PendingKind::Ask,
+            step_id: step.clone(),
+            attempt: None,
+        };
+        assert!(seats.slot_of(&run_id, &ask).is_none());
+
+        let spawn = PendingRequest {
+            req_id: "S-1-spawn-ccc".to_string(),
+            kind: PendingKind::Spawn,
+            step_id: step,
+            attempt: Some(1),
+        };
+        assert_eq!(
+            seats.slot_of(&run_id, &spawn).as_deref(),
+            Some(SLOT),
+            "sanity: the routed spawn of the same step IS attributed"
+        );
     }
 
     fn ctx_for(run_id: Option<&RunId>) -> Ctx {
@@ -1482,6 +2228,167 @@ mod tests {
             "Q7 / A8: the re-acquire stands — refusing the reply does not undo it"
         );
         assert_eq!(record.current[SLOT].gen, 2);
+    }
+
+    /// **R7 / W4.** An **A7** release is a seat emptied by the system, so
+    /// it goes on the Run's own trace — the same rail the step events are
+    /// on — naming the slot, the holder it read, and why. Without this
+    /// row the only evidence a restart cost a Run its holder is a
+    /// dispatch that failed some time later.
+    #[tokio::test]
+    async fn an_a7_release_is_recorded_on_the_runs_trace() {
+        use mlua_swarm::store::trace::{
+            kind as trace_kind, InMemoryRunTraceStore, RunTraceStore, TraceQuery,
+        };
+
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = seeded_run(&store).await;
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let adapters = Arc::new(OperatorAdapterRegistry::new());
+        adapters
+            .register("S-away", away_adapter("away", &seen))
+            .await;
+
+        let trace_store: Arc<dyn RunTraceStore> = Arc::new(InMemoryRunTraceStore::new());
+        let trace = RunTraceSlot::new();
+        // Built BEFORE the store is bound, exactly as the resolver builds
+        // routers before the terminal builder attaches one — the slot is
+        // read at release time, not at construction.
+        let router = AssigneeRouter::with_trace(
+            store.clone(),
+            SLOT,
+            adapters,
+            trace.clone(),
+            Arc::new(SeatLedger::new()),
+        );
+        assert!(trace.set(trace_store.clone()), "first bind takes");
+        assert!(
+            !trace.set(trace_store.clone()),
+            "the slot is write-once: one server, one rail"
+        );
+
+        store
+            .acquire_assignee(&run_id, SLOT, "S-away", "held by a client that went quiet")
+            .await
+            .expect("acquire");
+        router
+            .execute(
+                &ctx_for(Some(&run_id)),
+                None,
+                serde_json::json!("go"),
+                None,
+                cap_token(),
+            )
+            .await
+            .expect_err("A5 forbids delivering to a Disconnected holder");
+
+        let events = trace_store
+            .list(&run_id, &TraceQuery::default())
+            .await
+            .expect("trace list");
+        assert_eq!(events.len(), 1, "exactly one release row: {events:?}");
+        let event = &events[0];
+        assert_eq!(event.kind, trace_kind::ASSIGNEE_RELEASED);
+        assert_eq!(event.payload["slot"], SLOT);
+        assert_eq!(event.payload["assignee"]["op"], "S-away");
+        assert_eq!(event.payload["assignee"]["gen"], 1);
+        assert_eq!(
+            event.payload["assignee"]["desc"],
+            "held by a client that went quiet"
+        );
+        assert_eq!(event.payload["reason"], "a7_disconnected");
+    }
+
+    /// A release that was **refused** as stale writes nothing: the seat
+    /// did not change hands, so a row claiming it did would be a lie the
+    /// four-axis read surface would then repeat.
+    #[tokio::test]
+    async fn a_stale_a7_release_records_nothing() {
+        use mlua_swarm::store::trace::{InMemoryRunTraceStore, RunTraceStore, TraceQuery};
+
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = seeded_run(&store).await;
+        let adapters = Arc::new(OperatorAdapterRegistry::new());
+        adapters
+            .register(
+                "S-away",
+                Arc::new(HandsOverWhileAnsweringAlive {
+                    store: store.clone(),
+                    run_id: run_id.clone(),
+                    next_op: "S-fresh",
+                }) as Arc<dyn OperatorAdapter>,
+            )
+            .await;
+        let trace_store: Arc<dyn RunTraceStore> = Arc::new(InMemoryRunTraceStore::new());
+        let trace = RunTraceSlot::new();
+        trace.set(trace_store.clone());
+        let router = AssigneeRouter::with_trace(
+            store.clone(),
+            SLOT,
+            adapters,
+            trace,
+            Arc::new(SeatLedger::new()),
+        );
+
+        store
+            .acquire_assignee(&run_id, SLOT, "S-away", "held by a client that went quiet")
+            .await
+            .expect("acquire");
+        router
+            .execute(
+                &ctx_for(Some(&run_id)),
+                None,
+                serde_json::json!("go"),
+                None,
+                cap_token(),
+            )
+            .await
+            .expect_err("the holder was displaced before the release landed");
+
+        assert!(
+            trace_store
+                .list(&run_id, &TraceQuery::default())
+                .await
+                .expect("trace list")
+                .is_empty(),
+            "nothing was released, so nothing is recorded"
+        );
+    }
+
+    /// A router with no rail bound still releases the seat: the trace is
+    /// observational, and an unattached slot must not turn **A7** into a
+    /// dispatch that leaves a Disconnected holder in place.
+    #[tokio::test]
+    async fn an_unattached_trace_slot_does_not_stop_the_release() {
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let run_id = seeded_run(&store).await;
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let adapters = Arc::new(OperatorAdapterRegistry::new());
+        adapters
+            .register("S-away", away_adapter("away", &seen))
+            .await;
+        let router = AssigneeRouter::new(store.clone(), SLOT, adapters);
+
+        store
+            .acquire_assignee(&run_id, SLOT, "S-away", "held by a client that went quiet")
+            .await
+            .expect("acquire");
+        router
+            .execute(
+                &ctx_for(Some(&run_id)),
+                None,
+                serde_json::json!("go"),
+                None,
+                cap_token(),
+            )
+            .await
+            .expect_err("A5 forbids delivering to a Disconnected holder");
+
+        let record = store.get(&run_id).await.expect("run get");
+        assert!(
+            !record.current.contains_key(SLOT),
+            "the seat is released whether or not the release could be traced"
+        );
     }
 
     /// **T4.** The session's three internal states project onto the

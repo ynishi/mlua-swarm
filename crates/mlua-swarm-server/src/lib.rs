@@ -60,6 +60,7 @@
 
 #![warn(missing_docs)]
 
+mod assignee_trace;
 pub mod binding;
 /// HTTP surface for inspecting/registering Blueprint state (`/v1/blueprints/*`).
 pub mod blueprints;
@@ -73,6 +74,12 @@ pub mod doctor;
 pub mod enhance_log;
 /// `EnhanceSetting` HTTP CRUD (`/v1/enhance-settings*`).
 pub mod enhance_settings;
+/// The 記名's observed part and the per-Run holder list — the two things
+/// model §4.5 leaves standing once **A8** removed exclusivity
+/// (`GET /v1/runs/:id/assignees`) — plus the four-axis read surface **W5**
+/// requires an Assignee to have (`GET /v1/runs/:id/handover` and
+/// `GET /v1/runs/:id/material`).
+pub mod handover;
 /// HTTP surface for the Enhance issue axis (`/v1/issues*`).
 pub mod issues;
 /// WebSocket Operator Callback IF (`/v1/operators*`).
@@ -103,13 +110,13 @@ pub use operator_ws::{
     operators_create, operators_delete, operators_delete_by_role, operators_info, operators_list,
     operators_ws_connect, AssigneeRouter, AssigneeRouterResolver, ClientMsg, Liveness,
     LoginSession, OperatorAdapter, OperatorAdapterRegistry, OperatorsListEntry, OperatorsListResp,
-    ServerMsg, WSOperatorSession, WsOperatorWiring,
+    RunTraceSlot, ServerMsg, WSOperatorSession, WsOperatorWiring,
 };
 pub use projection::{McpQueryAdapter, ProjectionSource, StepList, StepPathQuery, StepSummary};
 pub use tasks::{
     RunAcquireRequest, RunAcquireResponse, RunBindingDifference, RunBindingExplainEntry,
     RunBindingStatus, RunBindingsExplainResponse, RunKickRequest, RunKickResponse,
-    RunResumeResponse, RunStepsResponse, TaskDetailResponse,
+    RunResumeResponse, RunStepsResponse, TDiscardReport, TaskDetailResponse,
 };
 pub use worker::{
     worker_artifact, worker_prompt, worker_result, ArtifactQuery, DegradationBody, PromptQuery,
@@ -187,6 +194,28 @@ pub struct AppState {
     /// [`WsOperatorWiring`](crate::operator_ws::WsOperatorWiring)); an empty
     /// registry with no reader otherwise.
     pub operator_adapters: Arc<OperatorAdapterRegistry>,
+    /// Which Operator seat each in-flight dispatch went out through.
+    /// Written by every
+    /// [`AssigneeRouter`](crate::operator_ws::AssigneeRouter) as it
+    /// delegates, read here by `POST /v1/runs/:id/acquire` and
+    /// `GET /v1/runs/:id/handover`.
+    ///
+    /// The companion to [`Self::operator_adapters`], and needed for the
+    /// same reason that map is: an `OperatorId` resolves to an adapter, but
+    /// **one adapter can back several seats of one Run** (a session is
+    /// registered under its sid and under each of its roles), so "what this
+    /// operator has in flight for this Run" is not the same question as
+    /// "what this *seat* has in flight". Without this ledger a takeover on
+    /// one seat discards another seat's live work, and the un-answered list
+    /// reports each waiting request once per seat. See
+    /// [`SeatLedger`](crate::operator_ws::SeatLedger).
+    ///
+    /// Shared with the routers when the caller wired a
+    /// [`WsOperatorWiring`](crate::operator_ws::WsOperatorWiring); an empty
+    /// ledger with no writer otherwise — which is consistent, because with
+    /// no wiring nothing routes and [`Self::operator_adapters`] is empty
+    /// too, so neither reader has an adapter to ask in the first place.
+    pub seat_ledger: Arc<crate::operator_ws::SeatLedger>,
     /// Owner of the Store on the Data path (Big Response handling). Added in v9.
     /// Independent layer — the Engine core and the Domain path (`/v1/worker/result`)
     /// are not involved.
@@ -629,19 +658,39 @@ pub fn build_router_full_with_operator_session_persistence(
         Some(s) => s,
         None => Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
     };
+    // R7 needs the routers to reach the trace rail, and this is the only
+    // place that knows WHICH rail: `run_trace_store` was resolved just
+    // above, and it is the store `GET /v1/runs/:id/trace` reads back
+    // from. Handing the routers any other one would write their A7
+    // releases where nothing looks (see `RunTraceSlot`), so the binding
+    // is made here rather than at `WsOperatorWiring::new`, which runs at
+    // boot before this choice exists.
+    if let Some(wiring) = &ws_operator {
+        wiring.attach_trace_store(run_trace_store.clone());
+    }
     // The registry every `AssigneeRouter` resolves a seat's holder through,
     // and the one the login path registers sessions into — the same value
     // when the caller wired one (`WsOperatorWiring` ties the two together),
     // and an empty one otherwise: with no factory wired nothing routes, so
     // the registrations below simply have no reader.
-    let operator_adapters = ws_operator
-        .map(|w| w.adapters)
-        .unwrap_or_else(|| Arc::new(OperatorAdapterRegistry::new()));
+    //
+    // The seat ledger travels with it, for the same reason and out of the
+    // same value: the routers write it and this state's two readers
+    // (`run_acquire`, `run_handover`) read it, and a pair that did not
+    // match would silently make every dispatch look seatless.
+    let (operator_adapters, seat_ledger) = match ws_operator {
+        Some(wiring) => (wiring.adapters, wiring.seats),
+        None => (
+            Arc::new(OperatorAdapterRegistry::new()),
+            Arc::new(crate::operator_ws::SeatLedger::new()),
+        ),
+    };
     let state = AppState {
         engine,
         sessions: Arc::new(Mutex::new(SessionStore::default())),
         task_app,
         operator_adapters,
+        seat_ledger,
         data_store,
         operator_sessions,
         roles_to_sid,
@@ -692,6 +741,21 @@ pub fn build_router_full_with_operator_session_persistence(
         // deliberately the only one: `Vacant` is reached by A7 / O8 / a
         // competing acquire, never by asking. See `tasks::run_acquire`.
         .route("/v1/runs/:id/acquire", post(tasks::run_acquire))
+        // Who holds each of the Run's Operator seats, and which seats
+        // nobody holds (model §4.3). Bearer-gated (D3) where the acquire
+        // above deliberately is not (B2/B3): taking a seat needs no token,
+        // reading who is on it does. See `handover::run_assignees`.
+        .route("/v1/runs/:id/assignees", get(handover::run_assignees))
+        // W5's four axes in one read: the holder list and the un-answered
+        // Step list inline (they are joined, so they must come from one
+        // `RunRecord` read), the trace by reference, and per un-answered
+        // step whether its attempt already has a `Final`. Bearer-gated
+        // (D3/W5). See `handover::run_handover`.
+        .route("/v1/runs/:id/handover", get(handover::run_handover))
+        // The material for one step, under an Assignee's bearer — the
+        // sibling of `GET /v1/worker/prompt`, whose worker CapToken gate
+        // is deliberately left alone. See `handover::run_step_material`.
+        .route("/v1/runs/:id/material", get(handover::run_step_material))
         // Resume an Interrupted Run under the SAME run_id (replay cursor +
         // stored launch-input snapshot); see `tasks::run_resume`.
         .route("/v1/runs/:id/resume", post(tasks::run_resume))
@@ -701,8 +765,11 @@ pub fn build_router_full_with_operator_session_persistence(
         .route("/v1/runs/:id/rerun-from", post(tasks::run_rerun_from))
         // REST-like Operator login flow (Bearer-mandatory, roles exclusivity).
         // Sole WS Operator session route; see `operator_ws::login` module doc.
-        // GH #81 Layer 2: `GET /v1/operators` (list, read-only observability
-        // — no Bearer, same trust tier as `GET /v1/status`) and
+        // `GET /v1/operators` is the 記名 list (model §4.2) and is
+        // **Bearer-gated** (D3) — a breaking change from its GH #81 Layer 2
+        // shape, which was unauthenticated on the `GET /v1/status` trust
+        // tier. Any live session's token opens it; join itself stays
+        // unguarded so an incoming Assignee can always get in.
         // `DELETE /v1/operators/by-role/:role` (stale-session recovery
         // without knowing the sid — same trust tier as
         // `mlua_swarm_server_shutdown`) close the pre-#81 recovery gap
@@ -1557,7 +1624,7 @@ async fn run_flow_form(
     // resolves its destination from, and a handover moves it without this
     // launch record changing.
     if let Some((slot, op, desc)) = &launch_assign {
-        tasks::assign_launch_operator(state, &run_id, slot, op, desc).await?;
+        tasks::assign_launch_operator(state, &run_id, &task_id, slot, op, desc).await?;
     }
     // And every other declared seat that already has a holder registered
     // under its own name — the unpinned launch's route to an operator, and
@@ -1568,6 +1635,7 @@ async fn run_flow_form(
     tasks::seat_declared_operators(
         state,
         &run_id,
+        &task_id,
         resolved_bp
             .as_ref()
             .map(|bp| bp.operators.as_slice())
@@ -2301,6 +2369,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(SessionStore::default())),
             task_app: Arc::new(mlua_swarm::TaskApplication::new_inline_only(launch)),
             operator_adapters: Arc::new(crate::operator_ws::OperatorAdapterRegistry::new()),
+            seat_ledger: Arc::new(crate::operator_ws::SeatLedger::new()),
             data_store: Arc::new(mlua_swarm::store::output::InMemoryOutputStore::new()),
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),

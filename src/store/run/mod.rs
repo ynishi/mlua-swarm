@@ -361,7 +361,19 @@ pub struct RunRecord {
     /// processes. Additive with `#[serde(default)]` so rows serialized
     /// before the assignment axis existed decode unchanged (as an empty
     /// map = every slot Vacant).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    ///
+    /// # An empty map is written out, not skipped
+    ///
+    /// This field used to carry `skip_serializing_if =
+    /// "BTreeMap::is_empty"`, so a Run holding nothing had no `current`
+    /// key on the wire at all. That made "nobody holds anything on this
+    /// Run" and "this response does not report holders" the same bytes,
+    /// and §4.3 asks for the opposite (*居なければ居ないと分かる* — when
+    /// nobody is there, it must be possible to tell that nobody is there).
+    /// `"current": {}` says it. The per-seat form of the same answer, which
+    /// also names the seats nobody holds, is
+    /// [`crate::handover::run_assignees`].
+    #[serde(default)]
     pub current: BTreeMap<String, Assignee>,
     /// The Run's generation counter — the model's `G` (**A4**).
     ///

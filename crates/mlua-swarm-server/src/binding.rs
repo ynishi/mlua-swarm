@@ -250,6 +250,9 @@ mod tests {
                 roles: vec![role("main-ai")],
                 capability_manifest: manifest,
                 joined_at_secs: 0,
+                desc: None,
+                observed: Vec::new(),
+                observed_total: 0,
             },
             None,
         );
@@ -353,6 +356,9 @@ mod tests {
                 roles: vec![role("main-ai")],
                 capability_manifest: None,
                 joined_at_secs: 0,
+                desc: None,
+                observed: Vec::new(),
+                observed_total: 0,
             },
             None,
         );
@@ -363,6 +369,9 @@ mod tests {
                 roles: Vec::new(),
                 capability_manifest: Some(manifest),
                 joined_at_secs: 0,
+                desc: None,
+                observed: Vec::new(),
+                observed_total: 0,
             },
             None,
         );

@@ -7,9 +7,10 @@
 //! 1. `POST /v1/operators` with a role already held returns 409, and the
 //!    body carries the additive `conflicts_detail: [{role, sid}]` array
 //!    identifying the holding session (Layer 2 (a)).
-//! 2. `GET /v1/operators` enumerates every live session's
-//!    `{sid, roles, joined_at_secs, connected}` without requiring a
-//!    Bearer (Layer 2 (b)).
+//! 2. `GET /v1/operators` enumerates every live session's identity and
+//!    its 記名 (model §4.2), and is **Bearer-gated** (**D3**) — a
+//!    breaking change from the Layer 2 (b) shape, which answered
+//!    anonymously. Any live session's token opens it (**W5**).
 //! 3. `DELETE /v1/operators/by-role/:role` releases the stale role
 //!    holder without knowing the sid or its Bearer, and a subsequent
 //!    `POST /v1/operators` with the same role succeeds (Layer 2 (c)).
@@ -85,10 +86,22 @@ async fn spawn_server() -> ServerHandle {
 }
 
 async fn mint(client: &reqwest::Client, base_url: &str, role: &str) -> serde_json::Value {
+    mint_with_desc(client, base_url, role, None).await
+}
+
+/// Mint carrying the 記名's confirmed part (**D1**). `None` exercises the
+/// join that writes none — which the server accepts, and the list reports
+/// as `desc: null`.
+async fn mint_with_desc(
+    client: &reqwest::Client,
+    base_url: &str,
+    role: &str,
+    desc: Option<&str>,
+) -> serde_json::Value {
     // convention-token-ok: role names are mlua-swarm public operator role literals.
     let resp = client
         .post(format!("{base_url}/v1/operators"))
-        .json(&json!({ "roles": [role] }))
+        .json(&json!({ "roles": [role], "desc": desc }))
         .send()
         .await
         .expect("mint request");
@@ -134,19 +147,52 @@ async fn conflict_body_names_the_holding_session_id() {
     server.shutdown();
 }
 
+/// The 記名 list, and the breaking change that came with it: this route
+/// used to answer anyone (GH #81 Layer 2 (b), `GET /v1/status` trust
+/// tier). **D3** gates it, and any live session's token opens it.
 #[tokio::test]
-async fn list_route_enumerates_live_sessions_without_bearer() {
+async fn list_route_enumerates_live_sessions_with_any_live_bearer() {
     let server = spawn_server().await;
     let client = reqwest::Client::new();
 
     // convention-token-ok: mlua-swarm public operator role literals.
-    let a = mint(&client, &server.base_url, "main-ai").await;
+    let a = mint_with_desc(
+        &client,
+        &server.base_url,
+        "main-ai",
+        Some("  rewriting the seat resolver in mlua-swarm-server  "),
+    )
+    .await;
     let b = mint(&client, &server.base_url, "auditor").await;
     let sid_a = a["sid"].as_str().unwrap().to_string();
     let sid_b = b["sid"].as_str().unwrap().to_string();
+    let token_b = b["token"].as_str().unwrap().to_string();
 
+    // D3: no Bearer is a 401 now, where it used to be the whole answer.
+    let anonymous = client
+        .get(format!("{}/v1/operators", server.base_url))
+        .send()
+        .await
+        .expect("anonymous list request");
+    assert_eq!(
+        anonymous.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "D3: the 記名 list is Bearer-gated"
+    );
+
+    // A token no live session answers to is a 401 as well.
+    let wrong = client
+        .get(format!("{}/v1/operators", server.base_url))
+        .bearer_auth("not-a-minted-token")
+        .send()
+        .await
+        .expect("bad-token list request");
+    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // W5: the reader is any Assignee — B's token reads A's entry.
     let list = client
         .get(format!("{}/v1/operators", server.base_url))
+        .bearer_auth(&token_b)
         .send()
         .await
         .expect("list request");
@@ -156,6 +202,11 @@ async fn list_route_enumerates_live_sessions_without_bearer() {
         .as_array()
         .expect("operators must be an array");
     assert_eq!(ops.len(), 2);
+    assert_eq!(body["total"], 2);
+    assert!(
+        body["limit"].as_u64().is_some(),
+        "D5: the list reports the count limit it applied"
+    );
     let sids: Vec<&str> = ops.iter().map(|e| e["sid"].as_str().unwrap()).collect();
     assert!(sids.contains(&sid_a.as_str()));
     assert!(sids.contains(&sid_b.as_str()));
@@ -164,9 +215,34 @@ async fn list_route_enumerates_live_sessions_without_bearer() {
         assert!(entry["roles"].is_array());
         assert!(entry["joined_at_secs"].as_u64().is_some());
         assert!(entry["connected"].as_bool().is_some());
+        assert!(entry["last_activity_secs"].as_u64().is_some());
+        assert!(entry["observed"].is_array());
+        assert_eq!(entry["observed_total"], 0, "nothing assigned yet");
+        // D1's absence is a value, not a missing key.
+        assert!(
+            entry.get("desc").is_some(),
+            "the desc key is always present: {entry}"
+        );
         // Bearer secrets must never surface on the list route.
         assert!(entry.get("token").is_none());
     }
+
+    let entry_a = ops
+        .iter()
+        .find(|e| e["sid"] == sid_a.as_str())
+        .expect("A's entry");
+    assert_eq!(
+        entry_a["desc"], "rewriting the seat resolver in mlua-swarm-server",
+        "D1: the join-time description is kept, trimmed"
+    );
+    let entry_b = ops
+        .iter()
+        .find(|e| e["sid"] == sid_b.as_str())
+        .expect("B's entry");
+    assert!(
+        entry_b["desc"].is_null(),
+        "a session that wrote nothing reports null rather than dropping the key"
+    );
 
     server.shutdown();
 }
@@ -442,6 +518,9 @@ async fn seed_persisted_session(store: &FaultyDeleteStore, role: &str) -> Sessio
             ],
             capability_manifest: None,
             joined_at_secs: 0,
+            desc: None,
+            observed: Vec::new(),
+            observed_total: 0,
         })
         .await
         .expect("seed the persisted row");
