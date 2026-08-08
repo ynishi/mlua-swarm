@@ -684,15 +684,42 @@ impl Engine {
     // Token verify (= sig + expire + gate + uses_left)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Four steps: (1) signature verify, (2) expiry check, (3) role × verb
-    /// gate, (4) `uses_left` consume.
+    /// Four steps: (1) signature verify, (2) expiry check — **skipped for
+    /// `Role::Operator`**, (3) role × verb gate, (4) `uses_left` consume.
+    ///
+    /// # Why step (2) is role-conditional
+    ///
+    /// An Operator session token stays inside the process. [`Self::attach`] /
+    /// [`Self::attach_with_ids`] mint it and the server holds it for exactly
+    /// as long as the attach lives; unlike a Worker token it is never
+    /// serialized out to a spawned SubAgent, and it is never rendered as an
+    /// `Authorization: Bearer <CapToken::encode()>` header. (The HTTP
+    /// `/v1/sessions` route hands the caller only the opaque session id,
+    /// which the server resolves back to the token it kept.) A TTL on it
+    /// therefore bounds no capability that a spawned worker could be
+    /// holding; its only observable effect is to reject the *next*
+    /// legitimate `start_task` / `dispatch_attempt` as soon as one step
+    /// outlives the attach TTL. That is a misfire, not a defence, so
+    /// `Role::Operator` skips the expiry check entirely.
+    ///
+    /// Every other role keeps it. A Worker token goes out over the wire to a
+    /// subprocess or a remote SubAgent, where the bearer can outlive the step
+    /// it was minted for, and the TTL is the only bound on a leaked one; the
+    /// same reasoning is applied conservatively to `Senior` / `Observer`,
+    /// which are not proven to stay in-process. Those roles still fail with
+    /// [`EngineError::TokenExpired`].
+    ///
+    /// [`CapToken::expire_at`] and the signed payload are unchanged — an
+    /// Operator token still carries an `expire_at`, it just no longer gates
+    /// verification.
     pub async fn verify_token(&self, token: &CapToken, verb: Verb) -> Result<(), EngineError> {
         // (1) sig
         if !self.inner.signer.verify_sig(token) {
             return Err(EngineError::BadSignature);
         }
-        // (2) expire
-        if token.is_expired(now_unix()) {
+        // (2) expire — Operator is exempt (in-process-only token, nothing to
+        // guard); Worker / Senior / Observer keep the check. See the fn doc.
+        if token.role != Role::Operator && token.is_expired(now_unix()) {
             return Err(EngineError::TokenExpired);
         }
         // (3) role × verb gate
@@ -1042,6 +1069,12 @@ impl Engine {
 
     /// Attach a new session with default `OperatorInfo` (`Automate`, no
     /// bridges/hooks). Shorthand for `attach_with(.., OperatorInfo::default())`.
+    ///
+    /// `ttl` is still stamped onto the minted token's
+    /// [`CapToken::expire_at`], but for `Role::Operator` it **no longer
+    /// gates verification** — [`Self::verify_token`] skips the expiry check
+    /// for that role, so an Operator session keeps working past `ttl`. Pass
+    /// a non-Operator `role` and the TTL is enforced as before.
     pub async fn attach(
         &self,
         operator_id: impl Into<String>,
@@ -1155,6 +1188,14 @@ impl Engine {
     /// outranks the BP-level tiers; `None` leaves it unspecified so the
     /// BP-level tiers / final default decide. See
     /// `crate::core::ctx::collapse_operator_kind`.
+    ///
+    /// `ttl` is still stamped onto the minted token's
+    /// [`CapToken::expire_at`], but for `Role::Operator` it **no longer
+    /// gates verification** — [`Self::verify_token`] skips the expiry check
+    /// for that role, so a long step can no longer make the next
+    /// `start_task` / `dispatch_attempt` fail with
+    /// [`EngineError::TokenExpired`]. Pass a non-Operator `role` and the TTL
+    /// is enforced as before.
     #[allow(clippy::too_many_arguments)]
     pub async fn attach_with_ids(
         &self,
@@ -1285,6 +1326,11 @@ impl Engine {
     /// Handy for tests and short-lived in-process sessions. Production
     /// WebSocket callbacks and the like should prefer `attach_with_ids`
     /// as the canonical path.
+    ///
+    /// `ttl` is still stamped onto the minted token's
+    /// [`CapToken::expire_at`], but for `Role::Operator` it **no longer
+    /// gates verification** — see [`Self::verify_token`] for why the expiry
+    /// check is role-conditional.
     pub async fn attach_with(
         &self,
         operator_id: impl Into<String>,
@@ -3664,6 +3710,117 @@ mod token_fingerprint_store_tests {
             .detach(&token)
             .await
             .expect("detach finds the session by fp");
+    }
+}
+
+// ─── UT: `verify_token` step (2) is role-conditional ───────────────────────
+//
+// The expiry check guards a bearer that can outlive the step it was minted
+// for. Only the Worker token is such a bearer (it ships as
+// `Authorization: Bearer` to a subprocess / remote SubAgent); the Operator
+// session token stays in-process, so its TTL guarded nothing and merely
+// rejected the next legitimate call after a long step. These tests pin both
+// directions: if the role condition is ever dropped or inverted, one of them
+// fails.
+#[cfg(test)]
+mod verify_token_expiry_role_gate_tests {
+    use super::*;
+
+    /// `Duration::from_secs(0)` mints `expire_at == now`, and
+    /// `is_expired` is `now >= expire_at` — i.e. already expired on arrival.
+    const ALREADY_EXPIRED: Duration = Duration::from_secs(0);
+
+    /// Mint + register a `Role::Worker` token bound to a fresh task, the
+    /// same way `dispatch_attempt_with_run_ctx` does.
+    async fn register_worker_token(engine: &Engine, ttl: Duration) -> CapToken {
+        let task_id = StepId::new();
+        let token = engine.signer().session(
+            format!("worker-of-{task_id}"),
+            Role::Worker,
+            vec!["*".into()],
+            ttl,
+        );
+        let fp = token.fingerprint();
+        let record = CapTokenRecord::from_worker_token(token.clone(), task_id);
+        engine
+            .with_state("test.register_worker", move |s| {
+                s.tokens.insert(fp, record);
+            })
+            .await
+            .expect("register worker token");
+        token
+    }
+
+    /// An Operator token past its `expire_at` still verifies: the token is
+    /// process-local, so the TTL guards nothing and must not gate.
+    #[tokio::test]
+    async fn expired_operator_token_still_verifies() {
+        let engine = Engine::new(EngineCfg::default());
+        let token = engine
+            .attach("op-expired", Role::Operator, ALREADY_EXPIRED)
+            .await
+            .expect("attach");
+        assert!(
+            token.is_expired(now_unix()),
+            "test premise: the token must actually be past expire_at"
+        );
+        engine
+            .verify_token(&token, Verb::ReadTaskState)
+            .await
+            .expect("Operator tokens are exempt from the expiry check");
+    }
+
+    /// The reported symptom, end to end: a step long enough to outlive the
+    /// attach TTL must not make the next `start_task` fail.
+    #[tokio::test]
+    async fn expired_operator_token_can_still_start_a_task() {
+        let engine = Engine::new(EngineCfg::default());
+        let token = engine
+            .attach("op-expired", Role::Operator, ALREADY_EXPIRED)
+            .await
+            .expect("attach");
+        engine
+            .start_task(
+                &token,
+                TaskSpec {
+                    agent: "step-a".to_string(),
+                    initial_directive: Value::String("go".to_string()),
+                    step_ctx: None,
+                    check_policy: None,
+                },
+            )
+            .await
+            .expect("start_task must not fail with TokenExpired");
+    }
+
+    /// A Worker token past its `expire_at` is still rejected. This one does
+    /// leave the process as a Bearer, so the TTL is its only bound and stays
+    /// enforced (the TTL value itself is config-owned — see `EngineCfg`).
+    #[tokio::test]
+    async fn expired_worker_token_is_rejected() {
+        let engine = Engine::new(EngineCfg::default());
+        let token = register_worker_token(&engine, ALREADY_EXPIRED).await;
+        let err = engine
+            .verify_token(&token, Verb::FetchPrompt)
+            .await
+            .expect_err("Worker tokens keep the expiry check");
+        assert!(
+            matches!(err, EngineError::TokenExpired),
+            "expected TokenExpired, got {err:?}"
+        );
+    }
+
+    /// Control for the test above: with a live TTL the very same Worker
+    /// token and verb pass, so the rejection there is attributable to
+    /// expiry and not to the role × verb gate or the store lookup.
+    #[tokio::test]
+    async fn live_worker_token_verifies() {
+        let engine = Engine::new(EngineCfg::default());
+        let token = register_worker_token(&engine, Duration::from_secs(600)).await;
+        engine
+            .verify_token(&token, Verb::FetchPrompt)
+            .await
+            .expect("a live Worker token passes all four steps");
     }
 }
 

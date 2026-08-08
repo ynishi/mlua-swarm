@@ -78,7 +78,10 @@ so the response body is the ref form, not what you sent:
 // POST /v1/enhance-settings  ->  201
 {
   "id": "default",
-  "ttl_secs": 600,                    // operator-session TTL for the run
+  "ttl_secs": 600,                    // stamped on the run's operator session
+                                      // token; it no longer gates verification
+                                      // (Operator tokens are expiry-exempt), so
+                                      // the run's real bound is the driver ceiling
   "blueprint": { /* full Blueprint document — schema: mse://api/blueprint-schema */ },
   "verifier_axes": ["des", "canonical", "noop", "agent-ref"]  // optional; this is the default
 }
