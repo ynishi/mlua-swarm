@@ -458,7 +458,9 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
 /// `operator_sid` pin, and through its roles — from the moment the server
 /// is up, without waiting for the owning client's WS to reconnect. The
 /// restored sessions carry no sender until that connect happens: registered
-/// is not reachable, and a send before the client attaches fails loud.
+/// is not reachable — `after` is dropped before the connect, and a
+/// reply-expecting send parks until it (or until teardown), bounded only by
+/// the caller's own launch ceiling.
 pub struct OperatorSessionPersistence {
     /// Write-through target for mint / teardown.
     pub store: Arc<dyn OperatorSessionStore>,

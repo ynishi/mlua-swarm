@@ -302,8 +302,10 @@ pub async fn operators_create(
     // Registered here, at mint — the same shape the restore path uses at
     // boot (see [`restored_login_session`], which carries the
     // full "registered is not reachable" rationale). The session starts
-    // disconnected: anything sent to it before the client attaches a
-    // socket fails loud with `"ws operator disconnected"`.
+    // disconnected: `after` (`send_oneway`) is dropped until a socket
+    // attaches, while the three reply-expecting verbs (`spawn` / `ask` /
+    // `hook_before`) park on `ConnState` until the first connect swaps a
+    // sender in — see `WSOperatorSession::send_when_connected`.
     //
     // Registering at mint rather than on first WS connect is what keeps
     // the connect path out of the registries entirely. When the two were
@@ -322,6 +324,21 @@ pub async fn operators_create(
     // write-through note above), so registration sits on the same side of
     // it as the map insert below, and the failure path above stays exactly
     // as it was: release the roles, answer `500`, leave nothing behind.
+    //
+    // # The window this ordering leaves
+    //
+    // Between the registration below and the map insert after it, the sid
+    // and its roles resolve in the engine while `operator_sessions` does
+    // not yet hold the session. Both exits a parked send has —
+    // `replace_tx` (reached only via `operators_ws_connect`) and
+    // `ConnState::TornDown` (published only by `teardown_operator_session`)
+    // — look the sid up in that map first, so a dispatch landing in the
+    // window parks with neither exit reachable. It is bounded, not stuck:
+    // the park sits inside the run driver, which ends at its own
+    // `sync_timeout_secs` or detach TTL. The cost is a run that burns its
+    // full ceiling and then reports a timeout, naming the wrong cause.
+    // Reaching the window needs this request to die between the two
+    // statements (see the dropped-response-future note below).
     let live = LoginSession::new(record, state.base_url.clone());
     register_operator_session(
         &state.engine,
@@ -473,10 +490,11 @@ async fn register_operator_session(
 ///
 /// The session is created **disconnected**
 /// ([`WSOperatorSession::disconnected_with_base_url`]): it is registered,
-/// not reachable. Anything actually sent to it before the client attaches a
-/// socket fails loud with `"ws operator disconnected"`, and the client's
-/// connect is then a plain `replace_tx` in [`handle_operator_socket`] — no
-/// second registration.
+/// not reachable. A reply-expecting send issued before the client attaches
+/// a socket parks until that connect, or until a teardown publishes
+/// [`ConnState::TornDown`]; only `after` (`send_oneway`) still fails with
+/// `"ws operator disconnected"`. The client's connect is then a plain
+/// `replace_tx` in [`handle_operator_socket`] — no second registration.
 ///
 /// [`operators_create`] does the same thing at mint time, so this is the
 /// restore half of one shared shape rather than a special case.
