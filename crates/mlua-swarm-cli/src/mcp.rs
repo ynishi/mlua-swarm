@@ -2526,6 +2526,11 @@ struct OperatorJoinReq {
     /// Logical operator role alias(es), e.g. `["main-ai"]`. Checked for
     /// exclusivity server-side (`POST /v1/operators` returns 409 on
     /// conflict). Omitted/empty = no alias claimed.
+    ///
+    /// Stays `String` on the tool boundary (like the server's own request
+    /// body) so an unusable alias is reported as an invalid-params tool
+    /// error naming the problem, rather than as a schema-level decode
+    /// failure; `mse_operator_join` converts to `OperatorRef` before use.
     #[serde(default)]
     roles: Option<Vec<String>>,
     /// Effective model/tool/variant capabilities enforced by this
@@ -3060,7 +3065,18 @@ impl MseServer {
         &self,
         Parameters(req): Parameters<OperatorJoinReq>,
     ) -> Result<CallToolResult, McpError> {
-        let roles = req.roles.unwrap_or_default();
+        let roles = req
+            .roles
+            .unwrap_or_default()
+            .into_iter()
+            .map(mlua_swarm::OperatorRef::new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                McpError::invalid_params(
+                    format!("mse_operator_join: invalid role alias: {error}"),
+                    None,
+                )
+            })?;
         let (sid, roles) = self
             .op_client
             .join(roles, req.capability_manifest)

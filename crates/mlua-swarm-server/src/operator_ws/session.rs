@@ -8,6 +8,11 @@
 //! side, so a client holding answer/ack values across a disconnect can reconnect
 //! and resend them.
 //!
+//! Disconnect and teardown are separate events. Clearing `tx` says "this
+//! socket went away, a reconnect may follow"; `WSOperatorSession::close`
+//! says "this session is over" and pushes that fact out to the socket
+//! itself (see its doc).
+//!
 //! ## Reconnect-wait on the send path (issue abcb43e2)
 //!
 //! A reply-expecting send (`ask` / `hook_before` / `Operator::execute`) issued
@@ -40,6 +45,7 @@ use mlua_swarm::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use super::protocol::{current_parent_req_id, PendingReply, ServerMsg};
@@ -80,6 +86,11 @@ pub struct WSOperatorSession {
     /// `req_id` → pending oneshot. Resolved when `answer` / `hook_ack` /
     /// `spawn_ack` arrives.
     pending: Mutex<HashMap<String, oneshot::Sender<PendingReply>>>,
+    /// Server-initiated close signal for whichever socket is pumping this
+    /// session. `None` = none requested; `Some(reason)` is latched by
+    /// [`Self::close`] and never cleared — a session is torn down once.
+    /// The pump subscribes via [`Self::close_signal`].
+    close: watch::Sender<Option<Arc<str>>>,
     /// Public HTTP base URL the server is reachable at (from
     /// `AppState.base_url`, sourced from the binary at boot time).
     /// Rendered literally into the Spawn `directive`'s `base_url` line
@@ -89,15 +100,23 @@ pub struct WSOperatorSession {
 }
 
 impl WSOperatorSession {
-    /// `login.rs::handle_operator_socket` is the sole constructor call site.
-    /// Auth (Bearer token match) is checked there against `OperatorSessionEntry.token`
-    /// *before* upgrade — this struct no longer carries its own auth_token copy.
+    /// Test-only shorthand for "a session that already has a sender".
+    ///
+    /// Production has no such constructor any more: every session is born
+    /// disconnected via [`Self::disconnected_with_base_url`] — at mint
+    /// (`login::operators_create`) or at boot
+    /// (`login::restored_login_session`) — and acquires its sender
+    /// through [`Self::replace_tx`] when a socket attaches. This used to be
+    /// the first-connect constructor in `login::handle_operator_socket`;
+    /// that arm registered the session it built, which is exactly what a
+    /// connect racing a teardown must not be able to do.
     ///
     /// `base_url` is the server's public HTTP root (e.g.
     /// `"http://127.0.0.1:7777"`), threaded from `AppState.base_url`.
     /// When `Some`, it is rendered literally into Spawn directives
     /// (issue #8); `None` falls back to a `mse_doctor`-pointer
     /// placeholder.
+    #[cfg(test)]
     pub(super) fn new_with_base_url(
         sid: SessionId,
         tx: mpsc::UnboundedSender<ServerMsg>,
@@ -108,6 +127,40 @@ impl WSOperatorSession {
             tx: Mutex::new(Some(tx)),
             conn: watch::Sender::new(ConnState::Connected),
             pending: Mutex::new(HashMap::new()),
+            close: watch::Sender::new(None),
+            base_url,
+        }
+    }
+
+    /// Constructor for a session that exists with no socket behind it yet:
+    /// the boot-time restore path (`OperatorSessionPersistence::restore`),
+    /// which puts a persisted login record into the engine's three
+    /// registries before its owning client has reconnected.
+    ///
+    /// `tx: None` is the very state a live session falls into on
+    /// [`Self::clear_tx`] / [`Self::clear_tx_if`], so nothing downstream
+    /// needs a new branch: it starts [`ConnState::Disconnected`], which is
+    /// what a reply-expecting send parks on until the client's first
+    /// connect swaps a sender in (issue abcb43e2), and
+    /// [`Self::is_connected`] answers `false` meanwhile. Being registered
+    /// and being reachable stay separate facts — that first connect walks
+    /// `login::handle_operator_socket`'s existing reconnect arm and only
+    /// swaps the sender in ([`Self::replace_tx`]).
+    ///
+    /// Parking is the wanted shape here: a run pinned to a restored
+    /// session waits for its operator to come back rather than failing on
+    /// the gap between boot and reconnect. `send_oneway` (`after`) still
+    /// drops during that gap, as it does on any disconnect.
+    pub(super) fn disconnected_with_base_url(
+        sid: SessionId,
+        base_url: Option<std::sync::Arc<str>>,
+    ) -> Self {
+        Self {
+            sid,
+            tx: Mutex::new(None),
+            conn: watch::Sender::new(ConnState::Disconnected),
+            pending: Mutex::new(HashMap::new()),
+            close: watch::Sender::new(None),
             base_url,
         }
     }
@@ -167,6 +220,38 @@ impl WSOperatorSession {
         let mut current = self.tx.lock().await;
         *current = None;
         self.publish_conn(ConnState::Disconnected);
+    }
+
+    /// Ask the socket currently pumping this session to shut down, carrying
+    /// `reason` to the client.
+    ///
+    /// Clearing `tx` is not enough to end a connection: the pump
+    /// (`login::handle_operator_socket`) holds its own clone of the sender,
+    /// so the mpsc channel — and with it the write task and the socket —
+    /// stays alive even after the session has let go. A client torn down by
+    /// a third party (`DELETE /v1/operators/by-role/:role`) was left holding
+    /// a socket nothing would ever speak on again, with no error to notice:
+    /// its session was already out of `operator_sessions`, so no frame could
+    /// be routed to it and no reconnect could find it.
+    ///
+    /// Latching this signal is what the pump watches; it answers by sending
+    /// a **WS Close frame** (a standard disconnect every client already
+    /// understands — no new `ServerMsg` variant, so the wire shape is
+    /// unchanged) and ending both of its tasks.
+    ///
+    /// Called on **teardown** only. A plain disconnect must not fire it:
+    /// the two are separate events, and a reconnect is legitimate after the
+    /// second but impossible after the first.
+    pub(crate) fn close(&self, reason: &str) {
+        self.close.send_replace(Some(Arc::from(reason)));
+    }
+
+    /// Subscribe to [`Self::close`]. Because the signal is latched rather
+    /// than edge-triggered, a subscriber that arrives *after* the teardown
+    /// still observes it (see `login::close_requested`) — which is what a
+    /// socket that connected while its session was being torn down needs.
+    pub(super) fn close_signal(&self) -> watch::Receiver<Option<Arc<str>>> {
+        self.close.subscribe()
     }
 
     /// Drains every in-flight `pending` entry, dropping its oneshot

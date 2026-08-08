@@ -433,9 +433,9 @@ impl OperatorClientState {
     /// returned to the caller. Returns `(sid, roles)`.
     pub async fn join(
         &self,
-        roles: Vec<String>,
+        roles: Vec<mlua_swarm::OperatorRef>,
         capability_manifest: Option<mlua_swarm::AgentProviderManifest>,
-    ) -> Result<(String, Vec<String>), ClientError> {
+    ) -> Result<(String, Vec<mlua_swarm::OperatorRef>), ClientError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -470,11 +470,16 @@ impl OperatorClientState {
                 ClientError::Http("missing token in POST /v1/operators response".into())
             })?
             .to_string();
-        let resolved_roles: Vec<String> = body["roles"]
+        // The server echoes the roles it granted. Anything that is not a
+        // usable role is dropped rather than carried back to the caller —
+        // the same `filter_map` tolerance this had when the elements were
+        // untyped strings.
+        let resolved_roles: Vec<mlua_swarm::OperatorRef> = body["roles"]
             .as_array()
             .map(|a| {
                 a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|v| mlua_swarm::OperatorRef::new(v).ok())
                     .collect()
             })
             .unwrap_or_default();
@@ -917,6 +922,11 @@ fn http_to_ws_base(http_base: &str) -> String {
 mod tests {
     use super::*;
 
+    /// convention-token-ok: mlua-swarm public operator role literal.
+    fn role(name: &str) -> mlua_swarm::OperatorRef {
+        mlua_swarm::OperatorRef::new(name).expect("test role literal is never empty")
+    }
+
     // ─── parse_server_frame ──────────────────────────────────────────────
 
     #[test]
@@ -1268,7 +1278,7 @@ mod tests {
 
         let state = OperatorClientState::with_http_base(base);
         let error = state
-            .join(vec!["main-ai".to_string()], None)
+            .join(vec![role("main-ai")], None)
             .await
             .expect_err("missing WS route must fail the upgrade");
 
@@ -1468,10 +1478,7 @@ mod tests {
     async fn pending_wait_reconnects_when_the_reader_task_has_finished() {
         let stub = StubServer::start(vec![WsBehavior::CloseImmediately, WsBehavior::Hold]).await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state
-            .join(vec!["main-ai".to_string()], None)
-            .await
-            .expect("join");
+        let (sid, _) = state.join(vec![role("main-ai")], None).await.expect("join");
         await_reader_finished(&state, &sid).await;
 
         let frame = state
@@ -1501,10 +1508,7 @@ mod tests {
     async fn reconnect_declines_without_a_ws_attempt_when_healthz_is_down() {
         let stub = StubServer::start(vec![WsBehavior::CloseImmediately]).await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state
-            .join(vec!["main-ai".to_string()], None)
-            .await
-            .expect("join");
+        let (sid, _) = state.join(vec![role("main-ai")], None).await.expect("join");
         await_reader_finished(&state, &sid).await;
         stub.set_healthy(false);
 
@@ -1540,10 +1544,7 @@ mod tests {
         ])
         .await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state
-            .join(vec!["main-ai".to_string()], None)
-            .await
-            .expect("join");
+        let (sid, _) = state.join(vec![role("main-ai")], None).await.expect("join");
         await_reader_finished(&state, &sid).await;
         let entry = state.get_entry(&sid).await.expect("session kept");
         assert_eq!(
@@ -1575,10 +1576,7 @@ mod tests {
         ])
         .await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state
-            .join(vec!["main-ai".to_string()], None)
-            .await
-            .expect("join");
+        let (sid, _) = state.join(vec![role("main-ai")], None).await.expect("join");
         await_reader_finished(&state, &sid).await;
         let entry = state.get_entry(&sid).await.expect("session kept");
 

@@ -110,8 +110,8 @@ pub mod session;
 
 pub use login::{
     operators_create, operators_delete, operators_delete_by_role, operators_info, operators_list,
-    operators_ws_connect, OperatorSessionEntry, OperatorsCreateReq, OperatorsCreateResp,
-    OperatorsInfoResp, OperatorsListEntry, OperatorsListResp,
+    operators_ws_connect, LoginSession, OperatorsCreateReq, OperatorsCreateResp, OperatorsInfoResp,
+    OperatorsListEntry, OperatorsListResp,
 };
 pub use protocol::{ClientMsg, ServerMsg};
 pub use session::WSOperatorSession;

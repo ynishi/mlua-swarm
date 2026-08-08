@@ -31,7 +31,9 @@
 //! );
 //! ```
 
-use super::{OperatorSessionRecord, OperatorSessionStore, OperatorSessionStoreError, SessionId};
+use super::{
+    OperatorRef, OperatorSessionRecord, OperatorSessionStore, OperatorSessionStoreError, SessionId,
+};
 use crate::AgentProviderManifest;
 use async_trait::async_trait;
 use rusqlite::params;
@@ -158,16 +160,44 @@ type SessionRow = (String, String, String, Option<String>, i64);
 const SESSION_SELECT_COLUMNS: &str =
     "sid, token_digest, roles_json, capability_manifest_json, joined_at_secs";
 
-fn row_to_record(row: SessionRow) -> Result<OperatorSessionRecord, OperatorSessionStoreError> {
-    let (sid, token_digest, roles_json, capability_manifest_json, joined_at_secs) = row;
-    let sid = SessionId::parse(sid)
-        .map_err(|e| OperatorSessionStoreError::Other(format!("decode sid: {e}")))?;
-    let roles: Vec<String> = serde_json::from_str(&roles_json)
-        .map_err(|e| OperatorSessionStoreError::Other(format!("decode roles: {e}")))?;
+/// Why one `operator_sessions` row could not be turned into an
+/// [`OperatorSessionRecord`].
+///
+/// Deliberately *not* an [`OperatorSessionStoreError`]: a bad row is not a
+/// store failure, and conflating the two is what let a single row abort
+/// [`OperatorSessionStore::list`] (and with it the boot that calls it).
+/// This type exists so `list` can report the row and carry on.
+struct RowDecodeError {
+    /// The row's `sid` column verbatim — the only handle on a row whose sid
+    /// is itself what failed to decode, so it is kept as the raw string.
+    raw_sid: String,
+    /// Which column's decode failed: `sid`, `roles`, or
+    /// `capability_manifest`.
+    column: &'static str,
+    /// The decoder's own message.
+    detail: String,
+}
+
+fn row_to_record(row: SessionRow) -> Result<OperatorSessionRecord, RowDecodeError> {
+    let (raw_sid, token_digest, roles_json, capability_manifest_json, joined_at_secs) = row;
+    // All three decodes below fail the same way and get the same treatment.
+    // `roles` is the one an older build is known to have poisoned, but the
+    // sid and the manifest are no more trustworthy for having been quiet so
+    // far — special-casing `roles` would just move the boot-stopper.
+    let fail = |column: &'static str, detail: String| RowDecodeError {
+        raw_sid: raw_sid.clone(),
+        column,
+        detail,
+    };
+    let sid = SessionId::parse(raw_sid.clone()).map_err(|e| fail("sid", e.to_string()))?;
+    // The stored JSON is (and stays) an array of plain strings; the element
+    // type only decides what the decode validates on the way back in.
+    let roles: Vec<OperatorRef> =
+        serde_json::from_str(&roles_json).map_err(|e| fail("roles", e.to_string()))?;
     let capability_manifest: Option<AgentProviderManifest> = match capability_manifest_json {
-        Some(text) => Some(serde_json::from_str(&text).map_err(|e| {
-            OperatorSessionStoreError::Other(format!("decode capability_manifest: {e}"))
-        })?),
+        Some(text) => Some(
+            serde_json::from_str(&text).map_err(|e| fail("capability_manifest", e.to_string()))?,
+        ),
         None => None,
     };
     Ok(OperatorSessionRecord {
@@ -267,7 +297,31 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
             })
             .await
             .map_err(map_isle_err)?;
-        rows.into_iter().map(row_to_record).collect()
+        // Per row, not all-or-nothing — see `OperatorSessionStore::list`'s
+        // contract. The returned `Err` above is a backend failure; a row
+        // that will not decode is reported and dropped here instead of
+        // being promoted into one.
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| match row_to_record(row) {
+                Ok(record) => Some(record),
+                Err(RowDecodeError {
+                    raw_sid,
+                    column,
+                    detail,
+                }) => {
+                    tracing::warn!(
+                        row_sid = %raw_sid,
+                        column,
+                        detail = %detail,
+                        "operator session store: skipping a row that will not decode; \
+                         this session is gone and its owner must re-login, but the \
+                         remaining sessions are restored"
+                    );
+                    None
+                }
+            })
+            .collect())
     }
 }
 
@@ -279,11 +333,16 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
 mod tests {
     use super::*;
 
+    /// convention-token-ok: mlua-swarm public operator role literal.
+    fn role(name: &str) -> OperatorRef {
+        OperatorRef::new(name).expect("test role literal is never empty")
+    }
+
     fn mk(sid: &str, joined_at_secs: u64) -> OperatorSessionRecord {
         OperatorSessionRecord {
             sid: SessionId::parse(sid).unwrap(),
             token_digest: OperatorSessionRecord::digest_of(&format!("bearer-{sid}")),
-            roles: vec!["main-ai".into()],
+            roles: vec![role("main-ai")],
             capability_manifest: None,
             joined_at_secs,
         }
@@ -372,7 +431,7 @@ mod tests {
             list[0].verify_bearer("bearer-S-keep"),
             "the restored digest must still verify the original bearer"
         );
-        assert_eq!(list[0].roles, vec!["main-ai".to_string()]);
+        assert_eq!(list[0].roles, vec![role("main-ai")]);
         drop(s);
         driver.shutdown().await.unwrap();
     }
@@ -442,6 +501,195 @@ mod tests {
         assert_eq!(s.list().await.unwrap().len(), 1);
         drop(s);
         driver.shutdown().await.unwrap();
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Per-row fault tolerance
+    //
+    // Every row below is written straight through `rusqlite`, bypassing
+    // `put`'s typed encode. That is not a shortcut: `put` takes an
+    // `OperatorSessionRecord`, whose fields are already `SessionId` /
+    // `Vec<OperatorRef>` / `AgentProviderManifest`, so it *cannot* produce
+    // any of these shapes. An older build could, and did — `roles: [""]`
+    // was persistable before the `OperatorRef` typing landed.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// A shared buffer a `tracing` subscriber can write into, so a test can
+    /// assert on the warn a skipped row emits.
+    #[derive(Clone, Default)]
+    struct CaptureBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CaptureBuf {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CaptureBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Seed one row directly into the table, bypassing the typed encode.
+    fn insert_raw_row(
+        path: &Path,
+        sid: &str,
+        roles_json: &str,
+        capability_manifest_json: Option<&str>,
+        joined_at_secs: i64,
+    ) {
+        let conn = rusqlite::Connection::open(path).expect("open db for the raw seed");
+        conn.execute(
+            "INSERT OR REPLACE INTO operator_sessions \
+             (sid, token_digest, roles_json, capability_manifest_json, joined_at_secs) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                sid,
+                OperatorSessionRecord::digest_of(&format!("bearer-{sid}")),
+                roles_json,
+                capability_manifest_json,
+                joined_at_secs
+            ],
+        )
+        .expect("seed the raw row");
+    }
+
+    /// Create the store file with one healthy row, so the poisoned row a
+    /// caller adds afterwards has an intact sibling to be measured against.
+    async fn seed_healthy(path: &Path) {
+        let (s, driver) = SqliteOperatorSessionStore::open(path).await.unwrap();
+        s.put(mk("S-healthy", 1)).await.unwrap();
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// Reopen the store and `list()` it with a warn-capturing subscriber
+    /// installed. Returns the decoded rows and everything logged.
+    ///
+    /// `#[tokio::test]` runs on a current-thread runtime, so the future is
+    /// polled on this thread throughout and the thread-local subscriber
+    /// covers the whole call.
+    async fn list_capturing_warnings(path: &Path) -> (Vec<OperatorSessionRecord>, String) {
+        let buf = CaptureBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let (s, driver) = SqliteOperatorSessionStore::open(path).await.unwrap();
+        let list = s
+            .list()
+            .await
+            .expect("one undecodable row must not fail the whole list");
+        drop(s);
+        driver.shutdown().await.unwrap();
+
+        drop(guard);
+        (list, buf.contents())
+    }
+
+    fn assert_only_healthy_survived(list: &[OperatorSessionRecord]) {
+        let sids: Vec<_> = list.iter().map(|r| r.sid.to_string()).collect();
+        assert_eq!(
+            sids,
+            vec!["S-healthy"],
+            "the intact row must survive and the poisoned one must not be returned"
+        );
+    }
+
+    /// (a) An empty role alias — the shape an older build could persist via
+    /// `POST /v1/operators {"roles":[""]}`, before `roles` decoded into
+    /// `Vec<OperatorRef>`. This is the combination that actually exists in
+    /// the wild, so it is the one that must not take the boot down with it.
+    #[tokio::test]
+    async fn empty_role_row_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operator_session.db");
+        seed_healthy(&path).await;
+        insert_raw_row(&path, "S-empty-role", r#"[""]"#, None, 2);
+
+        let (list, logged) = list_capturing_warnings(&path).await;
+        assert_only_healthy_survived(&list);
+        assert!(
+            logged.contains("S-empty-role") && logged.contains(r#"column="roles""#),
+            "the warn must name the row and the column that failed: {logged}"
+        );
+    }
+
+    /// (b) A sid that is not `S-`-shaped. Decoded with the same regime as
+    /// the other two — the sid is not special-cased just because it is the
+    /// key.
+    #[tokio::test]
+    async fn undecodable_sid_row_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operator_session.db");
+        seed_healthy(&path).await;
+        insert_raw_row(&path, "op-legacy-uuid", r#"["main-ai"]"#, None, 2);
+
+        let (list, logged) = list_capturing_warnings(&path).await;
+        assert_only_healthy_survived(&list);
+        assert!(
+            logged.contains("op-legacy-uuid") && logged.contains(r#"column="sid""#),
+            "the warn must name the row and the column that failed: {logged}"
+        );
+    }
+
+    /// (c) A capability manifest that is not valid JSON for the manifest
+    /// type. Same regime again.
+    #[tokio::test]
+    async fn undecodable_capability_manifest_row_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operator_session.db");
+        seed_healthy(&path).await;
+        insert_raw_row(
+            &path,
+            "S-bad-manifest",
+            r#"["main-ai"]"#,
+            Some(r#"{"provider_id": 42}"#),
+            2,
+        );
+
+        let (list, logged) = list_capturing_warnings(&path).await;
+        assert_only_healthy_survived(&list);
+        assert!(
+            logged.contains("S-bad-manifest") && logged.contains(r#"column="capability_manifest""#),
+            "the warn must name the row and the column that failed: {logged}"
+        );
+    }
+
+    /// Every undecodable row is dropped, not just the first one, and a file
+    /// where *all* rows are poisoned lists empty rather than erroring.
+    #[tokio::test]
+    async fn several_poisoned_rows_are_all_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operator_session.db");
+        seed_healthy(&path).await;
+        insert_raw_row(&path, "S-empty-role", r#"[""]"#, None, 2);
+        insert_raw_row(&path, "op-legacy-uuid", r#"["main-ai"]"#, None, 3);
+        insert_raw_row(
+            &path,
+            "S-bad-manifest",
+            r#"["main-ai"]"#,
+            Some(r#"{"provider_id": 42}"#),
+            4,
+        );
+
+        let (list, _logged) = list_capturing_warnings(&path).await;
+        assert_only_healthy_survived(&list);
     }
 
     /// On unix the file is owner-only (`0600`) — the umask default would

@@ -1452,9 +1452,13 @@ pub struct BindRequest {
     /// Runner backend family Core resolved for this agent.
     pub backend: BindingBackend,
     /// Provider-specific routing key. For Operator-backed runners this is
-    /// the logical `operator_ref`, never a runtime session id.
+    /// the logical `operator_ref`, never a runtime session id — which is
+    /// why it is typed [`OperatorRef`] rather than a bare string. The
+    /// `schemars(with)` keeps the generated JSON Schema a plain optional
+    /// string, matching the wire form the newtype serializes to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding_target: Option<String>,
+    #[schemars(with = "Option<String>")]
+    pub binding_target: Option<OperatorRef>,
     /// Requested model name or tier from [`AgentProfile::model`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
@@ -1806,6 +1810,111 @@ pub enum OperatorKind {
     Composite,
 }
 
+/// Logical Operator role handle — the one type behind the three names the
+/// same concept used to carry: a Blueprint's `AgentDef.spec.operator_ref`,
+/// a [`BindRequest::binding_target`], and the `roles` a
+/// `POST /v1/operators` login mints.
+///
+/// # Why a newtype and not `String`
+///
+/// Those three sites name one thing: "which Operator is meant", written by
+/// the Blueprint author and claimed at login. Spelling it `String`
+/// everywhere let it be swapped at a call site with the several other
+/// strings that travel alongside it — an agent name, a session id, a
+/// launch variant — none of which the compiler could tell apart.
+///
+/// Deliberately **not** built from the `id_newtype!` macro: that shape
+/// mints `<PREFIX>-<hex>` values and validates the prefix, which fits a
+/// server-minted id like [`BindingDigest`]'s siblings. An `OperatorRef` is
+/// authored, not minted (`main-ai`, `phase_a_op`), so it carries no prefix
+/// and no generated form.
+///
+/// # The only rule is "not empty"
+///
+/// No naming convention is imposed — every name an existing Blueprint
+/// already uses stays valid. An empty ref is rejected because it can only
+/// be a mistake: nothing can hold the role `""`, so it names no Operator
+/// and would fail later, further from the author who wrote it.
+///
+/// The wire form is unchanged: a plain string in both directions
+/// (`#[serde(try_from = "String")]` over a newtype, so serialization is the
+/// inner string verbatim and deserialization runs the emptiness check at
+/// the boundary).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct OperatorRef(String);
+
+impl OperatorRef {
+    /// Build a ref from an authored name, rejecting only the empty string.
+    pub fn new(name: impl Into<String>) -> Result<Self, EmptyOperatorRef> {
+        let name = name.into();
+        if name.is_empty() {
+            Err(EmptyOperatorRef)
+        } else {
+            Ok(Self(name))
+        }
+    }
+
+    /// View the ref as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the ref and return the inner string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for OperatorRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for OperatorRef {
+    type Error = EmptyOperatorRef;
+    fn try_from(name: String) -> Result<Self, EmptyOperatorRef> {
+        Self::new(name)
+    }
+}
+
+impl std::str::FromStr for OperatorRef {
+    type Err = EmptyOperatorRef;
+    fn from_str(name: &str) -> Result<Self, EmptyOperatorRef> {
+        Self::new(name)
+    }
+}
+
+impl AsRef<str> for OperatorRef {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Lets a `HashMap<OperatorRef, _>` be probed with a plain `&str`, so a
+/// lookup does not have to allocate (or fallibly construct) a ref first.
+///
+/// Sound because the derived `Hash` / `Eq` on this newtype are exactly the
+/// inner `String`'s, which are in turn `str`'s — the `Borrow` contract's
+/// requirement that borrowed and owned forms hash and compare identically.
+impl std::borrow::Borrow<str> for OperatorRef {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<OperatorRef> for String {
+    fn from(operator_ref: OperatorRef) -> String {
+        operator_ref.0
+    }
+}
+
+/// The sole way to fail [`OperatorRef::new`]: an empty role name.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("operator ref must not be empty")]
+pub struct EmptyOperatorRef;
+
 /// Design-time definition of an Operator role (first-class).
 ///
 /// `AgentDef.spec.operator_ref` references this struct's `name` as a logical role name.
@@ -2107,6 +2216,69 @@ pub enum BlueprintOrigin {
         /// Algocline session identifier.
         session_id: String,
     },
+}
+
+#[cfg(test)]
+mod operator_ref_tests {
+    use super::*;
+
+    /// The typing must be invisible on the wire: an `OperatorRef` is a
+    /// plain string in both directions, which is what lets every existing
+    /// Blueprint, stored row, and HTTP body keep its byte-for-byte shape.
+    #[test]
+    fn serde_wire_form_is_a_plain_string() {
+        let role = OperatorRef::new("main-ai").expect("non-empty");
+        assert_eq!(
+            serde_json::to_value(&role).unwrap(),
+            serde_json::json!("main-ai")
+        );
+        let back: OperatorRef = serde_json::from_value(serde_json::json!("main-ai")).unwrap();
+        assert_eq!(back, role);
+    }
+
+    /// Deserialization runs the same check as the constructor, so a stored
+    /// or received `""` cannot re-enter through the back door.
+    #[test]
+    fn empty_is_rejected_by_both_the_constructor_and_deserialize() {
+        assert_eq!(OperatorRef::new(""), Err(EmptyOperatorRef));
+        assert!(serde_json::from_value::<OperatorRef>(serde_json::json!("")).is_err());
+    }
+
+    /// No naming convention beyond "not empty" — every shape an existing
+    /// Blueprint already uses stays valid.
+    #[test]
+    fn authored_names_are_accepted_verbatim() {
+        for name in ["main-ai", "phase_a_op", "role-a", "primary", " ", "S-abc"] {
+            let role = OperatorRef::new(name).expect("only emptiness is rejected");
+            assert_eq!(role.as_str(), name);
+        }
+    }
+
+    /// `binding_target` is the field this newtype exists for; its JSON
+    /// Schema must still describe a plain optional string.
+    #[test]
+    fn bind_request_schema_still_describes_binding_target_as_a_string() {
+        let schema = schemars::schema_for!(BindRequest);
+        let v = serde_json::to_value(&schema).expect("schema serializes");
+        let target = &v["properties"]["binding_target"];
+        assert_eq!(
+            target["type"],
+            serde_json::json!(["string", "null"]),
+            "binding_target must stay a nullable string in the schema: {target}"
+        );
+    }
+
+    /// `HashMap<OperatorRef, _>` is probed with a `&str` on the server's
+    /// role map; this pins the `Borrow` impl that makes it possible.
+    #[test]
+    fn a_map_keyed_by_ref_is_lookupable_by_str() {
+        let map = std::collections::HashMap::from([(
+            OperatorRef::new("main-ai").expect("non-empty"),
+            "S-1",
+        )]);
+        assert_eq!(map.get("main-ai"), Some(&"S-1"));
+        assert_eq!(map.get("other"), None);
+    }
 }
 
 #[cfg(test)]

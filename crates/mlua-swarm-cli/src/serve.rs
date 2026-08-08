@@ -521,18 +521,42 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
         None => Arc::new(InMemoryOperatorSessionStore::new()),
     };
+    // Issue #8: source the public base URL from the same bind the
+    // listener will use, so `WSOperatorSession` can render it into
+    // Spawn directives literally (no example port drift). Since the
+    // `inject_endpoint_for_worker` opt-in this is OFF by default —
+    // `None` makes the directive render its historical placeholder and
+    // keeps `StepPointer.content_url` a relative path, so the server
+    // endpoint is never handed to workers unless explicitly requested
+    // (`--inject-endpoint-for-worker` / config `inject_endpoint_for_worker`).
+    // Resolved here, ahead of the session restore below, because a
+    // restored session is built with the same base URL a freshly
+    // connected one gets.
+    let base_url: Option<std::sync::Arc<str>> = if cfg.inject_endpoint_for_worker {
+        Some(format!("http://{}", cfg.bind).into())
+    } else {
+        None
+    };
+
     // Rehydrate persisted Operator login sessions so a restart keeps every
     // logged-in Operator logged in: their saved sid + token reconnect the
     // WS directly (no re-mint), and persisted `RunRecord.operator_sid`
     // pins stay resolvable instead of stranding on `404 unknown sid`.
-    let operator_session_persistence =
-        mlua_swarm_server::OperatorSessionPersistence::restore(operator_session_store)
-            .await
-            .unwrap_or_else(|e| panic!("mse serve: operator session restore failed: {e}"));
-    if !operator_session_persistence.restored.is_empty() {
+    // The call also registers each restored session with the engine (+ the
+    // shared `OperatorSpawnerFactory`), so those pins resolve from boot
+    // rather than only after the owning client's WS reconnects.
+    let operator_session_persistence = mlua_swarm_server::OperatorSessionPersistence::restore(
+        operator_session_store,
+        &engine,
+        Some(&op_factory),
+        base_url.clone(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("mse serve: operator session restore failed: {e}"));
+    if !operator_session_persistence.prepared.is_empty() {
         eprintln!(
             "mse serve: restored {} operator session(s) (reconnect with the saved sid + token)",
-            operator_session_persistence.restored.len()
+            operator_session_persistence.prepared.len()
         );
     }
     // The trace rail shares the Run store's database FILE (one Run = one
@@ -553,20 +577,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         };
 
     recover_interrupted_runs(&task_store, &run_store, &replay_store).await;
-
-    // Issue #8: source the public base URL from the same bind the
-    // listener will use, so `WSOperatorSession` can render it into
-    // Spawn directives literally (no example port drift). Since the
-    // `inject_endpoint_for_worker` opt-in this is OFF by default —
-    // `None` makes the directive render its historical placeholder and
-    // keeps `StepPointer.content_url` a relative path, so the server
-    // endpoint is never handed to workers unless explicitly requested
-    // (`--inject-endpoint-for-worker` / config `inject_endpoint_for_worker`).
-    let base_url: Option<std::sync::Arc<str>> = if cfg.inject_endpoint_for_worker {
-        Some(format!("http://{}", cfg.bind).into())
-    } else {
-        None
-    };
 
     // B-4 graceful shutdown drain: keep handles to the Task/Run stores
     // before they are moved into the router below, so the post-serve drain

@@ -128,3 +128,7 @@ llm-extract.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Store-level regression tests assert on the `tracing::warn!` a skipped
+# undecodable row emits — the skip is deliberately silent in the return
+# value, so the log line is the only observable the contract offers.
+tracing-subscriber.workspace = true
