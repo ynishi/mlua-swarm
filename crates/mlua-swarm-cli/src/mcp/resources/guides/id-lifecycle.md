@@ -81,7 +81,8 @@ access, it's `secure_hex`.
 
 ```
 mint    TokenSigner::mint — agent_id / role / scopes / issued_at /
-        expire_at (worker tokens: 1800s TTL) / max_uses / nonce
+        expire_at (worker tokens: default 1800s TTL, configurable via
+        EngineCfg.worker_token_ttl_secs) / max_uses / nonce
         (secure_hex) / sig_hex (HMAC-SHA256 over the signing input)
    │
 carry   Spawn frames carry the encoded token (URL-safe base64 JSON) and a

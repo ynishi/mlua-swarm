@@ -91,8 +91,10 @@ pub struct WorkerBinding {
 ///   `None` for agents whose profile has no `worker_binding` set.
 ///   Backends that require one (see [`Operator::requires_worker_binding`])
 ///   must fail loud rather than silently degrade when this is `None`.
-/// - `worker_token`: a capability token (`Role::Worker`, 1800s TTL,
-///   `scopes = ["*"]`). Thin-path operators (a `a WebSocket-backed operator session`,
+/// - `worker_token`: a capability token (`Role::Worker`,
+///   `scopes = ["*"]`, TTL from
+///   [`EngineCfg::worker_token_ttl_secs`](crate::EngineCfg) — default
+///   1800s). Thin-path operators (a `a WebSocket-backed operator session`,
 ///   for instance) `encode()` this token and hand it to the MainAI
 ///   WebSocket client, so the SubAgent can hit `/v1/worker/prompt` +
 ///   `/v1/worker/result` with `Authorization: Bearer <encoded>`.

@@ -107,8 +107,10 @@ pub enum ServerMsg {
     /// purely thin control).
     ///
     /// `capability_token` is `CapToken::encode()` form (= URL-safe base64 of
-    /// serde_json): a session token with `Role::Worker` + `["*"]` scopes + 600s
-    /// TTL. The HMAC sig is verified server-side by `verify_token_for_task` —
+    /// serde_json): a session token with `Role::Worker` + `["*"]` scopes, and a
+    /// TTL taken from `EngineCfg::worker_token_ttl_secs` (default 1800s,
+    /// configurable server-side). The HMAC sig is verified server-side by
+    /// `verify_token_for_task` —
     /// a self-contained capability token (= no server lookup required).
     ///
     /// `directive` (= immediate instruction for the MainAI; fix for observation #7):

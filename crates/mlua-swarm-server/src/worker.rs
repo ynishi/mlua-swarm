@@ -63,7 +63,9 @@
 //! store lookup required).
 //!
 //! Tokens are minted during the "2) mint outside the lock" phase of
-//! `engine.dispatch_attempt` (`Role::Worker`, 600s TTL, `scopes=["*"]`).
+//! `engine.dispatch_attempt` (`Role::Worker`, `scopes=["*"]`, TTL from
+//! `EngineCfg::worker_token_ttl_secs` — default 1800s, configurable
+//! server-side via `worker_token_ttl_secs` / `--worker-token-ttl-secs`).
 //! The verb gate covers `FetchPrompt` / `EmitOutput` / `PostResult` — the worker
 //! leaf capability set (`crate::types::WORKER_LEAF_VERBS`).
 

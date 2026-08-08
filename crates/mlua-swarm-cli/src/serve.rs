@@ -207,6 +207,15 @@ pub struct Args {
     /// both are omitted the engine's built-in default (50ms) stands.
     #[arg(long)]
     engine_max_hold_ms: Option<u64>,
+    /// TTL (seconds) for the worker capability tokens the engine mints and
+    /// hands to SubAgents. A Step whose SubAgent runs longer than this
+    /// fails authentication mid-flight, so raise it alongside the run TTL
+    /// when running long Steps. Overrides the config file's
+    /// `worker_token_ttl_secs`; when both are omitted the engine's built-in
+    /// default (1800s / 30 min) stands. `0` is rejected at startup — it would
+    /// mint worker tokens that are already expired.
+    #[arg(long)]
+    worker_token_ttl_secs: Option<u64>,
     /// Opt-out of the persist-by-default `TaskStore`/`RunStore` (issue #35
     /// ST1): restores the previous InMemory default. Has no effect when an
     /// explicit `--task-store-path`/`--run-store-path` (or the config
@@ -293,6 +302,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         token_secret: args.token_secret.clone(),
         sync_timeout_secs: args.sync_timeout_secs,
         engine_max_hold_ms: args.engine_max_hold_ms,
+        worker_token_ttl_secs: args.worker_token_ttl_secs,
         check_policy: args
             .check_policy
             .as_ref()
@@ -681,9 +691,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 ///
 /// A free fn (rather than the closure it grew out of) so the config →
 /// engine mapping is unit-testable on its own: `token_secret` is decoded
-/// here, `check_policy` is carried through, and `engine_max_hold_ms`
-/// overrides the R4 lock-hold guard only when it is actually set — an
-/// absent key leaves `EngineCfg::default()`'s 50ms in place.
+/// here, `check_policy` is carried through, and `engine_max_hold_ms` /
+/// `worker_token_ttl_secs` override their engine counterparts only when
+/// actually set — absent keys leave `EngineCfg::default()`'s 50ms / 1800s
+/// in place.
 fn engine_cfg_from(cfg: &mlua_swarm_server::config::ResolvedConfig) -> EngineCfg {
     let mut c = EngineCfg::default();
     if let Some(hex_secret) = &cfg.token_secret {
@@ -692,6 +703,9 @@ fn engine_cfg_from(cfg: &mlua_swarm_server::config::ResolvedConfig) -> EngineCfg
     c.check_policy = cfg.check_policy;
     if let Some(ms) = cfg.engine_max_hold_ms {
         c.max_hold_ms = ms as u128;
+    }
+    if let Some(secs) = cfg.worker_token_ttl_secs {
+        c.worker_token_ttl_secs = secs;
     }
     c
 }
@@ -1222,5 +1236,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(engine_cfg_from(&cfg).max_hold_ms, 200);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // `worker_token_ttl_secs` → `EngineCfg.worker_token_ttl_secs`
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn engine_cfg_from_keeps_the_engine_default_worker_token_ttl_when_unset() {
+        let cfg = mlua_swarm_server::config::ResolvedConfig::default();
+        assert_eq!(cfg.worker_token_ttl_secs, None);
+        assert_eq!(engine_cfg_from(&cfg).worker_token_ttl_secs, 1800);
+    }
+
+    #[test]
+    fn engine_cfg_from_applies_the_configured_worker_token_ttl() {
+        let cfg = mlua_swarm_server::config::ResolvedConfig {
+            worker_token_ttl_secs: Some(7200),
+            ..Default::default()
+        };
+        assert_eq!(engine_cfg_from(&cfg).worker_token_ttl_secs, 7200);
     }
 }

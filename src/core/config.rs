@@ -2,6 +2,12 @@
 
 use std::time::Duration;
 
+/// Built-in default for [`EngineCfg::worker_token_ttl_secs`] — 1800s
+/// (30 min). Deliberately short: a worker token is handed out of the
+/// process, so its TTL is the only bound on the capability. See the field
+/// doc for when to raise it.
+pub const DEFAULT_WORKER_TOKEN_TTL_SECS: u64 = 1800;
+
 fn random_token_secret() -> Vec<u8> {
     let mut buf = vec![0u8; 32];
     getrandom::fill(&mut buf).expect("OS RNG unavailable");
@@ -47,6 +53,21 @@ pub struct EngineCfg {
     pub token_secret: Vec<u8>,
     /// Long-hold session tuning (idle keepalive, heartbeat cadence).
     pub long_hold: LongHoldConfig,
+    /// TTL (seconds) stamped into every worker capability token the engine
+    /// mints — both the `dispatch_attempt` path and the ordinary-spawn path
+    /// of `dispatch_run_ctx` read this one value.
+    ///
+    /// Unlike an Operator token, a worker token **leaves the process**: it is
+    /// handed to a SubAgent as `Authorization: Bearer <CapToken::encode()>`,
+    /// so nothing downstream can revoke it and this TTL is the only effective
+    /// bound on the capability. That is why it stays short by default
+    /// (`1800` = 30 min) rather than tracking the run TTL.
+    ///
+    /// The flip side: a Step whose SubAgent runs longer than this fails
+    /// authentication mid-flight. When raising the run TTL for long Steps
+    /// (`default_run_ttl` / `sync_timeout_secs`), raise this alongside it —
+    /// a run TTL on its own cannot lift the worker-side ceiling.
+    pub worker_token_ttl_secs: u64,
     /// Worker recursive spawn depth ceiling (guards against unbounded spawn).
     ///
     /// When `Ctx.meta.runtime["spawn_depth"]` has already reached this value
@@ -113,7 +134,8 @@ impl EngineCfg {
 
 impl Default for EngineCfg {
     /// Baseline configuration: bounded retry with backoff, a generous
-    /// (but non-zero) `max_hold_ms`, and `max_spawn_depth = 4`.
+    /// (but non-zero) `max_hold_ms`, `max_spawn_depth = 4`, and
+    /// `worker_token_ttl_secs = 1800` (the pre-config hard-coded value).
     /// `token_secret` is generated fresh per call — see the field doc.
     fn default() -> Self {
         Self {
@@ -124,6 +146,7 @@ impl Default for EngineCfg {
             max_hold_panic: false,
             token_secret: random_token_secret(),
             long_hold: LongHoldConfig::default(),
+            worker_token_ttl_secs: DEFAULT_WORKER_TOKEN_TTL_SECS,
             max_spawn_depth: 4,
             system_ref: SystemRefConfig::default(),
             check_policy: CheckPolicy::default(),

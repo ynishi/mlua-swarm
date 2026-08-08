@@ -1674,12 +1674,13 @@ impl Engine {
         // expected to hit `verify_token + fetch_prompt + fetch_data + post_result`
         // multiple times in order, so `one_time` would exhaust the token on the
         // very first verb. Capability is guarded by (a) the role × verb gate and
-        // (b) the short TTL (1800s).
+        // (b) the short TTL (`EngineCfg::worker_token_ttl_secs`, default 1800s
+        // — the same value the `dispatch_run_ctx` spawn path mints with).
         let worker_token = self.inner.signer.session(
             format!("worker-of-{task_id}"),
             Role::Worker,
             vec!["*".into()],
-            Duration::from_secs(1800),
+            Duration::from_secs(self.inner.cfg.worker_token_ttl_secs),
         );
         let worker_fp = worker_token.fingerprint();
         let task_id_for_worker = task_id.clone();
@@ -1956,11 +1957,13 @@ impl Engine {
         } else {
             // 5) Ordinary spawn path — mint a worker token+handle, run the
             //    spawner, join, and pull the last Final from output_tail.
+            //    Same TTL source as the `dispatch_attempt` mint above: a
+            //    per-site literal here is what let the two drift apart.
             let worker_token = self.inner.signer.session(
                 format!("worker-of-{task_id}"),
                 Role::Worker,
                 vec!["*".into()],
-                Duration::from_secs(1800),
+                Duration::from_secs(self.inner.cfg.worker_token_ttl_secs),
             );
             let worker_fp = worker_token.fingerprint();
             let task_id_for_worker = task_id.clone();
@@ -3980,6 +3983,126 @@ mod dispatch_attempt_with_run_id_tests {
             !observed.meta.runtime.contains_key("run_id"),
             "no run_id key must be injected when dispatch_attempt_with is called with None"
         );
+    }
+}
+
+/// The worker token TTL comes from `EngineCfg::worker_token_ttl_secs`, and
+/// **both** mint sites must read it: `dispatch_attempt_with` and the
+/// ordinary-spawn path of `dispatch_attempt_with_run_ctx`. The two used to
+/// carry independent `Duration::from_secs(1800)` literals, so a fix applied
+/// to one silently left the other pinned — these tests drive each path and
+/// assert the minted token's own `expire_at - issued_at`, which fails if
+/// either site stops honouring the config.
+///
+/// Same probe shape as `dispatch_attempt_with_run_id_tests`, except the
+/// snapshot taken is the minted `CapToken` rather than the `Ctx`.
+#[cfg(test)]
+mod worker_token_ttl_tests {
+    use super::*;
+    use crate::worker::adapter::{SpawnError, SpawnerAdapter};
+    use crate::worker::Worker;
+    use std::sync::Mutex as StdMutex;
+
+    struct TokenProbe {
+        seen: Arc<StdMutex<Option<CapToken>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnerAdapter for TokenProbe {
+        async fn spawn(
+            &self,
+            _engine: &Engine,
+            _ctx: &Ctx,
+            _task_id: StepId,
+            _attempt: u32,
+            token: CapToken,
+        ) -> Result<Box<dyn Worker>, SpawnError> {
+            *self.seen.lock().unwrap() = Some(token);
+            Err(SpawnError::Internal("probe stop".into()))
+        }
+    }
+
+    /// Start a task on an engine configured with `ttl_secs` and return the
+    /// worker token the requested dispatch entry point minted for it.
+    async fn minted_worker_token(ttl_secs: u64, via_run_ctx: bool) -> CapToken {
+        let engine = Engine::new(EngineCfg {
+            worker_token_ttl_secs: ttl_secs,
+            ..EngineCfg::default()
+        });
+        let op_token = engine
+            .attach("ut-op", Role::Operator, Duration::from_secs(30))
+            .await
+            .expect("attach");
+        let tid = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: "step-a".into(),
+                    initial_directive: "hi".into(),
+                    step_ctx: None,
+                    check_policy: None,
+                },
+            )
+            .await
+            .expect("start_task");
+        let seen: Arc<StdMutex<Option<CapToken>>> = Arc::new(StdMutex::new(None));
+        let spawner: Arc<dyn SpawnerAdapter> = Arc::new(TokenProbe { seen: seen.clone() });
+        // The probe always errors the spawn; only the token it captured
+        // matters, so the dispatch outcome (`Err`) is discarded.
+        if via_run_ctx {
+            let _ = engine
+                .dispatch_attempt_with_run_ctx(&op_token, &tid, &spawner, None)
+                .await;
+        } else {
+            let _ = engine
+                .dispatch_attempt_with(&op_token, &tid, &spawner, None)
+                .await;
+        }
+        let captured = seen.lock().unwrap().clone();
+        captured.expect("worker token captured")
+    }
+
+    #[tokio::test]
+    async fn dispatch_attempt_mint_honours_the_configured_ttl() {
+        let token = minted_worker_token(7200, false).await;
+        assert_eq!(token.role, Role::Worker);
+        assert_eq!(
+            token.expire_at - token.issued_at,
+            7200,
+            "dispatch_attempt must mint with EngineCfg::worker_token_ttl_secs, not a literal"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_run_ctx_spawn_mint_honours_the_configured_ttl() {
+        let token = minted_worker_token(7200, true).await;
+        assert_eq!(token.role, Role::Worker);
+        assert_eq!(
+            token.expire_at - token.issued_at,
+            7200,
+            "the dispatch_run_ctx spawn path must mint with \
+             EngineCfg::worker_token_ttl_secs, not a literal"
+        );
+    }
+
+    /// Both paths keep the pre-config 1800s behaviour when the config is
+    /// left at its default — the config route must not shift the default.
+    #[tokio::test]
+    async fn both_mint_paths_default_to_1800s() {
+        let default_ttl = EngineCfg::default().worker_token_ttl_secs;
+        assert_eq!(
+            default_ttl, 1800,
+            "default must stay at the pre-config value"
+        );
+
+        for via_run_ctx in [false, true] {
+            let token = minted_worker_token(default_ttl, via_run_ctx).await;
+            assert_eq!(
+                token.expire_at - token.issued_at,
+                1800,
+                "default TTL drifted (via_run_ctx = {via_run_ctx})"
+            );
+        }
     }
 }
 

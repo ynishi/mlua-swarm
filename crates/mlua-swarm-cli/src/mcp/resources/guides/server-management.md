@@ -289,6 +289,7 @@ it becomes an unknown key on upgrade, so drop it from
 | Key | CLI flag | Default | Effect |
 |---|---|---|---|
 | `engine_max_hold_ms` | `--engine-max-hold-ms` | `50` | Engine lock-hold guard threshold in milliseconds: how long a single state-lock operation may run before the engine reports a suspected long operation inside the lock. Raise it on a loaded host where the warning fires on healthy runs. |
+| `worker_token_ttl_secs` | `--worker-token-ttl-secs` | `1800` | TTL in seconds for the worker capability tokens handed to SubAgents. A Step whose SubAgent runs longer than this fails authentication mid-flight, so raise it alongside the run TTL when running long Steps. The token leaves the process and cannot be revoked, so this TTL is the only bound on the capability — keep it as short as the workload allows. `0` is refused at startup (it would mint already-expired tokens). |
 
 ## See also
 

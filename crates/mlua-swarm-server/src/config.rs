@@ -199,6 +199,15 @@ pub struct FileConfig {
     /// engine reports a suspected long operation inside the lock. `None`
     /// = leave the engine's built-in default (50ms) in place.
     pub engine_max_hold_ms: Option<u64>,
+    /// TTL (seconds) for the worker capability tokens the engine mints
+    /// (`mlua_swarm::EngineCfg::worker_token_ttl_secs`). A worker token is
+    /// handed to a SubAgent and thus leaves the process, so this TTL is the
+    /// only bound on that capability — and equally, a Step running longer
+    /// than it fails authentication mid-flight. Raise it together with the
+    /// run TTL when running long Steps. `None` = leave the engine's built-in
+    /// default (1800s / 30 min) in place. `Some(0)` is refused by [`resolve`]
+    /// — it would mint tokens that are already expired.
+    pub worker_token_ttl_secs: Option<u64>,
     /// Server-wide [`mlua_swarm::core::config::CheckPolicy`] — governs how
     /// submit-time projection sinks
     /// (`Engine::materialize_final_submission` /
@@ -271,6 +280,9 @@ pub struct CliOverrides {
     /// `--engine-max-hold-ms` value (mirrors
     /// [`FileConfig::engine_max_hold_ms`]).
     pub engine_max_hold_ms: Option<u64>,
+    /// `--worker-token-ttl-secs` value (mirrors
+    /// [`FileConfig::worker_token_ttl_secs`]).
+    pub worker_token_ttl_secs: Option<u64>,
     /// `--check-policy` value (mirrors [`FileConfig::check_policy`]).
     /// Parsed at the caller (`serve.rs`) before landing here — invalid
     /// tokens are rejected before this struct is ever constructed.
@@ -343,6 +355,10 @@ pub struct ResolvedConfig {
     /// = the engine's built-in default (50ms) stands. See
     /// [`FileConfig::engine_max_hold_ms`].
     pub engine_max_hold_ms: Option<u64>,
+    /// Resolved `EngineCfg.worker_token_ttl_secs` override in seconds.
+    /// `None` = the engine's built-in default (1800s) stands. See
+    /// [`FileConfig::worker_token_ttl_secs`].
+    pub worker_token_ttl_secs: Option<u64>,
     /// Opt-in endpoint injection into worker-facing data (WS Spawn
     /// directive `base_url` line / `StepPointer.content_url` absolute
     /// prefix). Always set — defaults to `false` (never injected) when
@@ -384,6 +400,7 @@ impl Default for ResolvedConfig {
             token_secret: None,
             sync_timeout_secs: default_sync_timeout_secs(),
             engine_max_hold_ms: None,
+            worker_token_ttl_secs: None,
             inject_endpoint_for_worker: false,
             long_hold_warn_ms: None,
             check_policy: CheckPolicy::default(),
@@ -441,6 +458,21 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
         .sync_timeout_secs
         .or(file.sync_timeout_secs)
         .unwrap_or_else(default_sync_timeout_secs);
+
+    // A zero worker-token TTL mints tokens that are already expired
+    // (`is_expired` is `now >= expire_at`), so every `/v1/worker/*` verb
+    // would fail `TokenExpired` — a total outage whose only symptom is the
+    // error this very key exists to make configurable. Refuse it at startup
+    // rather than let an operator discover it by guessing.
+    let worker_token_ttl_secs = cli.worker_token_ttl_secs.or(file.worker_token_ttl_secs);
+    if worker_token_ttl_secs == Some(0) {
+        return Err(
+            "worker_token_ttl_secs must be greater than 0 (a zero TTL mints \
+             already-expired worker tokens, failing every worker call); omit \
+             the key to use the built-in default"
+                .to_string(),
+        );
+    }
 
     Ok(ResolvedConfig {
         bind,
@@ -519,6 +551,7 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
         token_secret: cli.token_secret.or(file.token_secret),
         sync_timeout_secs,
         engine_max_hold_ms: cli.engine_max_hold_ms.or(file.engine_max_hold_ms),
+        worker_token_ttl_secs,
         check_policy: cli
             .check_policy
             .or(file.check_policy)
@@ -587,6 +620,73 @@ mod tests {
             resolved.legacy_worker_binding_policy,
             LegacyWorkerBindingPolicy::Allow
         );
+    }
+
+    #[test]
+    fn resolve_worker_token_ttl_secs_uses_cli_file_default_precedence() {
+        let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
+        assert_eq!(
+            resolved.worker_token_ttl_secs, None,
+            "absent on both sides leaves the engine's built-in 1800s in place"
+        );
+
+        let file = FileConfig {
+            worker_token_ttl_secs: Some(7200),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file.clone()).expect("resolve");
+        assert_eq!(
+            resolved.worker_token_ttl_secs,
+            Some(7200),
+            "file value must win over the built-in default"
+        );
+
+        let cli = CliOverrides {
+            worker_token_ttl_secs: Some(10_800),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).expect("resolve");
+        assert_eq!(
+            resolved.worker_token_ttl_secs,
+            Some(10_800),
+            "cli value must win over the file value"
+        );
+    }
+
+    /// A zero TTL is the one value that turns this knob back into the bug it
+    /// was added to fix — every minted worker token is already expired — so
+    /// `resolve` refuses it from either side instead of booting a server on
+    /// which no worker call can succeed.
+    #[test]
+    fn resolve_worker_token_ttl_secs_rejects_zero_from_either_side() {
+        let file = FileConfig {
+            worker_token_ttl_secs: Some(0),
+            ..Default::default()
+        };
+        let err = resolve(CliOverrides::default(), file).expect_err("zero from the file must fail");
+        assert!(
+            err.contains("worker_token_ttl_secs"),
+            "the error must name the key: {err}"
+        );
+
+        let cli = CliOverrides {
+            worker_token_ttl_secs: Some(0),
+            ..Default::default()
+        };
+        resolve(cli, FileConfig::default()).expect_err("zero from the CLI must fail");
+
+        // A CLI value still shadows the file value, so a valid flag rescues a
+        // zero left in the config file.
+        let cli = CliOverrides {
+            worker_token_ttl_secs: Some(60),
+            ..Default::default()
+        };
+        let file = FileConfig {
+            worker_token_ttl_secs: Some(0),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).expect("a valid CLI value overrides a zero in the file");
+        assert_eq!(resolved.worker_token_ttl_secs, Some(60));
     }
 
     #[test]

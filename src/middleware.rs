@@ -616,7 +616,8 @@ impl SpawnerAdapter for OperatorDelegateWrapped {
                 // Blueprint-baked binding into ctx.meta.runtime and we forward
                 // it here — the delegate axis is a first-class variant-dispatch
                 // path, not a binding-less fallback (issue 45db42a7).
-                // We hand the capability token (Role::Worker, 1800s TTL —
+                // We hand the capability token (Role::Worker, TTL from
+                // `EngineCfg::worker_token_ttl_secs` — default 1800s —
                 // minted by `Engine::dispatch_attempt_with`) to the
                 // operator as `worker_token` — thin-spawn operators (e.g. a
                 // WebSocket-backed operator session) forward it to the SubAgent
