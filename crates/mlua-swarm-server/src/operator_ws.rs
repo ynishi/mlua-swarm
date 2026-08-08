@@ -67,8 +67,16 @@
 //! - **`Mutex<Option<Sender>>` for tx swap-in**: `None` on disconnect,
 //!   `Some(new_tx)` on reconnect. The pending `HashMap` persists on the session
 //!   side, so a client that held answer/ack values during a disconnect can
-//!   reconnect and resend them. (In v1.5, sends during a disconnect fail
-//!   immediately — the client is responsible for remembering its own pending.)
+//!   reconnect and resend them.
+//! - **Reconnect-wait on the send path** (issue abcb43e2): a reply-expecting
+//!   send (`ask` / `hook_before` / `Operator::execute`) issued while `tx` is
+//!   `None` parks until a reconnect swaps a sender back in, rather than
+//!   failing the step. The wait has no deadline — its only other exit is
+//!   session teardown (`DELETE /v1/operators/:sid` / `/by-role`), whose
+//!   `fail_pending` fails parked sends loud because that session can never be
+//!   reconnected. No buffer/flush queue is introduced: the caller's own task
+//!   is the queue. `after` (fire-and-forget) is excluded and still drops on a
+//!   disconnect. See `session::WSOperatorSession`'s module doc.
 //! - **req_id naming**: `<sid>-<ask|hb|ha|spawn>-<uuid>` covers both the trait
 //!   axis and uniqueness. Clients can identify the trait from the req_id.
 //! - **`parent_req_id` field**: Schema for representing nesting (e.g. a hook
@@ -78,8 +86,6 @@
 //!
 //! ## Out of scope for v1.5 (carry)
 //!
-//! - Buffering / replay of ask/spawn/hook_before during a disconnect (= sends
-//!   currently just return `Err` on failure).
 //! - Automatic session-TTL cleanup (= session leaks after disconnect wait for
 //!   the admin `DELETE` endpoint).
 //! - True nested ask (= depends on a middleware extension; the `parent_req_id`

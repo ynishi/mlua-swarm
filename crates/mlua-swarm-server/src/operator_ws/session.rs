@@ -8,6 +8,24 @@
 //! side, so a client holding answer/ack values across a disconnect can reconnect
 //! and resend them.
 //!
+//! ## Reconnect-wait on the send path (issue abcb43e2)
+//!
+//! A reply-expecting send (`ask` / `hook_before` / `Operator::execute`) issued
+//! while `tx` is `None` does **not** fail: it parks on [`ConnState`] until a
+//! reconnect swaps a sender back in, then sends. Delivery is what this path
+//! owes its caller, and a disconnect window is not a reason to kill a step —
+//! an unanswered step is stopped, not broken. Consequences of that choice:
+//!
+//! - There is **no send queue / buffer + flush**: the caller's own task is the
+//!   queue, and each parked send re-reads `tx` when it wakes.
+//! - There is **no wait deadline**. A parked send has exactly two exits: a
+//!   reconnect ([`ConnState::Connected`]) or session teardown
+//!   ([`ConnState::TornDown`], published by [`WSOperatorSession::fail_pending`]),
+//!   which fails it loud. Bounding the wait is infra's call, not this layer's.
+//! - `after` (fire-and-forget, [`WSOperatorSession::send_oneway`]) is
+//!   deliberately excluded — it has no reply to wait for and keeps its
+//!   drop-on-disconnect behaviour.
+//!
 //! For the detailed S↔C message flow, see the overview figure in `mod.rs`.
 
 use async_trait::async_trait;
@@ -22,9 +40,32 @@ use mlua_swarm::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use super::protocol::{current_parent_req_id, PendingReply, ServerMsg};
+
+/// Observable connectivity of a [`WSOperatorSession`], published on a
+/// `watch` channel so a send parked during a disconnect can be woken.
+///
+/// `Connected` / `Disconnected` mirror `tx` being `Some` / `None` and are
+/// published under the same `tx` lock the swap happens in, so a reader that
+/// observes `Connected` can rely on `tx` having been `Some` at that instant.
+///
+/// `TornDown` is **terminal**: once published it is never overwritten (see
+/// [`WSOperatorSession::publish_conn`]). Teardown calls `fail_pending` and
+/// *then* `clear_tx`; without the sticky rule that second call would demote
+/// the state back to `Disconnected` and re-park the very sends teardown just
+/// woke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnState {
+    /// `tx` holds a live sender.
+    Connected,
+    /// `tx` is `None` — the client may still reconnect and swap one back in.
+    Disconnected,
+    /// The session was torn down (`DELETE /v1/operators/:sid` or `/by-role`)
+    /// and removed from `operator_sessions`; no reconnect can find it again.
+    TornDown,
+}
 
 /// 1 sid = 1 session. Looked up by sid in the `operator_sessions` store on reconnect.
 pub struct WSOperatorSession {
@@ -32,6 +73,10 @@ pub struct WSOperatorSession {
     /// The current mpsc sender on the write path. `None` on disconnect;
     /// swapped to `Some(new_tx)` on reconnect.
     tx: Mutex<Option<mpsc::UnboundedSender<ServerMsg>>>,
+    /// Connectivity broadcast for [`Self::send_when_connected`]'s park.
+    /// Written only via [`Self::publish_conn`], always while the `tx` lock
+    /// is held, so the pair stays consistent for a parked reader.
+    conn: watch::Sender<ConnState>,
     /// `req_id` → pending oneshot. Resolved when `answer` / `hook_ack` /
     /// `spawn_ack` arrives.
     pending: Mutex<HashMap<String, oneshot::Sender<PendingReply>>>,
@@ -61,14 +106,40 @@ impl WSOperatorSession {
         Self {
             sid,
             tx: Mutex::new(Some(tx)),
+            conn: watch::Sender::new(ConnState::Connected),
             pending: Mutex::new(HashMap::new()),
             base_url,
         }
     }
 
+    /// Publishes a connectivity transition to every parked send.
+    ///
+    /// Two rules, both load-bearing:
+    /// - [`ConnState::TornDown`] is terminal — a later `Disconnected` from
+    ///   teardown's own `clear_tx` must not re-park sends teardown just woke.
+    /// - An unchanged state is not re-published; `Connected` and `tx` being
+    ///   `Some` are kept in lockstep by every caller holding the `tx` lock
+    ///   across this call.
+    fn publish_conn(&self, next: ConnState) {
+        self.conn.send_if_modified(|current| {
+            if *current == ConnState::TornDown || *current == next {
+                false
+            } else {
+                *current = next;
+                true
+            }
+        });
+    }
+
     /// Swaps in a new tx on reconnect. Expected to be called only from the handler side.
+    ///
+    /// This is what unparks sends waiting in [`Self::send_when_connected`],
+    /// which is why that park must never hold the `tx` lock across its wait —
+    /// it would deadlock right here.
     pub(super) async fn replace_tx(&self, new_tx: mpsc::UnboundedSender<ServerMsg>) {
-        *self.tx.lock().await = Some(new_tx);
+        let mut current = self.tx.lock().await;
+        *current = Some(new_tx);
+        self.publish_conn(ConnState::Connected);
     }
 
     /// Whether this session currently has a live WebSocket sender.
@@ -87,12 +158,15 @@ impl WSOperatorSession {
             .is_some_and(|sender| sender.same_channel(expected))
         {
             *current = None;
+            self.publish_conn(ConnState::Disconnected);
         }
     }
 
     /// Clears tx to `None` on disconnect. Expected to be called only from the handler side.
     pub(crate) async fn clear_tx(&self) {
-        *self.tx.lock().await = None;
+        let mut current = self.tx.lock().await;
+        *current = None;
+        self.publish_conn(ConnState::Disconnected);
     }
 
     /// Drains every in-flight `pending` entry, dropping its oneshot
@@ -105,6 +179,15 @@ impl WSOperatorSession {
     /// dropped `oneshot::Sender` can carry no payload, so the receiver
     /// observes the generic "reply path closed" error.
     ///
+    /// It also publishes [`ConnState::TornDown`] **first**, which is the
+    /// other half of the guarantee: a send parked in
+    /// [`Self::send_when_connected`] has not reached `orx.await` yet, so
+    /// draining `pending` alone would not touch it and it would wait for a
+    /// reconnect that can never come (issue abcb43e2). Publishing before
+    /// draining also removes the register-vs-drain race — `TornDown` is
+    /// terminal, so a send that registers after the drain still observes it
+    /// and fails itself.
+    ///
     /// Called on **session teardown** (`DELETE /v1/operators/:sid` and
     /// `/by-role`), where the session is being removed from
     /// `operator_sessions` and can never be reconnected — so the
@@ -113,6 +196,8 @@ impl WSOperatorSession {
     /// WS disconnect, which keeps `pending` alive for a reconnecting client
     /// to resend against.
     pub(crate) async fn fail_pending(&self, reason: &str) {
+        // Wake the pre-send parks before draining the post-send ones.
+        self.publish_conn(ConnState::TornDown);
         let drained: Vec<(String, oneshot::Sender<PendingReply>)> =
             self.pending.lock().await.drain().collect();
         if !drained.is_empty() {
@@ -135,24 +220,19 @@ impl WSOperatorSession {
         }
     }
 
-    /// Inserts an entry into pending, sends S→C, and waits for the reply. No
-    /// timeout in v1.5 (= an ask during a disconnect immediately returns `Err`
-    /// on send failure; reconnect-wait behavior is v2).
+    /// Inserts an entry into pending, sends S→C (parking until connected if
+    /// the client is away), and waits for the reply.
+    ///
+    /// No deadline on either wait — see the module doc's reconnect-wait
+    /// section. The pending entry is registered *before* the send parks and
+    /// is kept across the park, so a reply that arrives right after the
+    /// reconnect still finds its slot; it is removed only when the send
+    /// itself fails and no reply can ever arrive.
     async fn send_and_await(&self, req_id: String, msg: ServerMsg) -> Result<PendingReply, String> {
         let (otx, orx) = oneshot::channel::<PendingReply>();
         self.pending.lock().await.insert(req_id.clone(), otx);
 
-        // Fetch `tx` and send. When None, we are disconnected — fail fast.
-        let send_result = {
-            let guard = self.tx.lock().await;
-            match guard.as_ref() {
-                Some(tx) => tx
-                    .send(msg)
-                    .map_err(|_| "ws send channel closed".to_string()),
-                None => Err("ws operator disconnected".to_string()),
-            }
-        };
-        if let Err(e) = send_result {
+        if let Err(e) = self.send_when_connected(msg).await {
             self.pending.lock().await.remove(&req_id);
             return Err(e);
         }
@@ -161,7 +241,57 @@ impl WSOperatorSession {
             .map_err(|_| "ws operator: oneshot cancelled (= reply path closed)".to_string())
     }
 
+    /// Sends `msg` on the current write path, parking until a sender exists
+    /// when the client is disconnected (issue abcb43e2). Returns `Err` only
+    /// when the message can never be delivered: the session was torn down, or
+    /// the sender it was handed to was already closed.
+    ///
+    /// The `tx` guard is taken per attempt and dropped **before** awaiting —
+    /// holding it across the wait would deadlock [`Self::replace_tx`], i.e.
+    /// the one event this park exists to wait for.
+    ///
+    /// `conn_rx` is subscribed before the first `tx` read so a reconnect
+    /// landing mid-attempt cannot be missed; the `Connected` arm re-loops
+    /// instead of waiting for the *next* change, which closes the same
+    /// window on the state read.
+    async fn send_when_connected(&self, msg: ServerMsg) -> Result<(), String> {
+        let mut conn_rx = self.conn.subscribe();
+        loop {
+            {
+                let guard = self.tx.lock().await;
+                if let Some(tx) = guard.as_ref() {
+                    return tx
+                        .send(msg)
+                        .map_err(|_| "ws send channel closed".to_string());
+                }
+            }
+            match *conn_rx.borrow_and_update() {
+                ConnState::TornDown => {
+                    return Err("ws operator session torn down while a send was parked".to_string());
+                }
+                // Reconnected between the `tx` read and this state read —
+                // retry the send rather than park on an already-seen change.
+                ConnState::Connected => continue,
+                ConnState::Disconnected => {}
+            }
+            tracing::debug!(
+                sid = %self.sid,
+                "ws operator disconnected: parking a send until reconnect"
+            );
+            if conn_rx.changed().await.is_err() {
+                return Err("ws operator: connection state channel closed".to_string());
+            }
+        }
+    }
+
     /// Fire-and-forget send for `after` (= no reply expected).
+    ///
+    /// Deliberately **not** on the reconnect-wait path
+    /// ([`Self::send_when_connected`]): `after` has no reply to wait for and
+    /// its caller already swallows the error, so a disconnect drops the
+    /// notification silently. Whether that drop is acceptable is a separate
+    /// question from issue abcb43e2, whose scope is the three reply-expecting
+    /// verbs (`spawn` / `ask` / `hook_before`).
     async fn send_oneway(&self, msg: ServerMsg) -> Result<(), String> {
         let guard = self.tx.lock().await;
         match guard.as_ref() {
@@ -1400,6 +1530,213 @@ mod tests {
             matches!(err, WorkerError::Failed(_)),
             "fail_pending must surface a WorkerError::Failed, got: {err:?}"
         );
+    }
+
+    // ─── issue abcb43e2: reconnect-wait on the send path ─────────────────
+    //
+    // Every wait below is bounded by an explicit `tokio::time::timeout` in
+    // the TEST — production has no deadline by design, so an unwoken park
+    // would otherwise hang `cargo test` rather than fail it.
+
+    /// The headline case: a `Spawn` issued while the operator is
+    /// disconnected must NOT come back as
+    /// `WorkerError::Failed("… ws operator disconnected")`. It parks, and
+    /// the reconnect both delivers it and lets the ack resolve normally.
+    ///
+    /// The `replace_tx` call here is also the deadlock guard: it takes the
+    /// same `tx` lock the parked send reads under, so a park that held its
+    /// guard across the wait would hang this test at that line.
+    #[tokio::test]
+    async fn a_spawn_sent_while_disconnected_parks_and_lands_after_reconnect() {
+        use mlua_swarm::Operator;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-park-reconnect").unwrap(),
+            tx.clone(),
+            None,
+        ));
+        session.clear_tx_if(&tx).await;
+        assert!(!session.is_connected().await, "precondition: disconnected");
+
+        let session_bg = session.clone();
+        let mut handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &test_ctx("ST-park-reconnect"),
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+
+        // It parked: no early return, and nothing was pushed at the
+        // disconnected sender.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut handle)
+                .await
+                .is_err(),
+            "a spawn during a disconnect must park, not resolve"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing may be written while disconnected"
+        );
+
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+        session.replace_tx(new_tx).await;
+
+        let sent = tokio::time::timeout(Duration::from_secs(5), new_rx.recv())
+            .await
+            .expect("the parked Spawn must be delivered once reconnected")
+            .expect("Spawn sent");
+        let req_id = match sent {
+            ServerMsg::Spawn { req_id, .. } => req_id,
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+
+        // The pending entry survived the park, so the ack still finds its
+        // slot — this is why the park must not drop it.
+        session
+            .resolve_pending(
+                &req_id,
+                PendingReply::SpawnAck {
+                    value: serde_json::json!({"delivered": true}),
+                    ok: true,
+                    error: None,
+                    stats: None,
+                },
+            )
+            .await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("execute must return once acked")
+            .expect("join")
+            .expect("execute Ok");
+        assert!(result.ok);
+        assert_eq!(result.value["delivered"], true);
+    }
+
+    /// The other exit: teardown. A send parked BEFORE it ever reached
+    /// `pending`'s `orx.await` is invisible to `fail_pending`'s drain, so
+    /// the drain alone would leave it waiting for a reconnect that can
+    /// never come (the session is being removed from `operator_sessions`).
+    /// It must fail loud instead.
+    ///
+    /// `clear_tx` is called after `fail_pending` exactly as
+    /// `teardown_operator_session` does it — it must not demote the
+    /// terminal torn-down state and re-park the send.
+    #[tokio::test]
+    async fn a_spawn_parked_while_disconnected_is_woken_by_teardown() {
+        use mlua_swarm::{Operator, WorkerError};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-park-teardown").unwrap(),
+            tx.clone(),
+            None,
+        ));
+        session.clear_tx_if(&tx).await;
+
+        let session_bg = session.clone();
+        let mut handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &test_ctx("ST-park-teardown"),
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    test_cap_token(),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut handle)
+                .await
+                .is_err(),
+            "precondition: the spawn is parked"
+        );
+
+        session.fail_pending("operator session torn down").await;
+        session.clear_tx().await;
+
+        let err = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("teardown must wake a parked send, not leave it waiting")
+            .expect("join")
+            .expect_err("a torn-down session can never deliver");
+        assert!(
+            matches!(&err, WorkerError::Failed(msg) if msg.contains("torn down")),
+            "the failure must name teardown as the cause, got: {err:?}"
+        );
+    }
+
+    /// Same contract on the `SeniorBridge` axis: `ask` parks during the
+    /// disconnect window and its answer still resolves after the
+    /// reconnect. (`hook_before` shares the identical `send_and_await`
+    /// path.)
+    #[tokio::test]
+    async fn an_ask_sent_while_disconnected_parks_and_lands_after_reconnect() {
+        use mlua_swarm::SeniorBridge;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = std::sync::Arc::new(WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-park-ask").unwrap(),
+            tx.clone(),
+            None,
+        ));
+        session.clear_tx_if(&tx).await;
+
+        let session_bg = session.clone();
+        let mut handle = tokio::spawn(async move {
+            session_bg
+                .ask(
+                    &StepId::parse("ST-park-ask").unwrap(),
+                    serde_json::json!({"question": "still there?"}),
+                )
+                .await
+        });
+
+        // Without this the test also passes when the ask never parked: if
+        // `replace_tx` wins the race, the first `tx` read already succeeds.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut handle)
+                .await
+                .is_err(),
+            "precondition: the ask is parked"
+        );
+
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+        session.replace_tx(new_tx).await;
+
+        let sent = tokio::time::timeout(Duration::from_secs(5), new_rx.recv())
+            .await
+            .expect("the parked Ask must be delivered once reconnected")
+            .expect("Ask sent");
+        let req_id = match sent {
+            ServerMsg::Ask { req_id, .. } => req_id,
+            other => panic!("expected Ask, got {other:?}"),
+        };
+
+        session
+            .resolve_pending(&req_id, PendingReply::Answer(serde_json::json!("yes")))
+            .await;
+
+        let answer = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("ask must return once answered")
+            .expect("join")
+            .expect("ask Ok");
+        assert_eq!(answer, serde_json::json!("yes"));
     }
 
     // ─── Issue #17: end-to-end `execute()` splice (ctx.meta.runtime → Spawn.directive) ───
