@@ -2,8 +2,8 @@
 //! default.
 
 use super::{
-    DegradationEntry, Inner, RunId, RunListFilter, RunRecord, RunStatus, RunStore, RunStoreError,
-    SharedInner, StepEntry, TaskId,
+    Assignee, DegradationEntry, Inner, RunId, RunListFilter, RunRecord, RunStatus, RunStore,
+    RunStoreError, SharedInner, StepEntry, TaskId,
 };
 use async_trait::async_trait;
 use std::sync::Mutex;
@@ -32,6 +32,9 @@ impl RunStore for InMemoryRunStore {
     }
 
     async fn create(&self, record: RunRecord) -> Result<(), RunStoreError> {
+        // **A2** on the way in — see `RunStore::create`. Checked before the
+        // lock so a rejected record never touches the map.
+        record.validate_assignment_generations()?;
         let mut inner = self.inner.lock().unwrap();
         if inner.records.contains_key(&record.id) {
             return Err(RunStoreError::Duplicate(record.id));
@@ -118,6 +121,69 @@ impl RunStore for InMemoryRunStore {
             }
             _ => Ok(false),
         }
+    }
+
+    async fn acquire_assignee(
+        &self,
+        id: &RunId,
+        slot: &str,
+        op: &str,
+        desc: &str,
+    ) -> Result<(u64, Option<Assignee>), RunStoreError> {
+        // A9 (and the slot's own requirement): refuse before taking the
+        // lock — a rejected acquire must not burn a generation.
+        if slot.is_empty() {
+            return Err(RunStoreError::AssigneeSlotRequired);
+        }
+        if desc.trim().is_empty() {
+            return Err(RunStoreError::AssigneeDescRequired);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner
+            .records
+            .get_mut(id)
+            .ok_or_else(|| RunStoreError::NotFound(id.clone()))?;
+        // A4: the bump is unconditional (an Assign to the incumbent still
+        // advances the counter) and Run-wide (a different slot advances the
+        // same counter). Held under the single `inner` mutex with no await
+        // in between, so concurrent acquires cannot read the same
+        // generation. A8: no precondition on the incumbent.
+        record.next_generation += 1;
+        // Q3: `insert` returns the previous holder OF THIS SLOT, moved out
+        // whole — it is handed back with its `gen` intact (A3), never
+        // rewritten. Other slots' entries are not read or touched.
+        let previous = record.current.insert(
+            slot.to_string(),
+            Assignee {
+                op: op.to_string(),
+                desc: desc.to_string(),
+                gen: record.next_generation,
+            },
+        );
+        record.updated_at = crate::types::now_unix();
+        Ok((record.next_generation, previous))
+    }
+
+    async fn vacate_assignee(
+        &self,
+        id: &RunId,
+        slot: &str,
+    ) -> Result<(u64, Option<Assignee>), RunStoreError> {
+        if slot.is_empty() {
+            return Err(RunStoreError::AssigneeSlotRequired);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner
+            .records
+            .get_mut(id)
+            .ok_or_else(|| RunStoreError::NotFound(id.clone()))?;
+        // A4: Vacant bumps `G` exactly like Assign does; it just mints no
+        // Assignee, so the next acquire continues from the bumped value.
+        record.next_generation += 1;
+        // Only this slot's key leaves the map — a Vacant is per seat.
+        let previous = record.current.remove(slot);
+        record.updated_at = crate::types::now_unix();
+        Ok((record.next_generation, previous))
     }
 
     async fn set_result(
@@ -212,6 +278,8 @@ mod tests {
             step_entries: vec![],
             degradations: vec![],
             operator_sid: None,
+            current: Default::default(),
+            next_generation: 0,
             result_ref: None,
             input_json: None,
             created_at,
@@ -239,6 +307,70 @@ mod tests {
         assert_eq!(got.task_id, TaskId::parse("T-1").unwrap());
         assert_eq!(got.status, RunStatus::Pending);
         assert!(got.step_entries.is_empty());
+    }
+
+    /// **A2** at the one door that takes a caller-built record. Seeding
+    /// `current[slot].gen = 99` against `next_generation = 0` would be
+    /// permanent: the next acquire stamps generation 1, *below* the
+    /// incumbent, and ordering two holders by `gen` — the reason `G` is
+    /// Run-wide — silently inverts. So it is refused, and nothing is
+    /// stored.
+    #[tokio::test]
+    async fn create_rejects_a_holder_generation_above_the_counter() {
+        let s = InMemoryRunStore::new();
+        let mut record = mk("R-1", "T-1", 100);
+        record.current.insert(
+            SLOT_A.to_string(),
+            Assignee {
+                op: "S-seeded".to_string(),
+                desc: "seeded straight into the record".to_string(),
+                gen: 99,
+            },
+        );
+
+        let err = s.create(record).await.unwrap_err();
+        match err {
+            RunStoreError::AssigneeGenerationAhead {
+                slot,
+                gen,
+                next_generation,
+            } => {
+                assert_eq!(slot, SLOT_A);
+                assert_eq!(gen, 99);
+                assert_eq!(next_generation, 0);
+            }
+            other => panic!("got: {other:?}"),
+        }
+        assert!(
+            matches!(
+                s.get(&RunId::parse("R-1").unwrap()).await.unwrap_err(),
+                RunStoreError::NotFound(_)
+            ),
+            "a refused create must leave no row behind"
+        );
+    }
+
+    /// The boundary is `>`, not `>=`: a record whose holder was stamped at
+    /// exactly `G` satisfies `a.gen ≤ G` and is the normal shape of a Run
+    /// that has been assigned once, so round-tripping one through `create`
+    /// must keep working.
+    #[tokio::test]
+    async fn create_accepts_a_holder_generation_equal_to_the_counter() {
+        let s = InMemoryRunStore::new();
+        let mut record = mk("R-1", "T-1", 100);
+        record.next_generation = 1;
+        record.current.insert(
+            SLOT_A.to_string(),
+            Assignee {
+                op: "S-a1".to_string(),
+                desc: "stamped at G".to_string(),
+                gen: 1,
+            },
+        );
+
+        s.create(record).await.unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
+        assert_eq!(got.current[SLOT_A].gen, 1);
     }
 
     #[tokio::test]
@@ -467,6 +599,331 @@ mod tests {
             .await
             .unwrap();
         assert!(!flipped, "an absent Run must report false, not error");
+    }
+
+    // ── assignment axis (model §4.3) ──────────────────────────────────
+
+    /// The two slots (Blueprint-declared Operator seats) the tests below
+    /// assign to — the shipped per-lane alias shape, where a Blueprint
+    /// declares one seat per phase.
+    const SLOT_A: &str = "phase-a-op";
+    const SLOT_B: &str = "phase-b-op";
+
+    /// A4: a launched Run starts with every slot Vacant and `G == 0` — the
+    /// counter is not pre-advanced by the launch itself.
+    #[tokio::test]
+    async fn launch_starts_vacant_at_generation_zero() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
+        assert!(got.current.is_empty(), "no slot is held at launch");
+        assert_eq!(got.next_generation, 0);
+    }
+
+    /// A4: every event advances `G` by one, and the FIRST Assign lands on
+    /// `1`. A8: re-acquiring for the incumbent still succeeds and still
+    /// advances — the counter tracks events, not state changes.
+    #[tokio::test]
+    async fn acquire_advances_generation_even_for_the_same_op() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        let (gen, previous) = s
+            .acquire_assignee(&id, SLOT_A, "S-a1", "first hold")
+            .await
+            .unwrap();
+        assert_eq!(gen, 1, "the first Assign stamps generation 1");
+        assert_eq!(previous, None);
+
+        let (gen, previous) = s
+            .acquire_assignee(&id, SLOT_A, "S-a1", "same holder, new event")
+            .await
+            .unwrap();
+        assert_eq!(gen, 2, "A4: a repeat Assign for the same op still bumps");
+        assert_eq!(previous.expect("displaced holder").gen, 1);
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.next_generation, 2);
+        assert_eq!(
+            got.current.len(),
+            1,
+            "A1: re-assigning a slot leaves it with exactly one holder"
+        );
+        assert_eq!(got.current[SLOT_A].gen, 2);
+    }
+
+    /// The slots are independent: assigning one leaves every other Vacant.
+    #[tokio::test]
+    async fn assigning_one_slot_leaves_the_others_vacant() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "holds phase a")
+            .await
+            .unwrap();
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.current[SLOT_A].op, "S-a1");
+        assert!(
+            !got.current.contains_key(SLOT_B),
+            "an unassigned slot has no entry — that absence IS its Vacant"
+        );
+    }
+
+    /// A4 is Run-wide, not per slot: interleaved assignments to two slots
+    /// walk ONE counter, so any two holders can be ordered by `gen`.
+    #[tokio::test]
+    async fn the_generation_counter_is_shared_across_slots() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        let (first, _) = s
+            .acquire_assignee(&id, SLOT_A, "S-a1", "holds phase a")
+            .await
+            .unwrap();
+        let (second, _) = s
+            .acquire_assignee(&id, SLOT_B, "S-b2", "holds phase b")
+            .await
+            .unwrap();
+        let (third, _) = s
+            .acquire_assignee(&id, SLOT_A, "S-a3", "takes over phase a")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (first, second, third),
+            (1, 2, 3),
+            "a second slot does not start its own counter at 1"
+        );
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.next_generation, 3);
+        assert_eq!(got.current[SLOT_A].gen, 3);
+        assert_eq!(got.current[SLOT_B].gen, 2);
+        assert!(
+            got.current[SLOT_A].gen > got.current[SLOT_B].gen,
+            "holders of different slots stay comparable by gen"
+        );
+    }
+
+    /// A4 (Vacant side): releasing bumps `G` too, so the next Assign picks
+    /// up from the bumped value rather than reusing the released one.
+    #[tokio::test]
+    async fn vacate_advances_generation_and_clears_the_holder() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "first hold")
+            .await
+            .unwrap();
+        let (gen, released) = s.vacate_assignee(&id, SLOT_A).await.unwrap();
+        assert_eq!(gen, 2, "A4: Vacant is an event and advances G");
+        assert_eq!(released.expect("released holder").op, "S-a1");
+
+        let got = s.get(&id).await.unwrap();
+        assert!(
+            !got.current.contains_key(SLOT_A),
+            "R2: the Run stays, the holder does not"
+        );
+        assert_eq!(got.next_generation, 2);
+
+        let (gen, previous) = s
+            .acquire_assignee(&id, SLOT_A, "S-b2", "after release")
+            .await
+            .unwrap();
+        assert_eq!(gen, 3, "the next Assign continues from the bumped counter");
+        assert_eq!(
+            previous, None,
+            "nothing was displaced — the slot was Vacant"
+        );
+    }
+
+    /// A Vacant applies to the named slot only — the other seats keep the
+    /// holders they had.
+    #[tokio::test]
+    async fn vacate_releases_only_the_named_slot() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "holds phase a")
+            .await
+            .unwrap();
+        s.acquire_assignee(&id, SLOT_B, "S-b2", "holds phase b")
+            .await
+            .unwrap();
+
+        let (_, released) = s.vacate_assignee(&id, SLOT_A).await.unwrap();
+        assert_eq!(released.expect("released holder").op, "S-a1");
+
+        let got = s.get(&id).await.unwrap();
+        assert!(!got.current.contains_key(SLOT_A));
+        assert_eq!(
+            got.current[SLOT_B].op, "S-b2",
+            "vacating one seat must not empty another"
+        );
+    }
+
+    /// A4: vacating an already-Vacant slot is a real event, not a no-op.
+    #[tokio::test]
+    async fn vacate_on_a_vacant_run_still_advances_generation() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+        let (gen, released) = s.vacate_assignee(&id, SLOT_A).await.unwrap();
+        assert_eq!(gen, 1);
+        assert_eq!(released, None);
+    }
+
+    /// A3 / Q3: an acquire mints a NEW `Assignee`; a handle taken before it
+    /// still reads its original generation afterwards, and the displaced
+    /// holder is handed back with that same stamp.
+    #[tokio::test]
+    async fn acquire_never_rewrites_the_incumbent_assignee() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "first hold")
+            .await
+            .unwrap();
+        let held_before = s.get(&id).await.unwrap().current[SLOT_A].clone();
+        assert_eq!(held_before.gen, 1);
+
+        let (_, displaced) = s
+            .acquire_assignee(&id, SLOT_A, "S-b2", "takeover")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            held_before.gen, 1,
+            "A3: gen is immutable for the lifetime of an instance"
+        );
+        assert_eq!(
+            displaced.expect("displaced holder"),
+            held_before,
+            "Q3: the displaced instance is returned as-is, not mutated"
+        );
+    }
+
+    /// A8: acquire has no precondition on the slot's incumbent — the later
+    /// caller wins outright, no exclusion, no rejection.
+    #[tokio::test]
+    async fn acquire_displaces_a_live_holder() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "first hold")
+            .await
+            .unwrap();
+        let (gen, displaced) = s
+            .acquire_assignee(&id, SLOT_A, "S-b2", "takeover")
+            .await
+            .unwrap();
+
+        assert_eq!(gen, 2);
+        assert_eq!(displaced.expect("displaced holder").op, "S-a1");
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.current[SLOT_A].op, "S-b2", "last writer wins");
+        assert_eq!(got.current.len(), 1, "A1: still one holder for that slot");
+    }
+
+    /// A9: `desc` is mandatory, and so is the slot. A rejected acquire must
+    /// not have burned a generation or disturbed the incumbent.
+    #[tokio::test]
+    async fn acquire_rejects_a_missing_desc_without_side_effects() {
+        let s = InMemoryRunStore::new();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "first hold")
+            .await
+            .unwrap();
+
+        for blank in ["", "   "] {
+            let err = s
+                .acquire_assignee(&id, SLOT_A, "S-b2", blank)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RunStoreError::AssigneeDescRequired),
+                "got: {err:?}"
+            );
+        }
+
+        let err = s
+            .acquire_assignee(&id, "", "S-b2", "no slot named")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RunStoreError::AssigneeSlotRequired),
+            "got: {err:?}"
+        );
+        let err = s.vacate_assignee(&id, "").await.unwrap_err();
+        assert!(
+            matches!(err, RunStoreError::AssigneeSlotRequired),
+            "got: {err:?}"
+        );
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.next_generation, 1, "a refused event is not an event");
+        assert_eq!(got.current[SLOT_A].op, "S-a1");
+    }
+
+    /// Concurrent acquires must never read the same `G`, so no two callers
+    /// can be told they hold the same generation — including when they name
+    /// different slots, since the counter is Run-wide.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_acquires_hand_out_distinct_generations() {
+        let s = std::sync::Arc::new(InMemoryRunStore::new());
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let s = s.clone();
+            let slot = if i % 2 == 0 { SLOT_A } else { SLOT_B };
+            handles.push(tokio::spawn(async move {
+                s.acquire_assignee(
+                    &RunId::parse("R-1").unwrap(),
+                    slot,
+                    &format!("S-{i}"),
+                    "concurrent hold",
+                )
+                .await
+                .unwrap()
+                .0
+            }));
+        }
+        let mut generations = Vec::new();
+        for h in handles {
+            generations.push(h.await.unwrap());
+        }
+        generations.sort_unstable();
+        assert_eq!(generations, (1..=8).collect::<Vec<u64>>());
+        assert_eq!(
+            s.get(&RunId::parse("R-1").unwrap())
+                .await
+                .unwrap()
+                .next_generation,
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn assignment_on_an_unknown_run_fails() {
+        let s = InMemoryRunStore::new();
+        let missing = RunId::parse("R-nope").unwrap();
+        let err = s
+            .acquire_assignee(&missing, SLOT_A, "S-a1", "hold")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RunStoreError::NotFound(_)), "got: {err:?}");
+        let err = s.vacate_assignee(&missing, SLOT_A).await.unwrap_err();
+        assert!(matches!(err, RunStoreError::NotFound(_)), "got: {err:?}");
     }
 
     #[tokio::test]

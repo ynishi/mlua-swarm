@@ -88,7 +88,7 @@ async fn spawn_server(run_store: Arc<dyn RunStore>, replay_store: Arc<dyn Replay
         engine,
         mlua_swarm_server::default_registry(),
         None, // BlueprintStore (Inline-only)
-        None, // ws_operator_factory
+        None, // ws_operator (Operator wiring)
         None, // output_store
         None, // base_url
         None, // task_store (default InMemory)
@@ -119,6 +119,8 @@ fn seed_run(
         step_entries: vec![],
         degradations: vec![],
         operator_sid: None,
+        current: Default::default(),
+        next_generation: 0,
         result_ref: None,
         input_json,
         created_at: 0,

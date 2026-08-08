@@ -372,8 +372,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     // Build the SpawnerRegistry once and share the OperatorSpawnerFactory as
     // an Arc: hand the same Arc to both (a) the registry and (b) the
-    // ws_operator_factory arg of build_router_with_ws_factory. On WS
-    // connect, the handler registers the sid directly on that factory.
+    // `WsOperatorWiring` below, which installs the slot resolver on it so a
+    // compiled `kind = Operator` agent resolves its seat's current holder
+    // per dispatch.
     let op_factory = Arc::new(OperatorSpawnerFactory::new());
     let make_registry = || -> SpawnerRegistry {
         let mut reg = if cfg.enable_enhance_flow {
@@ -492,6 +493,17 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
         None => Arc::new(InMemoryRunStore::new()),
     };
+    // The Operator wiring, in one value: the shared `OperatorSpawnerFactory`
+    // (already inside `make_registry()`'s SpawnerRegistry) gains the slot
+    // resolver that turns every Blueprint-declared Operator seat into an
+    // `AssigneeRouter` over THIS run store, and the adapter registry those
+    // routers resolve holders through is the one the login path registers
+    // sessions into. Built here, after `run_store`, because the routers need
+    // it: `Run.current` is the single place a seat's holder is written and
+    // read (model A10).
+    let ws_operator =
+        mlua_swarm_server::WsOperatorWiring::new(op_factory.clone(), run_store.clone());
+
     let replay_store: Arc<dyn ReplayStore> = match &cfg.replay_store_path {
         Some(path) => {
             eprintln!("mse serve: SqliteReplayStore at {}", path.display());
@@ -542,13 +554,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // logged-in Operator logged in: their saved sid + token reconnect the
     // WS directly (no re-mint), and persisted `RunRecord.operator_sid`
     // pins stay resolvable instead of stranding on `404 unknown sid`.
-    // The call also registers each restored session with the engine (+ the
-    // shared `OperatorSpawnerFactory`), so those pins resolve from boot
-    // rather than only after the owning client's WS reconnects.
+    // The call also registers each restored session with the engine and as
+    // an adapter in the wiring's registry, so a Run still holding one of
+    // those sids can be dispatched from boot rather than only after the
+    // owning client's WS reconnects.
     let operator_session_persistence = mlua_swarm_server::OperatorSessionPersistence::restore(
         operator_session_store,
         &engine,
-        Some(&op_factory),
+        Some(&ws_operator),
         base_url.clone(),
     )
     .await
@@ -585,12 +598,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let shutdown_task_store = task_store.clone();
     let shutdown_run_store = run_store.clone();
 
-    // Router assembly (fixed combined mode): merges task, ws_operator_factory, and every enhance route.
+    // Router assembly (fixed combined mode): merges task, the Operator wiring, and every enhance route.
     let mut app = mlua_swarm_server::build_router_full_with_operator_session_persistence(
         engine.clone(),
         make_registry(),
         Some(store.clone()),
-        Some(op_factory.clone()),
+        Some(ws_operator),
         output_store,
         base_url,
         Some(task_store),
@@ -1019,6 +1032,8 @@ mod tests {
                 step_entries: vec![],
                 degradations: vec![],
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: None,
                 created_at: 1,
@@ -1034,6 +1049,8 @@ mod tests {
                 step_entries: vec![],
                 degradations: vec![],
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: None,
                 created_at: 2,
@@ -1104,6 +1121,8 @@ mod tests {
                     step_entries: vec![],
                     degradations: vec![],
                     operator_sid: None,
+                    current: Default::default(),
+                    next_generation: 0,
                     result_ref: None,
                     input_json: Some("{}".to_string()),
                     created_at: 1,
@@ -1186,6 +1205,8 @@ mod tests {
                 step_entries: vec![],
                 degradations: vec![],
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: None,
                 created_at: 1,
@@ -1201,6 +1222,8 @@ mod tests {
                 step_entries: vec![],
                 degradations: vec![],
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: None,
                 created_at: 2,

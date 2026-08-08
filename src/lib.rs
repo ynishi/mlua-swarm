@@ -160,7 +160,7 @@ pub use middleware::{
 /// lives in [`blueprint::compiler`]) without a separate dependency
 /// declaration.
 pub use mlua_swarm_diag as diag;
-pub use operator::{Operator, OperatorSpawner, WorkerBinding};
+pub use operator::{Operator, OperatorSlotResolver, OperatorSpawner, WorkerBinding};
 pub use service::{
     TaskInputSpec, TaskLaunchError, TaskLaunchInput, TaskLaunchOutput, TaskLaunchService,
 };

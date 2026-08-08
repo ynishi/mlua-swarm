@@ -2835,6 +2835,20 @@ struct SwarmRunReq {
     /// Operator sessions of its own) is rejected rather than ignored.
     #[serde(default)]
     operator_sid: Option<String>,
+    /// Which Blueprint-declared Operator seat the pin assigns — an
+    /// `OperatorDef.name` from the Blueprint's `operators[]`, sent as the
+    /// `operator_slot` field of `POST /v1/tasks`.
+    ///
+    /// Usually omitted: a Blueprint declaring exactly one Operator has
+    /// only one seat to fill, so the server fills it. Name it when the
+    /// Blueprint declares several (per-lane Blueprints such as
+    /// `phase_a_op` / `phase_b_op`), where omitting it is a `400` that
+    /// lists the candidates rather than a guess.
+    ///
+    /// Applies to the pin, so — like `operator_sid` — only the
+    /// `{kind: "id"}` selector carries it.
+    #[serde(default)]
+    operator_slot: Option<String>,
     /// `main_ai` / `automate` / `composite` — the "Runtime Global" tier of
     /// the 4-tier `OperatorKind` cascade. Unspecified falls through to the
     /// BP-level tiers (`OperatorDef.kind` / `Blueprint.default_operator_kind`)
@@ -2969,6 +2983,58 @@ fn auto_pin_targets_joined_server(http_base: &str, bind: Option<&str>) -> bool {
         bind.unwrap_or(launchd::DEFAULT_BIND).trim_end_matches('/')
     );
     http_base.trim_end_matches('/') == target
+}
+
+/// A run-scoped Operator pin, together with the record of how this process
+/// arrived at it.
+///
+/// A pin assigns the Run to that operator, and an assignment carries a
+/// mandatory `desc` (model §4.3 **A9** — `POST /v1/tasks` answers `400`
+/// without one). Two things can produce a sid here and they mean different
+/// things to whoever reads the Run afterwards: the caller naming a session
+/// ([`Self::explicit`]) versus this process pinning its own sole live one
+/// ([`Self::auto`]). Writing them as one indistinguishable string would
+/// throw away the only fact that distinguishes "the driver asked for this
+/// session" from "this session happened to be the only one joined".
+struct OperatorPin {
+    /// The `OperatorId` sent as `operator_sid`.
+    sid: String,
+    /// The `Assign.desc` sent as `operator_desc`.
+    desc: String,
+    /// Which Blueprint-declared Operator seat the pin assigns, sent as
+    /// `operator_slot`.
+    ///
+    /// `None` leaves the seat to the server's rule: a Blueprint declaring
+    /// exactly one Operator needs no naming, which is the shape of every
+    /// bundled Blueprint and therefore of the auto-pin path. A Blueprint
+    /// declaring several answers `400` listing its seats — the caller then
+    /// names one via `swarm_run(operator_slot = ...)`, rather than this
+    /// process picking a lane on their behalf.
+    slot: Option<String>,
+}
+
+impl OperatorPin {
+    /// The caller named this session in `swarm_run(operator_sid = ...)`,
+    /// and optionally the seat in `swarm_run(operator_slot = ...)`.
+    fn explicit(sid: String, slot: Option<String>) -> Self {
+        Self {
+            sid,
+            desc: "operator_sid named by the swarm_run caller".to_string(),
+            slot,
+        }
+    }
+
+    /// No `operator_sid` was given, and this process holds exactly one live
+    /// session joined to the server the launch targets. The seat may still
+    /// be named — "which session" and "which lane" are independent
+    /// questions, and only the first one is being answered automatically.
+    fn auto(sid: String, slot: Option<String>) -> Self {
+        Self {
+            sid,
+            desc: "mse-mcp auto-pin: this process's sole live operator session".to_string(),
+            slot,
+        }
+    }
 }
 
 /// Parse a wire-level kind string into `OperatorKind`. Shared by
@@ -3492,8 +3558,8 @@ impl MseServer {
             // very server that session is joined to (a sid means nothing on
             // another server, and auto-pinning one there would turn a
             // working launch into a 400).
-            let operator_sid = match req.operator_sid {
-                Some(sid) => Some(sid),
+            let operator_pin = match req.operator_sid {
+                Some(sid) => Some(OperatorPin::explicit(sid, req.operator_slot.clone())),
                 None => match self.op_client.sole_live_sid().await {
                     Some(sid)
                         if auto_pin_targets_joined_server(
@@ -3501,7 +3567,7 @@ impl MseServer {
                             bind.as_deref(),
                         ) =>
                     {
-                        Some(sid)
+                        Some(OperatorPin::auto(sid, req.operator_slot.clone()))
                     }
                     _ => None,
                 },
@@ -3518,7 +3584,7 @@ impl MseServer {
                     req.operator_kind_overrides,
                     detach,
                     req.ttl_secs,
-                    operator_sid,
+                    operator_pin,
                 )
                 .await;
         }
@@ -3533,6 +3599,19 @@ impl MseServer {
                 "operator_sid pins a run to an Operator session on `mse serve`, so it only \
                  applies to the {kind: \"id\"} selector; an inline / file Blueprint runs \
                  inside this mcp process, which holds no Operator sessions. Register the \
+                 Blueprint on the server and launch it by id to use the pin."
+                    .to_string(),
+                None,
+            ));
+        }
+        // `operator_slot` names the seat a pin fills, so it is the same
+        // argument by another half: rejected here for the same reason,
+        // rather than accepted and dropped on a path that pins nothing.
+        if req.operator_slot.is_some() {
+            return Err(McpError::invalid_params(
+                "operator_slot names the Blueprint-declared Operator seat an operator_sid pin \
+                 assigns, so it only applies to the {kind: \"id\"} selector; an inline / file \
+                 Blueprint runs inside this mcp process, which pins nothing. Register the \
                  Blueprint on the server and launch it by id to use the pin."
                     .to_string(),
                 None,
@@ -3657,6 +3736,8 @@ impl MseServer {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: None,
                 created_at: now,
@@ -3917,7 +3998,7 @@ impl MseServer {
         operator_kind_overrides: Option<HashMap<String, String>>,
         detach: bool,
         ttl_override: Option<u64>,
-        operator_sid: Option<String>,
+        operator_pin: Option<OperatorPin>,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut inner = self.state.write().await;
@@ -3985,8 +4066,24 @@ impl MseServer {
         // to that session instead of resolving the Blueprint's logical role
         // through whichever session happens to hold it. Absent field = the
         // pre-pin wire body, byte-for-byte.
-        if let Some(sid) = operator_sid {
-            payload.insert("operator_sid".into(), JsonValue::String(sid));
+        //
+        // The pin is the Run's first `Assign`, so the server requires the
+        // `desc` that goes with it (model §4.3 A9 — a `400` without one).
+        // `OperatorPin` carries a `desc` that distinguishes the two ways
+        // this process arrives at a sid, because "which one was it" is
+        // exactly the question a reader of the Run has later.
+        //
+        // `operator_slot` rides along only when the caller named a seat:
+        // the server treats an absent slot as "the Blueprint declares one
+        // Operator, so it is that one", and answers `400` with the
+        // candidates when it declares several. Sending a guess instead
+        // would be this process inventing a lane.
+        if let Some(pin) = operator_pin {
+            payload.insert("operator_sid".into(), JsonValue::String(pin.sid));
+            payload.insert("operator_desc".into(), JsonValue::String(pin.desc));
+            if let Some(slot) = pin.slot {
+                payload.insert("operator_slot".into(), JsonValue::String(slot));
+            }
         }
 
         let client = match reqwest::Client::builder()
@@ -5906,6 +6003,7 @@ mod tests {
             timeout_secs: Some(5),
             operator_id: None,
             operator_sid: None,
+            operator_slot: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -5968,6 +6066,7 @@ mod tests {
             timeout_secs: Some(10),
             operator_id: None,
             operator_sid: None,
+            operator_slot: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -6003,6 +6102,7 @@ mod tests {
             timeout_secs: Some(10),
             operator_id: None,
             operator_sid: None,
+            operator_slot: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: Some(true),
@@ -6048,6 +6148,7 @@ mod tests {
             timeout_secs: Some(10),
             operator_id: None,
             operator_sid: None,
+            operator_slot: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -6095,6 +6196,7 @@ mod tests {
             timeout_secs: Some(10),
             operator_id: None,
             operator_sid: None,
+            operator_slot: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -6119,6 +6221,7 @@ mod tests {
             timeout_secs: Some(10),
             operator_id: None,
             operator_sid: None,
+            operator_slot: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -6148,6 +6251,7 @@ mod tests {
             timeout_secs: Some(10),
             operator_id: None,
             operator_sid: None,
+            operator_slot: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -6176,6 +6280,7 @@ mod tests {
             timeout_secs: Some(10),
             operator_id: None,
             operator_sid: Some("S-somewhere".to_string()),
+            operator_slot: None,
             operator_kind: None,
             operator_kind_overrides: None,
             detach: None,
@@ -6193,6 +6298,36 @@ mod tests {
         assert!(
             message.contains("id"),
             "the error must point at the selector that does support it: {message}"
+        );
+    }
+
+    /// The other half of the pin gets the same treatment: naming a seat on
+    /// a path that pins nothing is refused rather than dropped.
+    #[tokio::test]
+    async fn swarm_run_rejects_an_operator_slot_on_the_inline_path() {
+        let server = MseServer::new();
+        let bp_json = serde_json::to_value(identity_blueprint()).expect("serialize");
+        let input: BlueprintInput = serde_json::from_value(bp_json).expect("bare parse");
+        let req = SwarmRunReq {
+            blueprint: input,
+            init_ctx: Some(serde_json::json!({"in": "hi"})),
+            timeout_secs: Some(10),
+            operator_id: None,
+            operator_sid: None,
+            operator_slot: Some("phase-a-op".to_string()),
+            operator_kind: None,
+            operator_kind_overrides: None,
+            detach: None,
+            ttl_secs: None,
+        };
+        let err = server
+            .swarm_run(Parameters(req))
+            .await
+            .expect_err("an inline run must not silently ignore the seat");
+        let message = err.to_string();
+        assert!(
+            message.contains("operator_slot"),
+            "the error must name the rejected param: {message}"
         );
     }
 
@@ -6219,6 +6354,47 @@ mod tests {
         assert!(
             !auto_pin_targets_joined_server("http://elsewhere:7777", None),
             "the default bind is not this process's server here"
+        );
+    }
+
+    /// Both ways of arriving at a pin carry the sid unchanged and a
+    /// non-empty `Assign.desc` (the server rejects a blank one with
+    /// `400`), and the two descs differ — "the caller named this session"
+    /// and "this process auto-pinned its only one" are different facts
+    /// about the same run, and the Run record is where that gets read
+    /// back.
+    #[test]
+    fn an_operator_pin_carries_a_desc_that_says_how_it_was_chosen() {
+        let explicit = OperatorPin::explicit("S-abc".to_string(), None);
+        let auto = OperatorPin::auto("S-abc".to_string(), None);
+        assert_eq!(explicit.sid, "S-abc");
+        assert_eq!(auto.sid, "S-abc");
+        assert!(!explicit.desc.trim().is_empty());
+        assert!(!auto.desc.trim().is_empty());
+        assert_ne!(
+            explicit.desc, auto.desc,
+            "an auto-pin must be distinguishable from a caller-named one"
+        );
+    }
+
+    /// The seat is carried verbatim on both paths and defaults to unset —
+    /// "which session" is answered automatically, "which lane" never is.
+    #[test]
+    fn an_operator_pin_carries_the_seat_only_when_the_caller_named_one() {
+        assert_eq!(OperatorPin::explicit("S-abc".to_string(), None).slot, None);
+        assert_eq!(
+            OperatorPin::auto("S-abc".to_string(), None).slot,
+            None,
+            "an auto-pin picks a session, never a lane"
+        );
+        assert_eq!(
+            OperatorPin::explicit("S-abc".to_string(), Some("phase-b-op".to_string())).slot,
+            Some("phase-b-op".to_string())
+        );
+        assert_eq!(
+            OperatorPin::auto("S-abc".to_string(), Some("phase-b-op".to_string())).slot,
+            Some("phase-b-op".to_string()),
+            "a named seat survives the auto-pinned session"
         );
     }
 
@@ -7337,6 +7513,7 @@ mod tests {
                 timeout_secs: Some(5),
                 operator_id: None,
                 operator_sid: None,
+                operator_slot: None,
                 operator_kind: None,
                 operator_kind_overrides: None,
                 detach: None,
@@ -7376,6 +7553,7 @@ mod tests {
                 timeout_secs: Some(5),
                 operator_id: None,
                 operator_sid: None,
+                operator_slot: None,
                 operator_kind: None,
                 operator_kind_overrides: None,
                 detach: None,

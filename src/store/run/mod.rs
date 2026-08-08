@@ -22,7 +22,7 @@ use crate::store::replay::{ReplayCursor, ReplayStore};
 use crate::types::{RunId, StepId, TaskId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -201,6 +201,59 @@ impl StepEntry {
     }
 }
 
+/// Who currently holds one **slot** of a Run — the model's `Assignee`
+/// (`{ op, desc, gen }`), persisted as one value of the
+/// [`RunRecord::current`] map.
+///
+/// A "slot" is a Blueprint-declared Operator seat: the `operator_ref` an
+/// agent names (`Blueprint.operators[].name`). A Blueprint may declare
+/// several, so a Run has as many slots as its Blueprint declares, each
+/// with its own holder over time.
+///
+/// Invariants this type carries (model §4.3):
+///
+/// - **A1** `|Run.current| ≤ 1` **per slot** — expressed as the map keyed
+///   by slot on [`RunRecord::current`]: one key cannot hold two values, so
+///   a seat cannot have two holders. The slot is the map key, never a
+///   field of this struct.
+/// - **A3** [`Self::gen`] is immutable for the lifetime of an instance.
+///   Re-assignment never mutates an existing `Assignee`; the store mints a
+///   fresh instance with the next generation (**Q3**). Nothing in this
+///   crate takes `&mut Assignee`.
+/// - **A9** [`Self::desc`] is mandatory. The store rejects an empty (or
+///   whitespace-only) `desc` with
+///   [`RunStoreError::AssigneeDescRequired`]; the HTTP layer maps that to
+///   `400`. The store itself never decides a status code.
+/// - **A10** this is the one place a slot's current holder is recorded and
+///   the one place it is read from — the destination is not baked into any
+///   sibling field.
+///
+/// The `Assignee` does not cross the SAP boundary (model §4.7 T1): the
+/// primitives below the boundary carry an `operator`, never an assignee or
+/// a generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Assignee {
+    /// Who holds the slot — the model's `OperatorId`, which is the key
+    /// space of the engine's operator registry. Session ids (`S-<hex>`)
+    /// and role aliases (`main-ai`) share that one key space (the WS login
+    /// path registers both), so this stays a plain `String` rather than
+    /// narrowing to a session id.
+    pub op: String,
+    /// Why this holder was assigned — the human-readable record of the
+    /// assignment. Required (**A9**); an empty value is rejected at the
+    /// store boundary rather than stored as `""`.
+    pub desc: String,
+    /// The generation stamped on this holder at acquire time (**A4**:
+    /// `G` after the increment). Immutable for the lifetime of the
+    /// instance (**A3**) — a later acquire produces a NEW `Assignee` with
+    /// a higher `gen` instead of rewriting this one.
+    ///
+    /// `G` is a single counter per **Run**, not per slot: an assignment to
+    /// any slot advances the one counter, so two holders of different
+    /// slots can be ordered against each other by `gen` alone.
+    pub gen: u64,
+}
+
 /// One persisted `Run` row — one kick of a [`crate::store::task::TaskRecord`].
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunRecord {
@@ -222,7 +275,72 @@ pub struct RunRecord {
     pub degradations: Vec<DegradationEntry>,
     /// Operator session id bound to this Run, if any (WS operator
     /// correlation).
+    ///
+    /// This is the **launch-time snapshot** of who was pinned when the Run
+    /// was kicked — not the live holder. The live holder is
+    /// [`Self::current`]; nothing resolves a dispatch destination from this
+    /// field, so the two are not competing destinations (**A10**).
     pub operator_sid: Option<String>,
+    /// The Run's live holders, keyed by **slot** — the model's
+    /// `Run.current` (§4.3).
+    ///
+    /// A slot is a Blueprint-declared Operator seat (`operator_ref` =
+    /// `Blueprint.operators[].name`): a Blueprint may declare several, and
+    /// each agent picks the one it dispatches through. The cardinality is
+    /// therefore `Run 1 : N Operator` and `Operator 1 : 1 Assignee` (at a
+    /// time), hence `Run 1 : N Assignee` — with **A1** reading "at most one
+    /// holder **per slot**", which is exactly what a map expresses. An
+    /// absent key is that slot's `Vacant`; an empty map is a Run with no
+    /// slot held at all.
+    ///
+    /// **R2** — a `Vacant` slot does not stop the Run; only a dispatch that
+    /// needs *that* slot's holder is affected, and dispatches through other
+    /// slots are untouched. **R6** — this travels with the Run row, so a
+    /// restart does not drop the assignments.
+    ///
+    /// Only [`RunStore::acquire_assignee`] / [`RunStore::vacate_assignee`]
+    /// write it, both scoped to one slot, and both mint a fresh
+    /// [`Assignee`] rather than mutating a stored one (**Q3**).
+    ///
+    /// [`BTreeMap`](std::collections::BTreeMap) rather than `HashMap`: the
+    /// map is serialized into a persisted column and into observation
+    /// payloads, and key-sorted output keeps those bytes stable across
+    /// processes. Additive with `#[serde(default)]` so rows serialized
+    /// before the assignment axis existed decode unchanged (as an empty
+    /// map = every slot Vacant).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub current: BTreeMap<String, Assignee>,
+    /// The Run's generation counter — the model's `G` (**A4**).
+    ///
+    /// `0` at launch. Every assignment event (`Assign` **or** `Vacant`)
+    /// increments it by one **before** stamping, so the first `Assign`
+    /// yields `gen == 1`; the counter therefore holds the generation of
+    /// the most recent event, and the next event will use this value `+ 1`.
+    /// The bump is unconditional — re-acquiring for the SAME `op` still
+    /// increments, because the counter counts events, not state changes.
+    ///
+    /// **One counter per Run, shared by every slot.** An `Assign` to slot
+    /// `b` advances the same `G` that a preceding `Assign` to slot `a`
+    /// advanced, so any two holders — of the same slot or of different
+    /// ones — can be ordered by `gen`. Per-slot counters would buy nothing
+    /// and would make that comparison meaningless.
+    ///
+    /// **A2** (`current = Assigned(a) ⟹ a.gen ≤ G`) holds on two legs, not
+    /// one. On the write path it holds by construction: every `current`
+    /// value's `gen` is stamped from this counter at the moment it is
+    /// bumped, so an acquire can never leave a holder above it. On the way
+    /// **in** it is checked — [`RunStore::create`] takes a caller-supplied
+    /// record with both fields public, so a record that arrives already
+    /// violating A2 is refused with
+    /// [`RunStoreError::AssigneeGenerationAhead`] rather than stored (see
+    /// [`RunRecord::validate_assignment_generations`]). Left unchecked, that
+    /// record would stay violated: the next acquire stamps generation 1,
+    /// below the seeded incumbent, and ordering two holders by `gen` — the
+    /// whole reason `G` is Run-wide — would silently invert.
+    ///
+    /// Additive with `#[serde(default)]` (pre-existing rows read back `0`).
+    #[serde(default)]
+    pub next_generation: u64,
     /// The Run's terminal result payload, set once by
     /// [`RunStore::set_result`]. `None` while the Run is in flight.
     #[schemars(with = "Option<serde_json::Value>")]
@@ -243,6 +361,35 @@ pub struct RunRecord {
     pub created_at: u64,
     /// Unix epoch seconds — last update time.
     pub updated_at: u64,
+}
+
+impl RunRecord {
+    /// **A2** as a check: every holder in [`Self::current`] must have been
+    /// stamped at or below [`Self::next_generation`]
+    /// (`current = Assigned(a) ⟹ a.gen ≤ G`).
+    ///
+    /// [`RunStore::create`] calls this on the record it is handed, and every
+    /// [`RunStore`] implementation is expected to — an out-of-tree backend
+    /// that skips it accepts records the two in-tree backends refuse.
+    /// Nothing else needs it: `acquire_assignee` stamps `gen` from the
+    /// counter it has just bumped, so no write path in this crate can
+    /// produce a record this rejects.
+    ///
+    /// Reports the first offending seat in [`Self::current`]'s key order,
+    /// which is stable (`BTreeMap`), so the same bad record always names the
+    /// same seat.
+    pub fn validate_assignment_generations(&self) -> Result<(), RunStoreError> {
+        for (slot, assignee) in &self.current {
+            if assignee.gen > self.next_generation {
+                return Err(RunStoreError::AssigneeGenerationAhead {
+                    slot: slot.clone(),
+                    gen: assignee.gen,
+                    next_generation: self.next_generation,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Filter/paging parameters for [`RunStore::list`] — the `GET /v1/runs`
@@ -271,6 +418,47 @@ pub enum RunStoreError {
     /// `create` was called with an id that is already stored.
     #[error("run already exists: {0}")]
     Duplicate(RunId),
+
+    /// **A9**: [`RunStore::acquire_assignee`] was called without a `desc`.
+    /// The record is mandatory, so the acquire is refused rather than
+    /// stored with an empty one. The store deliberately does not name an
+    /// HTTP status — the caller maps this to `400`.
+    #[error("assignee desc is required")]
+    AssigneeDescRequired,
+
+    /// **A2**: a record handed to [`RunStore::create`] carries a holder
+    /// whose generation is above the Run's counter `G`
+    /// (`current[slot].gen > next_generation`), so it would be stored
+    /// already violating `current = Assigned(a) ⟹ a.gen ≤ G`.
+    ///
+    /// The acquire path cannot produce this — it stamps `gen` from the
+    /// counter it just bumped — but `create` accepts a caller-built
+    /// [`RunRecord`] with both fields public, and that is a published
+    /// surface. Refused rather than stored: the violation is permanent
+    /// (the next acquire stamps a *lower* generation than the incumbent's,
+    /// inverting the ordering `G` being Run-wide exists to provide) and
+    /// invisible afterwards. Callers map this to `400`, same as
+    /// [`Self::AssigneeDescRequired`].
+    #[error(
+        "assignee generation is ahead of the run's counter: current['{slot}'].gen = {gen} > \
+         next_generation = {next_generation}"
+    )]
+    AssigneeGenerationAhead {
+        /// The seat whose holder is ahead of the counter.
+        slot: String,
+        /// That holder's generation.
+        gen: u64,
+        /// The Run counter `G` it was measured against.
+        next_generation: u64,
+    },
+
+    /// An assignment event named no slot. `Run.current` is keyed by slot,
+    /// so an `Assign` (or a `Vacant`) with an empty slot names no seat to
+    /// write — it is refused rather than collapsed onto a `""` key that
+    /// no `operator_ref` can ever resolve to. Callers map this to `400`,
+    /// same as [`Self::AssigneeDescRequired`].
+    #[error("assignee slot is required")]
+    AssigneeSlotRequired,
 
     /// Backend-specific failure not covered by the other variants.
     #[error("other: {0}")]
@@ -576,6 +764,15 @@ pub trait RunStore: Send + Sync {
 
     /// Create a new Run row. Returns `Duplicate` if `record.id` is already
     /// stored.
+    ///
+    /// This is the one door into the store that carries a caller-built
+    /// [`RunRecord`], so it is where the assignment axis is checked rather
+    /// than assumed: a record whose `current` holds a generation above
+    /// `next_generation` is refused with
+    /// [`RunStoreError::AssigneeGenerationAhead`] (**A2**, see
+    /// [`RunRecord::validate_assignment_generations`]). Implementations must
+    /// run that check before persisting anything. The rest of the record —
+    /// `step_entries`, `status`, timestamps — is still trusted as given.
     async fn create(&self, record: RunRecord) -> Result<(), RunStoreError>;
 
     /// Fetch a Run by id.
@@ -618,6 +815,65 @@ pub trait RunStore: Send + Sync {
         from: RunStatus,
         to: RunStatus,
     ) -> Result<bool, RunStoreError>;
+
+    /// Assign this Run's `slot` to `op` — the model's `Assign` event
+    /// (§4.3).
+    ///
+    /// `slot` is the Blueprint-declared Operator seat (`operator_ref`) the
+    /// assignment applies to; only that key of
+    /// [`RunRecord::current`] is touched, so assigning one seat never
+    /// disturbs another's holder.
+    ///
+    /// Bumps the Run's generation counter `G` by one and stamps the new
+    /// value onto a **freshly minted** [`Assignee`], which replaces
+    /// `current[slot]` (**A4** / **Q3**: the previously stored `Assignee`
+    /// is returned untouched, never rewritten in place). `G` is Run-wide,
+    /// so this advances the same counter every other slot's events advance.
+    /// `updated_at` is bumped to now.
+    ///
+    /// **A8**: this succeeds regardless of who holds the slot — a live
+    /// holder is displaced (last writer wins); there is no exclusion and
+    /// no rejection path for a contended slot. The only refusals are
+    /// **A9** (an empty or whitespace-only `desc` returns
+    /// [`RunStoreError::AssigneeDescRequired`]) and an empty `slot`
+    /// (returns [`RunStoreError::AssigneeSlotRequired`]); an unknown `id`
+    /// returns [`RunStoreError::NotFound`].
+    ///
+    /// The read of `G` and the write of both columns happen atomically, so
+    /// two concurrent acquires can never read the same `G` and hand out a
+    /// duplicate generation — including when they name different slots.
+    ///
+    /// Returns `(new generation, the holder this call displaced from this
+    /// slot)` — the caller needs both to tell whether it took over from
+    /// someone and under which generation it now dispatches.
+    async fn acquire_assignee(
+        &self,
+        id: &RunId,
+        slot: &str,
+        op: &str,
+        desc: &str,
+    ) -> Result<(u64, Option<Assignee>), RunStoreError>;
+
+    /// Release the holder of this Run's `slot` — the model's `Vacant`
+    /// event (§4.3). Other slots keep their holders.
+    ///
+    /// **A4**: `Vacant` bumps the Run-wide generation counter exactly like
+    /// `Assign` does; it just mints no [`Assignee`]. A subsequent
+    /// [`Self::acquire_assignee`] — on this slot or any other — therefore
+    /// continues from the bumped value rather than reusing the generation
+    /// the released holder had. `updated_at` is bumped to now.
+    ///
+    /// Vacating an already-vacant slot is not an error — it is a real
+    /// event and still bumps the counter. An empty `slot` returns
+    /// [`RunStoreError::AssigneeSlotRequired`] and an unknown `id`
+    /// returns [`RunStoreError::NotFound`].
+    ///
+    /// Returns `(new generation, the holder this call released)`.
+    async fn vacate_assignee(
+        &self,
+        id: &RunId,
+        slot: &str,
+    ) -> Result<(u64, Option<Assignee>), RunStoreError>;
 
     /// Set a Run's terminal `result_ref`, bumping `updated_at` to now.
     async fn set_result(

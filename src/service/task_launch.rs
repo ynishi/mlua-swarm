@@ -668,18 +668,21 @@ pub struct TaskLaunchInput {
     /// launch binds its whole Spawn stream to, independent of which axis
     /// carries the spawn.
     ///
-    /// A Blueprint's `spec.operator_ref` names a logical role; the role's
-    /// holder is process-global, so with two drivers on one process "the
-    /// role" and "the session this launch belongs to" are different facts.
-    /// `Some(sid)` makes the second one authoritative for this launch: the
-    /// binding provider attests through the pinned session
-    /// ([`crate::binding::AgentBindingProvider::pinned_to_session`]) and the
-    /// compiler resolves every `kind = Operator` agent against it
-    /// ([`Compiler::compile_bound_pinned`]). A pin naming no live session
-    /// fails the launch rather than falling back to the role.
+    /// A Blueprint's `spec.operator_ref` names a Blueprint-declared seat;
+    /// who holds that seat is per-Run, mutable state. `Some(sid)` says who
+    /// holds it at launch: the binding provider attests through that session
+    /// ([`crate::binding::AgentBindingProvider::pinned_to_session`]), and the
+    /// host records it as the Run's first `Assign`
+    /// (`RunStore::acquire_assignee`) — which is what a dispatch resolves
+    /// its destination from, on every dispatch, so a later handover moves
+    /// the destination without recompiling anything.
     ///
-    /// `None` (the default via [`Self::automate`]) leaves both resolutions
-    /// exactly as they were — role lookup, byte-for-byte.
+    /// The compile deliberately does **not** see this value: baking the
+    /// pinned session into `routes[agent_name]` is exactly the frozen
+    /// destination the per-dispatch lookup replaced.
+    ///
+    /// `None` (the default via [`Self::automate`]) attests through the
+    /// role's holder, byte-for-byte as before.
     ///
     /// Orthogonal to [`Self::operator_backend_id`]: that field is the
     /// opt-in `operator_delegate` layer's session-wide backend, which
@@ -909,11 +912,9 @@ impl TaskLaunchService {
             });
         }
         input.blueprint = materialize_bound_blueprint(&input.blueprint, &bound_agents);
-        let compiled = self.compiler.compile_bound_pinned(
-            &input.blueprint,
-            &bound_agents,
-            input.operator_pin.as_deref(),
-        )?;
+        let compiled = self
+            .compiler
+            .compile_bound(&input.blueprint, &bound_agents)?;
         // GH #50 (Subtask 2 follow-up): merge this Blueprint's compiled
         // `AgentDef.verdict` contracts into the engine's runtime registry —
         // see `Engine::register_verdict_contracts`'s doc for the additive
@@ -2077,6 +2078,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: Some("{}".to_string()),
                 created_at: 0,
@@ -2123,6 +2126,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: Some("{}".to_string()),
                 created_at: 0,
@@ -2232,6 +2237,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: Some("{}".to_string()),
                 created_at: 0,
@@ -2297,6 +2304,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: Some("{}".to_string()),
                 created_at: 0,
@@ -2358,6 +2367,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: Some("{}".to_string()),
                 created_at: 0,
@@ -2454,6 +2465,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: Some("{}".to_string()),
                 created_at: 0,
@@ -3180,6 +3193,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 // No `bound_agents` — a pre-binding-snapshot ("pre-upgrade")
                 // Run whose resume must backfill.
@@ -3391,6 +3406,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: Some("{}".to_string()),
                 created_at: 0,
@@ -3493,6 +3510,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: Some("{}".to_string()),
                 created_at: 0,

@@ -101,8 +101,9 @@ pub use enhance_settings::build_enhance_settings_router;
 pub use issues::{build_issues_router, GetIssueResponse, PostIssueRequest, PostIssueResponse};
 pub use operator_ws::{
     operators_create, operators_delete, operators_delete_by_role, operators_info, operators_list,
-    operators_ws_connect, ClientMsg, LoginSession, OperatorsListEntry, OperatorsListResp,
-    ServerMsg, WSOperatorSession,
+    operators_ws_connect, AssigneeRouter, AssigneeRouterResolver, ClientMsg, LoginSession,
+    OperatorAdapter, OperatorAdapterRegistry, OperatorsListEntry, OperatorsListResp, ServerMsg,
+    WSOperatorSession, WsOperatorWiring,
 };
 pub use projection::{McpQueryAdapter, ProjectionSource, StepList, StepPathQuery, StepSummary};
 pub use tasks::{
@@ -168,13 +169,23 @@ pub struct AppState {
     pub sessions: Arc<Mutex<SessionStore>>,
     /// Application used at the task entry to resolve `BlueprintRef`. Without a Store, runs in Inline-only mode.
     pub task_app: Arc<TaskApplication>,
-    /// When `Some`, on WS connect a new `WSOperatorSession` is automatically registered
-    /// with this factory under the sid name (= a `kind=operator` + `operator_ref=<sid>` AgentDef
-    /// binds to the `WSOperatorSession` backend).
-    /// When `None`, no auto-registration happens; the session is only registered on
-    /// `engine.OperatorRegistry` (= only the `OperatorDelegateMiddleware` path is effective;
-    /// the `OperatorSpawnerFactory` path is dead).
-    pub ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+    /// `OperatorId` → the Operator session that answers for it. Written by
+    /// the login path (`register_operator_session` binds each session under
+    /// its sid *and* each of its roles, both of which can appear as
+    /// `Assignee.op`), read by every
+    /// [`AssigneeRouter`](crate::operator_ws::AssigneeRouter) when it
+    /// resolves a seat's current holder.
+    ///
+    /// This is the delivery side of the split the router exists for: which
+    /// seat an agent dispatches through is baked at compile time, *who*
+    /// holds that seat is `Run.current`, and this map is what turns the
+    /// holder's `OperatorId` into something a dispatch can be handed to.
+    ///
+    /// Shared with the `OperatorSpawnerFactory`'s slot resolver when the
+    /// caller wired one (see
+    /// [`WsOperatorWiring`](crate::operator_ws::WsOperatorWiring)); an empty
+    /// registry with no reader otherwise.
+    pub operator_adapters: Arc<OperatorAdapterRegistry>,
     /// Owner of the Store on the Data path (Big Response handling). Added in v9.
     /// Independent layer — the Engine core and the Domain path (`/v1/worker/result`)
     /// are not involved.
@@ -243,7 +254,7 @@ pub struct AppState {
 }
 
 /// Minimal entry point: builds a router with [`default_registry`] and no
-/// `BlueprintStore` (Inline-only mode) or `ws_operator_factory`.
+/// `BlueprintStore` (Inline-only mode) or Operator wiring.
 pub fn build_router(engine: Engine) -> Router {
     build_router_with(engine, default_registry(), None)
 }
@@ -318,19 +329,26 @@ pub fn build_router_with(
     build_router_with_ws_factory(engine, registry, store, None)
 }
 
-/// 4-argument variant of `build_router_with`. Passing `ws_operator_factory = Some(arc)`
-/// causes each WS connect to auto-register a new `WSOperatorSession` under its sid
-/// name with the factory (= a `kind=operator` AgentDef with `operator_ref: <sid>`
-/// can then bind to the WS client backend). Callers are expected to also install
-/// the same `Arc` into the `SpawnerRegistry` via
-/// `reg.register::<OperatorSpawnerFactory>(arc.clone())`.
+/// 4-argument variant of `build_router_with`. Passing
+/// `ws_operator = Some(wiring)` makes every `kind = Operator` agent resolve
+/// through an [`AssigneeRouter`](crate::operator_ws::AssigneeRouter) — one
+/// per Blueprint-declared seat, each reading that seat's current holder off
+/// `Run.current` on every dispatch — and makes the login path register each
+/// `WSOperatorSession` as the adapter its `OperatorId`s (sid + roles)
+/// deliver through. Callers are expected to also install the wiring's
+/// factory into the `SpawnerRegistry` via
+/// `reg.register::<OperatorSpawnerFactory>(wiring.factory.clone())`.
+///
+/// `None` leaves both sides empty: no session is registered as an adapter
+/// and no seat resolves to a router, so a `kind = Operator` agent resolves
+/// through the factory's own registry as it always did.
 pub fn build_router_with_ws_factory(
     engine: Engine,
     registry: SpawnerRegistry,
     store: Option<Arc<dyn BlueprintStore>>,
-    ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+    ws_operator: Option<WsOperatorWiring>,
 ) -> Router {
-    build_router_with_ws_factory_and_output(engine, registry, store, ws_operator_factory, None)
+    build_router_with_ws_factory_and_output(engine, registry, store, ws_operator, None)
 }
 
 /// 5-argument variant of [`build_router_with_ws_factory`]. Passing
@@ -341,14 +359,14 @@ pub fn build_router_with_ws_factory_and_output(
     engine: Engine,
     registry: SpawnerRegistry,
     store: Option<Arc<dyn BlueprintStore>>,
-    ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+    ws_operator: Option<WsOperatorWiring>,
     output_store: Option<Arc<dyn mlua_swarm::store::output::OutputStore>>,
 ) -> Router {
     build_router_full(
         engine,
         registry,
         store,
-        ws_operator_factory,
+        ws_operator,
         output_store,
         None,
         None,
@@ -388,7 +406,7 @@ pub fn build_router_full(
     engine: Engine,
     registry: SpawnerRegistry,
     store: Option<Arc<dyn BlueprintStore>>,
-    ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+    ws_operator: Option<WsOperatorWiring>,
     output_store: Option<Arc<dyn mlua_swarm::store::output::OutputStore>>,
     base_url: Option<Arc<str>>,
     task_store: Option<Arc<dyn TaskStore>>,
@@ -400,7 +418,7 @@ pub fn build_router_full(
         engine,
         registry,
         store,
-        ws_operator_factory,
+        ws_operator,
         output_store,
         base_url,
         task_store,
@@ -420,7 +438,7 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
     engine: Engine,
     registry: SpawnerRegistry,
     store: Option<Arc<dyn BlueprintStore>>,
-    ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+    ws_operator: Option<WsOperatorWiring>,
     output_store: Option<Arc<dyn mlua_swarm::store::output::OutputStore>>,
     base_url: Option<Arc<str>>,
     task_store: Option<Arc<dyn TaskStore>>,
@@ -434,7 +452,7 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
         engine,
         registry,
         store,
-        ws_operator_factory,
+        ws_operator,
         output_store,
         base_url,
         task_store,
@@ -472,8 +490,8 @@ pub struct OperatorSessionPersistence {
 impl OperatorSessionPersistence {
     /// Restore `store`'s persisted sessions into a bundle ready to hand to
     /// [`build_router_full_with_operator_session_persistence`], registering
-    /// each one with `engine` (and `ws_operator_factory`, when the caller
-    /// wires one) on the way through.
+    /// each one with `engine` (and, when the caller wires one, as an
+    /// adapter in `ws_operator`'s registry) on the way through.
     ///
     /// The registration lives here — inside the one call every boot path
     /// already makes — rather than in a separate "and now register them"
@@ -484,25 +502,25 @@ impl OperatorSessionPersistence {
     /// restored session renders into its Spawn directives once its client
     /// reconnects.
     ///
-    /// # Pass the builder's own `ws_operator_factory` / `base_url`
+    /// # Pass the builder's own `ws_operator` / `base_url`
     ///
     /// Both arguments must be the same values later handed to
     /// [`build_router_full_with_operator_session_persistence`] — nothing in
     /// the types ties the two call sites together, so the split is the
     /// caller's to keep honest. The "a caller could forget" rationale above
-    /// applies verbatim here: passing `None` for `ws_operator_factory` while
-    /// the builder gets `Some(factory)` restores sessions into the engine's
-    /// three registries (so the launch-time `operator_sid` fail-fast no
-    /// longer fires) but leaves them out of `OperatorSpawnerFactory`'s own
-    /// operator map, moving the failure to a later, less obvious
-    /// `CompileError` out of `OperatorSpawnerFactory::build`. A mismatched
+    /// applies verbatim here: passing `None` for `ws_operator` while the
+    /// builder gets `Some(wiring)` restores sessions into the engine's three
+    /// registries (so the launch-time `operator_sid` fail-fast no longer
+    /// fires) but leaves them out of the adapter registry every router
+    /// resolves holders through, moving the failure to a later, less obvious
+    /// dispatch-time "holder names no registered adapter". A mismatched
     /// `base_url` is quieter still: the restored session renders a stale
     /// root into its Spawn directives while every freshly connected one
     /// renders the builder's.
     pub async fn restore(
         store: Arc<dyn OperatorSessionStore>,
         engine: &Engine,
-        ws_operator_factory: Option<&Arc<OperatorSpawnerFactory>>,
+        ws_operator: Option<&WsOperatorWiring>,
         base_url: Option<Arc<str>>,
     ) -> Result<Self, OperatorSessionStoreError> {
         let records: Vec<OperatorSessionRecord> = store.list().await?;
@@ -511,7 +529,7 @@ impl OperatorSessionPersistence {
             prepared.push(
                 crate::operator_ws::login::restored_login_session(
                     engine,
-                    ws_operator_factory,
+                    ws_operator.map(|w| &w.adapters),
                     base_url.clone(),
                     record,
                 )
@@ -532,7 +550,7 @@ pub fn build_router_full_with_operator_session_persistence(
     engine: Engine,
     registry: SpawnerRegistry,
     store: Option<Arc<dyn BlueprintStore>>,
-    ws_operator_factory: Option<Arc<OperatorSpawnerFactory>>,
+    ws_operator: Option<WsOperatorWiring>,
     output_store: Option<Arc<dyn mlua_swarm::store::output::OutputStore>>,
     base_url: Option<Arc<str>>,
     task_store: Option<Arc<dyn TaskStore>>,
@@ -610,11 +628,19 @@ pub fn build_router_full_with_operator_session_persistence(
         Some(s) => s,
         None => Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
     };
+    // The registry every `AssigneeRouter` resolves a seat's holder through,
+    // and the one the login path registers sessions into — the same value
+    // when the caller wired one (`WsOperatorWiring` ties the two together),
+    // and an empty one otherwise: with no factory wired nothing routes, so
+    // the registrations below simply have no reader.
+    let operator_adapters = ws_operator
+        .map(|w| w.adapters)
+        .unwrap_or_else(|| Arc::new(OperatorAdapterRegistry::new()));
     let state = AppState {
         engine,
         sessions: Arc::new(Mutex::new(SessionStore::default())),
         task_app,
-        ws_operator_factory,
+        operator_adapters,
         data_store,
         operator_sessions,
         roles_to_sid,
@@ -982,24 +1008,60 @@ pub struct TaskLaunchRequest {
     /// (unchanged precondition, same as the existing `operator_backend_id`
     /// field).
     ///
-    /// The field also pins the **AgentSpec axis** (the per-agent
+    /// The field also drives the **AgentSpec axis** (the per-agent
     /// `spec.operator_ref` route every Blueprint with `kind = Operator`
-    /// agents uses, whether or not it declares the delegate layer):
-    /// `TaskApplicationInput.operator_pin` carries the sid down to the
-    /// compiler, which resolves those agents against the pinned session
-    /// instead of the role's current process-global holder, and to the
-    /// binding provider, which attests their manifests through the same
-    /// session. Blueprints keep declaring the logical role; which session
-    /// that role means for this run becomes a launch-time fact, recorded on
-    /// `RunRecord.operator_sid`. A pin naming no live session fails the
-    /// launch — there is no fallback to the role, because that fallback is
-    /// exactly how a run ends up on another driver's session.
+    /// agents uses, whether or not it declares the delegate layer): the sid
+    /// becomes the holder of this run's Operator seat
+    /// (`RunRecord.current`, see [`Self::operator_slot`]), which is what
+    /// every dispatch through such an agent resolves — freshly, each time —
+    /// and `TaskApplicationInput.operator_pin` carries it to the binding
+    /// provider, which attests their manifests through the same session.
+    /// Blueprints keep declaring the logical seat; who holds it for this run
+    /// becomes a launch-time fact, and stays movable afterwards. A pin
+    /// naming no live session fails the launch — there is no fallback to the
+    /// role, because that fallback is exactly how a run ends up on another
+    /// driver's session.
     ///
     /// When unset, behavior is unchanged: whatever
     /// `operator.operator_backend_id` / BP-level `operator_ref` alias
     /// resolution already does still applies.
     #[serde(default)]
     operator_sid: Option<String>,
+    /// Why this launch is assigned to [`Self::operator_sid`] — the model's
+    /// `Assign.desc` (§4.3 **A9**), recorded on the Run's holder.
+    ///
+    /// A launch that names an operator is the Run's first `Assign`, and an
+    /// `Assign` without a record of why it happened is refused: with
+    /// `operator_sid` present, an absent / empty / whitespace-only
+    /// `operator_desc` is a `400`, before any Task or Run row is written.
+    /// Without `operator_sid` there is no assignment to describe and this
+    /// field is ignored (**model §4.3**: `launch(op, desc)` — both or
+    /// neither).
+    ///
+    /// Write it for the reader of `GET /v1/runs/:id` who has to work out
+    /// why this run went to that session ("mse-mcp auto-pin: sole live
+    /// session", "operator_sid pinned by the launch request"), not as a
+    /// label for the session itself.
+    #[serde(default)]
+    operator_desc: Option<String>,
+    /// Which Blueprint-declared Operator seat [`Self::operator_sid`] is
+    /// assigned to — an `OperatorDef.name` from the Blueprint's
+    /// `operators[]`, the same symbol its agents select with
+    /// `spec.operator_ref`.
+    ///
+    /// `Run.current` holds one holder per seat, so a pin has to say which
+    /// seat it fills. Omit this when the Blueprint declares exactly one
+    /// Operator (that one is the answer); name it when the Blueprint
+    /// declares several, where omitting it is a `400` that lists the
+    /// candidates rather than a guess. A name the Blueprint does not
+    /// declare is also a `400` — filing a holder under a key no router
+    /// reads would leave the run dispatching into a `Vacant` seat while
+    /// the pin looked like it took. Ignored without `operator_sid`: no
+    /// assignment, no seat to fill.
+    ///
+    /// See `tasks::resolve_launch_slot` for the rule in one place.
+    #[serde(default)]
+    operator_slot: Option<String>,
     /// Per-request override for the sync launch's timeout ceiling (GH #33
     /// Guard 2, see `run_flow_form`'s doc comment). `None` (the default;
     /// existing clients are unaffected) falls back to
@@ -1277,6 +1339,14 @@ async fn run_flow_form(
         op_req.operator_backend_id = Some(sid.clone());
     }
 
+    // A pinned launch is this Run's first `Assign` (model §4.3), so it must
+    // carry the `desc` **A9** makes mandatory. Resolved here, alongside the
+    // sid validation and before any Task/Run row exists, so a launch that
+    // cannot record why it was assigned fails without leaving records
+    // behind. The acquire itself runs after `RunStore::create` below.
+    let launch_assign =
+        tasks::resolve_launch_assign(req.operator_sid.as_deref(), req.operator_desc.as_deref())?;
+
     // GH #33 Guard 2 ceiling resolution: request field > server config >
     // built-in default (300s, `config::default_sync_timeout_secs`).
     // Validated up front — before any TaskRecord/RunRecord side effects —
@@ -1349,21 +1419,58 @@ async fn run_flow_form(
         AppBlueprintRef::Id { id, version } => AppBlueprintRef::Id { id, version },
     };
 
+    // Three questions need the real Blueprint, and all three are answered
+    // before any Task/Run row exists: the TTL cascade's middle tier
+    // (`metadata.default_run_ttl_secs`), the seat a launch pin's `Assign`
+    // lands in, and — for every launch, pinned or not — which Operator
+    // seats the Blueprint declares, so the ones with a holder can be
+    // seated (`tasks::seat_declared_operators`). That last one is why this
+    // is no longer conditional: an unpinned launch used to skip the
+    // resolve, but it also used to reach its operator through the factory's
+    // role lookup, and now the only way it reaches one is by having its
+    // declared seats filled here. The resolve is not extra work overall —
+    // the dispatch below resolves the same Blueprint anyway; this only
+    // moves the failure of an unresolvable ref ahead of the Task/Run rows.
+    let resolved_bp = {
+        let (bp, _ver) = state
+            .task_app
+            .resolve(&blueprint)
+            .await
+            .map_err(|e| ApiError::from_task_resolve(&e, "bp resolve"))?;
+        Some(bp)
+    };
+
     // TTL resolution cascade: (1) request body value, (2) BP metadata `default_run_ttl_secs`,
     // (3) server global default (`default_run_ttl()`, 1800s).
     let (ttl_secs, ttl_source) = match req.ttl_secs {
         Some(v) => (v, TtlSource::RequestBody),
-        None => {
-            let (resolved_bp, _ver) = state
-                .task_app
-                .resolve(&blueprint)
-                .await
-                .map_err(|e| ApiError::from_task_resolve(&e, "bp resolve"))?;
-            match resolved_bp.metadata.default_run_ttl_secs {
-                Some(v) => (v, TtlSource::BpMetadata),
-                None => (default_run_ttl(), TtlSource::ServerDefault),
-            }
+        None => match resolved_bp
+            .as_ref()
+            .and_then(|bp| bp.metadata.default_run_ttl_secs)
+        {
+            Some(v) => (v, TtlSource::BpMetadata),
+            None => (default_run_ttl(), TtlSource::ServerDefault),
+        },
+    };
+
+    // Which Operator seat the pin assigns. The Blueprint decides: exactly
+    // one declared Operator is implicit, several make `operator_slot`
+    // mandatory, and a name the Blueprint does not declare is refused
+    // rather than filed under a key no router reads. See
+    // `tasks::resolve_launch_slot`.
+    let launch_assign = match launch_assign {
+        Some((op, desc)) => {
+            let operators = resolved_bp
+                .as_ref()
+                .map(|bp| bp.operators.as_slice())
+                .unwrap_or(&[]);
+            Some((
+                tasks::resolve_launch_slot(req.operator_slot.as_deref(), operators)?,
+                op,
+                desc,
+            ))
         }
+        None => None,
     };
 
     // Build the launch input up front so a snapshot of it can be persisted
@@ -1380,10 +1487,10 @@ async fn run_flow_form(
         hook_id: op_req.spawn_hook_id,
         operator_backend_id: op_req.operator_backend_id,
         // Axis-independent half of `operator_sid` (see its doc on
-        // `TaskLaunchRequest`): the same sid binds this launch's AgentSpec
-        // axis — Operator agents compile against the pinned session and
-        // their manifests are attested through it — while the field above
-        // keeps feeding the opt-in delegate layer unchanged.
+        // `TaskLaunchRequest`): the same sid attests this launch's AgentSpec
+        // agents' manifests through the pinned session (the routing half is
+        // the seat assignment written above), while the field above keeps
+        // feeding the opt-in delegate layer unchanged.
         operator_pin: req.operator_sid.clone(),
         operator_kind_overrides,
         task_input: task_input_spec,
@@ -1424,6 +1531,12 @@ async fn run_flow_form(
             step_entries: Vec::new(),
             degradations: Vec::new(),
             operator_sid: req.operator_sid.clone(),
+            // A launch never carries a holder: every slot starts Vacant
+            // (`current` empty) and `G` starts at 0 (A4). The Assign that a
+            // launch-time operator pin implies is a separate event on top
+            // of this row.
+            current: Default::default(),
+            next_generation: 0,
             result_ref: None,
             input_json,
             created_at: now,
@@ -1431,6 +1544,31 @@ async fn run_flow_form(
         })
         .await
         .map_err(ApiError::engine)?;
+
+    // The launch-time `Assign`, on top of the row just written: the Run's
+    // holder becomes the pinned operator at generation 1 (**A4**). From
+    // here on `RunRecord.current` — not `operator_sid` — is what a dispatch
+    // resolves its destination from, and a handover moves it without this
+    // launch record changing.
+    if let Some((slot, op, desc)) = &launch_assign {
+        tasks::assign_launch_operator(state, &run_id, slot, op, desc).await?;
+    }
+    // And every other declared seat that already has a holder registered
+    // under its own name — the unpinned launch's route to an operator, and
+    // the reason a multi-seat Blueprint no longer comes up with permanently
+    // Vacant lanes. The pinned seat is excluded, so an explicit
+    // `operator_sid` is never displaced by the role holder it outranks. See
+    // [`tasks::seat_declared_operators`].
+    tasks::seat_declared_operators(
+        state,
+        &run_id,
+        resolved_bp
+            .as_ref()
+            .map(|bp| bp.operators.as_slice())
+            .unwrap_or(&[]),
+        launch_assign.as_ref().map(|(slot, _, _)| slot.as_str()),
+    )
+    .await?;
 
     let trace =
         mlua_swarm::store::trace::TraceHandle::new(run_id.clone(), state.run_trace_store.clone());
@@ -2066,6 +2204,8 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            operator_desc: None,
+            operator_slot: None,
             timeout_secs: None,
             goal: None,
             detach: false,
@@ -2154,7 +2294,7 @@ mod tests {
             engine,
             sessions: Arc::new(Mutex::new(SessionStore::default())),
             task_app: Arc::new(mlua_swarm::TaskApplication::new_inline_only(launch)),
-            ws_operator_factory: None,
+            operator_adapters: Arc::new(crate::operator_ws::OperatorAdapterRegistry::new()),
             data_store: Arc::new(mlua_swarm::store::output::InMemoryOutputStore::new()),
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
@@ -2190,6 +2330,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: None,
                 created_at: now,

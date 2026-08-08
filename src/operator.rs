@@ -131,6 +131,37 @@ pub trait Operator: Send + Sync {
     }
 }
 
+/// Resolves the `Arc<dyn Operator>` a Blueprint-declared Operator seat
+/// dispatches through.
+///
+/// # Why a hook instead of a lookup
+///
+/// `AgentDef.spec.operator_ref` names a **seat** (one of
+/// `Blueprint.operators[]`), not a backend. Historically
+/// [`OperatorSpawnerFactory`](crate::OperatorSpawnerFactory) answered it by
+/// looking the name up in its own `id → Arc<dyn Operator>` map, which baked
+/// whichever session held that name at compile time into
+/// `routes[agent_name]` for the whole Run — so re-assigning the seat later
+/// could not change where a dispatch went (model §4.3 **A10**: *the
+/// destination is not baked in*).
+///
+/// A host that records seat holders per Run installs a resolver instead. It
+/// is handed the seat name and returns the indirection that performs the
+/// per-dispatch holder lookup (`mlua-swarm-server`'s `AssigneeRouter`), so
+/// what gets baked is **which seat**, never **who holds it**.
+///
+/// The hook lives here rather than in the compiler because the resolving
+/// type needs a `RunStore` and the live session registry, both of which are
+/// the host's; the core only needs to know that something can answer
+/// "operator for seat *X*".
+pub trait OperatorSlotResolver: Send + Sync {
+    /// The backend for `slot`, or `None` when this resolver cannot serve
+    /// that seat — which fails the compile loudly (there is deliberately no
+    /// fallback to the factory's own registry, since falling back is how a
+    /// dispatch ends up somewhere the caller never named).
+    fn resolve(&self, slot: &str) -> Option<Arc<dyn Operator>>;
+}
+
 /// A `SpawnerAdapter` implementation that hands the dispatch off to an
 /// `Arc<dyn Operator>`.
 ///

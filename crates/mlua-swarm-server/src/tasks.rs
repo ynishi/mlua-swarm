@@ -43,7 +43,7 @@ use futures_util::FutureExt;
 use mlua_swarm::application::{
     BlueprintRef, TaskApplicationError, TaskApplicationInput, TaskApplicationOutput,
 };
-use mlua_swarm::blueprint::{BindRequest, BindingAttestation, BoundAgent};
+use mlua_swarm::blueprint::{BindRequest, BindingAttestation, BoundAgent, OperatorDef};
 use mlua_swarm::core::config::CheckPolicy;
 use mlua_swarm::service::merge_init_ctx_3layer;
 use mlua_swarm::service::TaskLaunchError;
@@ -160,6 +160,248 @@ impl RunLaunchSnapshot {
 pub(crate) fn snapshot_launch_input(input: &TaskApplicationInput) -> Result<String, ApiError> {
     serde_json::to_string(&RunLaunchSnapshot::from_input(input))
         .map_err(|e| ApiError::bad_request(format!("launch input snapshot: {e}")))
+}
+
+/// Validate the `(operator_sid, operator_desc)` pair a launch carries, and
+/// return the `Assign` it implies.
+///
+/// Model §4.3 spells the launch verb `launch(op, desc)` with the operator
+/// optional and, when present, its `desc` mandatory (**A9**: "the `desc` of
+/// an `Assign` is required; `∅` is rejected with `400` — the launch-time
+/// `Assign` included"). This function is that rule, in one place, for both
+/// Run-creation sites (`run_flow_form` and [`task_rekick`]):
+///
+/// - `(Some(op), Some(non-blank desc))` → `Some((op, desc))`, the launch's
+///   first `Assign`.
+/// - `(Some(op), None | Some(blank))` → `400`. Refused **before** any
+///   Task/Run row is written, the same fail-fast-before-side-effects
+///   ordering the sid-validation and the timeout-ceiling checks already
+///   observe — a launch that cannot record why it was assigned should not
+///   leave records behind.
+/// - `(None, _)` → `None`: nothing was assigned, so there is nothing to
+///   describe. A stray `operator_desc` is not an error; it describes an
+///   assignment that was never requested.
+///
+/// The store enforces **A9** again at its own boundary
+/// (`RunStoreError::AssigneeDescRequired`); this is the HTTP-side
+/// spelling, which is where the status code lives.
+pub(crate) fn resolve_launch_assign(
+    operator_sid: Option<&str>,
+    operator_desc: Option<&str>,
+) -> Result<Option<(String, String)>, ApiError> {
+    let Some(op) = operator_sid else {
+        return Ok(None);
+    };
+    let desc = operator_desc.map(str::trim).unwrap_or_default();
+    if desc.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "operator_desc is required when operator_sid is given: pinning this launch to \
+             operator '{op}' assigns the Run to it, and an assignment must record why it \
+             happened (e.g. \"pinned by the launch request\")"
+        )));
+    }
+    Ok(Some((op.to_string(), desc.to_string())))
+}
+
+/// Which Blueprint-declared Operator seat a launch pin's `Assign` lands
+/// in.
+///
+/// `Run.current` is keyed by slot (`operator_ref`): a Blueprint declares N
+/// Operator seats in `operators[]` and each agent picks the one it
+/// dispatches through (`AgentDef.spec.operator_ref`), so "assign this Run
+/// to that operator" is only half an instruction — the other half is
+/// *which seat*. The rule, in launch-request terms:
+///
+/// 1. `operator_slot` given → that seat, provided the Blueprint declares
+///    it. A name no `OperatorDef` carries is a `400`, not a new seat:
+///    accepting it would file a holder under a key no router ever reads,
+///    and the run would dispatch into a `Vacant` seat with the pin looking
+///    like it took.
+/// 2. `operator_slot` absent and the Blueprint declares exactly one
+///    Operator → that one. Nothing to disambiguate, so nothing to ask for
+///    (this is the shape every bundled Blueprint has today).
+/// 3. `operator_slot` absent and the Blueprint declares two or more →
+///    `400`, listing the candidates. Picking one (the first, say) would be
+///    an addressing rule the model does not have, and would silently
+///    mis-address every multi-Operator Blueprint — the exact failure the
+///    per-lane split (`phase_a_op` / `phase_b_op`) exists to keep visible.
+/// 4. The Blueprint declares no Operator at all → `400`. There is no seat
+///    to assign, so the pin cannot be honored.
+///
+/// The comparison is literal (no trimming): a padded or empty name is a
+/// name nothing declares, and gets the same candidate-listing `400` as any
+/// other typo.
+pub(crate) fn resolve_launch_slot(
+    operator_slot: Option<&str>,
+    operators: &[OperatorDef],
+) -> Result<String, ApiError> {
+    let declared = || {
+        operators
+            .iter()
+            .map(|o| format!("'{}'", o.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if let Some(slot) = operator_slot {
+        return if operators.iter().any(|o| o.name == slot) {
+            Ok(slot.to_string())
+        } else if operators.is_empty() {
+            Err(ApiError::bad_request(format!(
+                "operator_slot '{slot}': this Blueprint declares no operators[], so there is \
+                 no seat to assign a launch pin to"
+            )))
+        } else {
+            Err(ApiError::bad_request(format!(
+                "operator_slot '{slot}': this Blueprint declares no such operator (declared: \
+                 {})",
+                declared()
+            )))
+        };
+    }
+
+    match operators {
+        [only] => Ok(only.name.clone()),
+        [] => Err(ApiError::bad_request(
+            "operator_sid assigns this Run to an operator, but the Blueprint declares no \
+             operators[] — there is no seat to assign it to. Declare the Operator the agents \
+             dispatch through, or launch without operator_sid."
+                .to_string(),
+        )),
+        _ => Err(ApiError::bad_request(format!(
+            "operator_slot is required: this Blueprint declares {} Operator seats ({}), so a \
+             launch pin has to name the one it assigns",
+            operators.len(),
+            declared()
+        ))),
+    }
+}
+
+/// Write a launch's first `Assign` onto a freshly created Run.
+///
+/// Called right after `RunStore::create`, with the pair
+/// [`resolve_launch_assign`] validated and the seat [`resolve_launch_slot`]
+/// resolved out of the Blueprint. **A4**: the Run was created with
+/// `next_generation == 0`, so this acquire makes the holder generation `1`
+/// — a launch pin is an assignment event on top of the row, not a field of
+/// it, which is why `RunRecord.current` is not seeded at `create` time.
+///
+/// A failure here is a `500`: the row exists but does not carry the holder
+/// the caller asked for, and dispatching it would deliver somewhere the
+/// caller never named (or, with the router in place, nowhere at all).
+/// Degrading to an unassigned run would be the silent-fallback this whole
+/// axis exists to remove.
+pub(crate) async fn assign_launch_operator(
+    state: &AppState,
+    run_id: &RunId,
+    slot: &str,
+    op: &str,
+    desc: &str,
+) -> Result<(), ApiError> {
+    state
+        .run_store
+        .acquire_assignee(run_id, slot, op, desc)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            ApiError::engine(format!(
+                "run {run_id}: assigning launch operator '{op}' to slot '{slot}' failed: {e}"
+            ))
+        })
+}
+
+/// The `Assign.desc` written for a seat filled from its own declared name
+/// rather than from a launch pin. See [`seat_declared_operators`].
+///
+/// **A9** requires every `Assign` to record why it happened, and on an
+/// unpinned launch there is no human to write that sentence — so the server
+/// writes one, and it has to be honest about being server-authored. Reading
+/// `GET /v1/runs/:id`, a `desc` starting with "auto-seated at launch" is the
+/// tell that nobody chose this holder: the seat was filled because an
+/// operator happened to be registered under the seat's own name at launch
+/// time. A human pin's `desc` is whatever the caller wrote in
+/// `operator_desc`, which this literal can never be mistaken for.
+pub(crate) fn auto_seat_desc(slot: &str) -> String {
+    format!(
+        "auto-seated at launch from the Blueprint-declared operator role '{slot}' \
+         (no operator_sid pin in the launch request)"
+    )
+}
+
+/// Fill every Blueprint-declared Operator seat that has a holder registered
+/// under its own name, right after `RunStore::create`.
+///
+/// # Why a launch seats anything at all
+///
+/// `Run.current` is the single place a dispatch resolves its destination
+/// from (**A10**), so a seat nothing ever wrote is a seat no dispatch can
+/// reach. Before the `AssigneeRouter`, a `kind = Operator` agent resolved
+/// its `Arc<dyn Operator>` out of the `OperatorSpawnerFactory` registry
+/// under `spec.operator_ref`, where the login path had filed the role
+/// holder — so an *unpinned* launch dispatched to whoever held the role.
+/// Routing through `current` alone would have deleted that shipped shape:
+/// every bundled sample launches without `operator_sid`, and each would now
+/// compile and then die on its first dispatch.
+///
+/// This restores it *through* `current` rather than beside it. The seat is
+/// filled by an `acquire_assignee` like any other, so the destination is
+/// still read fresh on every dispatch and a later handover still moves it —
+/// A10 is untouched. What changes is only who is in the seat at generation
+/// 1 when the caller named nobody.
+///
+/// # The rule
+///
+/// - **Explicit pin wins.** `pinned_slot` names the seat
+///   [`assign_launch_operator`] already filled; it is skipped here, so a
+///   pin is never overwritten by the role holder it displaced.
+/// - **A seat is filled iff its own name resolves an adapter.** The
+///   registry's key space is the model's `OperatorId`, in which a role
+///   alias (`main-ai`) is first-class (`login::register_operator_session`
+///   files every session under its sid *and* each of its roles). A
+///   Blueprint's `operators[]` entry names the role its agents dispatch
+///   through, so "is anyone holding this role right now" is exactly
+///   `adapters.get(seat_name)`.
+/// - **No holder ⇒ the seat stays `Vacant`,** and nothing is invented for
+///   it. That is the honest outcome and it is loud: the first dispatch
+///   through that seat fails naming the seat
+///   (`AssigneeRouter::execute`). It used to fail earlier, at compile, with
+///   "not registered in factory" — later, but strictly more informative,
+///   and it no longer depends on who happened to be logged in at compile
+///   time.
+///
+/// A multi-seat Blueprint therefore comes up with every lane that has a
+/// holder already dispatchable, instead of at most the one lane a launch
+/// pin could name.
+///
+/// A store failure here is a `500`, for [`assign_launch_operator`]'s
+/// reason: the row exists but does not carry the holder the Run needs, and
+/// dispatching it would fail somewhere far from the cause.
+pub(crate) async fn seat_declared_operators(
+    state: &AppState,
+    run_id: &RunId,
+    operators: &[OperatorDef],
+    pinned_slot: Option<&str>,
+) -> Result<(), ApiError> {
+    for op_def in operators {
+        let slot = op_def.name.as_str();
+        if pinned_slot == Some(slot) {
+            continue;
+        }
+        if state.operator_adapters.get(slot).await.is_none() {
+            continue;
+        }
+        state
+            .run_store
+            .acquire_assignee(run_id, slot, slot, &auto_seat_desc(slot))
+            .await
+            .map_err(|e| {
+                ApiError::engine(format!(
+                    "run {run_id}: seating the declared operator role '{slot}' at launch failed: \
+                     {e}"
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 /// Shared finalize step for a dispatched kick: updates the Run's
@@ -507,6 +749,24 @@ pub struct RunKickRequest {
     /// byte-for-byte.
     #[serde(default)]
     pub operator_sid: Option<String>,
+    /// Why this kick is assigned to [`Self::operator_sid`] — the model's
+    /// `Assign.desc` (§4.3 **A9**), with the same contract as
+    /// `POST /v1/tasks`' own `operator_desc`: mandatory whenever
+    /// `operator_sid` is given (absent / blank is a `400`, resolved before
+    /// any store write), ignored when it is not. See
+    /// [`resolve_launch_assign`].
+    #[serde(default)]
+    pub operator_desc: Option<String>,
+    /// Which Blueprint-declared Operator seat ([`OperatorDef::name`], the
+    /// `operator_ref` agents dispatch through) this kick's `Assign` lands
+    /// in — the rekick twin of `POST /v1/tasks`' `operator_slot`, with the
+    /// identical rule in [`resolve_launch_slot`]: omit it when the Task's
+    /// Blueprint declares exactly one Operator, name it when the Blueprint
+    /// declares several (its absence there is a `400` listing the
+    /// candidates). Read only when `operator_sid` is given; there is no
+    /// seat to fill without a holder to put in it.
+    #[serde(default)]
+    pub operator_slot: Option<String>,
 }
 
 /// Response body for `POST /v1/tasks/:id/runs`.
@@ -607,6 +867,25 @@ pub async fn task_rekick(
         }
         None => None,
     };
+
+    // A pinned rekick is this Run's first `Assign` — same **A9** `desc`
+    // requirement, same fail-fast-before-side-effects ordering as
+    // `run_flow_form`. The acquire runs after `RunStore::create` below.
+    //
+    // The seat it lands in comes from the Blueprint just resolved above
+    // (`operators[]`), not from a constant: which Operator a pin assigns
+    // is a fact about the Blueprint the Task was launched with, and the
+    // rekick body only gets to name one when the Blueprint declares
+    // several. See [`resolve_launch_slot`].
+    let launch_assign =
+        match resolve_launch_assign(req.operator_sid.as_deref(), req.operator_desc.as_deref())? {
+            Some((op, desc)) => Some((
+                resolve_launch_slot(req.operator_slot.as_deref(), &resolved_bp.operators)?,
+                op,
+                desc,
+            )),
+            None => None,
+        };
 
     // GH #33 Guard 2 ceiling resolution (issue #35 ST3 — mirrors
     // `run_flow_form`'s `lib.rs:813-826` cascade): request field > server
@@ -733,6 +1012,12 @@ pub async fn task_rekick(
             step_entries: Vec::new(),
             degradations: Vec::new(),
             operator_sid: req.operator_sid.clone(),
+            // A launch never carries a holder: every slot starts Vacant
+            // (`current` empty) and `G` starts at 0 (A4). The Assign that a
+            // launch-time operator pin implies is a separate event on top
+            // of this row.
+            current: Default::default(),
+            next_generation: 0,
             result_ref: None,
             input_json,
             created_at: now,
@@ -740,6 +1025,21 @@ pub async fn task_rekick(
         })
         .await
         .map_err(ApiError::engine)?;
+
+    // The kick's `Assign` (**A4**: generation 1 on a freshly created Run).
+    if let Some((slot, op, desc)) = &launch_assign {
+        assign_launch_operator(&state, &run_id, slot, op, desc).await?;
+    }
+    // Every other declared seat that has a holder under its own name. The
+    // pinned seat above is excluded, so a pin is never displaced by the
+    // role holder it outranks. See [`seat_declared_operators`].
+    seat_declared_operators(
+        &state,
+        &run_id,
+        &resolved_bp.operators,
+        launch_assign.as_ref().map(|(slot, _, _)| slot.as_str()),
+    )
+    .await?;
 
     let trace = TraceHandle::new(run_id.clone(), state.run_trace_store.clone());
     trace
@@ -2026,7 +2326,7 @@ mod tests {
             engine,
             sessions: Arc::new(Mutex::new(crate::SessionStore::default())),
             task_app: Arc::new(mlua_swarm::TaskApplication::new_inline_only(launch)),
-            ws_operator_factory: None,
+            operator_adapters: Arc::new(crate::operator_ws::OperatorAdapterRegistry::new()),
             data_store: Arc::new(InMemoryOutputStore::new()),
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
             roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
@@ -2054,10 +2354,54 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            operator_desc: None,
+            operator_slot: None,
             timeout_secs: None,
             goal: Some(goal.to_string()),
             detach: false,
             check_policy: None,
+        }
+    }
+
+    /// The Operator seat the pin tests assign to. A launch pin lands in a
+    /// Blueprint-declared seat, so a Blueprint that declares none cannot
+    /// be pinned at all — every pinned fixture below therefore goes
+    /// through [`post_tasks_req_declaring`] rather than the bare
+    /// [`post_tasks_req`].
+    const SLOT_A: &str = "phase-a-op";
+    /// A sibling seat, for the multi-Operator (per-lane) cases.
+    const SLOT_B: &str = "phase-b-op";
+
+    /// An `OperatorDef` that declares nothing but its name — which is the
+    /// only field the slot rule reads.
+    fn operator_def(name: &str) -> OperatorDef {
+        OperatorDef {
+            name: name.to_string(),
+            display_name: None,
+            kind: None,
+            spec: Value::Null,
+            profile: None,
+            meta: None,
+        }
+    }
+
+    /// [`identity_blueprint`] plus the named Operator seats. The flow
+    /// still dispatches through the baseline `RustFn` agent — these seats
+    /// exist so a launch pin has somewhere to land, which is exactly the
+    /// shape a Blueprint with `kind = Operator` agents has.
+    fn blueprint_declaring(names: &[&str]) -> Blueprint {
+        Blueprint {
+            operators: names.iter().copied().map(operator_def).collect(),
+            ..identity_blueprint()
+        }
+    }
+
+    fn post_tasks_req_declaring(goal: &str, names: &[&str]) -> crate::TaskLaunchRequest {
+        crate::TaskLaunchRequest {
+            blueprint: BlueprintRef::Inline {
+                value: Box::new(blueprint_declaring(names)),
+            },
+            ..post_tasks_req(goal)
         }
     }
 
@@ -2189,6 +2533,8 @@ mod tests {
                 ..Default::default()
             }),
             operator_sid: None,
+            operator_desc: None,
+            operator_slot: None,
             timeout_secs,
             goal: Some("operator delegate test goal".to_string()),
             detach: false,
@@ -2419,6 +2765,8 @@ mod tests {
                 timeout_secs: None,
                 detach: true,
                 operator_sid: None,
+                operator_desc: None,
+                operator_slot: None,
             })),
         )
         .await
@@ -2458,6 +2806,8 @@ mod tests {
                 timeout_secs: Some(60),
                 detach: true,
                 operator_sid: None,
+                operator_desc: None,
+                operator_slot: None,
             })),
         )
         .await
@@ -2517,6 +2867,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: None,
                 created_at: now,
@@ -2813,6 +3165,8 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            operator_desc: None,
+            operator_slot: None,
             timeout_secs: None,
             goal: Some("st4 rekick goal".to_string()),
             detach: false,
@@ -2871,6 +3225,8 @@ mod tests {
                 timeout_secs: None,
                 detach: false,
                 operator_sid: None,
+                operator_desc: None,
+                operator_slot: None,
             })),
         )
         .await
@@ -2967,6 +3323,8 @@ mod tests {
                 timeout_secs: None,
                 detach: false,
                 operator_sid: None,
+                operator_desc: None,
+                operator_slot: None,
             })),
         )
         .await
@@ -3018,6 +3376,8 @@ mod tests {
             ttl_secs: None,
             operator: None,
             operator_sid: None,
+            operator_desc: None,
+            operator_slot: None,
             timeout_secs: None,
             goal: Some(goal.to_string()),
             detach: false,
@@ -3098,6 +3458,8 @@ mod tests {
                     timeout_secs: Some(1),
                     detach: false,
                     operator_sid: None,
+                    operator_desc: None,
+                    operator_slot: None,
                 })),
             ),
         )
@@ -3168,6 +3530,8 @@ mod tests {
                 timeout_secs: Some(0),
                 detach: false,
                 operator_sid: None,
+                operator_desc: None,
+                operator_slot: None,
             })),
         )
         .await;
@@ -3250,6 +3614,8 @@ mod tests {
                 timeout_secs: None,
                 detach: false,
                 operator_sid: Some("S-not-registered".to_string()),
+                operator_desc: Some("pinned by the rekick test".to_string()),
+                operator_slot: None,
             })),
         )
         .await;
@@ -3294,7 +3660,10 @@ mod tests {
             .await;
         let posted = crate::tasks_start(
             State(state.clone()),
-            Json(post_tasks_req("registered operator_sid rekick goal")),
+            Json(post_tasks_req_declaring(
+                "registered operator_sid rekick goal",
+                &[SLOT_A],
+            )),
         )
         .await
         .expect("tasks_start")
@@ -3309,6 +3678,8 @@ mod tests {
                 timeout_secs: None,
                 detach: false,
                 operator_sid: Some("S-live-op".to_string()),
+                operator_desc: Some("pinned by the rekick test".to_string()),
+                operator_slot: None,
             })),
         )
         .await
@@ -3341,7 +3712,10 @@ mod tests {
             .await;
         let posted = crate::tasks_start(
             State(state.clone()),
-            Json(post_tasks_req("pinned rekick snapshot goal")),
+            Json(post_tasks_req_declaring(
+                "pinned rekick snapshot goal",
+                &[SLOT_A],
+            )),
         )
         .await
         .expect("tasks_start")
@@ -3356,6 +3730,8 @@ mod tests {
                 timeout_secs: None,
                 detach: false,
                 operator_sid: Some("S-live-op".to_string()),
+                operator_desc: Some("pinned by the rekick test".to_string()),
+                operator_slot: None,
             })),
         )
         .await
@@ -3405,6 +3781,470 @@ mod tests {
         assert_eq!(
             run.operator_sid, None,
             "an unpinned launch records no session on the Run"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Launch-time Assign (model §4.3 A4 / A9)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// A pinned launch is the Run's first `Assign`: `current` names the
+    /// pinned operator with the supplied `desc` at generation **1**
+    /// (**A4** — `G` starts at 0 and every assignment event increments
+    /// before stamping).
+    ///
+    /// `operator_sid` is still written too: it is the launch-time
+    /// snapshot, `current` is the live holder, and a later handover moves
+    /// only the second one. Both are asserted here so the difference stays
+    /// visible.
+    #[tokio::test]
+    async fn a_pinned_launch_assigns_the_run_at_generation_one() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let mut req = post_tasks_req_declaring("pinned launch assign goal", &[SLOT_A]);
+        req.operator_sid = Some("S-live-op".to_string());
+        req.operator_desc = Some("pinned by the launch request".to_string());
+
+        let posted = crate::tasks_start(State(state.clone()), Json(req))
+            .await
+            .expect("tasks_start")
+            .0;
+
+        let run = state.run_store.get(&posted.run_id).await.expect("run get");
+        assert_eq!(
+            run.current.len(),
+            1,
+            "a launch pin assigns exactly one slot"
+        );
+        let current = run.current[SLOT_A].clone();
+        assert_eq!(current.op, "S-live-op");
+        assert_eq!(current.desc, "pinned by the launch request");
+        assert_eq!(current.gen, 1, "A4: the first Assign is generation 1");
+        assert_eq!(run.next_generation, 1);
+        assert_eq!(
+            run.operator_sid,
+            Some("S-live-op".to_string()),
+            "the launch-time snapshot field is written as well"
+        );
+    }
+
+    /// **A9**: an `Assign` without a `desc` is refused with `400`, and —
+    /// like every other pre-dispatch guard on this handler — refused
+    /// before any Task or Run row is written.
+    #[tokio::test]
+    async fn a_pinned_launch_without_a_desc_is_rejected_before_side_effects() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let tasks_before = tasks_list(State(state.clone()), Query(TasksListQuery { limit: None }))
+            .await
+            .expect("tasks_list")
+            .0
+            .len();
+
+        for desc in [None, Some(String::new()), Some("   ".to_string())] {
+            let mut req = post_tasks_req_declaring("desc-less pinned launch goal", &[SLOT_A]);
+            req.operator_sid = Some("S-live-op".to_string());
+            req.operator_desc = desc.clone();
+            let err = crate::tasks_start(State(state.clone()), Json(req))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("a pin with desc {desc:?} must be rejected"));
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert!(
+                err.message.contains("operator_desc"),
+                "the error must name the missing field: {}",
+                err.message
+            );
+        }
+
+        let tasks_after = tasks_list(State(state), Query(TasksListQuery { limit: None }))
+            .await
+            .expect("tasks_list")
+            .0
+            .len();
+        assert_eq!(
+            tasks_after, tasks_before,
+            "a rejected launch must not mint a Task (nor the Run under it)"
+        );
+    }
+
+    /// No pin, no assignment: the Run launches `Vacant` at generation 0
+    /// even when a stray `operator_desc` rides along, because there is no
+    /// `Assign` for it to describe. **R2** — that Run is not stopped by
+    /// being Vacant; this one runs to completion.
+    #[tokio::test]
+    async fn an_unpinned_launch_leaves_the_run_vacant() {
+        let state = test_state();
+        let mut req = post_tasks_req("unpinned launch goal");
+        req.operator_desc = Some("describes an assignment nobody asked for".to_string());
+
+        let posted = crate::tasks_start(State(state.clone()), Json(req))
+            .await
+            .expect("an unpinned launch is unaffected by the desc")
+            .0;
+
+        let run = state.run_store.get(&posted.run_id).await.expect("run get");
+        assert!(run.current.is_empty(), "nothing was assigned");
+        assert_eq!(run.next_generation, 0, "A4: no assignment event happened");
+        assert_eq!(run.status, RunStatus::Done);
+    }
+
+    /// Rekick parity: the same `Assign` on `POST /v1/tasks/:id/runs`, and
+    /// the same `400` without a `desc` (asserted on the same handler the
+    /// B-1 pin tests above drive).
+    #[tokio::test]
+    async fn a_pinned_rekick_assigns_at_generation_one_and_requires_a_desc() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req_declaring(
+                "pinned rekick assign goal",
+                &[SLOT_A],
+            )),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        let before = task_get(State(state.clone()), Path(posted.task_id.to_string()))
+            .await
+            .expect("task_get")
+            .0
+            .runs
+            .len();
+        let err = task_rekick(
+            State(state.clone()),
+            Path(posted.task_id.to_string()),
+            Some(Json(RunKickRequest {
+                init_ctx_override: None,
+                task_input_override: None,
+                timeout_secs: None,
+                detach: false,
+                operator_sid: Some("S-live-op".to_string()),
+                operator_desc: None,
+                operator_slot: None,
+            })),
+        )
+        .await
+        .expect_err("a pinned rekick with no desc must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        let after = task_get(State(state.clone()), Path(posted.task_id.to_string()))
+            .await
+            .expect("task_get")
+            .0
+            .runs
+            .len();
+        assert_eq!(after, before, "the rejected rekick minted no Run");
+
+        let (_status, rekicked) = task_rekick(
+            State(state.clone()),
+            Path(posted.task_id.to_string()),
+            Some(Json(RunKickRequest {
+                init_ctx_override: None,
+                task_input_override: None,
+                timeout_secs: None,
+                detach: false,
+                operator_sid: Some("S-live-op".to_string()),
+                operator_desc: Some("re-kicked onto the live session".to_string()),
+                operator_slot: None,
+            })),
+        )
+        .await
+        .expect("a pinned rekick with a desc dispatches");
+
+        let run = state
+            .run_store
+            .get(&rekicked.0.run_id)
+            .await
+            .expect("run get");
+        let current = run.current[SLOT_A].clone();
+        assert_eq!(current.op, "S-live-op");
+        assert_eq!(current.desc, "re-kicked onto the live session");
+        assert_eq!(current.gen, 1, "each Run counts its own generations");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Which seat a launch pin assigns (`operator_slot` / `operators[]`)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// The rule, on its own, in all four shapes it can take. Driven
+    /// directly because it is the one place the decision is made and the
+    /// handlers below only carry it.
+    #[test]
+    fn the_slot_rule_reads_the_blueprints_declared_operators() {
+        let none: Vec<OperatorDef> = Vec::new();
+        let one = vec![operator_def(SLOT_A)];
+        let two = vec![operator_def(SLOT_A), operator_def(SLOT_B)];
+
+        // 2. one declared Operator is implicit.
+        assert_eq!(
+            resolve_launch_slot(None, &one).expect("a sole Operator needs no naming"),
+            SLOT_A
+        );
+        // 1. a named seat the Blueprint declares.
+        assert_eq!(
+            resolve_launch_slot(Some(SLOT_B), &two).expect("a declared seat is nameable"),
+            SLOT_B
+        );
+        // 3. two or more, unnamed: refused, with the candidates listed so
+        //    the caller can pick without reading the Blueprint again.
+        let err = resolve_launch_slot(None, &two).expect_err("two seats cannot be guessed between");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("operator_slot"), "{}", err.message);
+        assert!(
+            err.message.contains(SLOT_A) && err.message.contains(SLOT_B),
+            "the candidates must be listed: {}",
+            err.message
+        );
+        // 1'. a name nothing declares is a typo, not a new seat.
+        let err = resolve_launch_slot(Some("phase-c-op"), &two)
+            .expect_err("an undeclared seat must not be filed");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("phase-c-op"), "{}", err.message);
+        assert!(
+            err.message.contains(SLOT_A) && err.message.contains(SLOT_B),
+            "the declared seats must be listed: {}",
+            err.message
+        );
+        // 4. no seat at all.
+        let err = resolve_launch_slot(None, &none).expect_err("nothing to assign to");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("operators[]"), "{}", err.message);
+        // Padding is not a name: it gets the same treatment as any typo,
+        // rather than quietly meaning "unnamed".
+        assert!(resolve_launch_slot(Some("  phase-a-op  "), &one).is_err());
+    }
+
+    /// A launch pin against a Blueprint declaring one Operator lands in
+    /// that seat — no request field, no constant, the Blueprint decided.
+    #[tokio::test]
+    async fn a_pin_lands_in_the_sole_declared_operator_seat() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let mut req = post_tasks_req_declaring("sole seat goal", &[SLOT_A]);
+        req.operator_sid = Some("S-live-op".to_string());
+        req.operator_desc = Some("pinned by the launch request".to_string());
+
+        let posted = crate::tasks_start(State(state.clone()), Json(req))
+            .await
+            .expect("tasks_start")
+            .0;
+        let run = state.run_store.get(&posted.run_id).await.expect("run get");
+        assert_eq!(
+            run.current.keys().collect::<Vec<_>>(),
+            vec![SLOT_A],
+            "the sole declared Operator is the seat the pin fills"
+        );
+    }
+
+    /// Two declared Operators and no `operator_slot`: refused, with both
+    /// candidates named. Guessing here would silently mis-address every
+    /// per-lane Blueprint (`phase_a_op` / `phase_b_op`), which is exactly
+    /// the shape the guide documents as supported.
+    #[tokio::test]
+    async fn a_pin_on_a_multi_operator_blueprint_must_name_its_seat() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let tasks_before = tasks_list(State(state.clone()), Query(TasksListQuery { limit: None }))
+            .await
+            .expect("tasks_list")
+            .0
+            .len();
+
+        let mut req = post_tasks_req_declaring("two seats goal", &[SLOT_A, SLOT_B]);
+        req.operator_sid = Some("S-live-op".to_string());
+        req.operator_desc = Some("pinned by the launch request".to_string());
+        let err = crate::tasks_start(State(state.clone()), Json(req))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("an ambiguous seat must be refused, not guessed"));
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains(SLOT_A) && err.message.contains(SLOT_B),
+            "the candidates must be listed: {}",
+            err.message
+        );
+
+        let tasks_after = tasks_list(State(state), Query(TasksListQuery { limit: None }))
+            .await
+            .expect("tasks_list")
+            .0
+            .len();
+        assert_eq!(
+            tasks_after, tasks_before,
+            "a refused launch must not mint a Task (nor the Run under it)"
+        );
+    }
+
+    /// Naming the seat resolves the same launch — and the holder lands in
+    /// the named one, not the first declared.
+    #[tokio::test]
+    async fn a_named_seat_is_the_seat_the_pin_fills() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let mut req = post_tasks_req_declaring("named seat goal", &[SLOT_A, SLOT_B]);
+        req.operator_sid = Some("S-live-op".to_string());
+        req.operator_desc = Some("pinned by the launch request".to_string());
+        req.operator_slot = Some(SLOT_B.to_string());
+
+        let posted = crate::tasks_start(State(state.clone()), Json(req))
+            .await
+            .expect("a named seat resolves the ambiguity")
+            .0;
+        let run = state.run_store.get(&posted.run_id).await.expect("run get");
+        assert_eq!(
+            run.current.keys().collect::<Vec<_>>(),
+            vec![SLOT_B],
+            "the pin fills the seat it named"
+        );
+        assert!(
+            !run.current.contains_key(SLOT_A),
+            "the seat that was not named stays Vacant"
+        );
+    }
+
+    /// An `operator_slot` the Blueprint does not declare is a `400`, before
+    /// any record exists — not a seat conjured out of the request body.
+    #[tokio::test]
+    async fn an_undeclared_seat_is_rejected_before_side_effects() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let tasks_before = tasks_list(State(state.clone()), Query(TasksListQuery { limit: None }))
+            .await
+            .expect("tasks_list")
+            .0
+            .len();
+
+        let mut req = post_tasks_req_declaring("undeclared seat goal", &[SLOT_A]);
+        req.operator_sid = Some("S-live-op".to_string());
+        req.operator_desc = Some("pinned by the launch request".to_string());
+        req.operator_slot = Some("typo-op".to_string());
+        let err = crate::tasks_start(State(state.clone()), Json(req))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("an undeclared seat must be refused"));
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("typo-op"), "{}", err.message);
+
+        let tasks_after = tasks_list(State(state), Query(TasksListQuery { limit: None }))
+            .await
+            .expect("tasks_list")
+            .0
+            .len();
+        assert_eq!(tasks_after, tasks_before, "no Task was minted");
+    }
+
+    /// A Blueprint that declares no Operator at all has no seat for a pin
+    /// to fill, so the pin is refused rather than filed under a key
+    /// nothing reads.
+    #[tokio::test]
+    async fn a_pin_on_an_operator_less_blueprint_is_rejected() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let mut req = post_tasks_req("no seats goal");
+        req.operator_sid = Some("S-live-op".to_string());
+        req.operator_desc = Some("pinned by the launch request".to_string());
+
+        let err = crate::tasks_start(State(state), Json(req))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("there is no seat to assign to"));
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("operators[]"), "{}", err.message);
+    }
+
+    /// Rekick parity for the seat rule: the Task's stored Blueprint is
+    /// what decides, and a kick can name a seat the same way a launch can.
+    #[tokio::test]
+    async fn a_rekick_resolves_its_seat_from_the_tasks_blueprint() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req_declaring(
+                "rekick seat goal",
+                &[SLOT_A, SLOT_B],
+            )),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        // Unnamed against two declared seats: same `400` as the launch.
+        let err = task_rekick(
+            State(state.clone()),
+            Path(posted.task_id.to_string()),
+            Some(Json(RunKickRequest {
+                init_ctx_override: None,
+                task_input_override: None,
+                timeout_secs: None,
+                detach: false,
+                operator_sid: Some("S-live-op".to_string()),
+                operator_desc: Some("re-kicked".to_string()),
+                operator_slot: None,
+            })),
+        )
+        .await
+        .expect_err("an ambiguous seat must be refused on the rekick path too");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains(SLOT_A) && err.message.contains(SLOT_B),
+            "the candidates must be listed: {}",
+            err.message
+        );
+
+        let (_status, rekicked) = task_rekick(
+            State(state.clone()),
+            Path(posted.task_id.to_string()),
+            Some(Json(RunKickRequest {
+                init_ctx_override: None,
+                task_input_override: None,
+                timeout_secs: None,
+                detach: false,
+                operator_sid: Some("S-live-op".to_string()),
+                operator_desc: Some("re-kicked onto lane B".to_string()),
+                operator_slot: Some(SLOT_B.to_string()),
+            })),
+        )
+        .await
+        .expect("a named seat dispatches");
+        let run = state
+            .run_store
+            .get(&rekicked.0.run_id)
+            .await
+            .expect("run get");
+        assert_eq!(
+            run.current.keys().collect::<Vec<_>>(),
+            vec![SLOT_B],
+            "the kick filled the seat it named"
         );
     }
 
@@ -3662,6 +4502,8 @@ mod tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: Some("{}".to_string()),
                 created_at: 0,

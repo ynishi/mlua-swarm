@@ -998,12 +998,14 @@ Blueprint (design-time)         Launch (per run)              Run
 ────────────────────────        ─────────────────────         ──────────────
 operators:                      POST /v1/tasks
   - name: "main-ai"               { blueprint: {...},
-agents:                             operator_sid: "S-aaa" }   RunRecord
-  - spec:                                  │                    .operator_sid
-      operator_ref: "main-ai"              ▼                    = "S-aaa"
-                                  every kind=Operator agent
-                                  compiles against S-aaa,
-                                  manifests attest through it
+agents:                             operator_sid:  "S-aaa",   RunRecord
+  - spec:                           operator_desc: "why" }      .operator_sid
+      operator_ref: "main-ai"              │                    = "S-aaa"
+                                           ▼                    .current
+                                  the seat's holder becomes     = { "main-ai":
+                                  S-aaa, manifests attest          { op: "S-aaa",
+                                  through it                         desc: "why",
+                                                                     gen: 1 } }
 ```
 
 `operator_sid` is accepted by `POST /v1/tasks` and `POST
@@ -1012,9 +1014,13 @@ request time (an unknown sid is a `400`, before any Task/Run row is
 written), and recorded on `RunRecord.operator_sid`. It binds the run's
 whole Spawn stream:
 
-- **routing** — `kind = Operator` agents resolve to the pinned session at
-  compile time, not to whichever session currently holds
-  `spec.operator_ref`;
+- **routing** — the pin makes the pinned session the *holder* of the
+  Operator seat named by `spec.operator_ref`, recorded on
+  `RunRecord.current`. Every dispatch through a `kind = Operator` agent
+  reads that seat's holder afresh, so the run goes to the pinned session
+  rather than to whoever else holds the role — and re-assigning the seat
+  mid-run moves the next dispatch with it. Nothing about the session is
+  baked into the compiled Blueprint;
 - **attestation** — capability manifests resolve through the pinned
   session too, so `strict_binding` Blueprints stay `Bound` under pinning;
 - **resume** — the pin travels in the run's launch snapshot, so
@@ -1024,8 +1030,87 @@ A pin that names no live session **fails the launch**. There is
 deliberately no fallback to the role: falling back is how a run ends up
 on another driver's session in the first place, and it does so silently.
 
-Unpinned launches are untouched — same role lookup, same behaviour,
-byte for byte.
+Unpinned launches still reach the role's holder, but they now reach it
+*through* `RunRecord.current` rather than beside it. At launch, every
+Operator seat the Blueprint declares is filled from its own name: a
+session is registered under its sid **and** under each role it claims, so
+if anyone holds the role `operators[].name` spells, that holder is
+assigned the seat at generation 1 — same holder the old role lookup
+found, now recorded where every dispatch reads it. What it is *not* is
+byte-for-byte: the assignment is a real `Assign`, so it carries a
+generation and a `desc`, and a later handover moves it like any other.
+
+The `desc` is server-authored, because an unpinned launch has no caller
+text to use:
+
+```
+"auto-seated at launch from the Blueprint-declared operator role
+ 'main-ai' (no operator_sid pin in the launch request)"
+```
+
+Read `GET /v1/runs/:id` and that opening — `auto-seated at launch` — is
+how you tell a seat nobody chose from one a caller pinned; a pin's `desc`
+is whatever the caller wrote in `operator_desc`.
+
+A seat whose role nobody holds at launch stays `Vacant`. Nothing is
+invented for it, and the first dispatch that needs it fails naming the
+seat.
+
+##### `operator_desc` — pinning assigns, and an assignment is recorded
+
+A pinned launch does not merely note which session it prefers: it
+**assigns** the run to that operator, and the run carries that holder in
+`RunRecord.current` (`{ op, desc, gen }`) from then on. So the launch has
+to say why, and `operator_desc` is mandatory whenever `operator_sid` is
+given — absent, empty, or whitespace-only is a `400`, refused before any
+Task/Run row is written. Without `operator_sid` the field is ignored:
+there is no assignment for it to describe.
+
+Write it for whoever reads `GET /v1/runs/:id` later and has to work out
+why this run went to that session — `"pinned by the launch request"`,
+`"mse-mcp auto-pin: this process's sole live operator session"`. The two
+`swarm_run` paths below send different text for exactly that reason.
+
+`current` is the run's **live** holder; `operator_sid` is the launch-time
+snapshot of the same fact. They agree at launch and diverge afterwards:
+re-assigning a run rewrites `current` (at the next generation) and leaves
+`operator_sid` as the record of how the run started.
+
+##### `operator_slot` — which declared Operator the pin assigns
+
+A Blueprint may declare several Operators (`operators[]`, one per lane —
+see the per-lane alias section above), and `RunRecord.current` holds one
+holder **per declared Operator**. So a pin has to land in a named seat,
+and the Blueprint is what supplies the names:
+
+| Blueprint `operators[]` | `operator_slot` | result |
+|---|---|---|
+| exactly one | omitted | that one — nothing to disambiguate |
+| two or more | omitted | `400`, listing the declared names |
+| any | a declared name | that seat |
+| any | a name not declared | `400`, listing the declared names |
+| none | any | `400` — no seat to assign to |
+
+`operator_slot` is accepted by `POST /v1/tasks` and
+`POST /v1/tasks/:id/runs` alongside `operator_sid`, and — like
+`operator_desc` — is read only when a pin is actually being made. The
+undeclared-name case is a `400` rather than a new seat on purpose: a
+holder filed under a name no agent dispatches through would leave the run
+addressing a `Vacant` seat while the pin looked like it took.
+
+Single-Operator Blueprints (every bundled sample) therefore send exactly
+the pre-`operator_slot` body. Multi-lane Blueprints name the lane they are
+assigning, and the lanes hand over independently: re-assigning
+`phase-a-op` moves only the dispatches that resolve through `phase-a-op`.
+
+A pin names **one** lane, but it is not the only lane a launch fills: the
+seats it does not name are auto-seated from their own roles, exactly as in
+an unpinned launch. So a two-lane Blueprint launched with a driver holding
+`phase-a-op` and another holding `phase-b-op` comes up with both lanes
+dispatchable, whether the launch pins one of them or neither. A pin always
+wins the seat it names — the role holder for that lane is not seated over
+it. A lane whose role nobody holds, and which no pin names, stays `Vacant`
+until it is assigned.
 
 #### Auto-pin from `mse mcp`
 
@@ -1042,6 +1127,11 @@ process would have to guess, which is the failure the pin exists to
 prevent; name one explicitly there. Inline / file Blueprints run inside
 the mcp process, which holds no Operator sessions at all, so an explicit
 `operator_sid` on those selectors is rejected rather than ignored.
+
+The auto-pin answers "which session", never "which lane": `swarm_run`
+passes `operator_slot` through when the caller gives one, and omits it
+otherwise, so a multi-Operator Blueprint gets the server's
+candidate-listing `400` rather than a lane this process picked.
 
 So the everyday driver loop is unchanged: join, launch, `mse_pending_wait`
 — and the frames come back to the driver that launched, even with a
@@ -1060,10 +1150,12 @@ An empty `roles` never conflicts (nothing is claimed), so any number of
 drivers can join the same server for the same Blueprint. The Blueprint
 still declares `operators[].name` / `spec.operator_ref` — those are
 design-time symbols and unaffected. What the empty claim gives up is the
-*unpinned* path: with no session holding the role, an unpinned launch of
-that Blueprint has nothing to resolve and fails at compile time (loudly,
-naming the role and the registered ids). Claim the role when you want
-that fallback; leave it empty when every launch is pinned.
+*unpinned* path: launch-time seating looks for a holder of the seat's own
+role and an empty claim registers none, so an unpinned launch of that
+Blueprint compiles fine, leaves the seat `Vacant`, and then fails on its
+first Operator dispatch — loudly, naming the seat. Claim the role and
+pin to it when you want a launch-time answer; leave it empty when every
+launch carries its own `operator_sid`.
 
 #### Relationship to the delegate layer
 

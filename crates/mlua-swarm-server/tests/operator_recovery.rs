@@ -26,7 +26,7 @@
 use futures_util::StreamExt;
 use mlua_swarm::blueprint::{
     current_schema_version, AgentDef, AgentKind, Blueprint, BlueprintMetadata, CompilerHints,
-    CompilerStrategy,
+    CompilerStrategy, OperatorDef,
 };
 use mlua_swarm::core::config::EngineCfg;
 use mlua_swarm::core::engine::Engine;
@@ -688,7 +688,19 @@ fn identity_blueprint() -> Blueprint {
             verdict: None,
             lints: None,
         }],
-        operators: vec![],
+        // A launch pin assigns the Run to one Blueprint-declared Operator
+        // seat, so the Blueprint has to declare one for the pin below to
+        // resolve. Exactly one — that makes it implicit, and the launch
+        // payload stays the pre-seat one (no `operator_slot`).
+        operators: vec![OperatorDef {
+            // convention-token-ok: mlua-swarm public operator role literal.
+            name: "main-ai".into(),
+            display_name: None,
+            kind: None,
+            spec: json!(null),
+            profile: None,
+            meta: None,
+        }],
         metas: vec![],
         hints: CompilerHints::default(),
         strategy: CompilerStrategy::default(),
@@ -733,6 +745,10 @@ async fn minted_session_is_launch_pinnable_before_any_ws_connect() {
             // convention-token-ok: mlua-swarm public `POST /v1/tasks` payload field.
             "init_ctx": {},
             "operator_sid": sid,
+            // A pin assigns the Run to that operator, and an assignment
+            // records why (model A9) — a pinned launch without this is a
+            // `400` on its own, which would mask what this test measures.
+            "operator_desc": "minted session pinned by this test",
             "goal": "minted operator session pin",
         }))
         .send()

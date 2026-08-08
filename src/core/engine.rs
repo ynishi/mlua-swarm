@@ -6652,6 +6652,8 @@ mod skip_tier_tests {
                 step_entries: Vec::new(),
                 degradations: Vec::new(),
                 operator_sid: None,
+                current: Default::default(),
+                next_generation: 0,
                 result_ref: None,
                 input_json: None,
                 created_at: 0,

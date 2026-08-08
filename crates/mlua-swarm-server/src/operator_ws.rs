@@ -105,6 +105,9 @@
 pub mod login;
 /// Wire format (`ServerMsg` / `ClientMsg`) for `WS /v1/operators/:sid/ws`.
 pub mod protocol;
+/// `AssigneeRouter`: the `Arc<dyn Operator>` that resolves `Run.current` per
+/// dispatch instead of carrying a baked-in session (model §4.3 A10).
+pub mod router;
 /// `WSOperatorSession`: the 3-trait (`SeniorBridge`/`SpawnHook`/`Operator`) WS session object.
 pub mod session;
 
@@ -114,4 +117,8 @@ pub use login::{
     OperatorsListEntry, OperatorsListResp,
 };
 pub use protocol::{ClientMsg, ServerMsg};
+pub use router::{
+    AssigneeRouter, AssigneeRouterResolver, OperatorAdapter, OperatorAdapterRegistry,
+    WsOperatorWiring,
+};
 pub use session::WSOperatorSession;

@@ -19,6 +19,8 @@
 //!   step_entries_json  TEXT NOT NULL,      -- JSON-encoded `Vec<StepEntry>`
 //!   degradations_json  TEXT NOT NULL DEFAULT '[]', -- JSON-encoded `Vec<DegradationEntry>` (GH #32)
 //!   operator_sid       TEXT,
+//!   current_json       TEXT,               -- JSON object: slot -> `Assignee`, NULL when no slot is held
+//!   next_generation    INTEGER NOT NULL DEFAULT 0, -- the model's `G`
 //!   result_ref_json    TEXT,               -- JSON-encoded `serde_json::Value`, NULL when unset
 //!   input_json         TEXT,               -- opaque launch-input snapshot for resume, NULL when unset
 //!   created_at         INTEGER NOT NULL,
@@ -27,21 +29,41 @@
 //! CREATE INDEX IF NOT EXISTS ix_runs_task_id ON runs(task_id, created_at);
 //! ```
 //!
-//! `degradations_json` (GH #32) and `input_json` (the resume launch-input
-//! snapshot) were both added after the initial release; each migration is
-//! applied idempotently on open via a `PRAGMA table_info(runs)` existence
-//! check followed by the matching `ALTER TABLE runs ADD COLUMN …` when
-//! missing, so pre-existing database files pick up the columns without a
-//! manual migration step. `input_json` is a nullable `TEXT` (no default) —
-//! rows written before resume support simply read back `None`.
+//! `degradations_json` (GH #32), `input_json` (the resume launch-input
+//! snapshot) and the assignment pair `current_json` / `next_generation`
+//! were all added after the initial release; each migration is applied
+//! idempotently on open via a `PRAGMA table_info(runs)` existence check
+//! followed by the matching `ALTER TABLE runs ADD COLUMN …` when missing,
+//! so pre-existing database files pick up the columns without a manual
+//! migration step. `input_json` and `current_json` are nullable `TEXT` (no
+//! default) — rows written before those features read back `None`
+//! (`current_json` `NULL` = no slot held); `next_generation` carries
+//! `DEFAULT 0` so a back-filled row starts at the launch value of `G`.
+//!
+//! `current_json` holds the whole `slot -> Assignee` map as one JSON
+//! object, not one row per slot: the map is read and rewritten whole on
+//! every assignment event anyway (the event has to bump the sibling
+//! `next_generation` in the same transaction), and nothing queries a Run
+//! *by* who holds one of its slots. A map that has gone empty is stored
+//! back as SQL `NULL`, so "no slot held" has exactly one representation on
+//! disk.
+//!
+//! `acquire_assignee`/`vacate_assignee` bump `next_generation` and rewrite
+//! `current_json` as a read-modify-write inside one `Immediate`
+//! transaction — the same shape as `append_step_entry`, and for the same
+//! reason: the increment-and-stamp spans two columns, which a conditional
+//! `UPDATE` (the `try_transition` compare-and-set) cannot express. Two
+//! acquires naming *different* slots take the same path, so the map merge
+//! is serialized too and neither can drop the other's entry.
 
 use super::{
-    DegradationEntry, RunId, RunListFilter, RunRecord, RunStatus, RunStore, RunStoreError,
-    StepEntry, TaskId,
+    Assignee, DegradationEntry, RunId, RunListFilter, RunRecord, RunStatus, RunStore,
+    RunStoreError, StepEntry, TaskId,
 };
 use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
 use rusqlite_isle::{AsyncIsle, AsyncIsleDriver, IsleError};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 const SCHEMA_SQL: &str = "\
@@ -52,6 +74,8 @@ CREATE TABLE IF NOT EXISTS runs (\
   step_entries_json  TEXT NOT NULL, \
   degradations_json  TEXT NOT NULL DEFAULT '[]', \
   operator_sid       TEXT, \
+  current_json       TEXT, \
+  next_generation    INTEGER NOT NULL DEFAULT 0, \
   result_ref_json    TEXT, \
   input_json         TEXT, \
   created_at         INTEGER NOT NULL, \
@@ -105,7 +129,9 @@ impl SqliteRunStore {
             conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
             conn.execute_batch(SCHEMA_SQL)?;
             migrate_add_column_if_missing(conn, "degradations_json", "TEXT NOT NULL DEFAULT '[]'")?;
-            migrate_add_column_if_missing(conn, "input_json", "TEXT")
+            migrate_add_column_if_missing(conn, "input_json", "TEXT")?;
+            migrate_add_column_if_missing(conn, "current_json", "TEXT")?;
+            migrate_add_column_if_missing(conn, "next_generation", "INTEGER NOT NULL DEFAULT 0")
         })
         .await
         .map_err(map_isle_err)?;
@@ -118,11 +144,105 @@ impl SqliteRunStore {
             conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
             conn.execute_batch(SCHEMA_SQL)?;
             migrate_add_column_if_missing(conn, "degradations_json", "TEXT NOT NULL DEFAULT '[]'")?;
-            migrate_add_column_if_missing(conn, "input_json", "TEXT")
+            migrate_add_column_if_missing(conn, "input_json", "TEXT")?;
+            migrate_add_column_if_missing(conn, "current_json", "TEXT")?;
+            migrate_add_column_if_missing(conn, "next_generation", "INTEGER NOT NULL DEFAULT 0")
         })
         .await
         .map_err(map_isle_err)?;
         Ok((Self { isle }, driver))
+    }
+
+    /// Shared read-modify-write behind `acquire_assignee` / `vacate_assignee`
+    /// — the model's single assignment event (§4.3 **A4**), scoped to one
+    /// slot.
+    ///
+    /// `assign_to` selects the event: `Some((op, desc))` = `Assign`,
+    /// `None` = `Vacant`. Both bump the generation counter identically;
+    /// only `Assign` mints an [`Assignee`] to stamp it onto. Either way
+    /// only `slot`'s entry in the decoded map is written or removed — the
+    /// other slots' entries are re-encoded exactly as they were read.
+    ///
+    /// Returns `Ok(None)` when no row matched, which the callers lift to
+    /// [`RunStoreError::NotFound`].
+    async fn record_assignment_event(
+        &self,
+        id: &RunId,
+        slot: &str,
+        assign_to: Option<(String, String)>,
+    ) -> Result<Option<(u64, Option<Assignee>)>, RunStoreError> {
+        let id_str = id.to_string();
+        let slot = slot.to_string();
+        let updated_at = crate::types::now_unix() as i64;
+
+        self.isle
+            .call(move |conn| {
+                // Immediate — see `create`'s comment for the shared-file
+                // busy-wait rationale. Beyond that, the read-increment-
+                // stamp-write below MUST be one critical section: two
+                // acquires that read the same `next_generation` would hand
+                // out the same generation twice. A conditional UPDATE (the
+                // `try_transition` compare-and-set) cannot express this,
+                // because the new `current_json` depends on the value read
+                // from the sibling column.
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let existing: Option<(Option<String>, i64)> = tx
+                    .query_row(
+                        "SELECT current_json, next_generation FROM runs WHERE id = ?1",
+                        params![id_str],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((current_json, generation)) = existing else {
+                    return Ok(None);
+                };
+                let mut current: BTreeMap<String, Assignee> = match current_json {
+                    Some(text) => serde_json::from_str(&text)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    None => BTreeMap::new(),
+                };
+                // A4: unconditional — the counter counts events, so an
+                // Assign to the incumbent and a Vacant on an already-vacant
+                // slot both still advance it. It is one counter for the
+                // whole Run: this bump is the same one an event on any
+                // other slot would make.
+                let generation = generation as u64 + 1;
+                // Q3: a brand-new instance carries the new generation;
+                // `previous` — the entry this slot held — is handed back to
+                // the caller untouched.
+                let previous = match assign_to {
+                    Some((op, desc)) => current.insert(
+                        slot.clone(),
+                        Assignee {
+                            op,
+                            desc,
+                            gen: generation,
+                        },
+                    ),
+                    None => current.remove(&slot),
+                };
+                // An emptied map goes back as SQL NULL, matching both the
+                // pre-assignment rows and a Run that has never been
+                // assigned — one on-disk shape for "no slot held".
+                let next_json = if current.is_empty() {
+                    None
+                } else {
+                    Some(
+                        serde_json::to_string(&current)
+                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    )
+                };
+                tx.execute(
+                    "UPDATE runs SET current_json = ?1, next_generation = ?2, updated_at = ?3 \
+                     WHERE id = ?4",
+                    params![next_json, generation as i64, updated_at, id_str],
+                )?;
+                tx.commit()?;
+                Ok(Some((generation, previous)))
+            })
+            .await
+            .map_err(map_isle_err)
     }
 }
 
@@ -131,8 +251,11 @@ fn map_isle_err(e: IsleError) -> RunStoreError {
 }
 
 /// One `runs` SELECT row in column order: id, task_id, status,
-/// step_entries_json, degradations_json, operator_sid, result_ref_json,
-/// input_json, created_at, updated_at.
+/// step_entries_json, degradations_json, operator_sid, current_json,
+/// next_generation, result_ref_json, input_json, created_at, updated_at.
+///
+/// Position-coupled with [`RUN_SELECT_COLUMNS`], [`row_to_record`] and
+/// every `query_map` closure below — all of them move together.
 type RunRow = (
     String,
     String,
@@ -141,13 +264,37 @@ type RunRow = (
     String,
     Option<String>,
     Option<String>,
+    i64,
+    Option<String>,
     Option<String>,
     i64,
     i64,
 );
 
 const RUN_SELECT_COLUMNS: &str = "id, task_id, status, step_entries_json, degradations_json, \
-     operator_sid, result_ref_json, input_json, created_at, updated_at";
+     operator_sid, current_json, next_generation, result_ref_json, input_json, created_at, \
+     updated_at";
+
+/// Read one `runs` row into [`RunRow`] positionally. Every `SELECT
+/// {RUN_SELECT_COLUMNS}` in this file goes through here, so the column
+/// order lives in exactly two places (the const and this function) instead
+/// of once per query.
+fn read_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, String>(4)?,
+        row.get::<_, Option<String>>(5)?,
+        row.get::<_, Option<String>>(6)?,
+        row.get::<_, i64>(7)?,
+        row.get::<_, Option<String>>(8)?,
+        row.get::<_, Option<String>>(9)?,
+        row.get::<_, i64>(10)?,
+        row.get::<_, i64>(11)?,
+    ))
+}
 
 fn row_to_record(row: RunRow) -> Result<RunRecord, RunStoreError> {
     let (
@@ -157,6 +304,8 @@ fn row_to_record(row: RunRow) -> Result<RunRecord, RunStoreError> {
         step_entries_json,
         degradations_json,
         operator_sid,
+        current_json,
+        next_generation,
         result_ref_json,
         input_json,
         created_at,
@@ -168,6 +317,17 @@ fn row_to_record(row: RunRow) -> Result<RunRecord, RunStoreError> {
         .map_err(|e| RunStoreError::Other(format!("decode step_entries: {e}")))?;
     let degradations: Vec<DegradationEntry> = serde_json::from_str(&degradations_json)
         .map_err(|e| RunStoreError::Other(format!("decode degradations: {e}")))?;
+    // A NULL `current_json` is a Run with no slot held — a legitimate
+    // state, not a decode failure. A non-NULL value that is not a
+    // `slot -> Assignee` object IS a failure and is surfaced: silently
+    // reading it back as "no slot held" would turn a corrupt (or
+    // wrong-shaped) column into an apparently unassigned Run, and a
+    // dispatch would then be routed nowhere with no explanation.
+    let current: BTreeMap<String, Assignee> = match current_json {
+        Some(text) => serde_json::from_str(&text)
+            .map_err(|e| RunStoreError::Other(format!("decode current: {e}")))?,
+        None => BTreeMap::new(),
+    };
     let result_ref: Option<serde_json::Value> = match result_ref_json {
         Some(text) => Some(
             serde_json::from_str(&text)
@@ -188,6 +348,8 @@ fn row_to_record(row: RunRow) -> Result<RunRecord, RunStoreError> {
         step_entries,
         degradations,
         operator_sid,
+        current,
+        next_generation: next_generation as u64,
         result_ref,
         input_json,
         created_at: created_at as u64,
@@ -202,6 +364,9 @@ impl RunStore for SqliteRunStore {
     }
 
     async fn create(&self, record: RunRecord) -> Result<(), RunStoreError> {
+        // **A2** on the way in — see `RunStore::create`. Checked before any
+        // encoding so a rejected record never reaches the connection.
+        record.validate_assignment_generations()?;
         let id = record.id.to_string();
         let id_for_conflict = record.id.clone();
         let task_id = record.task_id.to_string();
@@ -212,6 +377,19 @@ impl RunStore for SqliteRunStore {
         let degradations_json = serde_json::to_string(&record.degradations)
             .map_err(|e| RunStoreError::Other(format!("encode degradations: {e}")))?;
         let operator_sid = record.operator_sid.clone();
+        // An empty map (no slot held) persists as SQL NULL rather than the
+        // JSON literal `{}`, so `row_to_record` can read absence straight
+        // off the column type and a never-assigned Run looks identical to a
+        // pre-assignment row.
+        let current_json = if record.current.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&record.current)
+                    .map_err(|e| RunStoreError::Other(format!("encode current: {e}")))?,
+            )
+        };
+        let next_generation = record.next_generation as i64;
         let result_ref_json = record
             .result_ref
             .as_ref()
@@ -243,9 +421,9 @@ impl RunStore for SqliteRunStore {
                 }
                 tx.execute(
                     "INSERT INTO runs (id, task_id, status, step_entries_json, \
-                     degradations_json, operator_sid, result_ref_json, input_json, \
-                     created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     degradations_json, operator_sid, current_json, next_generation, \
+                     result_ref_json, input_json, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         id,
                         task_id,
@@ -253,6 +431,8 @@ impl RunStore for SqliteRunStore {
                         step_entries_json,
                         degradations_json,
                         operator_sid,
+                        current_json,
+                        next_generation,
                         result_ref_json,
                         input_json,
                         created_at,
@@ -282,20 +462,7 @@ impl RunStore for SqliteRunStore {
                 conn.query_row(
                     &format!("SELECT {RUN_SELECT_COLUMNS} FROM runs WHERE id = ?1"),
                     params![id_str],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, Option<String>>(5)?,
-                            row.get::<_, Option<String>>(6)?,
-                            row.get::<_, Option<String>>(7)?,
-                            row.get::<_, i64>(8)?,
-                            row.get::<_, i64>(9)?,
-                        ))
-                    },
+                    read_run_row,
                 )
                 .optional()
             })
@@ -316,20 +483,7 @@ impl RunStore for SqliteRunStore {
                     "SELECT {RUN_SELECT_COLUMNS} FROM runs \
                      WHERE task_id = ?1 ORDER BY created_at ASC"
                 ))?;
-                let iter = stmt.query_map(params![task_id_str], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, i64>(9)?,
-                    ))
-                })?;
+                let iter = stmt.query_map(params![task_id_str], read_run_row)?;
                 let mut out = Vec::new();
                 for r in iter {
                     out.push(r?);
@@ -486,6 +640,41 @@ impl RunStore for SqliteRunStore {
         Ok(n == 1)
     }
 
+    async fn acquire_assignee(
+        &self,
+        id: &RunId,
+        slot: &str,
+        op: &str,
+        desc: &str,
+    ) -> Result<(u64, Option<Assignee>), RunStoreError> {
+        // Refuse before touching the row — a Run must never come to hold an
+        // unnamed assignment (A9) or one filed under no slot, and a
+        // rejected acquire must not have burned a generation.
+        if slot.is_empty() {
+            return Err(RunStoreError::AssigneeSlotRequired);
+        }
+        if desc.trim().is_empty() {
+            return Err(RunStoreError::AssigneeDescRequired);
+        }
+        // A8: no precondition on the slot's incumbent — whoever asks, wins.
+        self.record_assignment_event(id, slot, Some((op.to_string(), desc.to_string())))
+            .await?
+            .ok_or_else(|| RunStoreError::NotFound(id.clone()))
+    }
+
+    async fn vacate_assignee(
+        &self,
+        id: &RunId,
+        slot: &str,
+    ) -> Result<(u64, Option<Assignee>), RunStoreError> {
+        if slot.is_empty() {
+            return Err(RunStoreError::AssigneeSlotRequired);
+        }
+        self.record_assignment_event(id, slot, None)
+            .await?
+            .ok_or_else(|| RunStoreError::NotFound(id.clone()))
+    }
+
     async fn set_result(
         &self,
         id: &RunId,
@@ -543,20 +732,7 @@ impl RunStore for SqliteRunStore {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {RUN_SELECT_COLUMNS} FROM runs WHERE status = ?1"
                 ))?;
-                let iter = stmt.query_map(params![status_json], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, i64>(9)?,
-                    ))
-                })?;
+                let iter = stmt.query_map(params![status_json], read_run_row)?;
                 let mut out = Vec::new();
                 for r in iter {
                     out.push(r?);
@@ -590,20 +766,8 @@ impl RunStore for SqliteRunStore {
                      ORDER BY created_at DESC, rowid DESC \
                      LIMIT ?3 OFFSET ?4"
                 ))?;
-                let iter = stmt.query_map(params![task_id, status_json, limit, offset], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, i64>(9)?,
-                    ))
-                })?;
+                let iter =
+                    stmt.query_map(params![task_id, status_json, limit, offset], read_run_row)?;
                 let mut out = Vec::new();
                 for r in iter {
                     out.push(r?);
@@ -648,6 +812,8 @@ mod tests {
             step_entries: vec![],
             degradations: vec![],
             operator_sid: None,
+            current: Default::default(),
+            next_generation: 0,
             result_ref: None,
             input_json: None,
             created_at,
@@ -676,6 +842,45 @@ mod tests {
         assert_eq!(got.status, RunStatus::Pending);
         assert!(got.step_entries.is_empty());
         assert_eq!(got.result_ref, None);
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// **A2** at `create`, in parity with `InMemoryRunStore` — the check
+    /// belongs to the trait contract, not to one backend, and it runs
+    /// before any encoding so the connection never sees the row.
+    #[tokio::test]
+    async fn create_rejects_a_holder_generation_above_the_counter() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        let mut record = mk("R-1", "T-1", 100);
+        record.current.insert(
+            SLOT_A.to_string(),
+            Assignee {
+                op: "S-seeded".to_string(),
+                desc: "seeded straight into the record".to_string(),
+                gen: 99,
+            },
+        );
+
+        let err = s.create(record).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RunStoreError::AssigneeGenerationAhead {
+                    gen: 99,
+                    next_generation: 0,
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+        assert!(
+            matches!(
+                s.get(&RunId::parse("R-1").unwrap()).await.unwrap_err(),
+                RunStoreError::NotFound(_)
+            ),
+            "a refused create must leave no row behind"
+        );
         drop(s);
         driver.shutdown().await.unwrap();
     }
@@ -950,6 +1155,481 @@ mod tests {
             .await
             .unwrap();
         assert!(!absent, "an absent Run must report false, not error");
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    // ── assignment axis (model §4.3) ──────────────────────────────────
+
+    /// The two slots (Blueprint-declared Operator seats) the tests below
+    /// assign to — the shipped per-lane alias shape, where a Blueprint
+    /// declares one seat per phase.
+    const SLOT_A: &str = "phase-a-op";
+    const SLOT_B: &str = "phase-b-op";
+
+    /// A4: a launched Run starts with every slot Vacant and `G == 0`, and
+    /// both columns round-trip through the row decode.
+    #[tokio::test]
+    async fn launch_starts_vacant_at_generation_zero() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
+        assert!(got.current.is_empty(), "no slot is held at launch");
+        assert_eq!(got.next_generation, 0);
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// A4: every event advances `G` by one and the FIRST Assign lands on
+    /// `1`. A8: re-acquiring for the incumbent still advances it.
+    #[tokio::test]
+    async fn acquire_advances_generation_even_for_the_same_op() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        let (gen, previous) = s
+            .acquire_assignee(&id, SLOT_A, "S-a1", "first hold")
+            .await
+            .unwrap();
+        assert_eq!(gen, 1, "the first Assign stamps generation 1");
+        assert_eq!(previous, None);
+
+        let (gen, previous) = s
+            .acquire_assignee(&id, SLOT_A, "S-a1", "same holder, new event")
+            .await
+            .unwrap();
+        assert_eq!(gen, 2, "A4: a repeat Assign for the same op still bumps");
+        assert_eq!(previous.expect("displaced holder").gen, 1);
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.next_generation, 2);
+        assert_eq!(
+            got.current.len(),
+            1,
+            "A1: re-assigning a slot leaves it with exactly one holder"
+        );
+        let holder = &got.current[SLOT_A];
+        assert_eq!(holder.gen, 2);
+        assert_eq!(holder.desc, "same holder, new event");
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// The slots are independent through the column: writing one slot
+    /// re-encodes the other's entry untouched instead of replacing the map.
+    #[tokio::test]
+    async fn assigning_one_slot_leaves_the_others_intact() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "holds phase a")
+            .await
+            .unwrap();
+        let got = s.get(&id).await.unwrap();
+        assert!(
+            !got.current.contains_key(SLOT_B),
+            "an unassigned slot has no entry — that absence IS its Vacant"
+        );
+
+        s.acquire_assignee(&id, SLOT_B, "S-b2", "holds phase b")
+            .await
+            .unwrap();
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.current[SLOT_A].op, "S-a1", "the first seat survived");
+        assert_eq!(got.current[SLOT_B].op, "S-b2");
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// A4 is Run-wide, not per slot: interleaved assignments to two slots
+    /// walk ONE counter, so any two holders can be ordered by `gen`.
+    #[tokio::test]
+    async fn the_generation_counter_is_shared_across_slots() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        let (first, _) = s
+            .acquire_assignee(&id, SLOT_A, "S-a1", "holds phase a")
+            .await
+            .unwrap();
+        let (second, _) = s
+            .acquire_assignee(&id, SLOT_B, "S-b2", "holds phase b")
+            .await
+            .unwrap();
+        let (third, _) = s
+            .acquire_assignee(&id, SLOT_A, "S-a3", "takes over phase a")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (first, second, third),
+            (1, 2, 3),
+            "a second slot does not start its own counter at 1"
+        );
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.next_generation, 3);
+        assert_eq!(got.current[SLOT_A].gen, 3);
+        assert_eq!(got.current[SLOT_B].gen, 2);
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// A4 (Vacant side): releasing bumps `G` too; the next Assign continues
+    /// from the bumped value.
+    #[tokio::test]
+    async fn vacate_advances_generation_and_clears_the_holder() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "first hold")
+            .await
+            .unwrap();
+        let (gen, released) = s.vacate_assignee(&id, SLOT_A).await.unwrap();
+        assert_eq!(gen, 2, "A4: Vacant is an event and advances G");
+        assert_eq!(released.expect("released holder").op, "S-a1");
+
+        let got = s.get(&id).await.unwrap();
+        assert!(
+            !got.current.contains_key(SLOT_A),
+            "R2: the Run stays, the holder does not"
+        );
+        assert_eq!(got.next_generation, 2);
+
+        let (gen, previous) = s
+            .acquire_assignee(&id, SLOT_A, "S-b2", "after release")
+            .await
+            .unwrap();
+        assert_eq!(gen, 3, "the next Assign continues from the bumped counter");
+        assert_eq!(
+            previous, None,
+            "nothing was displaced — the slot was Vacant"
+        );
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// A Vacant applies to the named slot only — the other seats keep the
+    /// holders they had, across the column round-trip.
+    #[tokio::test]
+    async fn vacate_releases_only_the_named_slot() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "holds phase a")
+            .await
+            .unwrap();
+        s.acquire_assignee(&id, SLOT_B, "S-b2", "holds phase b")
+            .await
+            .unwrap();
+
+        let (_, released) = s.vacate_assignee(&id, SLOT_A).await.unwrap();
+        assert_eq!(released.expect("released holder").op, "S-a1");
+
+        let got = s.get(&id).await.unwrap();
+        assert!(!got.current.contains_key(SLOT_A));
+        assert_eq!(
+            got.current[SLOT_B].op, "S-b2",
+            "vacating one seat must not empty another"
+        );
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// A3 / Q3: an acquire mints a NEW `Assignee` and returns the displaced
+    /// one with its original stamp intact.
+    #[tokio::test]
+    async fn acquire_never_rewrites_the_incumbent_assignee() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "first hold")
+            .await
+            .unwrap();
+        let held_before = s.get(&id).await.unwrap().current[SLOT_A].clone();
+        assert_eq!(held_before.gen, 1);
+
+        let (_, displaced) = s
+            .acquire_assignee(&id, SLOT_A, "S-b2", "takeover")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            held_before.gen, 1,
+            "A3: gen is immutable for the lifetime of an instance"
+        );
+        assert_eq!(
+            displaced.expect("displaced holder"),
+            held_before,
+            "Q3: the displaced instance is returned as-is, not mutated"
+        );
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// A8: acquire has no precondition on the slot's incumbent — last
+    /// writer wins.
+    #[tokio::test]
+    async fn acquire_displaces_a_live_holder() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "first hold")
+            .await
+            .unwrap();
+        let (gen, displaced) = s
+            .acquire_assignee(&id, SLOT_A, "S-b2", "takeover")
+            .await
+            .unwrap();
+
+        assert_eq!(gen, 2);
+        assert_eq!(displaced.expect("displaced holder").op, "S-a1");
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.current[SLOT_A].op, "S-b2");
+        assert_eq!(got.current.len(), 1, "A1: still one holder for that slot");
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// A9: `desc` is mandatory, and so is the slot; a refused event leaves
+    /// the row alone.
+    #[tokio::test]
+    async fn acquire_rejects_a_missing_desc_without_side_effects() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+        let id = RunId::parse("R-1").unwrap();
+        s.acquire_assignee(&id, SLOT_A, "S-a1", "first hold")
+            .await
+            .unwrap();
+
+        for blank in ["", "   "] {
+            let err = s
+                .acquire_assignee(&id, SLOT_A, "S-b2", blank)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RunStoreError::AssigneeDescRequired),
+                "got: {err:?}"
+            );
+        }
+
+        let err = s
+            .acquire_assignee(&id, "", "S-b2", "no slot named")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RunStoreError::AssigneeSlotRequired),
+            "got: {err:?}"
+        );
+        let err = s.vacate_assignee(&id, "").await.unwrap_err();
+        assert!(
+            matches!(err, RunStoreError::AssigneeSlotRequired),
+            "got: {err:?}"
+        );
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.next_generation, 1, "a refused event is not an event");
+        assert_eq!(got.current[SLOT_A].op, "S-a1");
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// Concurrent acquires run as separate `Immediate` transactions and
+    /// must never read the same `G` — nor drop each other's slot entry,
+    /// since each rewrites the whole map.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_acquires_hand_out_distinct_generations() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        let s = std::sync::Arc::new(s);
+        s.create(mk("R-1", "T-1", 100)).await.unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let s = s.clone();
+            let slot = if i % 2 == 0 { SLOT_A } else { SLOT_B };
+            handles.push(tokio::spawn(async move {
+                s.acquire_assignee(
+                    &RunId::parse("R-1").unwrap(),
+                    slot,
+                    &format!("S-{i}"),
+                    "concurrent hold",
+                )
+                .await
+                .unwrap()
+                .0
+            }));
+        }
+        let mut generations = Vec::new();
+        for h in handles {
+            generations.push(h.await.unwrap());
+        }
+        generations.sort_unstable();
+        assert_eq!(generations, (1..=8).collect::<Vec<u64>>());
+        let got = s.get(&RunId::parse("R-1").unwrap()).await.unwrap();
+        assert_eq!(got.next_generation, 8);
+        assert_eq!(
+            got.current.len(),
+            2,
+            "both slots ended up held — no writer clobbered the other's entry"
+        );
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn assignment_on_an_unknown_run_fails() {
+        let (s, driver) = SqliteRunStore::open_in_memory().await.unwrap();
+        let missing = RunId::parse("R-nope").unwrap();
+        let err = s
+            .acquire_assignee(&missing, SLOT_A, "S-a1", "hold")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RunStoreError::NotFound(_)), "got: {err:?}");
+        let err = s.vacate_assignee(&missing, SLOT_A).await.unwrap_err();
+        assert!(matches!(err, RunStoreError::NotFound(_)), "got: {err:?}");
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// R6: a restart does not drop the assignments — every slot's holder
+    /// and `G` come back with the Run.
+    #[tokio::test]
+    async fn assignment_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+
+        {
+            let (s, driver) = SqliteRunStore::open(&path).await.unwrap();
+            s.create(mk("R-keep", "T-keep", 42)).await.unwrap();
+            let id = RunId::parse("R-keep").unwrap();
+            s.acquire_assignee(&id, SLOT_A, "main-ai", "held at restart")
+                .await
+                .unwrap();
+            s.acquire_assignee(&id, SLOT_B, "S-b2", "also held at restart")
+                .await
+                .unwrap();
+            drop(s);
+            driver.shutdown().await.unwrap();
+        }
+
+        let (s, driver) = SqliteRunStore::open(&path).await.unwrap();
+        let got = s.get(&RunId::parse("R-keep").unwrap()).await.unwrap();
+        let holder = &got.current[SLOT_A];
+        assert_eq!(holder.op, "main-ai");
+        assert_eq!(holder.desc, "held at restart");
+        assert_eq!(holder.gen, 1);
+        assert_eq!(
+            got.current[SLOT_B].gen, 2,
+            "the second seat survives with its own stamp"
+        );
+        assert_eq!(got.next_generation, 2);
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// The pre-correction `current_json` shape — a bare single `Assignee`
+    /// object, from before `current` became a per-slot map — is refused
+    /// loudly rather than read back as "no slot held".
+    ///
+    /// No released build ever wrote that shape (the single-holder form was
+    /// never committed), so this is not a migration path; it is the
+    /// assertion that a `current_json` the decoder does not understand
+    /// surfaces as an error instead of silently unassigning a Run.
+    #[tokio::test]
+    async fn a_pre_slot_current_json_fails_loud_rather_than_reading_vacant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+
+        {
+            let (s, driver) = SqliteRunStore::open(&path).await.unwrap();
+            s.create(mk("R-legacy", "T-legacy", 7)).await.unwrap();
+            drop(s);
+            driver.shutdown().await.unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE runs SET current_json = ?1, next_generation = 1 WHERE id = 'R-legacy'",
+                params![r#"{"op":"main-ai","desc":"held","gen":1}"#],
+            )
+            .unwrap();
+        }
+
+        let (s, driver) = SqliteRunStore::open(&path).await.unwrap();
+        let err = s.get(&RunId::parse("R-legacy").unwrap()).await.unwrap_err();
+        assert!(
+            matches!(&err, RunStoreError::Other(msg) if msg.contains("decode current")),
+            "got: {err:?}"
+        );
+        drop(s);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// A database file written before the assignment columns existed opens
+    /// cleanly: the migration adds both, and the pre-existing row reads
+    /// back as Vacant at generation 0.
+    #[tokio::test]
+    async fn legacy_db_without_assignment_columns_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+
+        // The `runs` shape as of the release before this axis landed.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE runs (\
+                   id                 TEXT PRIMARY KEY, \
+                   task_id            TEXT NOT NULL, \
+                   status             TEXT NOT NULL, \
+                   step_entries_json  TEXT NOT NULL, \
+                   degradations_json  TEXT NOT NULL DEFAULT '[]', \
+                   operator_sid       TEXT, \
+                   result_ref_json    TEXT, \
+                   input_json         TEXT, \
+                   created_at         INTEGER NOT NULL, \
+                   updated_at         INTEGER NOT NULL\
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO runs (id, task_id, status, step_entries_json, degradations_json, \
+                 operator_sid, result_ref_json, input_json, created_at, updated_at) \
+                 VALUES ('R-old', 'T-old', '\"pending\"', '[]', '[]', NULL, NULL, NULL, 7, 7)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let (s, driver) = SqliteRunStore::open(&path).await.unwrap();
+        let got = s.get(&RunId::parse("R-old").unwrap()).await.unwrap();
+        assert!(
+            got.current.is_empty(),
+            "a pre-existing row reads back with no slot held"
+        );
+        assert_eq!(
+            got.next_generation, 0,
+            "and starts at the launch value of G"
+        );
+        assert_eq!(got.created_at, 7);
+
+        // The migrated columns are writable, not just readable.
+        let (gen, _) = s
+            .acquire_assignee(
+                &RunId::parse("R-old").unwrap(),
+                SLOT_A,
+                "S-a1",
+                "after migration",
+            )
+            .await
+            .unwrap();
+        assert_eq!(gen, 1);
         drop(s);
         driver.shutdown().await.unwrap();
     }

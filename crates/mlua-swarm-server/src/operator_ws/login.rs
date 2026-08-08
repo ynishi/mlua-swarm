@@ -60,8 +60,7 @@ use axum::{
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use mlua_swarm::store::operator_session::{OperatorSessionRecord, OperatorSessionStoreError};
 use mlua_swarm::{
-    AgentProviderManifest, Engine, Operator, OperatorRef, OperatorSpawnerFactory, SeniorBridge,
-    SessionId, SpawnHook,
+    AgentProviderManifest, Engine, Operator, OperatorRef, SeniorBridge, SessionId, SpawnHook,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -70,6 +69,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 use super::protocol::{ClientMsg, PendingReply, ServerMsg};
+use super::router::{OperatorAdapter, OperatorAdapterRegistry};
 use super::session::WSOperatorSession;
 use crate::AppState;
 
@@ -342,7 +342,7 @@ pub async fn operators_create(
     let live = LoginSession::new(record, state.base_url.clone());
     register_operator_session(
         &state.engine,
-        state.ws_operator_factory.as_ref(),
+        Some(&state.operator_adapters),
         &sid,
         &roles,
         live.dispatch_target(),
@@ -416,8 +416,33 @@ pub async fn operators_ws_connect(
 
 /// Binds a session's dispatch target into every registry an Operator
 /// session must be reachable through: the engine's three (`senior_bridge` /
-/// `spawn_hook` / `operator`) under `sid`, the `OperatorSpawnerFactory` when
-/// one is wired, and the operator registries again under each of `roles`.
+/// `spawn_hook` / `operator`) under `sid`, the `OperatorAdapterRegistry`
+/// when one is wired, and the operator registries again under each of
+/// `roles`.
+///
+/// # Why two operator-side registries
+///
+/// They answer different questions and are read at different times:
+///
+/// - **`engine.register_operator`** — the Blueprint-global *delegate* axis
+///   (`OperatorDelegateMiddleware`). A launch names a backend id
+///   (`operator_backend_id`, set from `operator_sid`) and the engine
+///   resolves it once at attach time; an id that resolves to nothing makes
+///   the middleware fall through to `inner.spawn` silently, so a session
+///   missing here is a quiet loss of a shipped feature.
+/// - **`adapters`** — the AgentSpec axis's delivery side. A dispatch
+///   through a `kind = Operator` agent resolves its seat's *current holder*
+///   off `Run.current` and turns that `OperatorId` into a destination
+///   through this map (see [`AssigneeRouter`](super::router::AssigneeRouter)).
+///   Nothing about the session
+///   is baked into the compiled Blueprint any more, which is the whole
+///   point of the seat/holder split.
+///
+/// Both are written here, under the same keys, from this one call. That is
+/// what keeps the launch-time guard (`engine.list_operator_ids()`, which
+/// answers "is this `operator_sid` a live session") and the dispatch-time
+/// lookup on the same id space: a sid or role that passes the guard is one
+/// a router can deliver to.
 ///
 /// The single spelling of that registration, and — since the mint path
 /// took it over from the first-connect arm — the only one. Two callers
@@ -437,7 +462,7 @@ pub async fn operators_ws_connect(
 /// binds the aliases it granted.
 async fn register_operator_session(
     engine: &Engine,
-    ws_operator_factory: Option<&Arc<OperatorSpawnerFactory>>,
+    adapters: Option<&Arc<OperatorAdapterRegistry>>,
     sid: &SessionId,
     roles: &[OperatorRef],
     dispatch_target: &Arc<WSOperatorSession>,
@@ -454,18 +479,26 @@ async fn register_operator_session(
     engine
         .register_operator(sid.clone(), dispatch_target.clone() as Arc<dyn Operator>)
         .await;
-    if let Some(factory) = ws_operator_factory {
-        factory.register_operator(sid.clone(), dispatch_target.clone() as Arc<dyn Operator>);
+    if let Some(adapters) = adapters {
+        adapters
+            .register(
+                sid.clone(),
+                dispatch_target.clone() as Arc<dyn OperatorAdapter>,
+            )
+            .await;
     }
     for role in roles {
         // The registries are keyed by plain strings (a sid and a role alias
-        // share that key space by design), so the alias is spelled out here
-        // rather than handed over as a typed ref.
-        if let Some(factory) = ws_operator_factory {
-            factory.register_operator(
-                role.as_str().to_string(),
-                dispatch_target.clone() as Arc<dyn Operator>,
-            );
+        // share that key space by design — both are `OperatorId`s and both
+        // can be what `Assignee.op` records), so the alias is spelled out
+        // here rather than handed over as a typed ref.
+        if let Some(adapters) = adapters {
+            adapters
+                .register(
+                    role.as_str().to_string(),
+                    dispatch_target.clone() as Arc<dyn OperatorAdapter>,
+                )
+                .await;
         }
         engine
             .register_operator(
@@ -500,14 +533,14 @@ async fn register_operator_session(
 /// restore half of one shared shape rather than a special case.
 pub(crate) async fn restored_login_session(
     engine: &Engine,
-    ws_operator_factory: Option<&Arc<OperatorSpawnerFactory>>,
+    adapters: Option<&Arc<OperatorAdapterRegistry>>,
     base_url: Option<Arc<str>>,
     record: OperatorSessionRecord,
 ) -> Arc<LoginSession> {
     let live = LoginSession::new(record, base_url);
     register_operator_session(
         engine,
-        ws_operator_factory,
+        adapters,
         &live.record().sid,
         &live.record().roles,
         live.dispatch_target(),
@@ -703,7 +736,7 @@ async fn handle_operator_socket(socket: WebSocket, live: Arc<LoginSession>) {
 /// Shared teardown for `DELETE /v1/operators/:sid` (`operators_delete`) and
 /// `DELETE /v1/operators/by-role/:role` (`operators_delete_by_role` — GH #81
 /// Layer 2 (c)): drops the persisted row, the 3 engine registries + role
-/// aliases + `ws_operator_factory` bindings + `operator_sessions` entry,
+/// aliases + the adapter-registry bindings + `operator_sessions` entry,
 /// releases the sid's ownership in `roles_to_sid`, and closes the session's
 /// socket. Idempotent w.r.t. a concurrent delete — every `remove` /
 /// `unregister` is a no-op when the entry is already gone, and the socket
@@ -744,9 +777,7 @@ async fn teardown_operator_session(
     state.engine.unregister_senior_bridge(sid.as_str()).await;
     state.engine.unregister_spawn_hook(sid.as_str()).await;
     state.engine.unregister_operator(sid.as_str()).await;
-    if let Some(factory) = &state.ws_operator_factory {
-        factory.unregister_operator(sid.as_str());
-    }
+    state.operator_adapters.unregister(sid.as_str()).await;
     // The role key unregister above is unconditional, while the
     // `roles_to_sid` release below is guarded by ownership. That asymmetry
     // is reachable today — a role re-minted to another sid between this
@@ -756,9 +787,7 @@ async fn teardown_operator_session(
     // call shapes are deliberately frozen.
     for role in &live.record().roles {
         state.engine.unregister_operator(role.as_str()).await;
-        if let Some(factory) = &state.ws_operator_factory {
-            factory.unregister_operator(role.as_str());
-        }
+        state.operator_adapters.unregister(role.as_str()).await;
     }
 
     // Closed in place, never detached. A socket that upgraded before this
@@ -804,7 +833,7 @@ async fn teardown_operator_session(
 
 /// `DELETE /v1/operators/:sid`. Bearer mandatory. `404` on unknown sid, `401`
 /// on token mismatch. Drops the persisted row, the 3 engine registries +
-/// role aliases + `ws_operator_factory` bindings + `operator_sessions`
+/// role aliases + the adapter-registry bindings + `operator_sessions`
 /// entry, releases this sid's ownership in `roles_to_sid` (re-opening the
 /// role names for a future mint), and closes the session's socket.
 ///
@@ -1235,7 +1264,7 @@ mod tests {
                 engine,
                 sessions: Arc::new(Mutex::new(crate::SessionStore::default())),
                 task_app: Arc::new(mlua_swarm::TaskApplication::new_inline_only(launch)),
-                ws_operator_factory: None,
+                operator_adapters: Arc::new(OperatorAdapterRegistry::new()),
                 data_store: Arc::new(InMemoryOutputStore::new()),
                 operator_sessions: Arc::new(Mutex::new(HashMap::new())),
                 roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
@@ -1287,6 +1316,8 @@ mod tests {
                     step_entries: Vec::new(),
                     degradations: Vec::new(),
                     operator_sid: sid.map(|s| s.to_string()),
+                    current: Default::default(),
+                    next_generation: 0,
                     result_ref: None,
                     input_json: None,
                     created_at: 0,
@@ -1519,6 +1550,55 @@ mod tests {
             );
         }
 
+        /// A minted session must be reachable on both operator-side
+        /// registries, under both of its `OperatorId`s.
+        ///
+        /// This is what keeps the launch-time guard honest. `POST /v1/tasks`
+        /// answers "is this `operator_sid` a live session?" out of
+        /// `engine.list_operator_ids()`, while a dispatch resolves the
+        /// holder recorded in `Run.current` out of the adapter registry. Two
+        /// maps, one id space — a sid the guard accepts but no router could
+        /// deliver to would turn a `400` at launch into a failure several
+        /// steps later, naming the wrong thing. One call site writes both,
+        /// and this pins that both directions of it (register and
+        /// unregister) stay in step.
+        #[tokio::test]
+        async fn a_minted_session_is_reachable_on_the_guard_and_the_dispatch_side() {
+            let state = test_state();
+            let sid = mint(&state).await;
+
+            let guard_side = state.engine.list_operator_ids().await;
+            let dispatch_side = state.operator_adapters.ids().await;
+            for id in [sid.to_string(), ROLE.to_string()] {
+                assert!(
+                    guard_side.contains(&id),
+                    "the launch guard must know '{id}': {guard_side:?}"
+                );
+                assert!(
+                    dispatch_side.contains(&id),
+                    "a holder recorded as '{id}' must be deliverable to: {dispatch_side:?}"
+                );
+            }
+
+            let live = state
+                .operator_sessions
+                .lock()
+                .await
+                .get(&sid)
+                .cloned()
+                .expect("mint must publish the session");
+            teardown_operator_session(&state, &sid, &live)
+                .await
+                .expect("teardown must succeed against a healthy store");
+
+            assert!(
+                state.operator_adapters.ids().await.is_empty(),
+                "teardown must drop the adapter bindings too, or a Run still \
+                 naming this sid would keep resolving to a torn-down session"
+            );
+            assert!(state.engine.list_operator_ids().await.is_empty());
+        }
+
         /// A repeat teardown on the same session stays a no-op. Keeping the
         /// dispatch target in place (rather than detaching it) must not turn
         /// the second call into a second round of side effects.
@@ -1704,6 +1784,624 @@ mod tests {
                 body["roles"],
                 serde_json::json!([]),
                 "the response still echoes an empty array: {body}"
+            );
+        }
+    }
+
+    // ── the spine: a handover moves where the NEXT dispatch lands ─────────
+
+    /// The whole point of the seat/holder split, exercised through the
+    /// paths production uses rather than hand-built parts:
+    ///
+    /// - the sessions are minted through `operators_create`, so they are
+    ///   registered by `register_operator_session` — the one call site;
+    /// - the Operator wiring is `WsOperatorWiring::new`, exactly what
+    ///   `mse serve` builds, so the seats resolve through the factory's own
+    ///   slot resolver over the same adapter registry the mint wrote into;
+    /// - the Blueprint is compiled by a real `Compiler` over a
+    ///   `SpawnerRegistry` holding that factory, so the `Arc<dyn Operator>`
+    ///   under test is the one `OperatorSpawnerFactory::build` produces;
+    /// - each dispatch is answered like a WS client answers it (read the
+    ///   `Spawn` frame off the session's sender, resolve its `req_id`), so
+    ///   "where did it land" is measured at the socket, not inferred.
+    ///
+    /// What is deliberately *not* re-done between the two dispatches: the
+    /// compile, the registration, the routers. Only `Run.current` moves.
+    mod the_spine {
+        use super::by_role_in_flight::{body_json, test_state};
+        use super::*;
+        use crate::operator_ws::router::WsOperatorWiring;
+        use mlua_swarm::blueprint::Blueprint;
+        use mlua_swarm::store::run::{RunRecord, RunStatus};
+        use mlua_swarm::{
+            CapToken, Compiler, Ctx, Operator, OperatorSpawnerFactory, Role, RunId,
+            SpawnerRegistry, StepId, TaskId, WorkerBinding,
+        };
+        use tokio::sync::mpsc::UnboundedReceiver;
+
+        /// The two Blueprint-declared Operator seats, and the agent that
+        /// dispatches through each. Named for the lane they serve — a seat
+        /// is a position in the Blueprint, never a person.
+        const SEAT_A: &str = "phase-a-op";
+        const SEAT_B: &str = "phase-b-op";
+        const AGENT_A: &str = "lane-a-relay";
+        const AGENT_B: &str = "lane-b-relay";
+
+        /// Two seats, one `kind = Operator` agent each. Both agents declare
+        /// a `worker_binding`: the WS thin path requires one, and the
+        /// routers in front of those sessions report the same requirement,
+        /// so a Blueprint without it would fail this compile.
+        fn two_seat_blueprint() -> Blueprint {
+            serde_json::from_value(serde_json::json!({
+                "schema_version": mlua_swarm::blueprint::current_schema_version(),
+                "id": "spine-two-seat-bp",
+                "flow": {
+                    "kind": "step",
+                    "ref": AGENT_A,
+                    "in": { "op": "path", "at": "$.input" },
+                    "out": { "op": "path", "at": "$.output" }
+                },
+                "agents": [
+                    {
+                        "name": AGENT_A,
+                        "kind": "operator",
+                        "spec": { "operator_ref": SEAT_A },
+                        "profile": { "worker_binding": "mse-worker" }
+                    },
+                    {
+                        "name": AGENT_B,
+                        "kind": "operator",
+                        "spec": { "operator_ref": SEAT_B },
+                        "profile": { "worker_binding": "mse-worker" }
+                    }
+                ],
+                "operators": [{ "name": SEAT_A }, { "name": SEAT_B }],
+                "strategy": { "strict_refs": false }
+            }))
+            .expect("test Blueprint literal")
+        }
+
+        /// A minted Operator session with a sender attached — what
+        /// `handle_operator_socket` leaves behind when a client's WS
+        /// connects, minus the socket. `inbox` is the wire: every frame the
+        /// session would have written to that client shows up here.
+        struct Client {
+            name: &'static str,
+            sid: SessionId,
+            session: Arc<WSOperatorSession>,
+            inbox: UnboundedReceiver<ServerMsg>,
+        }
+
+        async fn mint_client(state: &AppState, role: &str, name: &'static str) -> Client {
+            let response = operators_create(
+                State(state.clone()),
+                Json(OperatorsCreateReq {
+                    roles: vec![role.to_string()],
+                    capability_manifest: None,
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "mint must succeed");
+            let body = body_json(response).await;
+            let sid = SessionId::parse(body["sid"].as_str().expect("sid").to_string())
+                .expect("parse sid");
+            let live = state
+                .operator_sessions
+                .lock()
+                .await
+                .get(&sid)
+                .cloned()
+                .expect("mint must publish the session");
+            let (tx, inbox) = mpsc::unbounded_channel();
+            let session = live.dispatch_target().clone();
+            session.replace_tx(tx).await;
+            Client {
+                name,
+                sid,
+                session,
+                inbox,
+            }
+        }
+
+        /// The wiring `mse serve` builds, over this state's Run store and
+        /// this state's adapter registry, plus a compile of
+        /// [`two_seat_blueprint`] through it. Returns the factory so a test
+        /// can ask it for the same `Arc<dyn Operator>` a built agent got.
+        fn wire_operator_axis(state: &mut AppState) -> Arc<OperatorSpawnerFactory> {
+            let factory = Arc::new(OperatorSpawnerFactory::new());
+            let wiring = WsOperatorWiring::new(factory.clone(), state.run_store.clone());
+            state.operator_adapters = wiring.adapters.clone();
+            factory
+        }
+
+        /// Compile the Blueprint the way a launch does. Nothing is
+        /// registered under a seat name anywhere, which is the point: the
+        /// compile resolves seats, not sessions, so it cannot depend on who
+        /// happens to be logged in.
+        fn compile_through(factory: &Arc<OperatorSpawnerFactory>) {
+            let mut registry = SpawnerRegistry::new();
+            registry.register::<OperatorSpawnerFactory>(factory.clone());
+            Compiler::new(registry)
+                .compile(&two_seat_blueprint())
+                .expect("a two-seat Blueprint must compile with no session registered anywhere");
+        }
+
+        async fn seeded_run(state: &AppState) -> RunId {
+            let run_id = RunId::new();
+            state
+                .run_store
+                .create(RunRecord {
+                    id: run_id.clone(),
+                    task_id: TaskId::new(),
+                    status: RunStatus::Running,
+                    step_entries: Vec::new(),
+                    degradations: Vec::new(),
+                    operator_sid: None,
+                    current: Default::default(),
+                    next_generation: 0,
+                    result_ref: None,
+                    input_json: None,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .await
+                .expect("seed run");
+            run_id
+        }
+
+        fn ctx_for(run_id: &RunId, agent: &str) -> Ctx {
+            let mut ctx = Ctx::new(StepId::parse("ST-spine").expect("step id"), 1, agent);
+            ctx.meta
+                .runtime
+                .insert("run_id".to_string(), serde_json::json!(run_id.to_string()));
+            ctx
+        }
+
+        fn worker_binding() -> WorkerBinding {
+            WorkerBinding {
+                variant: "mse-worker".to_string(),
+                tools: Vec::new(),
+                request_digest: None,
+                requested_model: None,
+            }
+        }
+
+        fn cap_token(agent: &str) -> CapToken {
+            CapToken {
+                agent_id: agent.to_string(),
+                role: Role::Worker,
+                scopes: vec!["*".into()],
+                issued_at: 0,
+                expire_at: u64::MAX / 2,
+                max_uses: None,
+                nonce: "spine-test-nonce".into(),
+                sig_hex: String::new(),
+            }
+        }
+
+        /// Dispatch through `router` and answer whichever of the two
+        /// sessions receives the `Spawn` frame, the way that session's WS
+        /// client would. Returns the name of the session it landed on —
+        /// cross-checked against the value that came back out of `execute`,
+        /// so a frame delivered to one session and answered as another
+        /// cannot pass.
+        async fn dispatch_and_name_the_receiver(
+            router: Arc<dyn Operator>,
+            ctx: Ctx,
+            a: &mut Client,
+            b: &mut Client,
+        ) -> &'static str {
+            let agent = ctx.agent.clone();
+            let dispatch = tokio::spawn(async move {
+                router
+                    .execute(
+                        &ctx,
+                        None,
+                        serde_json::json!("go"),
+                        Some(worker_binding()),
+                        cap_token(&agent),
+                    )
+                    .await
+            });
+
+            let (a_name, a_session) = (a.name, a.session.clone());
+            let (b_name, b_session) = (b.name, b.session.clone());
+            let (name, session, frame) = tokio::select! {
+                frame = a.inbox.recv() => (a_name, a_session, frame.expect("session A inbox")),
+                frame = b.inbox.recv() => (b_name, b_session, frame.expect("session B inbox")),
+            };
+            let ServerMsg::Spawn { req_id, .. } = frame else {
+                panic!("a dispatch must reach the session as a Spawn frame, got: {frame:?}");
+            };
+            session
+                .resolve_pending(
+                    &req_id,
+                    PendingReply::SpawnAck {
+                        value: serde_json::json!({ "answered_by": name }),
+                        ok: true,
+                        error: None,
+                        stats: None,
+                    },
+                )
+                .await;
+            let result = dispatch
+                .await
+                .expect("the dispatch task")
+                .expect("the answered dispatch must succeed");
+            assert_eq!(
+                result.value["answered_by"], name,
+                "the answer must come back out of the same dispatch that was delivered"
+            );
+            name
+        }
+
+        /// **The spine.** One compile, one registration, one router — and a
+        /// re-assignment of `Run.current` in between two dispatches. The
+        /// second one must land on the session that holds the seat *now*.
+        ///
+        /// Before the seat/holder split this was structurally impossible:
+        /// the compile baked the session that held the seat at compile time
+        /// into `routes[agent]`, so a handover could rewrite the Run's
+        /// holder all it liked and every dispatch still went to the first
+        /// session (model §4.3 **A10** — the destination is not baked in).
+        #[tokio::test]
+        async fn re_assigning_current_moves_the_next_dispatch_to_the_new_holder() {
+            let mut state = test_state();
+            let factory = wire_operator_axis(&mut state);
+            compile_through(&factory);
+
+            let mut first = mint_client(&state, "ws-relay-one", "first").await;
+            let mut second = mint_client(&state, "ws-relay-two", "second").await;
+            let run_id = seeded_run(&state).await;
+
+            // The one `Arc<dyn Operator>` under test: the same lookup
+            // `OperatorSpawnerFactory::build` performs for `AGENT_A`, kept
+            // across both dispatches exactly as a compiled route would be.
+            let router = factory
+                .resolve_operator(SEAT_A, AGENT_A)
+                .expect("the wired factory must resolve a declared seat");
+
+            // The launch pin: seat A is held by the first session.
+            state
+                .run_store
+                .acquire_assignee(&run_id, SEAT_A, first.sid.as_str(), "pinned by the launch")
+                .await
+                .expect("launch assign");
+            assert_eq!(
+                dispatch_and_name_the_receiver(
+                    router.clone(),
+                    ctx_for(&run_id, AGENT_A),
+                    &mut first,
+                    &mut second,
+                )
+                .await,
+                "first",
+                "the launch pin's holder must receive the first dispatch"
+            );
+
+            // The handover. Nothing is recompiled, re-registered or rebuilt
+            // — one row changes.
+            let (gen, displaced) = state
+                .run_store
+                .acquire_assignee(&run_id, SEAT_A, second.sid.as_str(), "took over mid-run")
+                .await
+                .expect("handover assign");
+            assert_eq!(gen, 2, "A4: the second assignment event is generation 2");
+            assert_eq!(
+                displaced.expect("seat A had a holder").op,
+                first.sid.to_string(),
+                "the displaced holder is the session that held the seat"
+            );
+
+            assert_eq!(
+                dispatch_and_name_the_receiver(
+                    router,
+                    ctx_for(&run_id, AGENT_A),
+                    &mut first,
+                    &mut second,
+                )
+                .await,
+                "second",
+                "re-pointing Run.current must change where the NEXT dispatch lands"
+            );
+            assert!(
+                first.inbox.try_recv().is_err(),
+                "the displaced session must receive nothing after the handover"
+            );
+        }
+
+        /// Per-lane independence on the same production path: two seats,
+        /// two routers, one handover. The re-assigned lane follows its new
+        /// holder; the untouched lane keeps delivering to its own.
+        ///
+        /// This is the routing contract behind the per-lane alias split the
+        /// operator-execution-model guide documents (`phase_a_op` /
+        /// `phase_b_op` as independent seats) — with a Run-wide holder,
+        /// handing one lane over would drag the other lane's traffic with
+        /// it.
+        #[tokio::test]
+        async fn re_assigning_one_seat_leaves_the_other_seats_destination_alone() {
+            let mut state = test_state();
+            let factory = wire_operator_axis(&mut state);
+            compile_through(&factory);
+
+            let mut first = mint_client(&state, "ws-relay-one", "first").await;
+            let mut second = mint_client(&state, "ws-relay-two", "second").await;
+            let run_id = seeded_run(&state).await;
+
+            let router_a = factory
+                .resolve_operator(SEAT_A, AGENT_A)
+                .expect("seat A resolves");
+            let router_b = factory
+                .resolve_operator(SEAT_B, AGENT_B)
+                .expect("seat B resolves");
+
+            state
+                .run_store
+                .acquire_assignee(&run_id, SEAT_A, first.sid.as_str(), "lane A launch pin")
+                .await
+                .expect("lane A assign");
+            state
+                .run_store
+                .acquire_assignee(&run_id, SEAT_B, second.sid.as_str(), "lane B launch pin")
+                .await
+                .expect("lane B assign");
+
+            // Hand lane A over to the session that already holds lane B.
+            // Lane B is not touched.
+            state
+                .run_store
+                .acquire_assignee(&run_id, SEAT_A, second.sid.as_str(), "lane A took over")
+                .await
+                .expect("lane A handover");
+
+            assert_eq!(
+                dispatch_and_name_the_receiver(
+                    router_a,
+                    ctx_for(&run_id, AGENT_A),
+                    &mut first,
+                    &mut second,
+                )
+                .await,
+                "second",
+                "the re-assigned lane must follow its new holder"
+            );
+            assert_eq!(
+                dispatch_and_name_the_receiver(
+                    router_b,
+                    ctx_for(&run_id, AGENT_B),
+                    &mut first,
+                    &mut second,
+                )
+                .await,
+                "second",
+                "the untouched lane must keep delivering to its own holder"
+            );
+
+            let record = state.run_store.get(&run_id).await.expect("run get");
+            assert_eq!(
+                record.current[SEAT_B].gen, 2,
+                "A3: an untouched seat's holder generation does not move"
+            );
+            assert!(
+                first.inbox.try_recv().is_err(),
+                "the session that holds neither seat any more receives nothing"
+            );
+        }
+
+        /// A seat whose holder is a role alias routes like one held by a
+        /// sid: both are `OperatorId`s, and the mint registers the session
+        /// as an adapter under both.
+        #[tokio::test]
+        async fn a_seat_held_by_a_role_alias_routes_to_that_sessions_socket() {
+            let mut state = test_state();
+            let factory = wire_operator_axis(&mut state);
+            let mut first = mint_client(&state, "ws-relay-one", "first").await;
+            let mut second = mint_client(&state, "ws-relay-two", "second").await;
+            let run_id = seeded_run(&state).await;
+
+            state
+                .run_store
+                .acquire_assignee(&run_id, SEAT_A, "ws-relay-two", "assigned by role")
+                .await
+                .expect("assign by role alias");
+
+            assert_eq!(
+                dispatch_and_name_the_receiver(
+                    factory
+                        .resolve_operator(SEAT_A, AGENT_A)
+                        .expect("seat A resolves"),
+                    ctx_for(&run_id, AGENT_A),
+                    &mut first,
+                    &mut second,
+                )
+                .await,
+                "second",
+                "a role-alias holder must reach the session that holds the role"
+            );
+        }
+
+        /// **The unpinned launch reaches its operator.** Every bundled
+        /// sample launches with no `operator_sid`, and this is the path that
+        /// carries it.
+        ///
+        /// The regression this locks in: routing moved from the factory's
+        /// role lookup (`lookup_key = pin.unwrap_or(operator_ref)`) to
+        /// `Run.current`, and for a moment the only writer of `current` was
+        /// a launch that carried a pin. An unpinned launch then compiled and
+        /// died on its first dispatch, naming a `Vacant` seat. The launch
+        /// now seats every declared seat whose role has a holder
+        /// (`tasks::seat_declared_operators`), so the same driver is reached
+        /// — through `current`, where a handover can still move it.
+        ///
+        /// Both lanes are asserted: a multi-seat Blueprint comes up fully
+        /// dispatchable, not with one lane seated and the rest Vacant.
+        #[tokio::test]
+        async fn an_unpinned_launch_seats_every_declared_seat_and_reaches_it() {
+            let mut state = test_state();
+            let factory = wire_operator_axis(&mut state);
+            compile_through(&factory);
+
+            // Two drivers, each claiming the role one seat is named after —
+            // what `mse_operator_join(roles=["phase-a-op"])` produces.
+            let mut a = mint_client(&state, SEAT_A, "lane-a-driver").await;
+            let mut b = mint_client(&state, SEAT_B, "lane-b-driver").await;
+            let run_id = seeded_run(&state).await;
+
+            // The launch. No `operator_sid`, so no pinned seat to exclude.
+            crate::tasks::seat_declared_operators(
+                &state,
+                &run_id,
+                &two_seat_blueprint().operators,
+                None,
+            )
+            .await
+            .expect("seating declared seats whose roles have holders");
+
+            let record = state.run_store.get(&run_id).await.expect("run get");
+            for seat in [SEAT_A, SEAT_B] {
+                let seated = record.current.get(seat).unwrap_or_else(|| {
+                    panic!("seat '{seat}' must be seated by an unpinned launch")
+                });
+                assert_eq!(
+                    seated.op, seat,
+                    "the holder is the role alias the seat is named after"
+                );
+                assert!(
+                    seated.desc.starts_with("auto-seated at launch"),
+                    "A9: the server-authored desc must say the seat was not chosen by a \
+                     caller, so `GET /v1/runs/:id` can tell it from a pin: {}",
+                    seated.desc
+                );
+            }
+            assert_eq!(
+                state.run_store.get(&run_id).await.expect("run get").current[SEAT_A].gen,
+                1,
+                "A4: the first seating of the launch is generation 1"
+            );
+
+            // And it dispatches — measured at the socket, both lanes.
+            assert_eq!(
+                dispatch_and_name_the_receiver(
+                    factory
+                        .resolve_operator(SEAT_A, AGENT_A)
+                        .expect("seat A resolves"),
+                    ctx_for(&run_id, AGENT_A),
+                    &mut a,
+                    &mut b,
+                )
+                .await,
+                "lane-a-driver",
+                "an unpinned launch must still reach the driver holding the seat's role"
+            );
+            assert_eq!(
+                dispatch_and_name_the_receiver(
+                    factory
+                        .resolve_operator(SEAT_B, AGENT_B)
+                        .expect("seat B resolves"),
+                    ctx_for(&run_id, AGENT_B),
+                    &mut a,
+                    &mut b,
+                )
+                .await,
+                "lane-b-driver",
+                "the second lane is seated too — a multi-seat Blueprint has no permanently \
+                 Vacant lane"
+            );
+        }
+
+        /// The pin outranks the role holder for the seat it names, and a
+        /// seat nobody holds stays `Vacant` rather than being filled with a
+        /// guess.
+        #[tokio::test]
+        async fn a_pin_wins_its_own_seat_and_an_unheld_seat_stays_vacant() {
+            let mut state = test_state();
+            let factory = wire_operator_axis(&mut state);
+            compile_through(&factory);
+
+            // `pinned` claims no seat's role; `role_holder` claims seat A's.
+            // Nobody claims seat B's.
+            let mut pinned = mint_client(&state, "ws-relay-one", "pinned").await;
+            let mut role_holder = mint_client(&state, SEAT_A, "role-holder").await;
+            let run_id = seeded_run(&state).await;
+
+            // A launch carrying `operator_sid` + `operator_desc`, in the
+            // order the handlers run them: the pin first, then the rest of
+            // the declared seats.
+            crate::tasks::assign_launch_operator(
+                &state,
+                &run_id,
+                SEAT_A,
+                pinned.sid.as_str(),
+                "pinned by the launch request",
+            )
+            .await
+            .expect("launch pin");
+            crate::tasks::seat_declared_operators(
+                &state,
+                &run_id,
+                &two_seat_blueprint().operators,
+                Some(SEAT_A),
+            )
+            .await
+            .expect("seating the seats the pin did not name");
+
+            let record = state.run_store.get(&run_id).await.expect("run get");
+            assert_eq!(
+                record.current[SEAT_A].op,
+                pinned.sid.to_string(),
+                "the pin must not be displaced by the holder of the seat's role"
+            );
+            assert_eq!(
+                record.current[SEAT_A].desc, "pinned by the launch request",
+                "the caller's own desc survives — it is not overwritten by the seating literal"
+            );
+            assert!(
+                !record.current.contains_key(SEAT_B),
+                "seat B's role has no holder, so it stays Vacant rather than being guessed at"
+            );
+
+            assert_eq!(
+                dispatch_and_name_the_receiver(
+                    factory
+                        .resolve_operator(SEAT_A, AGENT_A)
+                        .expect("seat A resolves"),
+                    ctx_for(&run_id, AGENT_A),
+                    &mut pinned,
+                    &mut role_holder,
+                )
+                .await,
+                "pinned",
+                "the pinned session receives the dispatch, not the role's holder"
+            );
+
+            // The Vacant lane fails loudly instead of borrowing seat A's
+            // holder, and the message says where the seat would have come
+            // from.
+            let err = factory
+                .resolve_operator(SEAT_B, AGENT_B)
+                .expect("seat B resolves")
+                .execute(
+                    &ctx_for(&run_id, AGENT_B),
+                    None,
+                    serde_json::json!("go"),
+                    Some(worker_binding()),
+                    cap_token(AGENT_B),
+                )
+                .await
+                .expect_err("a Vacant seat has no holder to dispatch to");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(SEAT_B) && msg.contains("Vacant"),
+                "the failure must name the Vacant seat: {msg}"
+            );
+            assert!(
+                msg.contains("registered under its own name") && msg.contains("operator_sid"),
+                "and say both ways the seat could have been filled: {msg}"
+            );
+            assert!(
+                role_holder.inbox.try_recv().is_err(),
+                "no other session may absorb the Vacant lane's dispatch"
             );
         }
     }

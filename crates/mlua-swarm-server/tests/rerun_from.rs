@@ -161,6 +161,8 @@ fn seed_run(
         step_entries: vec![],
         degradations: vec![],
         operator_sid: None,
+        current: Default::default(),
+        next_generation: 0,
         result_ref: None,
         input_json,
         created_at: 0,

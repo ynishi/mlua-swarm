@@ -18,11 +18,17 @@ use tokio::sync::Mutex;
 pub struct OperatorSessionBindingProvider {
     operator_sessions: Arc<Mutex<HashMap<SessionId, Arc<LoginSession>>>>,
     roles_to_sid: Arc<Mutex<HashMap<OperatorRef, SessionId>>>,
-    /// Run-scoped session pin (`operator_sid` on the launch). `Some`
-    /// resolves manifests through this session and never consults
-    /// `roles_to_sid`; `None` is the process-global role lookup every
-    /// unpinned launch keeps using.
-    pinned_sid: Option<SessionId>,
+    /// Run-scoped pin (`operator_sid` on the launch), as the model's
+    /// `OperatorId` — a session id (`S-<hex>`) **or** a role alias
+    /// (`main-ai`), which share one key space (the login path registers
+    /// both).
+    ///
+    /// `Some` resolves manifests through the session that id names, for
+    /// this launch only; `None` is the process-global role lookup every
+    /// unpinned launch keeps using. Held as the raw pin rather than a
+    /// [`SessionId`] because narrowing the type here is what used to make
+    /// an alias pin vanish — see [`Self::resolve_sid`].
+    pinned_op: Option<String>,
 }
 
 impl OperatorSessionBindingProvider {
@@ -35,7 +41,7 @@ impl OperatorSessionBindingProvider {
         Self {
             operator_sessions,
             roles_to_sid,
-            pinned_sid: None,
+            pinned_op: None,
         }
     }
 
@@ -43,13 +49,45 @@ impl OperatorSessionBindingProvider {
     /// there is one, otherwise the session currently holding the request's
     /// logical `target` role.
     ///
-    /// The pinned arm reports `Unbound` (not an error) when the sid names no
-    /// live session — same tier as an unjoined role, and the launch's own
-    /// fail-loud line is the compiler's pinned spawner lookup, which rejects
-    /// the same condition outright.
+    /// # The pin is an `OperatorId`, not a session id
+    ///
+    /// A pin is whatever the launch's `operator_sid` said, and that field
+    /// addresses the operator registry, whose key space holds session ids
+    /// and role aliases alike. So the pin is resolved, not classified: a
+    /// value that parses as a `SessionId` names that session directly, and
+    /// anything else is looked up in `roles_to_sid` as an alias. The alias
+    /// is a front door, not a back one.
+    ///
+    /// This used to be a `SessionId::parse(...).ok()?` in
+    /// [`AgentBindingProvider::pinned_to_session`]: an alias pin produced
+    /// no pinned provider at all, the launch silently kept the *unpinned*
+    /// one, and the run attested through whichever session held the role
+    /// — the exact substitution the pin exists to prevent — with nothing
+    /// anywhere saying so. Nothing else about that launch looked wrong;
+    /// only its manifest attestation quietly came from the wrong session.
+    ///
+    /// A pin that resolves to nothing is reported (`Unbound`, naming the
+    /// pin) rather than dropped. It stays the same tier as an unjoined
+    /// role because the launch's hard failure line is elsewhere — the
+    /// compiler's pinned spawner lookup rejects that same id outright.
     async fn resolve_sid(&self, target: &OperatorRef) -> Result<SessionId, String> {
-        match &self.pinned_sid {
-            Some(sid) => Ok(sid.clone()),
+        match &self.pinned_op {
+            Some(pin) => {
+                if let Ok(sid) = SessionId::parse(pin.clone()) {
+                    return Ok(sid);
+                }
+                self.roles_to_sid
+                    .lock()
+                    .await
+                    .get(pin.as_str())
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "run-scoped pin '{pin}' names neither a session id nor a joined \
+                             Operator role"
+                        )
+                    })
+            }
             None => self
                 .roles_to_sid
                 .lock()
@@ -92,8 +130,10 @@ impl OperatorSessionBindingProvider {
         // Named in every `Unbound` reason below so a driver reading a
         // degradation entry can tell "my pinned session is gone" from "the
         // role has no holder".
-        let via = match &self.pinned_sid {
-            Some(_) => format!("run-scoped pin (declared binding target '{target}')"),
+        let via = match &self.pinned_op {
+            Some(pin) => {
+                format!("run-scoped pin '{pin}' (declared binding target '{target}')")
+            }
             None => format!("binding target '{target}'"),
         };
         let Some(live) = self.operator_sessions.lock().await.get(&sid).cloned() else {
@@ -161,16 +201,19 @@ impl AgentBindingProvider for OperatorSessionBindingProvider {
     }
 
     /// Launch-scoped clone pinned to `session_id`, sharing the same live
-    /// session / role maps. An id that does not parse as a `SessionId`
-    /// cannot name a live session, so it yields `None` and the launch keeps
-    /// the unpinned provider — the pin's fail-loud line is the compiler's
-    /// pinned spawner lookup, which rejects that same id there.
+    /// session / role maps.
+    ///
+    /// Always `Some`: the argument is an `OperatorId` (a session id or a
+    /// role alias), and deciding here that some of them are not worth
+    /// pinning is what silently reverted alias-pinned launches to the
+    /// unpinned provider. Whether the id resolves to a live session is
+    /// [`Self::resolve_sid`]'s question, and an unresolvable one is
+    /// reported there instead of disappearing here.
     fn pinned_to_session(&self, session_id: &str) -> Option<Arc<dyn AgentBindingProvider>> {
-        let sid = SessionId::parse(session_id.to_string()).ok()?;
         Some(Arc::new(Self {
             operator_sessions: self.operator_sessions.clone(),
             roles_to_sid: self.roles_to_sid.clone(),
-            pinned_sid: Some(sid),
+            pinned_op: Some(session_id.to_string()),
         }))
     }
 }
@@ -377,15 +420,75 @@ mod tests {
         }
     }
 
-    /// An id that is not a `SessionId` at all cannot name a live session:
-    /// no pinned provider is produced, so the launch keeps the unpinned one
-    /// and fails loudly at the compiler instead.
-    #[test]
-    fn unparseable_pin_yields_no_pinned_provider() {
-        let sessions = Arc::new(Mutex::new(HashMap::new()));
-        let roles = Arc::new(Mutex::new(HashMap::new()));
-        let provider = OperatorSessionBindingProvider::new(sessions, roles);
-        assert!(provider.pinned_to_session("not-a-session-id").is_none());
+    /// A role-alias pin is a pin. `main-ai` is an `OperatorId` just as
+    /// much as `S-<hex>` is, so it resolves through the alias and attests
+    /// through that session — it does not fall back to the unpinned
+    /// provider, which is what the old `SessionId::parse(...).ok()?` did
+    /// (dropping the pin, and with it the guarantee it was asked for).
+    #[tokio::test]
+    async fn a_role_alias_pin_resolves_through_the_alias() {
+        let manifest = AgentProviderManifest {
+            provider_id: "alias-pinned".to_string(),
+            provider_revision: None,
+            capabilities: vec![AgentProviderCapability {
+                launch_variant: Some("mse-coder".to_string()),
+                resolved_model: None,
+                effective_tools: vec!["Read".to_string()],
+                capability_snapshot_digest: None,
+            }],
+        };
+        let provider = provider(Some(manifest)).await;
+
+        let pinned = provider
+            .pinned_to_session("main-ai")
+            .expect("a role alias is a pinnable OperatorId");
+        let outcomes = pinned.bind(&[request()]).await.unwrap();
+        let receipt = expect_bound(&outcomes[0]);
+        assert_eq!(receipt.provider_id, "alias-pinned");
+    }
+
+    /// A pin that resolves to neither a session id nor a joined role is
+    /// reported, naming the pin — never silently converted back into an
+    /// unpinned launch that attests through whatever holds the role.
+    #[tokio::test]
+    async fn an_unresolvable_pin_reports_unbound_naming_the_pin() {
+        // The role IS joined and DOES have a manifest, so an unpinned bind
+        // here would succeed: only refusing to fall back makes this Unbound.
+        let manifest = AgentProviderManifest {
+            provider_id: "role-holder".to_string(),
+            provider_revision: None,
+            capabilities: vec![AgentProviderCapability {
+                launch_variant: Some("mse-coder".to_string()),
+                resolved_model: None,
+                effective_tools: vec!["Read".to_string()],
+                capability_snapshot_digest: None,
+            }],
+        };
+        let provider = provider(Some(manifest)).await;
+        assert!(
+            matches!(
+                &provider.bind(&[request()]).await.unwrap()[0],
+                BindOutcome::Bound { .. }
+            ),
+            "precondition: unpinned, this request binds"
+        );
+
+        let pinned = provider
+            .pinned_to_session("not-a-session-id")
+            .expect("every OperatorId yields a pinned provider");
+        match &pinned.bind(&[request()]).await.unwrap()[0] {
+            BindOutcome::Unbound { reason, .. } => {
+                assert!(
+                    reason.contains("not-a-session-id"),
+                    "reason must name the pin: {reason}"
+                );
+            }
+            BindOutcome::Bound { receipt } => panic!(
+                "an unresolvable pin must not silently attest through the role holder \
+                 (got provider_id {})",
+                receipt.provider_id
+            ),
+        }
     }
 
     #[tokio::test]
