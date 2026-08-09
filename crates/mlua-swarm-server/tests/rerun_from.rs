@@ -187,7 +187,7 @@ fn snapshot_json_for(bp: &Blueprint) -> String {
         "operator_kind": null,
         "bridge_id": null,
         "hook_id": null,
-        "operator_backend_id": null,
+        "operator_sid": null,
         "operator_kind_overrides": {},
         "task_input": null,
         "check_policy": null,

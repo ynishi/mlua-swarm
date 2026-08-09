@@ -430,19 +430,22 @@ impl OperatorClientState {
 
     /// `POST /v1/operators` (mint sid+token) then `WS /v1/operators/:sid/ws`
     /// (Bearer). The token stays in-process (`SessionEntry.token`) — never
-    /// returned to the caller. Returns `(sid, roles)`.
+    /// returned to the caller. Returns the `sid`.
     ///
     /// `desc` is the session's 記名 (server model §4.2 **D1**): what this
     /// session is here to do, fixed at join and read back off
     /// [`Self::list_operators`]. The server accepts a join without one, so
     /// this is an `Option`; the tool that AIs join through makes it
     /// mandatory instead.
+    ///
+    /// A join claims no role: the sid the server mints here is the whole of
+    /// this session's identity, and which Run it drives is decided per Run
+    /// (a launch pin, or `POST /v1/runs/:id/acquire`).
     pub async fn join(
         &self,
-        roles: Vec<mlua_swarm::OperatorRef>,
         capability_manifest: Option<mlua_swarm::AgentProviderManifest>,
         desc: Option<String>,
-    ) -> Result<(String, Vec<mlua_swarm::OperatorRef>), ClientError> {
+    ) -> Result<String, ClientError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -450,7 +453,6 @@ impl OperatorClientState {
         let resp = client
             .post(format!("{}/v1/operators", self.http_base))
             .json(&serde_json::json!({
-                "roles": roles,
                 "capability_manifest": capability_manifest,
                 "desc": desc,
             }))
@@ -478,19 +480,6 @@ impl OperatorClientState {
                 ClientError::Http("missing token in POST /v1/operators response".into())
             })?
             .to_string();
-        // The server echoes the roles it granted. Anything that is not a
-        // usable role is dropped rather than carried back to the caller —
-        // the same `filter_map` tolerance this had when the elements were
-        // untyped strings.
-        let resolved_roles: Vec<mlua_swarm::OperatorRef> = body["roles"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .filter_map(|v| mlua_swarm::OperatorRef::new(v).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
 
         let (writer, reader) = match connect_ws(&self.http_base, &sid, &token).await {
             Ok(parts) => parts,
@@ -520,7 +509,7 @@ impl OperatorClientState {
             }),
         });
         self.sessions.lock().await.insert(sid.clone(), entry);
-        Ok((sid, resolved_roles))
+        Ok(sid)
     }
 
     /// Re-establishes ③ when its reader task has finished — the passive
@@ -712,37 +701,6 @@ impl OperatorClientState {
         if send_text(&entry, &text).await.is_err() {
             self.reconnect_after_failed_send(sid, &entry).await?;
             return send_text(&entry, &text).await;
-        }
-        Ok(())
-    }
-
-    /// GH #81 Layer 2 (c): `DELETE /v1/operators/by-role/:role` — release a
-    /// stale role holder without knowing the sid or its Bearer token. The
-    /// route is unauthenticated by design (same trust tier as
-    /// `mlua_swarm_server_shutdown`); the calling driver is expected to
-    /// hold the same trust as the server's shutdown surface. `404` if no
-    /// session holds the role, `204` on successful teardown. No local sid
-    /// cleanup — the recovery scenario is a driver that crashed and lost
-    /// its own local session map, so there is nothing local to sweep.
-    /// Callers that DO have a live local session and want to leave should
-    /// use [`Self::leave`] with the known sid instead.
-    pub async fn leave_by_role(&self, role: &str) -> Result<(), ClientError> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| ClientError::Http(e.to_string()))?;
-        let url = format!("{}/v1/operators/by-role/{role}", self.http_base);
-        let resp = client
-            .delete(&url)
-            .send()
-            .await
-            .map_err(|e| ClientError::Http(e.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Http(format!(
-                "DELETE {url} failed: {status} {body}"
-            )));
         }
         Ok(())
     }
@@ -983,11 +941,6 @@ fn http_to_ws_base(http_base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// convention-token-ok: mlua-swarm public operator role literal.
-    fn role(name: &str) -> mlua_swarm::OperatorRef {
-        mlua_swarm::OperatorRef::new(name).expect("test role literal is never empty")
-    }
 
     // ─── parse_server_frame ──────────────────────────────────────────────
 
@@ -1290,7 +1243,7 @@ mod tests {
     #[tokio::test]
     async fn join_unreachable_host_returns_http_error_not_panic() {
         let state = OperatorClientState::with_http_base("http://127.0.0.1:1");
-        let err = state.join(vec![], None, None).await.unwrap_err();
+        let err = state.join(None, None).await.unwrap_err();
         assert!(matches!(err, ClientError::Http(_)), "got: {err:?}");
     }
 
@@ -1310,7 +1263,6 @@ mod tests {
                     Json(serde_json::json!({
                         "sid": "S-rollback",
                         "token": "rollback-token",
-                        "roles": ["main-ai"]
                     }))
                 }),
             )
@@ -1340,14 +1292,14 @@ mod tests {
 
         let state = OperatorClientState::with_http_base(base);
         let error = state
-            .join(vec![role("main-ai")], None, None)
+            .join(None, None)
             .await
             .expect_err("missing WS route must fail the upgrade");
 
         assert!(matches!(error, ClientError::Ws(_)), "got: {error:?}");
         assert!(
             deleted.load(Ordering::SeqCst),
-            "failed WS join must delete the minted role-owning session"
+            "a failed WS join must delete the session it minted"
         );
         server.abort();
     }
@@ -1463,7 +1415,6 @@ mod tests {
                             Json(serde_json::json!({
                                 "sid": STUB_SID,
                                 "token": STUB_TOKEN,
-                                "roles": ["main-ai"],
                             }))
                         }),
                     )
@@ -1540,10 +1491,7 @@ mod tests {
     async fn pending_wait_reconnects_when_the_reader_task_has_finished() {
         let stub = StubServer::start(vec![WsBehavior::CloseImmediately, WsBehavior::Hold]).await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state
-            .join(vec![role("main-ai")], None, None)
-            .await
-            .expect("join");
+        let sid = state.join(None, None).await.expect("join");
         await_reader_finished(&state, &sid).await;
 
         let frame = state
@@ -1573,10 +1521,7 @@ mod tests {
     async fn reconnect_declines_without_a_ws_attempt_when_healthz_is_down() {
         let stub = StubServer::start(vec![WsBehavior::CloseImmediately]).await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state
-            .join(vec![role("main-ai")], None, None)
-            .await
-            .expect("join");
+        let sid = state.join(None, None).await.expect("join");
         await_reader_finished(&state, &sid).await;
         stub.set_healthy(false);
 
@@ -1612,10 +1557,7 @@ mod tests {
         ])
         .await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state
-            .join(vec![role("main-ai")], None, None)
-            .await
-            .expect("join");
+        let sid = state.join(None, None).await.expect("join");
         await_reader_finished(&state, &sid).await;
         let entry = state.get_entry(&sid).await.expect("session kept");
         assert_eq!(
@@ -1647,10 +1589,7 @@ mod tests {
         ])
         .await;
         let state = OperatorClientState::with_http_base(stub.base());
-        let (sid, _) = state
-            .join(vec![role("main-ai")], None, None)
-            .await
-            .expect("join");
+        let sid = state.join(None, None).await.expect("join");
         await_reader_finished(&state, &sid).await;
         let entry = state.get_entry(&sid).await.expect("session kept");
 

@@ -112,12 +112,23 @@ pub(crate) struct RunLaunchSnapshot {
     operator_kind: Option<OperatorKind>,
     bridge_id: Option<String>,
     hook_id: Option<String>,
-    operator_backend_id: Option<String>,
-    /// Run-scoped Operator session pin. `#[serde(default)]` so a Run
-    /// snapshotted before the field existed still decodes (it resumes
-    /// unpinned, exactly as it launched).
-    #[serde(default)]
-    operator_pin: Option<String>,
+    /// The one Operator the launch named (`TaskLaunchInput::operator_sid`).
+    ///
+    /// # Decoding a snapshot written before the fold
+    ///
+    /// This field used to be two, `operator_backend_id` and `operator_pin`,
+    /// and both are still out there in persisted `input_json` blobs. The
+    /// `alias` reads the first back into this one; the second needs nothing,
+    /// because serde ignores unknown fields and the two never disagreed —
+    /// every writer set `operator_pin` only alongside an
+    /// `operator_backend_id` holding the same sid. So an old blob resumes
+    /// pinned exactly as it launched, and an unpinned one resumes unpinned.
+    ///
+    /// `#[serde(default)]` covers the blob that carries neither key at all,
+    /// which the aliased name — unlike the one it replaced — no longer
+    /// requires to be present.
+    #[serde(default, alias = "operator_backend_id")]
+    operator_sid: Option<String>,
     #[serde(default)]
     operator_kind_overrides: HashMap<String, OperatorKind>,
     task_input: Option<TaskInputSpec>,
@@ -137,8 +148,7 @@ impl RunLaunchSnapshot {
             operator_kind: input.operator_kind,
             bridge_id: input.bridge_id.clone(),
             hook_id: input.hook_id.clone(),
-            operator_backend_id: input.operator_backend_id.clone(),
-            operator_pin: input.operator_pin.clone(),
+            operator_sid: input.operator_sid.clone(),
             operator_kind_overrides: input.operator_kind_overrides.clone(),
             task_input: input.task_input.clone(),
             check_policy: input.check_policy,
@@ -156,8 +166,7 @@ impl RunLaunchSnapshot {
             operator_kind: self.operator_kind,
             bridge_id: self.bridge_id,
             hook_id: self.hook_id,
-            operator_backend_id: self.operator_backend_id,
-            operator_pin: self.operator_pin,
+            operator_sid: self.operator_sid,
             operator_kind_overrides: self.operator_kind_overrides,
             task_input: self.task_input,
             check_policy: self.check_policy,
@@ -416,68 +425,81 @@ async fn trace_assigned(
     .await;
 }
 
-/// The `Assign.desc` written for a seat filled from its own declared name
-/// rather than from a launch pin. See [`seat_declared_operators`].
+/// The `Assign.desc` written for a seat the launching operator takes
+/// without having named it. See [`seat_declared_operators`].
 ///
-/// **A9** requires every `Assign` to record why it happened, and on an
-/// unpinned launch there is no human to write that sentence — so the server
-/// writes one, and it has to be honest about being server-authored. Reading
-/// `GET /v1/runs/:id`, a `desc` starting with "auto-seated at launch" is the
-/// tell that nobody chose this holder: the seat was filled because an
-/// operator happened to be registered under the seat's own name at launch
-/// time. A human pin's `desc` is whatever the caller wrote in
-/// `operator_desc`, which this literal can never be mistaken for.
+/// **A9** requires every `Assign` to record why it happened, and the
+/// launch request only describes the one seat it named (`operator_desc`) —
+/// so the server writes the sentence for the rest, and it has to be honest
+/// about being server-authored. Reading `GET /v1/runs/:id`, a `desc`
+/// starting with "auto-seated at launch" is the tell that the caller did
+/// not choose this lane: it went to the launching operator because a Run
+/// belongs to whoever launched it (model §5), not because anyone asked for
+/// this seat in particular. A human pin's `desc` is whatever the caller
+/// wrote, which this literal can never be mistaken for.
 pub(crate) fn auto_seat_desc(slot: &str) -> String {
     format!(
-        "auto-seated at launch from the Blueprint-declared operator role '{slot}' \
-         (no operator_sid pin in the launch request)"
+        "auto-seated at launch: the launching operator takes the Blueprint-declared seat \
+         '{slot}' along with the one its operator_sid named"
     )
 }
 
-/// Fill every Blueprint-declared Operator seat that has a holder registered
-/// under its own name, right after `RunStore::create`.
+/// Seat the launching operator in every Blueprint-declared Operator seat
+/// its pin did not already name, right after `RunStore::create`.
 ///
 /// # Why a launch seats anything at all
 ///
 /// `Run.current` is the single place a dispatch resolves its destination
 /// from (**A10**), so a seat nothing ever wrote is a seat no dispatch can
-/// reach. Before the `AssigneeRouter`, a `kind = Operator` agent resolved
-/// its `Arc<dyn Operator>` out of the `OperatorSpawnerFactory` registry
-/// under `spec.operator_ref`, where the login path had filed the role
-/// holder — so an *unpinned* launch dispatched to whoever held the role.
-/// Routing through `current` alone would have deleted that shipped shape:
-/// every bundled sample launches without `operator_sid`, and each would now
-/// compile and then die on its first dispatch.
+/// reach — and a multi-seat Blueprint would come up with every lane but
+/// one permanently `Vacant`, since a launch pin fills exactly one.
 ///
-/// This restores it *through* `current` rather than beside it. The seat is
-/// filled by an `acquire_assignee` like any other, so the destination is
-/// still read fresh on every dispatch and a later handover still moves it —
-/// A10 is untouched. What changes is only who is in the seat at generation
-/// 1 when the caller named nobody.
+/// # Who fills them: the launcher, and nobody else
 ///
-/// # The rule
+/// This used to ask a different question — "is anyone registered under
+/// this seat's own name?" — and seat that operator, writing the seat name
+/// itself into `Assignee.op`. It worked because a join claimed role
+/// aliases and the login path registered each session under them, so a
+/// seat called `main-ai` resolved to whoever held `main-ai`. Role
+/// declaration has moved onto the Run, so there is no name to look up and
+/// no registry entry to find: `operators[]` entries are seats, `Assignee.op`
+/// is a session id, and the two no longer share a key space.
 ///
-/// - **Explicit pin wins.** `pinned_slot` names the seat
-///   [`assign_launch_operator`] already filled; it is skipped here, so a
-///   pin is never overwritten by the role holder it displaced.
-/// - **A seat is filled iff its own name resolves an adapter.** The
-///   registry's key space is the model's `OperatorId`, in which a role
-///   alias (`main-ai`) is first-class (`login::register_operator_session`
-///   files every session under its sid *and* each of its roles). A
-///   Blueprint's `operators[]` entry names the role its agents dispatch
-///   through, so "is anyone holding this role right now" is exactly
-///   `adapters.get(seat_name)`.
-/// - **No holder ⇒ the seat stays `Vacant`,** and nothing is invented for
-///   it. That is the honest outcome and it is loud: the first dispatch
-///   through that seat fails naming the seat
-///   (`AssigneeRouter::execute`). It used to fail earlier, at compile, with
-///   "not registered in factory" — later, but strictly more informative,
-///   and it no longer depends on who happened to be logged in at compile
-///   time.
+/// What replaces the lookup is the launch's own operator, for the reason
+/// model §5 gives: *"このまま実行すると、いま実行している AI がこの Run の
+/// Assignee に割り当てられます"* — the Run goes to the AI that launched it.
+/// The pin is how that AI names itself, and `mse mcp` sends one on every
+/// launch it makes (explicitly, or auto-pinned from its sole live session).
+/// So the pinned operator takes the seat it named **and** the rest, at
+/// generation 1, through an ordinary `acquire_assignee` — the destination
+/// is still read fresh on every dispatch and a later handover still moves
+/// it, so **A10** is untouched and a second driver taking one lane is the
+/// same unrefusable acquire it always was (**A8**).
 ///
-/// A multi-seat Blueprint therefore comes up with every lane that has a
-/// holder already dispatchable, instead of at most the one lane a launch
-/// pin could name.
+/// # An unpinned launch seats nothing, and that is the honest answer
+///
+/// `POST /v1/tasks` carries no Bearer and no operator identity other than
+/// `operator_sid`: `operator.id` is a free-form label that defaults to
+/// `"http-run"`, and nothing else in the request or its headers names a
+/// session. So a launch without a pin does not have a launching operator
+/// to seat — it has a launching *process*, which is not the same thing and
+/// which no seat can be filled from. Every seat therefore stays `Vacant`,
+/// and the first dispatch through one fails naming it
+/// (`AssigneeRouter::execute`).
+///
+/// Guessing instead — "seat the only live session" — was the alternative,
+/// and it is what the role lookup effectively did on a single-driver
+/// server. It is rejected because the guess is invisible in the one place
+/// that matters: the Run would report a holder that nobody chose and that
+/// happens to be right until the day a second driver is logged in, at
+/// which point it is silently wrong. **D4** says the same thing from the
+/// other end — nothing about a session is a matching key.
+///
+/// The bundled samples are unaffected: each declares exactly one seat, and
+/// each is launched through `swarm_run`, which pins. A pin-less launch of
+/// one was already only reachable by hand-rolling `POST /v1/tasks`, and
+/// already died at the first dispatch whenever no session happened to hold
+/// the seat's name.
 ///
 /// A store failure here is a `500`, for [`assign_launch_operator`]'s
 /// reason: the row exists but does not carry the holder the Run needs, and
@@ -487,48 +509,173 @@ pub(crate) async fn seat_declared_operators(
     run_id: &RunId,
     task_id: &TaskId,
     operators: &[OperatorDef],
-    pinned_slot: Option<&str>,
+    launch_pin: Option<(&str, &str)>,
 ) -> Result<(), ApiError> {
+    let Some((pinned_slot, op)) = launch_pin else {
+        return Ok(());
+    };
     for op_def in operators {
         let slot = op_def.name.as_str();
-        if pinned_slot == Some(slot) {
-            continue;
-        }
-        if state.operator_adapters.get(slot).await.is_none() {
+        if pinned_slot == slot {
             continue;
         }
         let desc = auto_seat_desc(slot);
         let (gen, previous) = state
             .run_store
-            .acquire_assignee(run_id, slot, slot, &desc)
+            .acquire_assignee(run_id, slot, op, &desc)
             .await
             .map_err(|e| {
                 ApiError::engine(format!(
-                    "run {run_id}: seating the declared operator role '{slot}' at launch failed: \
-                     {e}"
+                    "run {run_id}: seating the launching operator '{op}' in the declared seat \
+                     '{slot}' failed: {e}"
                 ))
             })?;
         // W4, and the one place the `source` label earns its keep: an
-        // auto-seat is the server choosing a holder nobody named, so a
-        // reader should not have to recognise `auto_seat_desc`'s prose to
-        // tell it from a pin.
+        // auto-seat is the server filling a lane the caller did not name,
+        // so a reader should not have to recognise `auto_seat_desc`'s prose
+        // to tell it from a pin.
         trace_assigned(
             state,
             run_id,
             slot,
-            slot,
+            op,
             &desc,
             gen,
             AssignSource::AutoSeat,
             previous.as_ref(),
         )
         .await;
-        // D2, and the case the 記名 was written for: an auto-seat names
-        // nobody, so the operator that ends up holding this lane learns it
-        // has the Run only by finding it on its own list.
-        crate::handover::record_observed_assignment(state, run_id, task_id, slot, slot).await;
+        // D2: the lane lands on the launching operator's own 記名 too, so
+        // "which Runs am I on" answers with every seat it holds rather than
+        // only the one it asked for.
+        crate::handover::record_observed_assignment(state, run_id, task_id, slot, op).await;
     }
     Ok(())
+}
+
+/// The sentence every launch answer carries, verbatim (model §5:
+/// *"保証ではなく告知。担当は Run ごとに決まり、環境によって変わる"*).
+///
+/// It is a field rather than only a doc comment because the reader this is
+/// for is looking at one JSON body, not at the schema: the whole failure
+/// §5 describes — taking the announced holder for a property of the
+/// Blueprint — is one a reader makes silently, from a response that looked
+/// like a statement of fact.
+const LAUNCH_INFO_NOTE: &str = "Announcement, not a guarantee. These holders were seated by \
+     THIS launch and belong to THIS Run only: a Run goes to the AI that kicks it, so the same \
+     Blueprint launched from another process — or from another worktree of the same repo — \
+     seats whoever launches it there. Nothing here is re-checked later: a seat moves whenever \
+     someone acquires it (POST /v1/runs/:id/acquire), and GET /v1/runs/:id/assignees is the \
+     live answer. Read project_root / work_dir before assuming which checkout this Run drives.";
+
+/// What a launch announces about the Run it just created — model §5's Info
+/// display, as a field of the launch response.
+///
+/// # Why this rides on the response rather than being printed
+///
+/// §5 writes the announcement as console output, and there is no console:
+/// the CLI has no `launch` subcommand, so every launch this server serves
+/// arrives over HTTP (`POST /v1/tasks`, `POST /v1/tasks/:id/runs`) or
+/// through `swarm_run`, which proxies one of those. Putting the fields on
+/// the reply puts them in front of every one of those callers at the only
+/// moment §5 asks for — the launch — and leaves the rendering to whoever
+/// has a surface to render on. A `launch` subcommand added later reads
+/// this; it does not need its own source.
+///
+/// # Why the paths are not optional in spirit, only in type
+///
+/// §5 names one reason for printing them: *同じ repo で worktree を複数
+/// 走らせるのが常態* — the same repository, several checkouts, one Run per
+/// checkout, and no way to tell from the Run id which one it was. A launch
+/// that does not say which paths it bound to can only be caught after the
+/// fact, by which time a worker has already run somewhere. They are
+/// `Option` because a launch may genuinely carry neither (nothing supplied
+/// `project_root` / `work_dir`), and `null` says exactly that — which is
+/// itself the answer a reader needs, since a Run bound to no path is not a
+/// Run bound to the caller's own.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct LaunchInfo {
+    /// The Run this announcement is about. Repeated here, rather than left
+    /// to the sibling `run_id` field of the enclosing response, so the
+    /// block can be shown on its own without losing what it refers to.
+    #[schemars(with = "String")]
+    pub run_id: RunId,
+    /// The Task's goal, as launched.
+    pub goal: String,
+    /// The Task-level `project_root` this Run is bound to; `null` when the
+    /// launch supplied none.
+    pub project_root: Option<String>,
+    /// The Task-level `work_dir` this Run is bound to; `null` when the
+    /// launch supplied none.
+    pub work_dir: Option<String>,
+    /// Every Operator seat of this Run and who holds it *at this instant* —
+    /// the same per-seat answer `GET /v1/runs/:id/assignees` gives, read
+    /// from `Run.current` (**A10**) after this launch finished seating.
+    ///
+    /// Each entry carries the holder's `OperatorId`, the generation it was
+    /// stamped at (**A4**) and the `desc` its `Assign` recorded (**A9**) —
+    /// §5's *担当: `<OperatorId>` / `<Assignee の記名>`*, per seat because a
+    /// Blueprint may declare several and a launch fills each of them.
+    ///
+    /// A held seat whose `desc` begins with the server's auto-seat sentence
+    /// (see [`auto_seat_desc`]) went to the launching operator without
+    /// anyone naming that lane. An **unpinned** launch seats nothing, so
+    /// every seat here reports `vacant: true` — which is the announcement
+    /// worth making, since the first dispatch through any of them will fail
+    /// naming the seat.
+    pub seats: Vec<crate::handover::RunSeat>,
+    /// Whether [`Self::seats`] covers every declared seat or only the held
+    /// ones (the Blueprint could not be re-resolved).
+    pub seats_source: crate::handover::SeatsSource,
+    /// [`LAUNCH_INFO_NOTE`] — that this is an announcement and not a
+    /// guarantee, and why the paths are here.
+    pub note: &'static str,
+}
+
+/// Build the model §5 announcement for a Run this handler has just created
+/// and seated.
+///
+/// Called after `assign_launch_operator` / [`seat_declared_operators`], so
+/// `Run.current` already holds what the launch decided — this reads that
+/// back rather than re-deriving it from the launch request, for the same
+/// reason **A10** gives: `current` is the one place a holder is recorded,
+/// and an announcement assembled from anywhere else could disagree with
+/// the dispatch that follows it.
+///
+/// Best effort about the seats only. If the Run cannot be re-read, the
+/// announcement still names the Run, the goal and the paths — the half §5
+/// asks for by name — with an empty seat list and
+/// [`crate::handover::SeatsSource::RunCurrentOnly`], which says the seats
+/// were not resolved rather than that nobody holds one. The launch itself
+/// is never failed over this: the Run exists and is already running.
+pub(crate) async fn build_launch_info(
+    state: &AppState,
+    run_id: &RunId,
+    goal: &str,
+    spec: Option<&TaskInputSpec>,
+) -> LaunchInfo {
+    let (seats, seats_source) = match state.run_store.get(run_id).await {
+        Ok(run) => {
+            let (seats, source, _note) = crate::handover::seat_list(state, &run).await;
+            (seats, source)
+        }
+        Err(error) => {
+            tracing::warn!(
+                %run_id, %error,
+                "launch info: the Run could not be re-read, so the announcement names no seats"
+            );
+            (Vec::new(), crate::handover::SeatsSource::RunCurrentOnly)
+        }
+    };
+    LaunchInfo {
+        run_id: run_id.clone(),
+        goal: goal.to_string(),
+        project_root: spec.and_then(|s| s.project_root.clone()),
+        work_dir: spec.and_then(|s| s.work_dir.clone()),
+        seats,
+        seats_source,
+        note: LAUNCH_INFO_NOTE,
+    }
 }
 
 /// Shared finalize step for a dispatched kick: updates the Run's
@@ -869,11 +1016,11 @@ pub struct RunKickRequest {
     /// disconnected-vs-unknown / last-write-wins contract). Resolved
     /// before any Task/Run store write: an unknown sid fails fast with a
     /// `400`, never silently falling back to the BP-level alias lookup.
-    /// `Some(sid)` becomes this kick's `operator_backend_id` (this handler
-    /// carries no other Operator-override field) and is persisted verbatim
-    /// into `RunRecord.operator_sid`; `None` (absent field, or no body at
-    /// all) preserves the pre-existing Operator-default rekick path
-    /// byte-for-byte.
+    /// `Some(sid)` becomes this kick's `TaskApplicationInput::operator_sid`
+    /// (this handler carries no other Operator-override field) and is
+    /// persisted verbatim into `RunRecord.operator_sid`; `None` (absent
+    /// field, or no body at all) preserves the pre-existing
+    /// Operator-default rekick path byte-for-byte.
     #[serde(default)]
     pub operator_sid: Option<String>,
     /// Why this kick is assigned to [`Self::operator_sid`] — the model's
@@ -910,6 +1057,16 @@ pub struct RunKickResponse {
     /// detached kick reports `running` — poll `GET /v1/runs/:id` for the
     /// terminal status and result.
     pub status: RunStatus,
+    /// Model §5's launch announcement for the Run this kick just minted —
+    /// see [`LaunchInfo`].
+    ///
+    /// A rekick is a launch: it creates a Run, seats the pinned operator
+    /// and every other declared seat exactly as `POST /v1/tasks` does, and
+    /// `RunKickRequest.task_input_override` can point *this* kick at
+    /// different paths than the Task row carries. So the announcement is
+    /// not merely applicable here, this is the path where it is easiest to
+    /// be wrong about which checkout is being driven.
+    pub info: LaunchInfo,
 }
 
 /// `POST /v1/tasks/:id/runs`. Re-kicks an existing Task: reads its stored
@@ -978,11 +1135,11 @@ pub async fn task_rekick(
     // fast with a `400` rather than minting records for a kick that
     // references a session nothing can serve. Unlike `run_flow_form` this
     // handler has no other Operator-override field, so the resolved sid
-    // flows straight into `TaskApplicationInput.operator_backend_id`
-    // (below) and is persisted verbatim into `RunRecord.operator_sid`. See
+    // flows straight into `TaskApplicationInput.operator_sid` (below) and is
+    // persisted verbatim into `RunRecord.operator_sid`. See
     // `crate::TaskLaunchRequest::operator_sid` for the disconnected-vs-
     // unknown distinction.
-    let operator_backend_id = match &req.operator_sid {
+    let operator_sid = match &req.operator_sid {
         Some(sid) => {
             let known_ids = state.engine.list_operator_ids().await;
             if !known_ids.iter().any(|id| id == sid) {
@@ -1094,6 +1251,11 @@ pub async fn task_rekick(
             })?,
     };
 
+    // Model §5's announcement reports the paths *this* kick resolved,
+    // which `task_input_override` may have moved off the Task row's own —
+    // cloned before the spec is moved into the launch input below.
+    let info_spec = task_input_spec.clone();
+
     let run_id = RunId::new();
     let now = now_secs();
 
@@ -1106,12 +1268,11 @@ pub async fn task_rekick(
         operator_kind: None,
         bridge_id: None,
         hook_id: None,
-        operator_backend_id,
-        // Same value, second axis: the sid also binds this rekick's
-        // AgentSpec-axis Operator agents (and their manifest attestation) to
-        // that session, so a rekick lands on the session the caller named
-        // rather than on whichever session currently holds the role.
-        operator_pin: req.operator_sid.clone(),
+        // One value, both axes: the delegate layer's backend, and the
+        // session this rekick's AgentSpec-axis Operator agents attest their
+        // manifests through — so a rekick lands on the session the caller
+        // named rather than on whichever session the seat last pointed at.
+        operator_sid,
         operator_kind_overrides: HashMap::new(),
         task_input: task_input_spec,
         // This legacy `POST /v1/tasks/:id/runs`-style path does not carry a
@@ -1157,17 +1318,24 @@ pub async fn task_rekick(
     if let Some((slot, op, desc)) = &launch_assign {
         assign_launch_operator(&state, &run_id, &task_id, slot, op, desc).await?;
     }
-    // Every other declared seat that has a holder under its own name. The
-    // pinned seat above is excluded, so a pin is never displaced by the
-    // role holder it outranks. See [`seat_declared_operators`].
+    // Every other declared seat, to the same operator. The pinned seat
+    // above is excluded so the caller's own desc survives; an unpinned
+    // rekick seats nothing. See [`seat_declared_operators`].
     seat_declared_operators(
         &state,
         &run_id,
         &task_id,
         &resolved_bp.operators,
-        launch_assign.as_ref().map(|(slot, _, _)| slot.as_str()),
+        launch_assign
+            .as_ref()
+            .map(|(slot, op, _)| (slot.as_str(), op.as_str())),
     )
     .await?;
+
+    // Model §5, same as the launch path: announce the seating and the
+    // paths *this* kick bound to — which `task_input_override` may have
+    // moved off the Task row's own.
+    let info = build_launch_info(&state, &run_id, &task.goal, info_spec.as_ref()).await;
 
     let trace = TraceHandle::new(run_id.clone(), state.run_trace_store.clone());
     trace
@@ -1258,6 +1426,7 @@ pub async fn task_rekick(
                 task_id,
                 run_id,
                 status: RunStatus::Running,
+                info,
             }),
         ));
     }
@@ -1355,6 +1524,7 @@ pub async fn task_rekick(
             task_id,
             run_id,
             status: RunStatus::Done,
+            info,
         }),
     ))
 }
@@ -2513,17 +2683,13 @@ pub async fn run_acquire(
             other => ApiError::engine(other),
         })?;
 
-    // Q5. Addressed at the displaced holder's adapter, not at its
-    // `OperatorId`: `Assignee.op` may be a role alias, and a session
-    // asked to match that string against its own sid would discard
-    // nothing while reporting success.
+    // Q5. Addressed at the displaced holder's adapter, resolved from its
+    // `OperatorId` here rather than left to the session to match on its own.
     //
     // And narrowed to `slot` before it is sent. What this acquire took is
     // one seat; the displaced holder's adapter may be backing others of
-    // this same Run (one session is registered under its sid and under
-    // every role it claimed, and `seat_declared_operators` seats each
-    // declared slot from the adapter answering to that slot's name), and
-    // work in flight on those seats is not this acquire's to drop. A6 does
+    // this same Run (a launch seats its operator in every declared lane),
+    // and work in flight on those seats is not this acquire's to drop. A6 does
     // not clean up afterwards either: it is enforced per slot, so an
     // untouched seat's generation never moved and its dispatch was still
     // valid. The seat of each in-flight request is joined from the ledger
@@ -2886,7 +3052,6 @@ mod tests {
             seat_ledger: Arc::new(crate::operator_ws::SeatLedger::new()),
             data_store: Arc::new(InMemoryOutputStore::new()),
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
-            roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
             operator_session_store: Arc::new(
                 mlua_swarm::store::operator_session::InMemoryOperatorSessionStore::new(),
             ),
@@ -4255,11 +4420,179 @@ mod tests {
         );
     }
 
-    /// A pinned rekick feeds BOTH axes from the one `operator_sid`: the
-    /// delegate layer's session backend (unchanged behaviour) and the new
-    /// run-scoped pin the compiler / binding provider read. The launch
-    /// snapshot is where a resumed Run picks the pin back up, so that is
-    /// what the assertion reads.
+    // ──────────────────────────────────────────────────────────────────
+    // model §5 — the launch announcement (`LaunchInfo`)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// The seat named `slot`, from an announcement.
+    fn announced(info: &LaunchInfo, slot: &str) -> crate::handover::RunSeat {
+        info.seats
+            .iter()
+            .find(|seat| seat.slot == slot)
+            .unwrap_or_else(|| panic!("seat '{slot}' is missing from the announcement"))
+            .clone()
+    }
+
+    /// **An unpinned launch announces that nobody was seated.** §4.3's
+    /// *居なければ居ないと分かる* applied to the launch moment: a Run whose
+    /// seats are all `Vacant` is a Run whose first dispatch will fail
+    /// naming the seat, and a response that simply omitted the holders
+    /// would read as "the announcement did not manage to report them".
+    #[tokio::test]
+    async fn an_unpinned_launch_announces_every_declared_seat_as_vacant() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(post_tasks_req_declaring("unpinned goal", &[SLOT_A, SLOT_B])),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+
+        let info = &posted.info;
+        assert_eq!(info.run_id, posted.run_id, "the block names its own Run");
+        assert_eq!(info.goal, "unpinned goal");
+        assert_eq!(info.seats.len(), 2, "both declared seats are listed");
+        for slot in [SLOT_A, SLOT_B] {
+            let seat = announced(info, slot);
+            assert!(seat.vacant, "an unpinned launch seats nothing: {slot}");
+            assert!(seat.holder.is_none());
+            assert!(seat.declared);
+        }
+        assert!(
+            info.note.contains("not a guarantee"),
+            "the announcement has to say it is one: {}",
+            info.note
+        );
+    }
+
+    /// **A pinned launch announces the holder, its 記名, and the paths.**
+    /// The pinned seat carries the caller's own `operator_desc`; the other
+    /// declared seat goes to the same operator with the server-authored
+    /// [`auto_seat_desc`] sentence, which is the tell that nobody asked
+    /// for that lane.
+    ///
+    /// The paths are the part §5 names a reason for — the same repo in
+    /// several worktrees — so they are asserted as literals rather than as
+    /// "some string".
+    #[tokio::test]
+    async fn a_pinned_launch_announces_the_holder_the_kimei_and_the_paths() {
+        let state = test_state();
+        state
+            .engine
+            .register_operator("S-live-op", Arc::new(StallingOperator))
+            .await;
+        let req = crate::TaskLaunchRequest {
+            project_root: Some("/repo/.worktrees/topic".to_string()),
+            work_dir: Some("/repo/.worktrees/topic/crates".to_string()),
+            operator_sid: Some("S-live-op".to_string()),
+            operator_desc: Some("the AI that kicked this Run".to_string()),
+            operator_slot: Some(SLOT_A.to_string()),
+            ..post_tasks_req_declaring("pinned goal", &[SLOT_A, SLOT_B])
+        };
+        let posted = crate::tasks_start(State(state.clone()), Json(req))
+            .await
+            .expect("tasks_start")
+            .0;
+
+        let info = &posted.info;
+        assert_eq!(
+            info.project_root.as_deref(),
+            Some("/repo/.worktrees/topic"),
+            "which checkout this Run is bound to has to be visible at launch"
+        );
+        assert_eq!(
+            info.work_dir.as_deref(),
+            Some("/repo/.worktrees/topic/crates")
+        );
+
+        let pinned = announced(info, SLOT_A).holder.expect("the pinned holder");
+        assert_eq!(pinned.op, "S-live-op", "担当 = the OperatorId seated");
+        assert_eq!(
+            pinned.desc, "the AI that kicked this Run",
+            "記名 = the caller's own reason, not a server-written one"
+        );
+        assert_eq!(pinned.gen, 1, "A4: the first Assign of a fresh Run");
+
+        let auto = announced(info, SLOT_B)
+            .holder
+            .expect("the auto-seated lane");
+        assert_eq!(
+            auto.op, "S-live-op",
+            "a Run goes to the AI that launched it, every lane of it"
+        );
+        assert_eq!(
+            auto.desc,
+            auto_seat_desc(SLOT_B),
+            "and the lane nobody named says so in its own 記名"
+        );
+    }
+
+    /// **A rekick announces the paths of *that* kick.** This is the path
+    /// where being wrong about the checkout is easiest:
+    /// `task_input_override` retargets one kick without touching
+    /// `TaskRecord.task_input_spec`, so an announcement read off the Task
+    /// row would name the wrong worktree while the Run drove another.
+    #[tokio::test]
+    async fn a_rekick_announces_the_paths_of_that_kick_not_the_tasks() {
+        let state = test_state();
+        let posted = crate::tasks_start(
+            State(state.clone()),
+            Json(crate::TaskLaunchRequest {
+                project_root: Some("/repo".to_string()),
+                ..post_tasks_req_declaring("rekick announcement goal", &[SLOT_A])
+            }),
+        )
+        .await
+        .expect("tasks_start")
+        .0;
+        assert_eq!(posted.info.project_root.as_deref(), Some("/repo"));
+
+        let (_status, rekicked) = task_rekick(
+            State(state.clone()),
+            Path(posted.task_id.to_string()),
+            Some(Json(RunKickRequest {
+                init_ctx_override: None,
+                task_input_override: Some(TaskInputSpec {
+                    project_root: Some("/repo/.worktrees/other".to_string()),
+                    work_dir: None,
+                    task_metadata: None,
+                }),
+                timeout_secs: None,
+                detach: false,
+                operator_sid: None,
+                operator_desc: None,
+                operator_slot: None,
+            })),
+        )
+        .await
+        .expect("task_rekick");
+
+        let info = &rekicked.0.info;
+        assert_eq!(
+            info.run_id, rekicked.0.run_id,
+            "the announcement is about the Run this kick minted"
+        );
+        assert_eq!(
+            info.project_root.as_deref(),
+            Some("/repo/.worktrees/other"),
+            "the override retargets this kick, and the announcement has to follow it"
+        );
+        assert_eq!(
+            info.goal, "rekick announcement goal",
+            "the goal still comes from the Task row"
+        );
+        assert!(
+            announced(info, SLOT_A).vacant,
+            "an unpinned rekick seats nothing, same as an unpinned launch"
+        );
+    }
+
+    /// A pinned rekick feeds BOTH axes from the one `operator_sid` — the
+    /// delegate layer's session backend and the run-scoped pin the binding
+    /// provider reads — and now records it once. The launch snapshot is
+    /// where a resumed Run picks the pin back up, so that is what the
+    /// assertion reads.
     #[tokio::test]
     async fn rekick_pin_reaches_both_axes_and_survives_in_the_launch_snapshot() {
         let state = test_state();
@@ -4306,19 +4639,20 @@ mod tests {
         )
         .expect("snapshot json");
         assert_eq!(
-            snapshot["operator_backend_id"],
+            snapshot["operator_sid"],
             serde_json::json!("S-live-op"),
-            "the delegate axis keeps receiving the sid exactly as before: {snapshot}"
+            "the launch's one operator field must carry the pinned sid: {snapshot}"
         );
         assert_eq!(
-            snapshot["operator_pin"],
-            serde_json::json!("S-live-op"),
-            "the same sid must also pin the AgentSpec axis: {snapshot}"
+            snapshot.get("operator_backend_id"),
+            None,
+            "the folded-away spellings must not be written back out: {snapshot}"
         );
+        assert_eq!(snapshot.get("operator_pin"), None, "{snapshot}");
     }
 
-    /// An unpinned launch leaves both fields absent — the pre-pin snapshot
-    /// shape, byte-for-byte.
+    /// An unpinned launch leaves the operator field null and names no
+    /// session on the Run.
     #[tokio::test]
     async fn unpinned_launch_snapshot_carries_neither_axis() {
         let state = test_state();
@@ -4333,8 +4667,7 @@ mod tests {
         let snapshot: Value =
             serde_json::from_str(run.input_json.as_deref().expect("launch snapshot"))
                 .expect("snapshot json");
-        assert_eq!(snapshot["operator_backend_id"], Value::Null);
-        assert_eq!(snapshot["operator_pin"], Value::Null);
+        assert_eq!(snapshot["operator_sid"], Value::Null);
         assert_eq!(
             run.operator_sid, None,
             "an unpinned launch records no session on the Run"
@@ -4649,10 +4982,12 @@ mod tests {
         );
     }
 
-    /// Naming the seat resolves the same launch — and the holder lands in
-    /// the named one, not the first declared.
+    /// Naming the seat resolves the same launch. What `operator_slot`
+    /// decides is which seat carries the **caller's** `desc` — the others
+    /// go to the same operator with a server-authored one, since a Run
+    /// belongs to whoever launched it.
     #[tokio::test]
-    async fn a_named_seat_is_the_seat_the_pin_fills() {
+    async fn a_named_seat_is_the_seat_the_pins_desc_lands_on() {
         let state = test_state();
         state
             .engine
@@ -4668,14 +5003,26 @@ mod tests {
             .expect("a named seat resolves the ambiguity")
             .0;
         let run = state.run_store.get(&posted.run_id).await.expect("run get");
+        let mut seated: Vec<&String> = run.current.keys().collect();
+        seated.sort();
         assert_eq!(
-            run.current.keys().collect::<Vec<_>>(),
-            vec![SLOT_B],
-            "the pin fills the seat it named"
+            seated,
+            vec![SLOT_A, SLOT_B],
+            "both declared lanes are dispatchable after a pinned launch"
+        );
+        for slot in [SLOT_A, SLOT_B] {
+            assert_eq!(run.current[slot].op, "S-live-op");
+        }
+        assert_eq!(
+            run.current[SLOT_B].desc, "pinned by the launch request",
+            "the named seat keeps the caller's own desc"
         );
         assert!(
-            !run.current.contains_key(SLOT_A),
-            "the seat that was not named stays Vacant"
+            run.current[SLOT_A]
+                .desc
+                .starts_with("auto-seated at launch"),
+            "the one it did not name says the server chose it: {}",
+            run.current[SLOT_A].desc
         );
     }
 
@@ -4799,9 +5146,15 @@ mod tests {
             .await
             .expect("run get");
         assert_eq!(
-            run.current.keys().collect::<Vec<_>>(),
-            vec![SLOT_B],
-            "the kick filled the seat it named"
+            run.current[SLOT_B].desc, "re-kicked onto lane B",
+            "the kick's own desc lands on the seat it named"
+        );
+        assert!(
+            run.current[SLOT_A]
+                .desc
+                .starts_with("auto-seated at launch"),
+            "and the lane it did not name goes to the same operator: {}",
+            run.current[SLOT_A].desc
         );
     }
 
@@ -4809,10 +5162,11 @@ mod tests {
     // POST /v1/runs/:id/acquire — model §4.5
     // ──────────────────────────────────────────────────────────────────
 
-    /// A launched Run over a Blueprint declaring `seats`, with nothing
-    /// registered under any of their names — so every seat starts Vacant
-    /// (`seat_declared_operators` fills only seats that have a registered
-    /// holder) and an acquire is the only thing that can fill one.
+    /// A launched Run over a Blueprint declaring `seats`, launched without
+    /// an `operator_sid` — so every seat starts Vacant
+    /// (`seat_declared_operators` seats the launching operator, and this
+    /// launch names none) and an acquire is the only thing that can fill
+    /// one.
     async fn launched_run(state: &AppState, goal: &str, seats: &[&str]) -> RunId {
         crate::tasks_start(
             State(state.clone()),
@@ -4869,11 +5223,6 @@ mod tests {
                 requests: std::sync::Mutex::new(requests),
                 discards: std::sync::Mutex::new(Vec::new()),
             }
-        }
-
-        /// A double that owes nothing — a registered adapter and no more.
-        fn empty() -> Self {
-            Self::new(Vec::new())
         }
 
         /// The `req_id`s it still owes, sorted.
@@ -5315,7 +5664,7 @@ mod tests {
         // three are this acquire's to drop.
         let _seats: Vec<_> = steps
             .iter()
-            .map(|step| state.seat_ledger.record(&run_id, step, 1, SLOT_A))
+            .map(|step| state.seat_ledger.record(&run_id, step, 1, SLOT_A, 1))
             .collect();
 
         acquire(
@@ -5389,8 +5738,8 @@ mod tests {
                 .register(op, driver.clone() as Arc<dyn OperatorAdapter>)
                 .await;
         }
-        let _seat_a = state.seat_ledger.record(&run_id, &on_a, 1, SLOT_A);
-        let _seat_b = state.seat_ledger.record(&run_id, &on_b, 1, SLOT_B);
+        let _seat_a = state.seat_ledger.record(&run_id, &on_a, 1, SLOT_A, 1);
+        let _seat_b = state.seat_ledger.record(&run_id, &on_b, 1, SLOT_B, 1);
 
         acquire(
             &state,
@@ -5530,9 +5879,9 @@ mod tests {
         );
     }
 
-    /// A launch that pins an operator records the pin, and one that
-    /// auto-seats a declared role records that instead — with a `source`
-    /// label a reader does not have to parse English prose to tell apart.
+    /// A launch records which seat the caller named and which ones the
+    /// server filled on its behalf — with a `source` label a reader does
+    /// not have to parse English prose to tell apart.
     #[tokio::test]
     async fn a_launch_records_which_path_seated_the_operator() {
         // Pinned: the request named the holder. A launch pin is
@@ -5563,21 +5912,48 @@ mod tests {
         assert_eq!(pinned[0].payload["assignee"]["op"], "S-pinned");
         assert!(pinned[0].payload["previous"].is_null());
 
-        // Auto-seated: nobody was named, but an adapter answers to the
-        // seat's own role name.
+        // Auto-seated: the same pin, on a Blueprint with a second lane the
+        // caller did not name. That lane goes to the pinned operator too,
+        // and says the server chose it.
         let state = test_state();
         state
-            .operator_adapters
-            .register(
-                SLOT_A,
-                Arc::new(OwesRequests::empty()) as Arc<dyn OperatorAdapter>,
-            )
+            .engine
+            .register_operator("S-pinned", Arc::new(StallingOperator))
             .await;
-        let run_id = launched_run(&state, "auto seat trace goal", &[SLOT_A]).await;
+        let run_id = crate::tasks_start(
+            State(state.clone()),
+            Json(crate::TaskLaunchRequest {
+                operator_sid: Some("S-pinned".to_string()),
+                operator_desc: Some("pinned by the launch request".to_string()),
+                operator_slot: Some(SLOT_A.to_string()),
+                ..post_tasks_req_declaring("auto seat trace goal", &[SLOT_A, SLOT_B])
+            }),
+        )
+        .await
+        .expect("tasks_start")
+        .0
+        .run_id;
         let seated = assignment_events(&state, &run_id).await;
-        assert_eq!(seated.len(), 1, "one assign row: {seated:?}");
-        assert_eq!(seated[0].payload["source"], "auto_seat");
-        assert_eq!(seated[0].payload["assignee"]["op"], SLOT_A);
+        assert_eq!(seated.len(), 2, "one assign row per seat: {seated:?}");
+        assert_eq!(seated[0].payload["source"], "launch_pin");
+        assert_eq!(seated[0].payload["slot"], SLOT_A);
+        assert_eq!(
+            seated[1].payload["source"], "auto_seat",
+            "the lane the caller did not name is server-chosen"
+        );
+        assert_eq!(seated[1].payload["slot"], SLOT_B);
+        assert_eq!(
+            seated[1].payload["assignee"]["op"], "S-pinned",
+            "and it goes to the operator that launched the Run"
+        );
+
+        // An unpinned launch seats nothing at all, so it records nothing.
+        let state = test_state();
+        let run_id = launched_run(&state, "unpinned trace goal", &[SLOT_A]).await;
+        assert!(
+            assignment_events(&state, &run_id).await.is_empty(),
+            "a launch that named no operator has no assignment to record"
+        );
     }
 
     #[tokio::test]
@@ -5616,7 +5992,61 @@ mod tests {
         });
         let decoded: RunLaunchSnapshot =
             serde_json::from_value(snapshot).expect("a pre-pin snapshot must still decode");
-        assert!(decoded.into_input().operator_pin.is_none());
+        assert!(decoded.into_input().operator_sid.is_none());
+    }
+
+    /// A snapshot written before the two operator fields were folded into
+    /// one still decodes, and resumes pinned to the sid it launched with.
+    ///
+    /// This is the resume round-trip the fold had to keep: an `Interrupted`
+    /// Run created by the previous build is resumed by this one from the
+    /// `input_json` that build wrote. The old blob names the value twice
+    /// (`operator_backend_id` + `operator_pin`, always the same sid); the
+    /// alias reads the first and serde drops the second.
+    #[test]
+    fn pre_fold_launch_snapshot_resumes_pinned() {
+        let snapshot = serde_json::json!({
+            "blueprint": { "kind": "inline", "value": identity_blueprint() },
+            "operator_id": "http-run",
+            "role": "operator",
+            "ttl": { "secs": 60, "nanos": 0 },
+            "init_ctx": {},
+            "operator_kind": null,
+            "bridge_id": null,
+            "hook_id": null,
+            "operator_backend_id": "S-live-op",
+            "operator_pin": "S-live-op",
+            "task_input": null,
+            "check_policy": null,
+        });
+        let decoded: RunLaunchSnapshot =
+            serde_json::from_value(snapshot).expect("a pre-fold snapshot must still decode");
+        assert_eq!(
+            decoded.into_input().operator_sid.as_deref(),
+            Some("S-live-op"),
+            "a Run interrupted before the fold must resume on the session it launched with"
+        );
+    }
+
+    /// A snapshot carrying neither spelling — older than both — decodes to
+    /// an unpinned resume rather than failing.
+    #[test]
+    fn launch_snapshot_without_any_operator_field_decodes() {
+        let snapshot = serde_json::json!({
+            "blueprint": { "kind": "inline", "value": identity_blueprint() },
+            "operator_id": "http-run",
+            "role": "operator",
+            "ttl": { "secs": 60, "nanos": 0 },
+            "init_ctx": {},
+            "operator_kind": null,
+            "bridge_id": null,
+            "hook_id": null,
+            "task_input": null,
+            "check_policy": null,
+        });
+        let decoded: RunLaunchSnapshot =
+            serde_json::from_value(snapshot).expect("an absent operator field must default");
+        assert!(decoded.into_input().operator_sid.is_none());
     }
 
     #[tokio::test]

@@ -657,39 +657,45 @@ pub struct TaskLaunchInput {
     /// `SpawnHook` registry ID. Same shape as above, via
     /// `engine.register_spawn_hook`.
     pub hook_id: Option<String>,
-    /// Operator registry ID — used on the path that hands the whole
-    /// spawn off to an external Operator. Name previously registered
-    /// with `engine.register_operator`; resolved by
-    /// `OperatorDelegateMiddleware`, which — for `kind = MainAi` or
-    /// `Composite` — bypasses `inner.spawn` and calls
-    /// `operator.execute`.
-    pub operator_backend_id: Option<String>,
-    /// Run-scoped Operator session pin — the session id (`S-<hex>`) this
-    /// launch binds its whole Spawn stream to, independent of which axis
-    /// carries the spawn.
+    /// The one Operator this launch names — a session id (`S-<hex>`), or
+    /// any other key an embedder registered with `engine.register_operator`.
     ///
-    /// A Blueprint's `spec.operator_ref` names a Blueprint-declared seat;
-    /// who holds that seat is per-Run, mutable state. `Some(sid)` says who
-    /// holds it at launch: the binding provider attests through that session
-    /// ([`crate::binding::AgentBindingProvider::pinned_to_session`]), and the
-    /// host records it as the Run's first `Assign`
-    /// (`RunStore::acquire_assignee`) — which is what a dispatch resolves
-    /// its destination from, on every dispatch, so a later handover moves
-    /// the destination without recompiling anything.
+    /// # One input, both axes
+    ///
+    /// This used to be two fields, `operator_backend_id` and
+    /// `operator_pin`, and every caller set them from the same value:
+    ///
+    /// - **Delegate axis.** Stored on `LaunchEnvelope.operator_backend_id`
+    ///   and resolved by `OperatorDelegateMiddleware`, which — for
+    ///   `kind = MainAi` / `Composite`, and only when the Blueprint opts
+    ///   into the `operator_delegate` layer — bypasses `inner.spawn` and
+    ///   calls `operator.execute`.
+    /// - **AgentSpec axis.** The binding provider attests this launch's
+    ///   manifests through that session
+    ///   ([`crate::binding::AgentBindingProvider::pinned_to_session`]), and
+    ///   the host records the same id as the Run's first `Assign`
+    ///   (`RunStore::acquire_assignee`) — which is what a dispatch resolves
+    ///   its destination from, freshly each time, so a later handover moves
+    ///   the destination without recompiling anything.
+    ///
+    /// Keeping them apart let a launch say two different things about who
+    /// it belonged to, and nothing above ever wanted to: `POST /v1/tasks`
+    /// wrote the same sid into both, and `POST /v1/tasks/:id/runs` had only
+    /// one value to write. Two axes still read it — that is a fact about
+    /// how a launch reaches an operator, not a reason for the launch to
+    /// carry the answer twice.
     ///
     /// The compile deliberately does **not** see this value: baking the
     /// pinned session into `routes[agent_name]` is exactly the frozen
     /// destination the per-dispatch lookup replaced.
     ///
-    /// `None` (the default via [`Self::automate`]) attests through the
-    /// role's holder, byte-for-byte as before.
-    ///
-    /// Orthogonal to [`Self::operator_backend_id`]: that field is the
-    /// opt-in `operator_delegate` layer's session-wide backend, which
-    /// bypasses the per-agent spawners entirely when a Blueprint declares
-    /// the layer. A launch may carry both; the delegate layer keeps winning
-    /// where it applies, and the pin decides the AgentSpec axis underneath.
-    pub operator_pin: Option<String>,
+    /// `None` (the default via [`Self::automate`]) names no operator: the
+    /// delegate layer finds no backend and falls through to `inner.spawn`,
+    /// and the binding provider has nothing to attest through (it reports
+    /// `Unbound`). A value that is not a live session id behaves the same
+    /// way on the second axis while still resolving on the first, which is
+    /// how an embedder-registered backend keeps working.
+    pub operator_sid: Option<String>,
     /// "Runtime Agent-level" tier (highest priority) of the `OperatorKind`
     /// cascade — per-agent override, keyed by `AgentDef.name`. Empty by
     /// default (no override for any agent). See
@@ -764,8 +770,7 @@ impl TaskLaunchInput {
             operator_kind: None,
             bridge_id: None,
             hook_id: None,
-            operator_backend_id: None,
-            operator_pin: None,
+            operator_sid: None,
             operator_kind_overrides: HashMap::new(),
             init_ctx,
             task_input: None,
@@ -878,7 +883,7 @@ impl TaskLaunchService {
         // unpinned launch — and any provider without a session concept —
         // keeps using `self.binding_provider` unchanged).
         let pinned_binding_provider: Option<Arc<dyn AgentBindingProvider>> = input
-            .operator_pin
+            .operator_sid
             .as_deref()
             .and_then(|pin| self.binding_provider.as_ref()?.pinned_to_session(pin));
         let binding_provider = pinned_binding_provider
@@ -1028,6 +1033,24 @@ impl TaskLaunchService {
             .default_operator_kind
             .map(OperatorKind::from);
 
+        // The delegate axis's half of `operator_sid`: the envelope stores it
+        // as the `Engine.operators` key `resolve_operator_info` looks up at
+        // every dispatch.
+        //
+        // # Why this still reads a launch-time value rather than `Run.current`
+        //
+        // The AgentSpec axis moved off the launch record and onto the Run's
+        // seat, which is what makes a handover work: a dispatch re-reads
+        // `Run.current` and lands wherever the seat points *now*. The
+        // delegate axis did not move with it, so a delegate-layer Blueprint
+        // keeps dispatching to whoever the launch named even after the seat
+        // has been handed over. That gap is real and is tracked separately
+        // (issue `545411ab`); it is not closed here, because closing it
+        // means giving `Engine::resolve_operator_info` a way to reach the
+        // Run's seat — a `RunStore` dependency this crate's dispatch path
+        // does not have and should not grow as a side effect of folding an
+        // input field. Folding the field changes where the value comes from
+        // (one input instead of three), not when it is read.
         let token = self
             .engine
             .attach_with_ids(
@@ -1037,7 +1060,7 @@ impl TaskLaunchService {
                 input.operator_kind,
                 input.bridge_id,
                 input.hook_id,
-                input.operator_backend_id,
+                input.operator_sid,
                 input.operator_kind_overrides,
                 bp_agent_kinds,
                 bp_global_kind,

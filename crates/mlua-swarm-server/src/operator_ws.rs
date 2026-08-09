@@ -72,9 +72,10 @@
 //!   send (`ask` / `hook_before` / `Operator::execute`) issued while `tx` is
 //!   `None` parks until a reconnect swaps a sender back in, rather than
 //!   failing the step. The wait has no deadline — its only other exit is
-//!   session teardown (`DELETE /v1/operators/:sid` / `/by-role`), whose
-//!   `fail_pending` fails parked sends loud because that session can never be
-//!   reconnected. No buffer/flush queue is introduced: the caller's own task
+//!   session teardown (`DELETE /v1/operators/:sid`), whose `fail_pending`
+//!   fails parked sends loud because that session can never be reconnected
+//!   — see that method's doc for why teardown keeps doing this rather than
+//!   leaving the requests for the next Assignee. No buffer/flush queue is introduced: the caller's own task
 //!   is the queue. `after` (fire-and-forget) is excluded and still drops on a
 //!   disconnect. See `session::WSOperatorSession`'s module doc.
 //! - **req_id naming**: `<sid>-<ask|hb|ha|spawn>-<uuid>` covers both the trait
@@ -97,9 +98,9 @@
 //! ## REST-like login flow (`login.rs`) — sole Operator session entry point
 //!
 //! `POST/GET/DELETE /v1/operators` + `WS /v1/operators/:sid/ws` (`login.rs`) is
-//! the only Operator session route. The login flow mints the sid server-side,
-//! requires Bearer auth (no empty-string default), and enforces a
-//! roles-exclusivity 409 at mint time. See the `login` module doc for details.
+//! the only Operator session route. The login flow mints the sid server-side
+//! and requires Bearer auth (no empty-string default) on everything past the
+//! join itself. See the `login` module doc for details.
 
 /// REST-like Operator session resource (`POST/GET/DELETE /v1/operators` + WS upgrade).
 pub mod login;
@@ -112,13 +113,13 @@ pub mod router;
 pub mod session;
 
 pub use login::{
-    operators_create, operators_delete, operators_delete_by_role, operators_info, operators_list,
-    operators_ws_connect, LoginSession, OperatorsCreateReq, OperatorsCreateResp, OperatorsInfoResp,
-    OperatorsListEntry, OperatorsListResp,
+    operators_create, operators_delete, operators_info, operators_list, operators_ws_connect,
+    LoginSession, OperatorsCreateReq, OperatorsCreateResp, OperatorsInfoResp, OperatorsListEntry,
+    OperatorsListResp,
 };
 pub use protocol::{ClientMsg, ServerMsg};
 pub use router::{
     AssigneeRouter, AssigneeRouterResolver, Liveness, OperatorAdapter, OperatorAdapterRegistry,
-    PendingRequest, RunTraceSlot, SeatLedger, SeatTicket, WsOperatorWiring,
+    PendingRequest, RunTraceSlot, SeatEntry, SeatLedger, SeatTicket, WsOperatorWiring,
 };
 pub use session::{PendingKind, WSOperatorSession};

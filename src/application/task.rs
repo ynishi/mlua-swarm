@@ -96,15 +96,12 @@ pub struct TaskApplicationInput {
     /// `SpawnHook` registry ID. Same shape as above — attach a hook
     /// previously registered on the engine.
     pub hook_id: Option<String>,
-    /// Operator registry ID — used on the path that hands the whole
-    /// spawn off to an external Operator.
-    pub operator_backend_id: Option<String>,
-    /// Run-scoped Operator session pin, threaded verbatim into
-    /// [`TaskLaunchInput::operator_pin`] — the session id (`S-<hex>`) this
-    /// launch binds its Spawn stream to, on any axis. `None` (the default
-    /// via [`Self::automate`]) keeps the logical-role resolution every
-    /// pre-pin caller has.
-    pub operator_pin: Option<String>,
+    /// The one Operator this launch names, threaded verbatim into
+    /// [`TaskLaunchInput::operator_sid`] — see there for what the two axes
+    /// downstream do with it, and why they read one field rather than the
+    /// two this replaced. `None` (the default via [`Self::automate`]) names
+    /// no operator.
+    pub operator_sid: Option<String>,
     /// "Runtime Agent-level" tier (highest priority) of the `OperatorKind`
     /// cascade — per-agent override, keyed by `AgentDef.name`. Empty by
     /// default. See `crate::core::ctx::collapse_operator_kind` for the full tier
@@ -151,8 +148,7 @@ impl TaskApplicationInput {
             operator_kind: None,
             bridge_id: None,
             hook_id: None,
-            operator_backend_id: None,
-            operator_pin: None,
+            operator_sid: None,
             operator_kind_overrides: HashMap::new(),
             task_input: None,
             check_policy: None,
@@ -326,8 +322,7 @@ impl TaskApplication {
                 operator_kind: input.operator_kind,
                 bridge_id: input.bridge_id,
                 hook_id: input.hook_id,
-                operator_backend_id: input.operator_backend_id,
-                operator_pin: input.operator_pin,
+                operator_sid: input.operator_sid,
                 operator_kind_overrides: input.operator_kind_overrides,
                 init_ctx: input.init_ctx,
                 run_ctx,
@@ -510,8 +505,7 @@ mod tests {
             operator_kind: Some(OperatorKind::MainAi),
             bridge_id: Some("br-x".into()),
             hook_id: Some("hk-y".into()),
-            operator_backend_id: None,
-            operator_pin: None,
+            operator_sid: None,
             operator_kind_overrides: HashMap::new(),
             task_input: None,
             check_policy: None,

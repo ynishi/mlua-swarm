@@ -68,8 +68,8 @@ enum ConnState {
     Connected,
     /// `tx` is `None` — the client may still reconnect and swap one back in.
     Disconnected,
-    /// The session was torn down (`DELETE /v1/operators/:sid` or `/by-role`)
-    /// and removed from `operator_sessions`; no reconnect can find it again.
+    /// The session was torn down (`DELETE /v1/operators/:sid`) and removed
+    /// from `operator_sessions`; no reconnect can find it again.
     TornDown,
 }
 
@@ -484,13 +484,58 @@ impl WSOperatorSession {
     /// terminal, so a send that registers after the drain still observes it
     /// and fails itself.
     ///
-    /// Called on **session teardown** (`DELETE /v1/operators/:sid` and
-    /// `/by-role`), where the session is being removed from
-    /// `operator_sessions` and can never be reconnected — so the
-    /// disconnect-survives-in-`pending` reconnect/resend contract (see the
-    /// module doc) does not apply. It is deliberately NOT called on a plain
-    /// WS disconnect, which keeps `pending` alive for a reconnecting client
-    /// to resend against.
+    /// Called on **session teardown** (`DELETE /v1/operators/:sid`), where
+    /// the session is being removed from `operator_sessions` and can never
+    /// be reconnected — so the disconnect-survives-in-`pending`
+    /// reconnect/resend contract (see the module doc) does not apply. It is
+    /// deliberately NOT called on a plain WS disconnect, which keeps
+    /// `pending` alive for a reconnecting client to resend against.
+    ///
+    /// # Why this was not removed
+    ///
+    /// The Operator-lifecycle teardown listed this for removal, with **W2**
+    /// as the replacement: the server resolves nothing on its own, an
+    /// unanswered Step stays unanswered, and the next Assignee answers it by
+    /// `req_id`. Its prerequisite landed — a [`PendingEntry`] now records
+    /// run / step / attempt, so an un-answered request is nameable. It is
+    /// still kept, for two reasons that are about teardown specifically.
+    ///
+    /// **W2's answer path cannot reach a pre-send park.** Publishing
+    /// [`ConnState::TornDown`] is not the same service as draining
+    /// `pending`. An entry registers in [`Self::send_and_await`] *before*
+    /// the send, so a request parked in [`Self::send_when_connected`] is
+    /// already listed by [`Self::pending_for_run`] (**W3** — unsent and
+    /// sent are one state) but its task is blocked one step earlier than
+    /// `orx.await`. Answering it through [`Self::resolve_pending`] puts the
+    /// reply in a `oneshot` nobody is receiving yet and leaves the task
+    /// waiting on a `watch` whose last publisher just went away with the
+    /// session. Teardown removes the sid from `operator_sessions`, so the
+    /// reconnect that is the park's only other exit can never arrive
+    /// either. Removing this call would therefore not hand those sends to
+    /// the next Assignee; it would leave them parked in silence until the
+    /// run's TTL — the exact outcome the park was introduced (abcb43e2) to
+    /// avoid.
+    ///
+    /// **Dropping only the drain would not implement W2 either.** For the
+    /// next Assignee to answer, it must be able to *read* the outstanding
+    /// requests, and both ways in — `pending_for_run` and
+    /// [`Self::discard_pending_requests`] — are reached through
+    /// `AppState.operator_adapters`, keyed by sid. `teardown_operator_session`
+    /// unregisters that adapter and drops the session from
+    /// `operator_sessions` before calling this. After teardown the map is
+    /// unreachable by any name, so an un-drained entry is not "waiting for
+    /// the next Assignee", it is orphaned: the trade would be a prompt loud
+    /// failure for a silent wait on the sync ceiling.
+    ///
+    /// The W2-shaped path for a live operator losing work already exists
+    /// and is the sibling below: `discard_pending_requests`, the handover
+    /// (**A8**) case, where the session survives, the caller has read the
+    /// `req_id`s first, and the seat's new holder can answer them. Teardown
+    /// is not a handover — the operator is gone, not displaced. Removing
+    /// this would need `pending` to outlive its session under a key
+    /// something still resolves (a Run-scoped index rather than a
+    /// session-scoped map), which is a different change from the one the
+    /// removal list assumed.
     pub(crate) async fn fail_pending(&self, reason: &str) {
         // Wake the pre-send parks before draining the post-send ones.
         self.publish_conn(ConnState::TornDown);

@@ -117,7 +117,7 @@ pub struct Args {
     #[arg(long)]
     replay_store_path: Option<std::path::PathBuf>,
     /// Path to the SQLite database file backing the `OperatorSessionStore`
-    /// (Operator login sessions — sid / roles / bearer digest; the bearer
+    /// (Operator login sessions — sid / 記名 / bearer digest; the bearer
     /// itself is never written, and the file is `0600` on unix). Persisted
     /// by default even when omitted (sibling of `--run-store-path`): falls
     /// back to `~/.mse/store/operator_session.sqlite` unless `--ephemeral`

@@ -28,7 +28,7 @@ pub struct Ctx {
     pub meta: CtxMeta,
     /// The Operator faces resolved for this attempt. Not serialized —
     /// `Arc<dyn ...>` trait objects have no stable on-wire form; only the
-    /// IDs (persisted on `OperatorSession`) survive a restart.
+    /// IDs (persisted on `LaunchEnvelope`) survive a restart.
     #[serde(skip)]
     pub operator: OperatorInfo,
 }
@@ -111,8 +111,8 @@ impl From<mlua_swarm_schema::OperatorKind> for OperatorKind {
 ///
 /// Consumed by `Engine::resolve_operator_info` (`crate::core::engine`), which
 /// supplies `runtime_agent` / `bp_agent` from per-agent `HashMap` lookups on
-/// `OperatorSession`, and `runtime_global` / `bp_global` from session-level
-/// fields — `runtime_global` is `OperatorSession.operator_kind` verbatim
+/// `LaunchEnvelope`, and `runtime_global` / `bp_global` from session-level
+/// fields — `runtime_global` is `LaunchEnvelope.operator_kind` verbatim
 /// (an `Option<OperatorKind>`; `Some(_)` is always an explicit request,
 /// including `Some(Automate)`, and `None` means unspecified).
 pub fn collapse_operator_kind(
@@ -268,7 +268,7 @@ mod collapse_operator_kind_tests {
 /// # Persistence boundary
 ///
 /// `OperatorInfo` is transient inside `Ctx` (`#[serde(skip)]`). The
-/// persisted `OperatorSession` only holds IDs (`bridge_id` / `hook_id` /
+/// persisted `LaunchEnvelope` only holds IDs (`bridge_id` / `hook_id` /
 /// `operator_backend_id`). At dispatch time the engine resolves each `Arc`
 /// by looking those IDs up in its `senior_bridges` / `spawn_hooks` /
 /// `operators` `HashMap`s via `resolve_operator_info(session) -> OperatorInfo`.
@@ -277,7 +277,7 @@ pub struct OperatorInfo {
     /// Gating signal consumed by middleware; see the "role of `kind`"
     /// section above.
     pub kind: OperatorKind,
-    /// Identifier of the attached Operator/session (`OperatorSession.operator_id`).
+    /// Identifier of the attached Operator/session (`LaunchEnvelope.operator_id`).
     pub id: String,
     /// See the `senior_bridge` row in the table above.
     pub senior_bridge: Option<Arc<dyn SeniorBridge>>,

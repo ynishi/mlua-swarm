@@ -273,12 +273,28 @@ pub enum SubmitOutcome {
 
 // ─── Session ───────────────────────────────────────────────────────────────
 
-/// Persisted record of one attached Operator session: identity, role,
+/// Everything one launch bakes for its own dispatches: identity, role,
 /// heartbeat bookkeeping, owned tasks, and the `OperatorKind` cascade
 /// inputs plus registry IDs used to rebuild `OperatorInfo` on dispatch
 /// (see `Engine::resolve_operator_info`).
+///
+/// # Why this is an envelope and not a session
+///
+/// It was called `OperatorSession`, and the name said the wrong thing on
+/// both halves. It is not *the* Operator session — that is
+/// `WSOperatorSession`, one per live WS connection, which outlives any
+/// number of launches and is reachable by sid. This is minted by
+/// `Engine::attach*` once per launch, keyed by a `SessionId` nobody
+/// dispatches to, and read only to rebuild the launch's own `Ctx`. Two
+/// launches driven by the same operator have two of these; a handover
+/// changes neither.
+///
+/// So the name now says what it holds: the launch-time envelope its
+/// dispatches are opened from. The `SessionId` in [`Self::id`] stays — it
+/// is the engine's own token/session bookkeeping key, and renaming that
+/// axis is a different change from renaming this type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OperatorSession {
+pub struct LaunchEnvelope {
     /// Unique session identifier (distinct from the token nonce).
     pub id: SessionId,
     /// Caller-supplied name identifying the Operator (not necessarily
@@ -350,6 +366,15 @@ pub struct OperatorSession {
     /// Used by `OperatorDelegateMiddleware` when `kind = MainAi` /
     /// `Composite` and `operator_id` is `Some`: it delegates the entire
     /// spawn to `operator.execute`.
+    ///
+    /// Its one source is the launch's `operator_sid`
+    /// (`TaskLaunchInput::operator_sid`), which is where the three former
+    /// spellings of this value were folded together. The name stays
+    /// registry-shaped because that is what the field *is* at this layer —
+    /// a key into `Engine.operators`, sibling to [`Self::bridge_id`] and
+    /// [`Self::hook_id`] — and because the key space it indexes is a
+    /// superset of the WS sids: an embedder can `register_operator` under
+    /// any name and launch against it.
     #[serde(default)]
     pub operator_backend_id: Option<String>,
 }
@@ -600,8 +625,11 @@ pub struct AgentCtxEntry {
 pub struct EngineState {
     /// All known tasks, keyed by `StepId`.
     pub tasks: HashMap<StepId, TaskState>,
-    /// All attached/detached sessions, keyed by `SessionId`.
-    pub sessions: HashMap<SessionId, OperatorSession>,
+    /// One [`LaunchEnvelope`] per `Engine::attach*`, keyed by the
+    /// `SessionId` minted with it. Named `sessions` because that is the
+    /// bookkeeping axis (a token, an attach, a detach); what each entry
+    /// holds is the launch envelope, not the Operator's WS session.
+    pub sessions: HashMap<SessionId, LaunchEnvelope>,
     /// Per-`(task_id, attempt)` prompt/directive value, seeded from
     /// `TaskSpec.initial_directive` and fetched via `fetch_prompt`. Held
     /// as `serde_json::Value` end-to-end (issue #18): the render down to

@@ -54,6 +54,26 @@
 //!   steps, since a pre-run-tracking dispatch has nowhere to record a
 //!   degradation and that must not become a client-visible error.
 //!
+//! ## A6 on the way in (model §4.3)
+//!
+//! The three routes that reach the fold — `/v1/worker/submit`,
+//! `/v1/worker/artifact` and `/v1/worker/result` — check, before writing,
+//! that the Operator seat their dispatch went out through is still held by
+//! the acquisition that sent it ([`reject_if_seat_moved`]). `Vacant` is a
+//! `503`; a seat that has changed hands is a `409`.
+//!
+//! This is a second site for a rule `AssigneeRouter::execute` already
+//! enforces, and it is not redundant: the router checks A6 on the way back
+//! from the delegation, and a worker's POST lands *inside* that await, so
+//! by the time the router refuses, the displaced holder's value has been
+//! folded. The observational channels (`/degradation`, `/stats`) are
+//! deliberately left out — they never touch OUTPUT, so nothing they carry
+//! can be attributed to the wrong holder's step.
+//!
+//! Every resolution step before a seat can be named fails open, the same
+//! contract [`reject_if_run_terminal`] follows: a dispatch that never went
+//! through a router has no seat term for A6 to evaluate and is untouched.
+//!
 //! ## Bearer authentication
 //!
 //! The Bearer value is the string produced by `CapToken::encode()` (= URL-safe
@@ -284,6 +304,31 @@ fn default_ok_true() -> bool {
 
 /// `POST /v1/worker/result`. Bearer = encoded `CapToken`.
 /// Fires `engine.submit_output(Final)` + `engine.post_result`.
+///
+/// # A6 reaches this route, and what it does not reach
+///
+/// This route was said to have no Run to resolve. It does: `agent_ctx` is
+/// keyed by `(task_id, attempt)`, and this handler holds both — `task_id`
+/// from the body, `attempt` from the body or from `task.attempt`. So
+/// [`reject_if_seat_moved`] applies here verbatim, and a displaced
+/// holder's late `Final` is refused the same way a `/v1/worker/submit`
+/// one is.
+///
+/// Two things it still does not guard, both of them the token's business
+/// rather than the seat's:
+///
+/// - **The `task_id`-binding hole is untouched.** `verify_token_for_task`
+///   (`Engine`) returns early for every non-`Worker` role, so an Operator
+///   token may still name any `task_id` in this body. The seat check
+///   narrows the window — a write is refused while a routed dispatch for
+///   that `(run, step, attempt)` is in flight under a generation that has
+///   since moved — but a `(task_id, attempt)` with no ledger entry has no
+///   seat term to evaluate and passes, exactly as it did before. Closing
+///   that would mean binding the token, not reading the Run.
+/// - **A caller-supplied [`WorkerResultReq::attempt`]** that no dispatch
+///   ever ran under resolves to no `agent_ctx` entry, so the guard fails
+///   open on it. That field exists for tests that write to a fixed
+///   attempt, and it keeps working.
 pub async fn worker_result(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -301,6 +346,10 @@ pub async fn worker_result(
             .await
             .map_err(|e| ApiError::engine(format!("task_attempt: {e}")))?,
     };
+
+    // A6 at the moment the value would land — see the fn doc for what this
+    // route can and cannot resolve.
+    reject_if_seat_moved(&state, &task_id, attempt).await?;
 
     let event = OutputEvent::Final {
         content: ContentRef::Inline {
@@ -815,6 +864,11 @@ pub async fn worker_submit(
     // GH #37: fail loud (410) instead of silently accepting a submit whose
     // addressed Run is already terminal — see `reject_if_run_terminal`.
     reject_if_run_terminal(&state, &task_id, attempt).await?;
+    // A6 at the moment the value would land: the router's own check runs
+    // on the way back from the delegation this POST is arriving inside of,
+    // which is too late to keep a displaced holder's output out of the
+    // fold — see `reject_if_seat_moved`.
+    reject_if_seat_moved(&state, &task_id, attempt).await?;
     // Strip trailing whitespace (newlines, etc.) so flow.ir `Eq` string matches
     // don't drift on `"BLOCKED\n" == "BLOCKED"` false results. Origin: the recent clean-up
     // verdict_loop smoke — sharp-edge removal. Internal `\n` inside the raw bytes
@@ -935,6 +989,10 @@ pub async fn worker_artifact(
     // GH #37: fail loud (410) instead of silently staging a part whose
     // addressed Run is already terminal — see `reject_if_run_terminal`.
     reject_if_run_terminal(&state, &task_id, attempt).await?;
+    // A6, for the same reason as `worker_submit`: a staged part is folded
+    // into the attempt's `"parts"`, so a displaced holder's worker staging
+    // one here reaches the flow ctx exactly as a submit would.
+    reject_if_seat_moved(&state, &task_id, attempt).await?;
     let body_str = String::from_utf8_lossy(&body).trim_end().to_string();
     // GH #42: same `@file:<abs-path>` sentinel as `worker_submit`.
     let body_str = resolve_file_sentinel(&state, &task_id, attempt, body_str).await?;
@@ -1233,6 +1291,140 @@ async fn reject_if_run_terminal(
     }
 }
 
+/// **A6 at submit time** — refuse a worker's write when the seat its
+/// dispatch went out through is no longer held by the acquisition that
+/// sent it.
+///
+/// # Why A6 needs a second site
+///
+/// `AssigneeRouter::execute` already enforces A6, on the way back from
+/// `adapter.execute`: it re-reads `Run.current[slot]` and rejects the
+/// delegation when the generation moved. But the worker's HTTP POST lands
+/// *inside* that await — `/v1/worker/submit` writes into the output tail,
+/// and `dispatch_attempt_with` folds it, before the router ever gets to
+/// re-read anything. So A6's refusal arrives after the displaced holder's
+/// value is already in the flow ctx, and for a poll-type dispatch that
+/// never passes through a router it does not arrive at all.
+///
+/// This is that same predicate, checked at the moment the value would
+/// land:
+///
+/// ```text
+/// current = Vacant       ⟹ 503, before any judgement of the body
+/// current = Assigned(a)  ⟹ accept ⟺ a.gen = the generation this
+///                                     dispatch was addressed under
+/// ```
+///
+/// # Where the addressed generation comes from
+///
+/// [`crate::operator_ws::SeatLedger`], written by the router immediately
+/// before it delegates and dropped when the delegation returns — so an
+/// entry exists for exactly the window in which a worker of that dispatch
+/// can submit. `Run.current` cannot supply it: re-reading that yields the
+/// *current* holder's `gen`, which is the value being compared against.
+///
+/// The generation is **not** pushed below the SAP to get here (**T1**):
+/// it is written above the boundary by the router and read above the
+/// boundary by this handler. Neither the worker token nor
+/// `AgentContextView` carries it, so nothing an operator or a worker sees
+/// on the wire gained a generation.
+///
+/// # What fails open, and where the line is
+///
+/// Every step *before* a seat is named degrades to `Ok(())`, matching
+/// [`reject_if_run_terminal`]'s contract — no `agent_ctx` entry, no
+/// `run_id` on the view, an unparseable id, and no ledger entry all mean
+/// this layer cannot name a seat, and A6 has no seat term to evaluate.
+/// That keeps every non-routed dispatch (in-process spawner,
+/// `SpawnerAdapter`, a delegation that has already returned) byte-for-byte
+/// as it was. A missing ledger entry in particular must not be read as
+/// `Vacant`: "no seat to check" and "the seat is empty" are different
+/// answers and only the second is a refusal.
+///
+/// *After* a seat is named the posture inverts, because A6 is an
+/// acceptance predicate whose default is refusal: a `RunStore` read that
+/// fails is a `503`, not a pass. `AssigneeRouter::execute` takes the same
+/// position on its own re-read ("could not be re-read … so it was not
+/// accepted").
+///
+/// # What this does not check
+///
+/// A6's `reply.from = a.op` leg. The Bearer here is a worker `CapToken`
+/// (or its short handle), which names an agent and a task — never an
+/// `OperatorId` — so this layer cannot compare the caller against the
+/// holder. It is not a gap in the check so much as a consequence of the
+/// generation being Run-wide and never reused: a seat still holding
+/// `dispatch.gen` is holding the very `Assignee` instance the dispatch
+/// read, so matching the generation *is* matching the holder. What stays
+/// unverified is that the HTTP caller is genuinely the worker that holder
+/// spawned, which is the worker token's own binding, on a different axis.
+///
+/// `ALIVE(a.op) = Connected` is likewise not re-asked here: it is the
+/// router's leg (**A7**), answered at dispatch time and again on the
+/// return, and **T7** forbids extrapolating from a previous answer — a
+/// third reading at submit time would be a new fact about a different
+/// instant, not a confirmation of that one.
+async fn reject_if_seat_moved(
+    state: &AppState,
+    task_id: &StepId,
+    attempt: u32,
+) -> Result<(), ApiError> {
+    let tid = task_id.clone();
+    let run_id_str = match state
+        .engine
+        .with_state("worker_seat_generation_guard", move |s| {
+            s.agent_ctx
+                .get(&(tid, attempt))
+                .and_then(|e| e.view.run_id.clone())
+        })
+        .await
+    {
+        Ok(Some(rid)) => rid,
+        _ => return Ok(()),
+    };
+    let Ok(run_id) = RunId::parse(run_id_str) else {
+        return Ok(());
+    };
+    // No seat named for this dispatch = nothing A6 applies to. Read the
+    // ledger before the store so an unrouted dispatch costs no read.
+    let Some(dispatch) = state.seat_ledger.dispatch_of(&run_id, task_id, attempt) else {
+        return Ok(());
+    };
+
+    let rec = state.run_store.get(&run_id).await.map_err(|e| {
+        tracing::warn!(
+            %run_id,
+            slot = %dispatch.slot,
+            addressed_gen = dispatch.gen,
+            error = %e,
+            "A6: the submit could not be checked against the current generation"
+        );
+        ApiError::unavailable(format!(
+            "run {run_id} could not be read to check whether this submit still belongs to \
+             generation {} of operator slot '{}', so it was not accepted (A6); retry once the \
+             Run store is readable",
+            dispatch.gen, dispatch.slot
+        ))
+    })?;
+
+    match rec.current.get(&dispatch.slot) {
+        Some(current) if current.gen == dispatch.gen => Ok(()),
+        Some(current) => Err(ApiError::conflict(format!(
+            "run {run_id}: this attempt was dispatched through operator slot '{}' under \
+             generation {}, but the seat is now generation {} (operator '{}'). The submit is \
+             the displaced holder's worker's and is not accepted (A6); the current holder's \
+             own dispatch will produce its own attempt.",
+            dispatch.slot, dispatch.gen, current.gen, current.op
+        ))),
+        None => Err(ApiError::unavailable(format!(
+            "run {run_id}: operator slot '{}' is Vacant, so there is no holder this submit \
+             could belong to and it is not accepted (A6). Acquire the seat (POST \
+             /v1/runs/{run_id}/acquire) and dispatch again.",
+            dispatch.slot
+        ))),
+    }
+}
+
 /// Query params for `GET /v1/worker/prompt/system`. Field names are fixed to
 /// `task_id` / `attempt` — this is the exact shape the engine bakes into
 /// `system_ref.uri`'s query string for `Http` mode (GH #31), so the names
@@ -1445,7 +1637,6 @@ mod tests {
             seat_ledger: Arc::new(crate::operator_ws::SeatLedger::new()),
             data_store,
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
-            roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
             operator_session_store: Arc::new(
                 mlua_swarm::store::operator_session::InMemoryOperatorSessionStore::new(),
             ),
@@ -2576,6 +2767,287 @@ mod tests {
         reject_if_run_terminal(&state, &task_id, 1)
             .await
             .expect("a Running run must pass the guard");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // A6 at submit time (`reject_if_seat_moved`)
+    // ──────────────────────────────────────────────────────────────────
+
+    const GUARD_SLOT: &str = "main-ai";
+
+    /// A Run linked to a seeded dispatch task, plus the `SeatLedger` entry
+    /// the router writes just before it delegates — the state a worker of
+    /// that dispatch submits into.
+    ///
+    /// Returns the ticket so the caller keeps it alive: dropping it is how
+    /// a delegation's seat record disappears, which is a *different*
+    /// situation from the ones these tests are about.
+    async fn seated_dispatch<'a>(
+        state: &'a AppState,
+        run_store: &Arc<dyn RunStore>,
+        task_id: &StepId,
+        run_id: &RunId,
+        holder: &str,
+    ) -> crate::operator_ws::SeatTicket<'a> {
+        run_store
+            .create(run_record(&TaskId::new(), run_id, vec![]))
+            .await
+            .expect("run create");
+        let (gen, _previous) = run_store
+            .acquire_assignee(run_id, GUARD_SLOT, holder, "holding the seat")
+            .await
+            .expect("acquire");
+        link_task_to_run(state, task_id, 1, run_id).await;
+        state
+            .seat_ledger
+            .record(run_id, task_id, 1, GUARD_SLOT, gen)
+    }
+
+    /// **A6, `current = Assigned(a)` with a different `a`.** A takeover
+    /// while the delegation is in flight moves the seat's generation; the
+    /// displaced holder's worker is still running and still holds a valid
+    /// worker handle, and its submit lands *inside* the router's await —
+    /// before `AssigneeRouter::execute` re-reads anything. Refusing it here
+    /// is the only point at which the value is kept out of the fold.
+    #[tokio::test]
+    async fn a_submit_under_a_displaced_generation_is_refused() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store.clone());
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+        let run_id = RunId::new();
+        let _seat = seated_dispatch(&state, &run_store, &task_id, &run_id, "S-incumbent").await;
+
+        // The takeover (A8 — an acquire never refuses), which stamps a new
+        // generation onto the same seat.
+        run_store
+            .acquire_assignee(&run_id, GUARD_SLOT, "S-successor", "taking over")
+            .await
+            .expect("takeover");
+
+        let err = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
+            axum::body::Bytes::from_static(b"DISPLACED OUTPUT"),
+        )
+        .await
+        .expect_err("a submit for a displaced generation must not be accepted");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(
+            err.message.contains(GUARD_SLOT) && err.message.contains("A6"),
+            "the refusal must name the seat and the rule: {}",
+            err.message
+        );
+
+        // Same predicate on the staging channel: a part folds into the
+        // attempt's `"parts"`, so it reaches the flow ctx exactly as a
+        // submit would.
+        let err = worker_artifact(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(ArtifactQuery {
+                name: "part.md".to_string(),
+            }),
+            axum::body::Bytes::from_static(b"DISPLACED PART"),
+        )
+        .await
+        .expect_err("a staged part for a displaced generation must not be accepted");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+
+        // And `/v1/worker/result`, which resolves its Run from the same
+        // `(task_id, attempt)` key its body names. That route takes the
+        // full-`CapToken` Bearer form only, so the short handle above does
+        // not apply to it. The token is unsigned, which is what makes the
+        // `409` load-bearing twice over: the seat is checked *before* the
+        // engine ever verifies the token, so removing the guard would
+        // surface a different status here rather than the same one.
+        let encoded = CapToken {
+            agent_id: "planner".to_string(),
+            role: mlua_swarm::Role::Worker,
+            scopes: vec!["*".to_string()],
+            issued_at: 0,
+            expire_at: u64::MAX,
+            max_uses: None,
+            nonce: format!("test-nonce-{task_id}"),
+            sig_hex: String::new(),
+        }
+        .encode();
+        let err = worker_result(
+            State(state.clone()),
+            bearer_headers(&encoded),
+            Json(WorkerResultReq {
+                task_id: task_id.clone(),
+                value: json!("DISPLACED FINAL"),
+                ok: true,
+                attempt: Some(1),
+            }),
+        )
+        .await
+        .expect_err("a Final for a displaced generation must not be accepted");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+
+        let tail = state.engine.output_tail(&task_id, 1).await;
+        assert!(
+            tail.is_empty(),
+            "nothing a displaced holder's worker sent may reach the fold: {tail:?}"
+        );
+    }
+
+    /// **A6, `current = Vacant` ⟹ 503 before the body is judged at all.**
+    /// The seat can empty under an in-flight delegation without anyone
+    /// taking it: **A7** releases a holder found `Disconnected`, and
+    /// **O8**'s cascade releases one whose Operator was deleted. There is
+    /// then no holder the submit could belong to.
+    #[tokio::test]
+    async fn a_submit_into_a_vacated_seat_is_refused_with_503() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store.clone());
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+        let run_id = RunId::new();
+        let _seat = seated_dispatch(&state, &run_store, &task_id, &run_id, "S-holder").await;
+
+        let holder_gen = run_store
+            .get(&run_id)
+            .await
+            .expect("run")
+            .current
+            .get(GUARD_SLOT)
+            .expect("a holder")
+            .gen;
+        run_store
+            .vacate_assignee(&run_id, GUARD_SLOT, holder_gen)
+            .await
+            .expect("vacate");
+
+        let err = worker_submit(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(SubmitQuery {
+                ok: None,
+                verdict: None,
+            }),
+            axum::body::Bytes::from_static(b"ORPHANED OUTPUT"),
+        )
+        .await
+        .expect_err("a submit into a Vacant seat must not be accepted");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.message.contains("Vacant"),
+            "the refusal must say the seat is empty: {}",
+            err.message
+        );
+
+        let tail = state.engine.output_tail(&task_id, 1).await;
+        assert!(
+            tail.is_empty(),
+            "the refused submit must not land: {tail:?}"
+        );
+    }
+
+    /// The accepting half of A6: the seat still holds the generation the
+    /// dispatch was addressed under, so the worker's write goes through
+    /// untouched. Without this the two refusals above would be satisfied by
+    /// a guard that refuses everything.
+    #[tokio::test]
+    async fn a_submit_under_the_addressed_generation_is_accepted() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store.clone());
+        let task_id = StepId::new();
+        let handle = seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+        let run_id = RunId::new();
+        let _seat = seated_dispatch(&state, &run_store, &task_id, &run_id, "S-holder").await;
+
+        let status = worker_artifact(
+            State(state.clone()),
+            bearer_headers(&handle),
+            Query(ArtifactQuery {
+                name: "summary".to_string(),
+            }),
+            axum::body::Bytes::from_static(b"the holder's own work"),
+        )
+        .await
+        .expect("the current holder's worker must be accepted");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            state.engine.output_tail(&task_id, 1).await.len(),
+            1,
+            "the accepted part must land"
+        );
+    }
+
+    /// **Fail-open above the seat, refuse-by-default below it.**
+    ///
+    /// Everything before a seat can be named degrades to `Ok(())`: no
+    /// `agent_ctx` linkage, an unknown Run, and — the one that matters
+    /// most — a Run with no ledger entry, which is every dispatch that
+    /// never went through a router (an in-process spawner, a
+    /// `SpawnerAdapter`) and every delegation that has already returned.
+    /// "No seat to check" must not be read as `Vacant`; those are different
+    /// answers and only the second is a refusal.
+    #[tokio::test]
+    async fn the_seat_guard_is_fail_open_until_a_seat_is_named() {
+        let data_store: Arc<dyn OutputStore> = Arc::new(InMemoryOutputStore::new());
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
+        let state = test_state(data_store, run_store.clone());
+        let task_id = StepId::new();
+        seed_task_with_handle(&state, &task_id, "planner", 1, None).await;
+
+        // (a) No agent-ctx linkage at all (a pre-run-tracking dispatch).
+        reject_if_seat_moved(&state, &task_id, 1)
+            .await
+            .expect("no linkage must fail open");
+
+        // (b) Linked to a Run the store does not know.
+        let unknown_run = RunId::new();
+        link_task_to_run(&state, &task_id, 1, &unknown_run).await;
+        reject_if_seat_moved(&state, &task_id, 1)
+            .await
+            .expect("an unknown run has no seat entry either, so it fails open");
+
+        // (c) A real Run with a Vacant seat but NO ledger entry — the
+        // unrouted dispatch. The seat being empty is not the question;
+        // nothing named a seat for this dispatch, so A6 has no term to
+        // evaluate and the submit is none of its business.
+        let unrouted = RunId::new();
+        run_store
+            .create(run_record(&TaskId::new(), &unrouted, vec![]))
+            .await
+            .expect("run create");
+        link_task_to_run(&state, &task_id, 1, &unrouted).await;
+        reject_if_seat_moved(&state, &task_id, 1)
+            .await
+            .expect("a dispatch that went through no router must be untouched");
+
+        // (d) The ticket's `Drop` is what ends the window: once the
+        // delegation returned there is nothing in flight to attribute, and
+        // a late submit is again outside A6 rather than refused by it.
+        let (gen, _previous) = run_store
+            .acquire_assignee(&unrouted, GUARD_SLOT, "S-holder", "holding it")
+            .await
+            .expect("acquire");
+        {
+            let _seat = state
+                .seat_ledger
+                .record(&unrouted, &task_id, 1, GUARD_SLOT, gen);
+            run_store
+                .acquire_assignee(&unrouted, GUARD_SLOT, "S-successor", "taking over")
+                .await
+                .expect("takeover");
+            reject_if_seat_moved(&state, &task_id, 1)
+                .await
+                .expect_err("while the ticket lives, the moved generation is refused");
+        }
+        reject_if_seat_moved(&state, &task_id, 1)
+            .await
+            .expect("with the ticket dropped there is no seat term left to evaluate");
     }
 
     // ──────────────────────────────────────────────────────────────────

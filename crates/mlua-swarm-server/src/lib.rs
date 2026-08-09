@@ -107,16 +107,16 @@ pub use enhance_log::build_enhance_log_router;
 pub use enhance_settings::build_enhance_settings_router;
 pub use issues::{build_issues_router, GetIssueResponse, PostIssueRequest, PostIssueResponse};
 pub use operator_ws::{
-    operators_create, operators_delete, operators_delete_by_role, operators_info, operators_list,
-    operators_ws_connect, AssigneeRouter, AssigneeRouterResolver, ClientMsg, Liveness,
-    LoginSession, OperatorAdapter, OperatorAdapterRegistry, OperatorsListEntry, OperatorsListResp,
-    RunTraceSlot, ServerMsg, WSOperatorSession, WsOperatorWiring,
+    operators_create, operators_delete, operators_info, operators_list, operators_ws_connect,
+    AssigneeRouter, AssigneeRouterResolver, ClientMsg, Liveness, LoginSession, OperatorAdapter,
+    OperatorAdapterRegistry, OperatorsListEntry, OperatorsListResp, RunTraceSlot, ServerMsg,
+    WSOperatorSession, WsOperatorWiring,
 };
 pub use projection::{McpQueryAdapter, ProjectionSource, StepList, StepPathQuery, StepSummary};
 pub use tasks::{
-    RunAcquireRequest, RunAcquireResponse, RunBindingDifference, RunBindingExplainEntry,
-    RunBindingStatus, RunBindingsExplainResponse, RunKickRequest, RunKickResponse,
-    RunResumeResponse, RunStepsResponse, TDiscardReport, TaskDetailResponse,
+    LaunchInfo, RunAcquireRequest, RunAcquireResponse, RunBindingDifference,
+    RunBindingExplainEntry, RunBindingStatus, RunBindingsExplainResponse, RunKickRequest,
+    RunKickResponse, RunResumeResponse, RunStepsResponse, TDiscardReport, TaskDetailResponse,
 };
 pub use worker::{
     worker_artifact, worker_prompt, worker_result, ArtifactQuery, DegradationBody, PromptQuery,
@@ -144,9 +144,8 @@ use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
 use mlua_swarm::{
     AgentBlockInProcessSpawnerFactory, CapToken, Compiler, Engine, LayerRegistry,
     LongHoldMiddleware, LuaInProcessSpawnerFactory, MainAIMiddleware, OperatorDelegateMiddleware,
-    OperatorRef, OperatorSpawnerFactory, Role, RunId, RustFnInProcessSpawnerFactory,
-    SeniorEscalationMiddleware, SessionId, SpawnerRegistry, SubprocessProcessSpawnerFactory,
-    TaskId,
+    OperatorSpawnerFactory, Role, RunId, RustFnInProcessSpawnerFactory, SeniorEscalationMiddleware,
+    SessionId, SpawnerRegistry, SubprocessProcessSpawnerFactory, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -179,8 +178,8 @@ pub struct AppState {
     pub task_app: Arc<TaskApplication>,
     /// `OperatorId` → the Operator session that answers for it. Written by
     /// the login path (`register_operator_session` binds each session under
-    /// its sid *and* each of its roles, both of which can appear as
-    /// `Assignee.op`), read by every
+    /// its sid, which is the whole of what `Assignee.op` can hold), read by
+    /// every
     /// [`AssigneeRouter`](crate::operator_ws::AssigneeRouter) when it
     /// resolves a seat's current holder.
     ///
@@ -202,8 +201,8 @@ pub struct AppState {
     ///
     /// The companion to [`Self::operator_adapters`], and needed for the
     /// same reason that map is: an `OperatorId` resolves to an adapter, but
-    /// **one adapter can back several seats of one Run** (a session is
-    /// registered under its sid and under each of its roles), so "what this
+    /// **one adapter can back several seats of one Run** (a launch seats
+    /// its operator in every declared seat), so "what this
     /// operator has in flight for this Run" is not the same question as
     /// "what this *seat* has in flight". Without this ledger a takeover on
     /// one seat discards another seat's live work, and the un-answered list
@@ -227,15 +226,9 @@ pub struct AppState {
     /// role. See `operator_ws::login` module doc.
     pub operator_sessions:
         Arc<Mutex<HashMap<SessionId, Arc<crate::operator_ws::login::LoginSession>>>>,
-    /// S1 login-flow roles-exclusivity map. Role name → owning `sid`. Checked
-    /// (and updated) atomically under a single lock in
-    /// `operator_ws::login::operators_create` — a role already present here
-    /// causes `POST /v1/operators` to return `409 CONFLICT`. Entries are
-    /// released on `DELETE /v1/operators/:sid`.
-    pub roles_to_sid: Arc<Mutex<HashMap<OperatorRef, SessionId>>>,
-    /// Persistence behind `operator_sessions` / `roles_to_sid`: mint
+    /// Persistence behind `operator_sessions`: mint
     /// (`POST /v1/operators`) writes through, teardown deletes, and a fresh
-    /// boot rehydrates both maps from it (see [`OperatorSessionPersistence`])
+    /// boot rehydrates the map from it (see [`OperatorSessionPersistence`])
     /// — so a single-server restart keeps every logged-in Operator logged in
     /// instead of forcing a re-mint (the pre-persistence behaviour stranded
     /// persisted `RunRecord.operator_sid` pins on `404 unknown sid`).
@@ -498,12 +491,12 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
 /// Operator login-session persistence bundle for the terminal router
 /// builder: the write-through [`OperatorSessionStore`] plus the sessions
 /// already restored from it, pre-built so the (synchronous) builder can
-/// seed `AppState.operator_sessions` / `roles_to_sid` without an await.
+/// seed `AppState.operator_sessions` without an await.
 ///
 /// Construct via [`OperatorSessionPersistence::restore`] at boot. That call
-/// also registers every restored session into the engine's three registries
-/// (+ role aliases), so a restored `sid` is resolvable — as an
-/// `operator_sid` pin, and through its roles — from the moment the server
+/// also registers every restored session into the engine's three registries,
+/// so a restored `sid` is resolvable — as an `operator_sid` pin, and as a
+/// seat's holder — from the moment the server
 /// is up, without waiting for the owning client's WS to reconnect. The
 /// restored sessions carry no sender until that connect happens: registered
 /// is not reachable — `after` is dropped before the connect, and a
@@ -606,19 +599,13 @@ pub fn build_router_full_with_operator_session_persistence(
     // its saved sid + token.
     let mut session_map: HashMap<SessionId, Arc<crate::operator_ws::login::LoginSession>> =
         HashMap::new();
-    let mut roles_map: HashMap<OperatorRef, SessionId> = HashMap::new();
     for live in restored_sessions {
-        for role in &live.record().roles {
-            roles_map.insert(role.clone(), live.record().sid.clone());
-        }
         session_map.insert(live.record().sid.clone(), live);
     }
     let operator_sessions = Arc::new(Mutex::new(session_map));
-    let roles_to_sid = Arc::new(Mutex::new(roles_map));
     let compiler = Compiler::new(registry);
     let binding_provider = Arc::new(binding::OperatorSessionBindingProvider::new(
         operator_sessions.clone(),
-        roles_to_sid.clone(),
     ));
     let launch = Arc::new(
         TaskLaunchService::new(engine.clone(), compiler)
@@ -693,7 +680,6 @@ pub fn build_router_full_with_operator_session_persistence(
         seat_ledger,
         data_store,
         operator_sessions,
-        roles_to_sid,
         operator_session_store,
         task_store,
         run_store,
@@ -763,26 +749,21 @@ pub fn build_router_full_with_operator_session_persistence(
         // truncates the replay log at the cut point); see
         // `tasks::run_rerun_from` for the full contract (GH #71 Layer A).
         .route("/v1/runs/:id/rerun-from", post(tasks::run_rerun_from))
-        // REST-like Operator login flow (Bearer-mandatory, roles exclusivity).
+        // REST-like Operator login flow (Bearer-mandatory past the join).
         // Sole WS Operator session route; see `operator_ws::login` module doc.
         // `GET /v1/operators` is the 記名 list (model §4.2) and is
         // **Bearer-gated** (D3) — a breaking change from its GH #81 Layer 2
         // shape, which was unauthenticated on the `GET /v1/status` trust
         // tier. Any live session's token opens it; join itself stays
         // unguarded so an incoming Assignee can always get in.
-        // `DELETE /v1/operators/by-role/:role` (stale-session recovery
-        // without knowing the sid — same trust tier as
-        // `mlua_swarm_server_shutdown`) close the pre-#81 recovery gap
-        // where a stale session was only clearable via a full server
-        // restart. Order matters: the `by-role` route is declared BEFORE
-        // the `:sid` route so `axum` matches `by-role/:role` as its own
-        // path, not as a `:sid` extract of literal `by-role`.
+        //
+        // `DELETE /v1/operators/by-role/:role` used to sit between the two
+        // routes below, declared first so `axum` would not read `by-role`
+        // as a sid. It is gone with the role declaration it addressed:
+        // stale-session recovery now reads the 記名 list for the sid it
+        // means and deletes that (`operator_ws::login::operators_delete`).
         .route("/v1/operators", post(operators_create).get(operators_list))
         .route("/v1/operators/:sid/ws", get(operators_ws_connect))
-        .route(
-            "/v1/operators/by-role/:role",
-            axum::routing::delete(operators_delete_by_role),
-        )
         .route(
             "/v1/operators/:sid",
             get(operators_info).delete(operators_delete),
@@ -1059,7 +1040,7 @@ pub struct TaskLaunchRequest {
     ttl_secs: Option<u64>,
     #[serde(default)]
     operator: Option<OperatorReq>,
-    /// Explicit Operator session sid (or role alias) this task's entire Spawn
+    /// Explicit Operator session sid this task's entire Spawn
     /// stream should be routed to (runtime Operator match stage 1).
     ///
     /// When `Some`, it is validated at request time against
@@ -1074,12 +1055,12 @@ pub struct TaskLaunchRequest {
     /// `tx` is `None`), which also propagates as a request failure rather
     /// than a silent fallback.
     ///
-    /// On success this value **overrides** `operator.operator_backend_id`
-    /// (last-write-wins, `operator_sid` takes priority) before the flow is
-    /// dispatched — see `run_flow_form`. Dispatch still only delegates if the
-    /// Blueprint opts into `spawner_hints.layers = ["operator_delegate"]`
-    /// (unchanged precondition, same as the existing `operator_backend_id`
-    /// field).
+    /// On success this value **supersedes** `operator.operator_backend_id`:
+    /// the two are folded into the launch's single
+    /// `TaskLaunchInput::operator_sid`, and this field wins — see
+    /// `run_flow_form`. Dispatch still only delegates if the Blueprint opts
+    /// into `spawner_hints.layers = ["operator_delegate"]` (unchanged
+    /// precondition, same as the older `operator_backend_id` field).
     ///
     /// The field also drives the **AgentSpec axis** (the per-agent
     /// `spec.operator_ref` route every Blueprint with `kind = Operator`
@@ -1087,7 +1068,7 @@ pub struct TaskLaunchRequest {
     /// becomes the holder of this run's Operator seat
     /// (`RunRecord.current`, see [`Self::operator_slot`]), which is what
     /// every dispatch through such an agent resolves — freshly, each time —
-    /// and `TaskApplicationInput.operator_pin` carries it to the binding
+    /// and `TaskApplicationInput.operator_sid` carries it to the binding
     /// provider, which attests their manifests through the same session.
     /// Blueprints keep declaring the logical seat; who holds it for this run
     /// becomes a launch-time fact, and stays movable afterwards. A pin
@@ -1095,9 +1076,11 @@ pub struct TaskLaunchRequest {
     /// role, because that fallback is exactly how a run ends up on another
     /// driver's session.
     ///
-    /// When unset, behavior is unchanged: whatever
-    /// `operator.operator_backend_id` / BP-level `operator_ref` alias
-    /// resolution already does still applies.
+    /// When unset, the launch names whatever `operator.operator_backend_id`
+    /// names — which reaches the delegate layer exactly as before, and
+    /// reaches the AgentSpec axis only if it happens to be a live session
+    /// id (otherwise the binding provider reports `Unbound`, the same
+    /// outcome an unnamed launch gets).
     #[serde(default)]
     operator_sid: Option<String>,
     /// Why this launch is assigned to [`Self::operator_sid`] — the model's
@@ -1202,6 +1185,12 @@ pub struct OperatorReq {
     /// `OperatorDelegateMiddleware` bypasses `inner.spawn` and calls `operator.execute` instead.
     /// This is a different axis from `operator.id` (= session tracking label);
     /// `operator_backend_id` is the registry lookup key.
+    ///
+    /// The older of the two spellings of [`TaskLaunchRequest::operator_sid`]
+    /// — it names the same registry, and loses to that field when both are
+    /// sent. Prefer `operator_sid`: it is validated at the door and it also
+    /// seats the operator on the Run. This one remains for the launch that
+    /// has a registered backend but no seat to pin it to.
     #[serde(default)]
     operator_backend_id: Option<String>,
     /// "Runtime Agent-level" tier (highest priority) of the `OperatorKind`
@@ -1258,6 +1247,14 @@ pub struct TaskLaunchResponse {
     /// `running` — the eval continues in the background; poll `GET
     /// /v1/runs/:id` for the terminal status and result.
     status: RunStatus,
+    /// Model §5's launch announcement: who this launch seated, and which
+    /// `project_root` / `work_dir` the Run is bound to. Present on both
+    /// the synchronous and the detached reply — a detached launch answers
+    /// before any dispatch has happened, which is precisely when the
+    /// announcement is still actionable. See [`tasks::LaunchInfo`], and
+    /// its `note` field for why it is an announcement rather than a
+    /// guarantee.
+    info: tasks::LaunchInfo,
 }
 
 /// `tasks_start`'s reply — a [`TaskLaunchResponse`] plus the HTTP status
@@ -1393,6 +1390,14 @@ async fn run_flow_form(
         .map(|spec| serde_json::to_value(&spec))
         .transpose()
         .map_err(|e| ApiError::bad_request(format!("task_input_spec snapshot: {e}")))?;
+    // Model §5's announcement needs the goal and the paths after both have
+    // been moved into the TaskRecord / the launch input, and it is built
+    // once for the sync and the detached reply alike. Kept as clones taken
+    // here rather than as a re-read of the Task row: these are the values
+    // this launch actually used, and a row read back could only differ by
+    // being wrong.
+    let info_goal = goal.clone();
+    let info_spec = task_input_spec.clone();
     let init_ctx = req.init_ctx.clone();
 
     let mut op_req = req.operator.unwrap_or_default();
@@ -1409,8 +1414,24 @@ async fn run_flow_form(
                 "operator_sid: no such registered operator session '{sid}'"
             )));
         }
-        op_req.operator_backend_id = Some(sid.clone());
     }
+
+    // The one Operator this launch names, from the two wire spellings that
+    // can say it. `operator_sid` wins — it is the validated one, and it is
+    // the only one that also assigns a seat. `operator.operator_backend_id`
+    // is the older spelling, kept for the delegate-layer launch that names
+    // a registered backend without pinning a seat (a Blueprint declaring no
+    // `operators[]` cannot use `operator_sid` at all: `resolve_launch_slot`
+    // refuses a pin with no seat to land in).
+    //
+    // Downstream they were already the same value on this route — the
+    // sid was copied into `operator_backend_id` here and into
+    // `operator_pin` below — so what collapses is the copying, not a
+    // distinction. See `TaskLaunchInput::operator_sid`.
+    let operator_sid = req
+        .operator_sid
+        .clone()
+        .or_else(|| op_req.operator_backend_id.take());
 
     // A pinned launch is this Run's first `Assign` (model §4.3), so it must
     // carry the `desc` **A9** makes mandatory. Resolved here, alongside the
@@ -1448,17 +1469,27 @@ async fn run_flow_form(
     };
 
     // GH #33 Guard 1: operator readiness precheck. Coarse signal — this
-    // handler can cheaply see whether the request/BP references an
-    // operator backend (`operator.operator_backend_id`, set directly or
-    // resolved above from `operator_sid`), but not the full
+    // handler can cheaply see whether the request names an operator at all
+    // (either wire spelling, folded above), but not the full
     // `OperatorDelegateMiddleware` routing decision (that also considers
-    // BP-level `kind` tiers, resolved only at dispatch time). When a
-    // backend is referenced and *zero* operators are attached at all,
-    // fail fast rather than dispatching into a session nothing can serve.
+    // BP-level `kind` tiers, resolved only at dispatch time). When one is
+    // named and *zero* operators are attached at all, fail fast rather than
+    // dispatching into a session nothing can serve.
     // A launch this coarse check cannot positively identify as
     // operator-delegate is never rejected here — Guard 2 (the timeout
     // wrap below) still covers the hang in that case.
-    if let Some(backend_id) = op_req.operator_backend_id.as_deref() {
+    //
+    // What it still catches after the fold: only the
+    // `operator.operator_backend_id` spelling. The `operator_sid` one is
+    // already checked harder above (its id must be a *live* registry key,
+    // which no empty registry can satisfy), so this arm is what remains for
+    // the launch that names a backend without pinning a seat. It stays
+    // rather than collapsing into that stronger check, because the two
+    // report different things: "this id is not attached" (`400`, the
+    // caller named the wrong session) versus "nothing is attached at all"
+    // (`503`, the caller named a plausible backend and the server is not
+    // ready to serve it).
+    if let Some(backend_id) = operator_sid.as_deref() {
         let attached = state.engine.list_operator_ids().await;
         if attached.is_empty() {
             return Err(ApiError::unavailable(format!(
@@ -1558,13 +1589,11 @@ async fn run_flow_form(
         operator_kind,
         bridge_id: op_req.senior_bridge_id,
         hook_id: op_req.spawn_hook_id,
-        operator_backend_id: op_req.operator_backend_id,
-        // Axis-independent half of `operator_sid` (see its doc on
-        // `TaskLaunchRequest`): the same sid attests this launch's AgentSpec
-        // agents' manifests through the pinned session (the routing half is
-        // the seat assignment written above), while the field above keeps
-        // feeding the opt-in delegate layer unchanged.
-        operator_pin: req.operator_sid.clone(),
+        // Both axes read this one value: the delegate layer's backend and
+        // the session this launch's AgentSpec agents attest their manifests
+        // through. The routing half of the pin is the seat assignment
+        // written below, which is a Run fact rather than a launch input.
+        operator_sid,
         operator_kind_overrides,
         task_input: task_input_spec,
         // The request-body top-level `check_policy` (tier 1)
@@ -1626,12 +1655,12 @@ async fn run_flow_form(
     if let Some((slot, op, desc)) = &launch_assign {
         tasks::assign_launch_operator(state, &run_id, &task_id, slot, op, desc).await?;
     }
-    // And every other declared seat that already has a holder registered
-    // under its own name — the unpinned launch's route to an operator, and
-    // the reason a multi-seat Blueprint no longer comes up with permanently
-    // Vacant lanes. The pinned seat is excluded, so an explicit
-    // `operator_sid` is never displaced by the role holder it outranks. See
-    // [`tasks::seat_declared_operators`].
+    // And every other declared seat, to the same operator — a Run belongs
+    // to the AI that launched it (model §5), so a multi-seat Blueprint does
+    // not come up with every lane but the pinned one permanently Vacant.
+    // The pinned seat is excluded so the caller's own `operator_desc`
+    // survives. An unpinned launch seats nothing at all; see
+    // [`tasks::seat_declared_operators`] for why there is nothing to seat.
     tasks::seat_declared_operators(
         state,
         &run_id,
@@ -1640,9 +1669,17 @@ async fn run_flow_form(
             .as_ref()
             .map(|bp| bp.operators.as_slice())
             .unwrap_or(&[]),
-        launch_assign.as_ref().map(|(slot, _, _)| slot.as_str()),
+        launch_assign
+            .as_ref()
+            .map(|(slot, op, _)| (slot.as_str(), op.as_str())),
     )
     .await?;
+
+    // Model §5: the launch announces who it just seated and what this Run
+    // is bound to. Built here — after the seating above, before any
+    // dispatch — so both replies below carry the same block and a detached
+    // launch gets it while it is still ahead of the work.
+    let info = tasks::build_launch_info(state, &run_id, &info_goal, info_spec.as_ref()).await;
 
     let trace =
         mlua_swarm::store::trace::TraceHandle::new(run_id.clone(), state.run_trace_store.clone());
@@ -1742,6 +1779,7 @@ async fn run_flow_form(
                 task_id,
                 run_id,
                 status: RunStatus::Running,
+                info,
             },
             StatusCode::ACCEPTED,
         ));
@@ -1860,6 +1898,7 @@ async fn run_flow_form(
             task_id,
             run_id,
             status: RunStatus::Done,
+            info,
         },
         StatusCode::OK,
     ))
@@ -2372,7 +2411,6 @@ mod tests {
             seat_ledger: Arc::new(crate::operator_ws::SeatLedger::new()),
             data_store: Arc::new(mlua_swarm::store::output::InMemoryOutputStore::new()),
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
-            roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
             operator_session_store: Arc::new(InMemoryOperatorSessionStore::new()),
             task_store: Arc::new(mlua_swarm::store::task::InMemoryTaskStore::new()),
             run_store: Arc::new(mlua_swarm::store::run::InMemoryRunStore::new()),

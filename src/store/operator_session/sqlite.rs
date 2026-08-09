@@ -2,10 +2,10 @@
 //! using [`rusqlite-isle`].
 //!
 //! The `Connection` is confined to a dedicated OS thread by `AsyncIsle`;
-//! every call is a typed closure dispatched over a bounded channel. `roles`
-//! and `capability_manifest` are stored as JSON blobs — neither is queried
-//! relationally; the boot-time `list()` rehydration decodes them back into
-//! their Rust shapes.
+//! every call is a typed closure dispatched over a bounded channel.
+//! `capability_manifest` and the 記名's observed log are stored as JSON
+//! blobs — neither is queried relationally; the boot-time `list()`
+//! rehydration decodes them back into their Rust shapes.
 //!
 //! ## The file holds no bearer secret
 //!
@@ -25,7 +25,6 @@
 //! CREATE TABLE IF NOT EXISTS operator_sessions (
 //!   sid                       TEXT PRIMARY KEY,
 //!   token_digest              TEXT NOT NULL,  -- hex(SHA-256(bearer)), never the bearer
-//!   roles_json                TEXT NOT NULL,  -- JSON-encoded `Vec<String>`
 //!   capability_manifest_json  TEXT,           -- JSON-encoded manifest, NULL when unset
 //!   joined_at_secs            INTEGER NOT NULL,
 //!   join_desc                 TEXT,           -- 記名 confirmed part (D1), NULL when unwritten
@@ -37,10 +36,16 @@
 //! The last three columns arrived with the 記名 (model §4.2) and are added
 //! to an older file by [`migrate_add_column_if_missing`], the same way the
 //! `runs` table grows a column.
+//!
+//! A column also *left*: `roles_json` held the role aliases a session
+//! claimed at join, back when a join claimed any. Role declaration moved
+//! onto the Run, so an older file has the column dropped on open by
+//! [`migrate_drop_column_if_present`] — see that function for why the
+//! column cannot simply be ignored.
 
 use super::{
-    ObservedAssignment, OperatorRef, OperatorSessionRecord, OperatorSessionStore,
-    OperatorSessionStoreError, SessionId,
+    ObservedAssignment, OperatorSessionRecord, OperatorSessionStore, OperatorSessionStoreError,
+    SessionId,
 };
 use crate::AgentProviderManifest;
 use async_trait::async_trait;
@@ -52,7 +57,6 @@ const SCHEMA_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS operator_sessions (\
   sid                       TEXT PRIMARY KEY, \
   token_digest              TEXT NOT NULL, \
-  roles_json                TEXT NOT NULL, \
   capability_manifest_json  TEXT, \
   joined_at_secs            INTEGER NOT NULL, \
   join_desc                 TEXT, \
@@ -89,6 +93,39 @@ fn migrate_add_column_if_missing(
     Ok(())
 }
 
+/// Drop `column` from `operator_sessions` when a file predates its removal.
+///
+/// The mirror image of [`migrate_add_column_if_missing`], and needed for a
+/// reason that one does not have: a column this build no longer writes is
+/// not merely untidy when it is `NOT NULL` with no default. `roles_json`
+/// was declared exactly that way, so leaving it in place would make every
+/// `INSERT` from this build fail the constraint on any file created before
+/// the removal — the sessions would stop persisting, and only on upgraded
+/// installs.
+///
+/// Dropping rather than back-filling a placeholder: the value would be a
+/// fiction (this build has no roles to write), and a fiction in a column
+/// nothing reads is the kind of residue the next reader has to work out
+/// the meaning of. `ALTER TABLE … DROP COLUMN` needs SQLite ≥ 3.35, which
+/// the bundled `libsqlite3-sys` is well past.
+fn migrate_drop_column_if_present(
+    conn: &rusqlite::Connection,
+    column: &str,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(operator_sessions)")?;
+    let has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<String>, _>>()?
+        .iter()
+        .any(|name| name == column);
+    if has_column {
+        conn.execute_batch(&format!(
+            "ALTER TABLE operator_sessions DROP COLUMN {column};"
+        ))?;
+    }
+    Ok(())
+}
+
 /// The open-time schema work, shared by the file and in-memory
 /// constructors so the two can never drift apart.
 fn init_schema(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
@@ -97,7 +134,11 @@ fn init_schema(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA_SQL)?;
     migrate_add_column_if_missing(conn, "join_desc", "TEXT")?;
     migrate_add_column_if_missing(conn, "observed_json", "TEXT")?;
-    migrate_add_column_if_missing(conn, "observed_total", "INTEGER NOT NULL DEFAULT 0")
+    migrate_add_column_if_missing(conn, "observed_total", "INTEGER NOT NULL DEFAULT 0")?;
+    // Last, and after the adds: a file from before the 記名 columns is
+    // brought up to the current shape first, then loses the one column the
+    // current shape does not have.
+    migrate_drop_column_if_present(conn, "roles_json")
 }
 
 /// Drop a pre-release `operator_sessions` table that still carries the
@@ -196,10 +237,9 @@ fn map_isle_err(e: IsleError) -> OperatorSessionStoreError {
 }
 
 /// One `operator_sessions` SELECT row in column order: sid, token_digest,
-/// roles_json, capability_manifest_json, joined_at_secs, join_desc,
-/// observed_json, observed_total.
+/// capability_manifest_json, joined_at_secs, join_desc, observed_json,
+/// observed_total.
 type SessionRow = (
-    String,
     String,
     String,
     Option<String>,
@@ -209,7 +249,7 @@ type SessionRow = (
     i64,
 );
 
-const SESSION_SELECT_COLUMNS: &str = "sid, token_digest, roles_json, capability_manifest_json, \
+const SESSION_SELECT_COLUMNS: &str = "sid, token_digest, capability_manifest_json, \
      joined_at_secs, join_desc, observed_json, observed_total";
 
 /// Why one `operator_sessions` row could not be turned into an
@@ -223,8 +263,8 @@ struct RowDecodeError {
     /// The row's `sid` column verbatim — the only handle on a row whose sid
     /// is itself what failed to decode, so it is kept as the raw string.
     raw_sid: String,
-    /// Which column's decode failed: `sid`, `roles`,
-    /// `capability_manifest`, or `observed`.
+    /// Which column's decode failed: `sid`, `capability_manifest`, or
+    /// `observed`.
     column: &'static str,
     /// The decoder's own message.
     detail: String,
@@ -234,27 +274,21 @@ fn row_to_record(row: SessionRow) -> Result<OperatorSessionRecord, RowDecodeErro
     let (
         raw_sid,
         token_digest,
-        roles_json,
         capability_manifest_json,
         joined_at_secs,
         desc,
         observed_json,
         observed_total,
     ) = row;
-    // All three decodes below fail the same way and get the same treatment.
-    // `roles` is the one an older build is known to have poisoned, but the
-    // sid and the manifest are no more trustworthy for having been quiet so
-    // far — special-casing `roles` would just move the boot-stopper.
+    // All three decodes below fail the same way and get the same treatment:
+    // no column is special-cased, because special-casing one only moves the
+    // boot-stopper to the next.
     let fail = |column: &'static str, detail: String| RowDecodeError {
         raw_sid: raw_sid.clone(),
         column,
         detail,
     };
     let sid = SessionId::parse(raw_sid.clone()).map_err(|e| fail("sid", e.to_string()))?;
-    // The stored JSON is (and stays) an array of plain strings; the element
-    // type only decides what the decode validates on the way back in.
-    let roles: Vec<OperatorRef> =
-        serde_json::from_str(&roles_json).map_err(|e| fail("roles", e.to_string()))?;
     let capability_manifest: Option<AgentProviderManifest> = match capability_manifest_json {
         Some(text) => Some(
             serde_json::from_str(&text).map_err(|e| fail("capability_manifest", e.to_string()))?,
@@ -272,7 +306,6 @@ fn row_to_record(row: SessionRow) -> Result<OperatorSessionRecord, RowDecodeErro
     Ok(OperatorSessionRecord {
         sid,
         token_digest,
-        roles,
         capability_manifest,
         joined_at_secs: joined_at_secs as u64,
         desc,
@@ -290,8 +323,6 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
     async fn put(&self, record: OperatorSessionRecord) -> Result<(), OperatorSessionStoreError> {
         let sid = record.sid.to_string();
         let token_digest = record.token_digest.clone();
-        let roles_json = serde_json::to_string(&record.roles)
-            .map_err(|e| OperatorSessionStoreError::Other(format!("encode roles: {e}")))?;
         let capability_manifest_json = record
             .capability_manifest
             .as_ref()
@@ -310,13 +341,12 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
             .call(move |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO operator_sessions \
-                     (sid, token_digest, roles_json, capability_manifest_json, joined_at_secs, \
+                     (sid, token_digest, capability_manifest_json, joined_at_secs, \
                       join_desc, observed_json, observed_total) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         sid,
                         token_digest,
-                        roles_json,
                         capability_manifest_json,
                         joined_at_secs,
                         desc,
@@ -364,12 +394,11 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 })?;
                 let mut out = Vec::new();
@@ -416,16 +445,10 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
 mod tests {
     use super::*;
 
-    /// convention-token-ok: mlua-swarm public operator role literal.
-    fn role(name: &str) -> OperatorRef {
-        OperatorRef::new(name).expect("test role literal is never empty")
-    }
-
     fn mk(sid: &str, joined_at_secs: u64) -> OperatorSessionRecord {
         OperatorSessionRecord {
             sid: SessionId::parse(sid).unwrap(),
             token_digest: OperatorSessionRecord::digest_of(&format!("bearer-{sid}")),
-            roles: vec![role("main-ai")],
             capability_manifest: None,
             joined_at_secs,
             desc: None,
@@ -517,7 +540,6 @@ mod tests {
             list[0].verify_bearer("bearer-S-keep"),
             "the restored digest must still verify the original bearer"
         );
-        assert_eq!(list[0].roles, vec![role("main-ai")]);
         drop(s);
         driver.shutdown().await.unwrap();
     }
@@ -578,6 +600,10 @@ mod tests {
     /// A file created before the 記名 columns existed gains them on open
     /// and keeps its rows — the sessions in it stay logged in, with an
     /// empty 記名 rather than none at all.
+    ///
+    /// It also carries `roles_json`, so the same open exercises the
+    /// removal in the other direction: the pre-記名 shape is the
+    /// pre-role-removal shape too, and one open has to land both.
     #[tokio::test]
     async fn a_pre_kimei_file_is_migrated_not_dropped() {
         let dir = tempfile::tempdir().unwrap();
@@ -615,7 +641,12 @@ mod tests {
         assert_eq!(list[0].observed_total, 0);
         assert!(list[0].verify_bearer("bearer-S-old"));
 
-        // And the migrated file is writable in the new shape.
+        // And the migrated file is writable in the new shape. This is the
+        // assertion `migrate_drop_column_if_present` exists for: the seeded
+        // table declares `roles_json TEXT NOT NULL` with no default, so a
+        // build that stopped writing the column but left it in place would
+        // fail this `put` on the constraint — persistence silently breaking
+        // on upgraded installs only.
         let mut updated = list[0].clone();
         updated.desc = Some("picked this session back up after a restart".to_string());
         s.put(updated).await.unwrap();
@@ -624,8 +655,27 @@ mod tests {
             list[0].desc.as_deref(),
             Some("picked this session back up after a restart")
         );
+        assert!(
+            !column_names(&path).contains(&"roles_json".to_string()),
+            "the role column is dropped, not carried along unwritten"
+        );
         drop(s);
         driver.shutdown().await.unwrap();
+    }
+
+    /// The column names `operator_sessions` currently has, straight off the
+    /// file.
+    fn column_names(path: &Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(path).expect("open db for the column check");
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(operator_sessions)")
+            .expect("prepare table_info");
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table_info")
+            .collect::<Result<Vec<String>, _>>()
+            .expect("collect column names");
+        names
     }
 
     /// An observed log that will not decode drops the session rather than
@@ -639,13 +689,12 @@ mod tests {
             let conn = rusqlite::Connection::open(&path).expect("open db for the raw seed");
             conn.execute(
                 "INSERT OR REPLACE INTO operator_sessions \
-                 (sid, token_digest, roles_json, capability_manifest_json, joined_at_secs, \
+                 (sid, token_digest, capability_manifest_json, joined_at_secs, \
                   join_desc, observed_json, observed_total) \
-                 VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, 1)",
+                 VALUES (?1, ?2, NULL, ?3, NULL, ?4, 1)",
                 params![
                     "S-bad-observed",
                     OperatorSessionRecord::digest_of("bearer-S-bad-observed"),
-                    r#"["main-ai"]"#,
                     2i64,
                     r#"[{"run_id": 42}]"#
                 ],
@@ -706,9 +755,9 @@ mod tests {
     // Every row below is written straight through `rusqlite`, bypassing
     // `put`'s typed encode. That is not a shortcut: `put` takes an
     // `OperatorSessionRecord`, whose fields are already `SessionId` /
-    // `Vec<OperatorRef>` / `AgentProviderManifest`, so it *cannot* produce
-    // any of these shapes. An older build could, and did — `roles: [""]`
-    // was persistable before the `OperatorRef` typing landed.
+    // `AgentProviderManifest`, so it *cannot* produce any of these shapes.
+    // An older build could, and did — `op-<uuid>` sids were persistable
+    // before the `S-<hex>` shape landed.
     // ──────────────────────────────────────────────────────────────────
 
     /// A shared buffer a `tracing` subscriber can write into, so a test can
@@ -743,19 +792,17 @@ mod tests {
     fn insert_raw_row(
         path: &Path,
         sid: &str,
-        roles_json: &str,
         capability_manifest_json: Option<&str>,
         joined_at_secs: i64,
     ) {
         let conn = rusqlite::Connection::open(path).expect("open db for the raw seed");
         conn.execute(
             "INSERT OR REPLACE INTO operator_sessions \
-             (sid, token_digest, roles_json, capability_manifest_json, joined_at_secs) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (sid, token_digest, capability_manifest_json, joined_at_secs) \
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 sid,
                 OperatorSessionRecord::digest_of(&format!("bearer-{sid}")),
-                roles_json,
                 capability_manifest_json,
                 joined_at_secs
             ],
@@ -808,34 +855,15 @@ mod tests {
         );
     }
 
-    /// (a) An empty role alias — the shape an older build could persist via
-    /// `POST /v1/operators {"roles":[""]}`, before `roles` decoded into
-    /// `Vec<OperatorRef>`. This is the combination that actually exists in
-    /// the wild, so it is the one that must not take the boot down with it.
-    #[tokio::test]
-    async fn empty_role_row_is_skipped_not_fatal() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("operator_session.db");
-        seed_healthy(&path).await;
-        insert_raw_row(&path, "S-empty-role", r#"[""]"#, None, 2);
-
-        let (list, logged) = list_capturing_warnings(&path).await;
-        assert_only_healthy_survived(&list);
-        assert!(
-            logged.contains("S-empty-role") && logged.contains(r#"column="roles""#),
-            "the warn must name the row and the column that failed: {logged}"
-        );
-    }
-
-    /// (b) A sid that is not `S-`-shaped. Decoded with the same regime as
-    /// the other two — the sid is not special-cased just because it is the
+    /// (a) A sid that is not `S-`-shaped. Decoded with the same regime as
+    /// the other one — the sid is not special-cased just because it is the
     /// key.
     #[tokio::test]
     async fn undecodable_sid_row_is_skipped_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("operator_session.db");
         seed_healthy(&path).await;
-        insert_raw_row(&path, "op-legacy-uuid", r#"["main-ai"]"#, None, 2);
+        insert_raw_row(&path, "op-legacy-uuid", None, 2);
 
         let (list, logged) = list_capturing_warnings(&path).await;
         assert_only_healthy_survived(&list);
@@ -845,20 +873,14 @@ mod tests {
         );
     }
 
-    /// (c) A capability manifest that is not valid JSON for the manifest
+    /// (b) A capability manifest that is not valid JSON for the manifest
     /// type. Same regime again.
     #[tokio::test]
     async fn undecodable_capability_manifest_row_is_skipped_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("operator_session.db");
         seed_healthy(&path).await;
-        insert_raw_row(
-            &path,
-            "S-bad-manifest",
-            r#"["main-ai"]"#,
-            Some(r#"{"provider_id": 42}"#),
-            2,
-        );
+        insert_raw_row(&path, "S-bad-manifest", Some(r#"{"provider_id": 42}"#), 2);
 
         let (list, logged) = list_capturing_warnings(&path).await;
         assert_only_healthy_survived(&list);
@@ -875,15 +897,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("operator_session.db");
         seed_healthy(&path).await;
-        insert_raw_row(&path, "S-empty-role", r#"[""]"#, None, 2);
-        insert_raw_row(&path, "op-legacy-uuid", r#"["main-ai"]"#, None, 3);
-        insert_raw_row(
-            &path,
-            "S-bad-manifest",
-            r#"["main-ai"]"#,
-            Some(r#"{"provider_id": 42}"#),
-            4,
-        );
+        insert_raw_row(&path, "op-legacy-uuid", None, 3);
+        insert_raw_row(&path, "S-bad-manifest", Some(r#"{"provider_id": 42}"#), 4);
 
         let (list, _logged) = list_capturing_warnings(&path).await;
         assert_only_healthy_survived(&list);

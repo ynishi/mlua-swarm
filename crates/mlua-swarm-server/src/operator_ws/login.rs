@@ -7,13 +7,11 @@
 //! ## Login flow
 //!
 //! ```text
-//! POST /v1/operators { roles?: ["main-ai"], capability_manifest?: {...} }
-//!   → 409 if any role already owns a live entry (roles alias exclusivity,
-//!     v1.md §Auth session flow)
-//!   → { sid: "S-<hex>", token: "<10-hex>", roles: [...] }
+//! POST /v1/operators { desc?: "...", capability_manifest?: {...} }
+//!   → { sid: "S-<hex>", token: "<10-hex>" }
 //!   → builds a disconnected `WSOperatorSession` and registers it into the
-//!     engine's 3 registries (senior_bridge / spawn_hook / operator) +
-//!     role aliases. The sid is therefore usable as an `operator_sid` pin
+//!     engine's 3 registries (senior_bridge / spawn_hook / operator) under
+//!     its sid. The sid is therefore usable as an `operator_sid` pin
 //!     from the moment it is minted; it is not yet *reachable* (no socket).
 //!   The manifest is pinned to this session and later resolved through the
 //!   Core `AgentBindingProvider` interface before any Runner-backed spawn.
@@ -27,19 +25,42 @@
 //!     boot on the restore path.
 //!
 //! DELETE /v1/operators/:sid   (Bearer required)
-//!   → unregisters the 3 registries + role aliases + `operator_sessions`
-//!     entry + releases `roles_to_sid` ownership, then vacates every Run
-//!     seat still held under this sid or one of its roles (model O8 —
-//!     `cascade_vacate_seats`; a delete leaves no holder behind).
+//!   → unregisters the 3 registries + the adapter binding +
+//!     `operator_sessions` entry, then vacates every Run seat still held
+//!     under this sid (model O8 — `cascade_vacate_seats`; a delete leaves
+//!     no holder behind).
 //!
 //! GET /v1/operators/:sid   (Bearer required)
-//!   → { sid, roles, connected, desc, observed, observed_total }
+//!   → { sid, connected, desc, observed, observed_total }
 //!
 //! GET /v1/operators   (Bearer required — any live session's token)
 //!   → the 記名 list (model §4.2): every live session's identity, its
 //!     join-time description (D1) and the seats it has been assigned (D2),
 //!     newest activity first with a count limit (D5).
 //! ```
+//!
+//! ## A join names nothing
+//!
+//! `POST /v1/operators` used to take `roles: ["main-ai"]`, reserve those
+//! names process-globally in `AppState.roles_to_sid`, answer `409` when one
+//! was taken, and register the session under each of them. The whole
+//! apparatus is gone, and it is worth saying what replaced it: **nothing
+//! did.** A role was a *server-wide* reservation, and Runs are concurrent —
+//! two Runs wanting a `main-ai` each is the ordinary case, not a conflict —
+//! so the name never had to be unique in the first place. Which operator
+//! serves which lane is a per-Run fact, and it lives where every other
+//! per-Run fact lives: `Run.current`, written by a launch pin or an
+//! acquire (model §4.3).
+//!
+//! So the 409 did not need switching off; its subject stopped existing.
+//! What that buys is not merely one fewer refusal:
+//!
+//! - `Assignee.op` is a session id on every path now — there is no other
+//!   kind of string it could hold, which is what **O4** ("join issues a new
+//!   `OperatorId` every time") means once the alias key space is gone;
+//! - the adapter registry is keyed by sid alone, so the last-write-wins
+//!   registration that let a second session claiming `main-ai` silently
+//!   take over the first one's dispatches has no key to collide on.
 //!
 //! ## 記名 (model §4.2)
 //!
@@ -67,8 +88,12 @@
 //! - [`WSOperatorSession`] — the 3-trait WS session object (`session.rs`):
 //!   the engine's dispatch target, whose sender is the only part that
 //!   tracks connectivity.
-//! - `mlua_swarm::OperatorSession` — the engine-side `attach`/session-token
-//!   record behind `/v1/sessions`. Unrelated to this route family.
+//! - `mlua_swarm::LaunchEnvelope` — the engine-side `attach` record behind
+//!   `/v1/sessions`: one per launch, holding that launch's token and the
+//!   ids its dispatches rebuild `OperatorInfo` from. Unrelated to this
+//!   route family, and no longer *named* like a session — which is the
+//!   confusion the rename was for: the sessions this module owns are the
+//!   two above, and they are the ones a sid addresses.
 
 use axum::{
     extract::{
@@ -85,9 +110,7 @@ use mlua_swarm::store::operator_session::{
 };
 use mlua_swarm::store::run::{Assignee, RunListFilter, RunStatus, VacateOutcome};
 use mlua_swarm::store::trace::TraceHandle;
-use mlua_swarm::{
-    AgentProviderManifest, Engine, Operator, OperatorRef, SeniorBridge, SessionId, SpawnHook,
-};
+use mlua_swarm::{AgentProviderManifest, Engine, Operator, SeniorBridge, SessionId, SpawnHook};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -111,7 +134,7 @@ use crate::AppState;
 /// latched, rather than minting a replacement nothing could unregister.
 pub struct LoginSession {
     /// Read-only snapshot of the persisted row's **immutable** half: the
-    /// identity, the roles, the manifest, the mint time, and the 記名's
+    /// identity, the manifest, the mint time, and the 記名's
     /// confirmed part (**D1** — written at join and never rewritten). Its
     /// `token_digest` is never read directly — [`Self::verify_bearer`] is
     /// the one predicate over it.
@@ -231,7 +254,7 @@ impl LoginSession {
 
     /// The WS session the engine dispatches to for this sid.
     ///
-    /// Held inline rather than as a registry id: `mlua_swarm::OperatorSession`
+    /// Held inline rather than as a registry id: `mlua_swarm::LaunchEnvelope`
     /// persists ids and rebuilds its handles at dispatch time, which does not
     /// work here — a route that upgraded a socket must keep observing this
     /// same object after a teardown removed the sid from
@@ -251,21 +274,21 @@ impl LoginSession {
 // ─── POST /v1/operators (mint) ──────────────────────────────────────────────
 
 /// Body for `POST /v1/operators`.
+///
+/// # There is no `roles` field
+///
+/// A join used to claim role aliases here and hold them against every
+/// other session on the server. Role declaration moved onto the Run (see
+/// the module doc), so the only thing a join carries about *what* this
+/// session is for is [`Self::desc`] — which is read by a person or an AI
+/// and matched against nothing (**D4**).
+///
+/// A caller that still sends `roles` is not refused: serde ignores the
+/// unknown key, and the join succeeds as the sid-only join it now is.
+/// Refusing would break the one thing a join must never break — a driver
+/// getting in — for a field whose removal costs the caller nothing.
 #[derive(Debug, Deserialize, Default)]
 pub struct OperatorsCreateReq {
-    /// Role aliases to claim exclusively (empty = no exclusivity claimed).
-    ///
-    /// # Why this is `String` when everything downstream is [`OperatorRef`]
-    ///
-    /// This is the untrusted wire-decode boundary, the same shape
-    /// `Path(sid): Path<String>` has on the sibling routes: the request
-    /// arrives as strings and [`operators_create`] validates them into
-    /// `OperatorRef` itself, so a rejection is answered with this module's
-    /// own `400` (and its own message naming the offending element)
-    /// instead of axum's extractor-level `422`. Nothing past that
-    /// conversion handles a role as a bare string.
-    #[serde(default)]
-    pub roles: Vec<String>,
     /// Effective execution capabilities supplied by the Operator/MainAI.
     #[serde(default)]
     pub capability_manifest: Option<AgentProviderManifest>,
@@ -312,20 +335,21 @@ pub struct OperatorsCreateResp {
     pub sid: SessionId,
     /// Bearer auth token required on the WS upgrade and admin routes.
     pub token: String,
-    /// Echoes the granted role aliases (each serializes as the plain role
-    /// string, unchanged from before the [`OperatorRef`] typing).
-    pub roles: Vec<OperatorRef>,
 }
 
 /// `POST /v1/operators`. Mints `sid` (`S-<hex>` — the shared `SessionId`
 /// shape; issue #11) + a 128-bit bearer token
 /// (`mlua_swarm::types::operator_bearer_token` — OS-RNG hex, unguessable
 /// across calls and restarts, which is the point: this token is the sole
-/// bearer secret on the short-handle path). When `roles` is non-empty,
-/// checks `AppState.roles_to_sid` for conflicts under a single lock (the
-/// check and the insert are atomic w.r.t. concurrent mints) and returns
-/// `409 CONFLICT` with the conflicting role names on collision. Empty
-/// `roles` never conflicts (= no exclusivity is claimed).
+/// bearer secret on the short-handle path).
+///
+/// # This route cannot refuse
+///
+/// Every arm below is `200` or a `500` from the store: there is no
+/// conflict left to detect, so the only way in for an incoming Assignee is
+/// also the only way this can answer. That is **D3**'s carve-out
+/// ("join 自体は無認証なので引き継ぎは妨げない") holding at the status-code
+/// level as well as at the auth one.
 ///
 /// # The bearer exists only inside this function
 ///
@@ -338,29 +362,6 @@ pub async fn operators_create(
     State(state): State<AppState>,
     Json(req): Json<OperatorsCreateReq>,
 ) -> Response {
-    // Validate the wire strings into role handles before anything is
-    // reserved, minted, or persisted. An empty element is the one thing
-    // rejected here: it names no Operator, so a session claiming it could
-    // never be routed to, and every failure it caused would surface far
-    // from the caller that sent it.
-    let roles: Vec<OperatorRef> = match req
-        .roles
-        .into_iter()
-        .map(OperatorRef::new)
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(roles) => roles,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("invalid role alias: {error}"),
-                    "hint": "omit `roles` (or send an empty array) to claim no alias at all",
-                })),
-            )
-                .into_response();
-        }
-    };
     let capability_manifest = req.capability_manifest;
     // D1's value, normalised once at the boundary: blank is absent.
     let desc = req
@@ -381,42 +382,6 @@ pub async fn operators_create(
     // at the end of this function and never stored anywhere.
     let token_digest = OperatorSessionRecord::digest_of(&token);
 
-    {
-        let mut map = state.roles_to_sid.lock().await;
-        let conflicts: Vec<OperatorRef> = roles
-            .iter()
-            .filter(|r| map.contains_key(r.as_str()))
-            .cloned()
-            .collect();
-        if !conflicts.is_empty() {
-            // GH #81 Layer 2 (a): identify the holding session per
-            // conflicted role so a recovery driver knows which sid to
-            // release without probing. The pre-#81 `conflicts: [role]`
-            // array stays byte-identical for callers that already
-            // ignore unknown keys; the new `conflicts_detail: [{role,
-            // sid}]` array is an additive companion.
-            let conflicts_detail: Vec<serde_json::Value> = conflicts
-                .iter()
-                .map(|r| {
-                    let holder = map.get(r.as_str()).map(|sid| sid.to_string());
-                    json!({ "role": r, "sid": holder })
-                })
-                .collect();
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": "roles conflict",
-                    "conflicts": conflicts,
-                    "conflicts_detail": conflicts_detail,
-                })),
-            )
-                .into_response();
-        }
-        for r in &roles {
-            map.insert(r.clone(), sid.clone());
-        }
-    }
-
     // A clock that cannot answer yields `0`, which `GET /v1/operators`
     // reads as the oldest possible mint — so such a session is the one a
     // recovery driver picking "the oldest stale session" always picks,
@@ -429,12 +394,10 @@ pub async fn operators_create(
     // Write-through BEFORE the in-memory insert and the mint response: a
     // sid the client can see must already be durable, or a crash between
     // response and persist would resurrect the pre-persistence forced
-    // logout this store exists to remove. On a store failure the roles
-    // reserved above are released so the names stay claimable.
+    // logout this store exists to remove.
     let record = OperatorSessionRecord {
         sid: sid.clone(),
         token_digest,
-        roles: roles.clone(),
         capability_manifest,
         joined_at_secs,
         desc,
@@ -445,12 +408,6 @@ pub async fn operators_create(
     };
     if let Err(error) = state.operator_session_store.put(record.clone()).await {
         tracing::error!(%sid, %error, "operators_create: session persist failed");
-        let mut map = state.roles_to_sid.lock().await;
-        for r in &roles {
-            if map.get(r.as_str()) == Some(&sid) {
-                map.remove(r.as_str());
-            }
-        }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("session persist failed: {error}") })),
@@ -482,13 +439,13 @@ pub async fn operators_create(
     // this function's gate for every in-memory effect (see the
     // write-through note above), so registration sits on the same side of
     // it as the map insert below, and the failure path above stays exactly
-    // as it was: release the roles, answer `500`, leave nothing behind.
+    // as it was: answer `500`, leave nothing behind.
     //
     // # The window this ordering leaves
     //
     // Between the registration below and the map insert after it, the sid
-    // and its roles resolve in the engine while `operator_sessions` does
-    // not yet hold the session. Both exits a parked send has —
+    // resolves in the engine while `operator_sessions` does not yet hold
+    // the session. Both exits a parked send has —
     // `replace_tx` (reached only via `operators_ws_connect`) and
     // `ConnState::TornDown` (published only by `teardown_operator_session`)
     // — look the sid up in that map first, so a dispatch landing in the
@@ -503,7 +460,6 @@ pub async fn operators_create(
         &state.engine,
         Some(&state.operator_adapters),
         &sid,
-        &roles,
         live.dispatch_target(),
     )
     .await;
@@ -514,11 +470,7 @@ pub async fn operators_create(
         .await
         .insert(sid.clone(), live);
 
-    (
-        StatusCode::OK,
-        Json(OperatorsCreateResp { sid, token, roles }),
-    )
-        .into_response()
+    (StatusCode::OK, Json(OperatorsCreateResp { sid, token })).into_response()
 }
 
 // ─── WS /v1/operators/:sid/ws (Bearer required) ─────────────────────────────
@@ -575,17 +527,27 @@ pub async fn operators_ws_connect(
 
 /// Binds a session's dispatch target into every registry an Operator
 /// session must be reachable through: the engine's three (`senior_bridge` /
-/// `spawn_hook` / `operator`) under `sid`, the `OperatorAdapterRegistry`
-/// when one is wired, and the operator registries again under each of
-/// `roles`.
+/// `spawn_hook` / `operator`) and the `OperatorAdapterRegistry` when one is
+/// wired — all four under `sid`, and under nothing else.
+///
+/// # One key per session
+///
+/// Each session used to be filed under its sid *and* under every role
+/// alias it claimed, because `Assignee.op` could be either. It cannot any
+/// more, so the alias registrations are gone — and with them the way a
+/// second session claiming an already-held alias silently took over the
+/// first one's dispatches: both registries are last-write-wins and neither
+/// reports a collision, so the `409` at mint was the only thing keeping
+/// two sessions off one key. A sid cannot collide (it is minted fresh
+/// every time, **O4**), so there is nothing left for a guard to guard.
 ///
 /// # Why two operator-side registries
 ///
 /// They answer different questions and are read at different times:
 ///
 /// - **`engine.register_operator`** — the Blueprint-global *delegate* axis
-///   (`OperatorDelegateMiddleware`). A launch names a backend id
-///   (`operator_backend_id`, set from `operator_sid`) and the engine
+///   (`OperatorDelegateMiddleware`). A launch names a backend id (its
+///   `operator_sid`, stored on the `LaunchEnvelope`) and the engine
 ///   resolves it once at attach time; an id that resolves to nothing makes
 ///   the middleware fall through to `inner.spawn` silently, so a session
 ///   missing here is a quiet loss of a shipped feature.
@@ -597,11 +559,11 @@ pub async fn operators_ws_connect(
 ///   is baked into the compiled Blueprint any more, which is the whole
 ///   point of the seat/holder split.
 ///
-/// Both are written here, under the same keys, from this one call. That is
+/// Both are written here, under the same key, from this one call. That is
 /// what keeps the launch-time guard (`engine.list_operator_ids()`, which
 /// answers "is this `operator_sid` a live session") and the dispatch-time
-/// lookup on the same id space: a sid or role that passes the guard is one
-/// a router can deliver to.
+/// lookup on the same id space: a sid that passes the guard is one a
+/// router can deliver to.
 ///
 /// The single spelling of that registration, and — since the mint path
 /// took it over from the first-connect arm — the only one. Two callers
@@ -609,21 +571,17 @@ pub async fn operators_ws_connect(
 /// persisted record ([`restored_login_session`]), and they have to
 /// leave identical registry state, or a session ends up resolvable on one
 /// axis (`GET /v1/operators/:sid`) and missing on another (an
-/// `operator_sid` pin, a role-aliased spawn).
+/// `operator_sid` pin, a seat that names it).
 ///
 /// Both callers run **before** their [`LoginSession`] reaches
 /// `operator_sessions`, so every one of them is registered by the time
 /// anything can look it up. Nothing on the WS connect path calls this: a
 /// connect that races a teardown must not be able to put a registration
 /// back.
-///
-/// Role exclusivity is settled at mint time (`operators_create`); this only
-/// binds the aliases it granted.
 async fn register_operator_session(
     engine: &Engine,
     adapters: Option<&Arc<OperatorAdapterRegistry>>,
     sid: &SessionId,
-    roles: &[OperatorRef],
     dispatch_target: &Arc<WSOperatorSession>,
 ) {
     engine
@@ -646,39 +604,20 @@ async fn register_operator_session(
             )
             .await;
     }
-    for role in roles {
-        // The registries are keyed by plain strings (a sid and a role alias
-        // share that key space by design — both are `OperatorId`s and both
-        // can be what `Assignee.op` records), so the alias is spelled out
-        // here rather than handed over as a typed ref.
-        if let Some(adapters) = adapters {
-            adapters
-                .register(
-                    role.as_str().to_string(),
-                    dispatch_target.clone() as Arc<dyn OperatorAdapter>,
-                )
-                .await;
-        }
-        engine
-            .register_operator(
-                role.as_str().to_string(),
-                dispatch_target.clone() as Arc<dyn Operator>,
-            )
-            .await;
-    }
 }
 
 /// Builds the [`LoginSession`] for a persisted login record and registers
 /// it — the boot-time half of session persistence, called from
 /// [`crate::OperatorSessionPersistence::restore`].
 ///
-/// Restoring the login maps alone leaves a window between boot and the
+/// Restoring the login map alone leaves a window between boot and the
 /// owning client's WS reconnect in which the sid is known to
 /// `GET /v1/operators/:sid` but not to the engine: a launch pinning it
 /// (`POST /v1/tasks` `operator_sid`) is rejected with `400 no such
-/// registered operator session`, and a role-routed launch has no operator
-/// to reach. Registering here closes that window, which is the whole point
-/// of persisting `RunRecord.operator_sid` pins across a restart.
+/// registered operator session`, and a Run whose `current` names it has no
+/// operator to reach. Registering here closes that window, which is the
+/// whole point of persisting `RunRecord.operator_sid` pins across a
+/// restart.
 ///
 /// The session is created **disconnected**
 /// ([`WSOperatorSession::disconnected_with_base_url`]): it is registered,
@@ -704,14 +643,7 @@ pub(crate) async fn restored_login_session(
     record: OperatorSessionRecord,
 ) -> Arc<LoginSession> {
     let live = LoginSession::new(record, base_url);
-    register_operator_session(
-        engine,
-        adapters,
-        &live.record().sid,
-        &live.record().roles,
-        live.dispatch_target(),
-    )
-    .await;
+    register_operator_session(engine, adapters, &live.record().sid, live.dispatch_target()).await;
     live
 }
 
@@ -899,17 +831,30 @@ async fn handle_operator_socket(socket: WebSocket, live: Arc<LoginSession>) {
 
 // ─── DELETE /v1/operators/:sid (Bearer required) ────────────────────────────
 
-/// Shared teardown for `DELETE /v1/operators/:sid` (`operators_delete`) and
-/// `DELETE /v1/operators/by-role/:role` (`operators_delete_by_role` — GH #81
-/// Layer 2 (c)): drops the persisted row, the 3 engine registries + role
-/// aliases + the adapter-registry bindings + `operator_sessions` entry,
-/// releases the sid's ownership in `roles_to_sid`, closes the session's
-/// socket, and finally releases every Run seat the operator still held
-/// (**O8** — see [`cascade_vacate_seats`]). Idempotent w.r.t. a concurrent
-/// delete — every `remove` / `unregister` is a no-op when the entry is
-/// already gone, the socket close is latched (see
-/// [`WSOperatorSession::close`]), and a repeated cascade finds the seats
-/// already vacant.
+/// Teardown for `DELETE /v1/operators/:sid` (`operators_delete`): drops the
+/// persisted row, the 3 engine registries + the adapter-registry binding +
+/// the `operator_sessions` entry, closes the session's socket, and finally
+/// releases every Run seat the operator still held (**O8** — see
+/// [`cascade_vacate_seats`]). Idempotent w.r.t. a concurrent delete —
+/// every `remove` / `unregister` is a no-op when the entry is already
+/// gone, the socket close is latched (see [`WSOperatorSession::close`]),
+/// and a repeated cascade finds the seats already vacant.
+///
+/// # The asymmetry that used to be deferred is gone
+///
+/// This teardown carried a note saying its two unregister paths disagreed:
+/// the role keys came out of the registries unconditionally, while the
+/// `roles_to_sid` release was guarded by ownership, so a role re-minted to
+/// another sid mid-teardown lost its registry binding to a teardown that
+/// no longer owned the name. Making the two predicates agree was deferred
+/// to "the RoleGrant lifecycle work".
+///
+/// That work is not needed, because the discrepancy was between two
+/// spellings of one thing that no longer exists: with no role keys and no
+/// `roles_to_sid`, a teardown removes exactly the sid it was called with,
+/// under one predicate, in one place. There is no second name to be
+/// re-granted underneath it and therefore no ownership question to get
+/// wrong. The deferral is closed by removal rather than by repair.
 ///
 /// # The persisted row goes first
 ///
@@ -947,17 +892,6 @@ async fn teardown_operator_session(
     state.engine.unregister_spawn_hook(sid.as_str()).await;
     state.engine.unregister_operator(sid.as_str()).await;
     state.operator_adapters.unregister(sid.as_str()).await;
-    // The role key unregister above is unconditional, while the
-    // `roles_to_sid` release below is guarded by ownership. That asymmetry
-    // is reachable today — a role re-minted to another sid between this
-    // teardown's start and here loses its registry binding to a teardown
-    // that no longer owns the name. Making the two predicates symmetric
-    // belongs to the RoleGrant lifecycle work, not here: this teardown's
-    // call shapes are deliberately frozen.
-    for role in &live.record().roles {
-        state.engine.unregister_operator(role.as_str()).await;
-        state.operator_adapters.unregister(role.as_str()).await;
-    }
 
     // Closed in place, never detached. A socket that upgraded before this
     // teardown and has not reached `handle_operator_socket` yet still holds
@@ -977,6 +911,15 @@ async fn teardown_operator_session(
     // is no reconnect/resend contract to preserve — an in-flight spawn
     // parked in `send_and_await` would otherwise orphan until the run's
     // sync timeout (up to 300s) fires.
+    //
+    // This is the call the teardown work proposed to drop, leaving the
+    // requests for the next Assignee to answer by `req_id` (**W2**). It
+    // stays: by this line the adapter is already unregistered and the sid
+    // is about to leave `operator_sessions`, so there is no longer any way
+    // to *read* those requests, and a send still parked before its first
+    // write has no exit left but the `TornDown` this publishes. The full
+    // argument, including what would have to change to remove it, is on
+    // `WSOperatorSession::fail_pending`.
     session.fail_pending(TEARDOWN_REASON).await;
     // Same reasoning one step further out: with no reconnect possible, the
     // socket itself has no future either. Clearing `tx` alone left the
@@ -988,18 +931,9 @@ async fn teardown_operator_session(
 
     state.operator_sessions.lock().await.remove(sid);
 
-    {
-        let mut map = state.roles_to_sid.lock().await;
-        for role in &live.record().roles {
-            if map.get(role.as_str()) == Some(sid) {
-                map.remove(role.as_str());
-            }
-        }
-    }
-
-    // O8, last: by here the operator is unreachable under every name it
+    // O8, last: by here the operator is unreachable under the one name it
     // answered to, so no dispatch can re-establish what this releases.
-    cascade_vacate_seats(state, sid, &live.record().roles).await;
+    cascade_vacate_seats(state, sid).await;
 
     Ok(())
 }
@@ -1030,8 +964,8 @@ async fn teardown_operator_session(
 /// calls is a full table scan, `limit` is `None`, and every surviving row
 /// is deserialized into a complete `RunRecord` — step trace included —
 /// only for its `current` map to be read. The cost of a leave (every
-/// `mse-mcp` shutdown, and `DELETE /v1/operators/by-role/:role`) is
-/// therefore linear in accumulated non-terminal Runs, not in live ones.
+/// `mse-mcp` shutdown) is therefore linear in accumulated non-terminal
+/// Runs, not in live ones.
 /// Measured against a workstation database of hundreds of Runs that is
 /// nothing; it is written down because the next reader would otherwise
 /// extend "bounded by live work" to a bigger scan. The fix, when the store
@@ -1052,17 +986,17 @@ async fn teardown_operator_session(
 ///
 /// The one path that revives such a Run
 /// (`POST /v1/runs/:id/rerun-from`) then dispatches against the preserved
-/// holder, and what happens next depends on **which name** that holder is.
-/// A sid is never re-minted, so it resolves to nothing and the dispatch
-/// fails loudly at the registry lookup, fixed by an acquire (**A8**). A
-/// **role alias does not fail**: teardown re-opens the role names it held
-/// for a future mint, and the next session to claim one registers under it
-/// — so the lookup succeeds and the dispatch reaches whoever holds that
-/// role now. That is what a role alias means (`seat_declared_operators`
-/// seats role names for exactly this reason), so the outcome is correct,
-/// but it is a live re-route rather than a loud failure and should not be
-/// read as one. Either way the repair is the same acquire, which is why
-/// **O8** is described as nice-to-have rather than load-bearing.
+/// holder, and that holder is a sid, which is never re-minted (**O4**) —
+/// so it resolves to nothing and the dispatch fails loudly at the registry
+/// lookup, repaired by an acquire (**A8**).
+///
+/// It used to be possible for that dispatch to *succeed* instead: a holder
+/// could be a role alias, teardown re-opened the alias for a future mint,
+/// and the next session to claim it registered under the same key — so the
+/// revived Run silently re-routed to whoever held the name now. With
+/// aliases gone there is one outcome, and it is the loud one. **O8** stays
+/// nice-to-have rather than load-bearing either way, because the repair is
+/// the same acquire.
 const CASCADE_STATUSES: [RunStatus; 4] = [
     RunStatus::Pending,
     RunStatus::Running,
@@ -1073,14 +1007,16 @@ const CASCADE_STATUSES: [RunStatus; 4] = [
 /// **O8**: `delete(op) ⟹ ∀run. current = Assigned(a) ∧ a.op = op ⟹
 /// current := Vacant`.
 ///
-/// # Both names, not just the sid
+/// # One name
 ///
-/// A session answers to its sid *and* to every role it holds — the login
-/// path registers the adapter under all of them, and a launch seats a role
-/// name as readily as a sid — so `current[slot].op` may be either. The
-/// cascade therefore matches against the whole set; releasing only the sid
-/// would leave the role-aliased seats pointing at the operator that was
-/// just deleted, which is precisely the lie **O8** exists to prevent.
+/// A session answers to its sid and to nothing else, so `current[slot].op`
+/// either is that sid or is not this operator's. The cascade used to match
+/// against a *set* of names — the sid plus every role the session held —
+/// because a launch could seat a role name as readily as a sid; releasing
+/// only the sid then left the alias-held seats pointing at an operator
+/// that had just been deleted, which is exactly the lie **O8** exists to
+/// prevent. With no aliases the set is a single value and the comparison
+/// is an equality.
 ///
 /// # Best effort, and why that is right here
 ///
@@ -1121,11 +1057,7 @@ const CASCADE_STATUSES: [RunStatus; 4] = [
 /// (**A7**) is likewise made where the seat is read. A periodic sweeper
 /// would be a second place where seats change hands, running against Runs
 /// nobody is dispatching to.
-async fn cascade_vacate_seats(state: &AppState, sid: &SessionId, roles: &[OperatorRef]) {
-    let mut names: Vec<&str> = Vec::with_capacity(roles.len() + 1);
-    names.push(sid.as_str());
-    names.extend(roles.iter().map(|role| role.as_str()));
-
+async fn cascade_vacate_seats(state: &AppState, sid: &SessionId) {
     let mut released = 0usize;
     for status in CASCADE_STATUSES {
         let runs = match state
@@ -1157,7 +1089,7 @@ async fn cascade_vacate_seats(state: &AppState, sid: &SessionId, roles: &[Operat
             let held: Vec<(String, Assignee)> = run
                 .current
                 .iter()
-                .filter(|(_, assignee)| names.contains(&assignee.op.as_str()))
+                .filter(|(_, assignee)| assignee.op == sid.as_str())
                 .map(|(slot, assignee)| (slot.clone(), assignee.clone()))
                 .collect();
             for (slot, holder) in held {
@@ -1212,13 +1144,42 @@ async fn cascade_vacate_seats(state: &AppState, sid: &SessionId, roles: &[Operat
     }
 }
 
-/// `DELETE /v1/operators/:sid`. Bearer mandatory. `404` on unknown sid, `401`
-/// on token mismatch. Drops the persisted row, the 3 engine registries +
-/// role aliases + the adapter-registry bindings + `operator_sessions`
-/// entry, releases this sid's ownership in `roles_to_sid` (re-opening the
-/// role names for a future mint), closes the session's socket, and vacates
-/// every Run seat this operator still held under its sid or any of its
-/// roles (**O8**).
+/// `DELETE /v1/operators/:sid`. Bearer mandatory. `404` on unknown sid,
+/// `401` on token mismatch. Drops the persisted row, the 3 engine
+/// registries + the adapter-registry binding + the `operator_sessions`
+/// entry, closes the session's socket, and vacates every Run seat this
+/// operator still held (**O8**).
+///
+/// **The only leave route.** `DELETE /v1/operators/by-role/:role` used to
+/// sit alongside it as the recovery door for a stale session whose driver
+/// crashed without keeping its sid — a role name was the one handle such a
+/// caller still had. A join claims no name now, so that door has no
+/// keyhole; what a recovery caller reads instead is `GET /v1/operators`,
+/// which lists every live session's sid next to the 記名 that says what it
+/// was doing (**D1** / **D2**), and then deletes the one it recognises by
+/// sid. That names the session it is about to kill rather than a name
+/// several sessions could answer to, and it is the reason the by-role
+/// route's whole retinue (`?force=true`, the in-flight `409` guard, the
+/// torn-mapping arm) went with it: each existed to make releasing
+/// *somebody else's* session by a shared name survivable.
+///
+/// # What that recovery cannot do
+///
+/// It cannot release a session whose driver is gone. This route checks
+/// the Bearer against *that session's own* digest, and the client keeps
+/// the token in process — a crash loses it. So the sid a recovery caller
+/// reads off `GET /v1/operators` is one it can identify and cannot
+/// delete: this route answers `401` for every caller except the corpse.
+///
+/// That is survivable for **assignment** — a replacement driver joins
+/// freely, pins its own launches, and `acquire` never refuses, so the
+/// stale session holds no seat anyone needs. It is not survivable for
+/// **storage**: the persisted row has no other deleter, and
+/// `OperatorSessionPersistence::restore` re-materializes every row at
+/// boot with no age filter, so the set grows once per crashed driver and
+/// survives restarts. The model's answer is O1 (§4.1, the 24h expiry from
+/// last access), which is not implemented — there is no reaper in this
+/// crate. Until there is, a long-lived server accumulates them.
 ///
 /// `500` when the persisted row cannot be dropped: the session is then
 /// still live and fully intact (see [`teardown_operator_session`]), and the
@@ -1271,7 +1232,7 @@ fn teardown_failed_response(sid: &SessionId, error: &OperatorSessionStoreError) 
         .into_response()
 }
 
-// ─── GH #81 Layer 2: GET /v1/operators + DELETE /v1/operators/by-role/:role
+// ─── GET /v1/operators — the 記名 list ──────────────────────────────────────
 
 /// One entry in the `GET /v1/operators` list response — a live session's
 /// identity plus its 記名 (model §4.2).
@@ -1280,10 +1241,10 @@ fn teardown_failed_response(sid: &SessionId, error: &OperatorSessionStoreError) 
 /// bearer secret, and the latter is what `GET /v1/operators/:sid` is for.
 #[derive(Debug, Serialize)]
 pub struct OperatorsListEntry {
-    /// Session id (`S-<hex>`) — safe to expose; token is the sole bearer secret.
+    /// Session id (`S-<hex>`) — safe to expose; token is the sole bearer
+    /// secret, and this is the whole of what identifies a session now that
+    /// a join claims no name.
     pub sid: SessionId,
-    /// Role aliases held by this session.
-    pub roles: Vec<OperatorRef>,
     /// Unix epoch seconds when the session minted (from
     /// [`OperatorSessionRecord::joined_at_secs`]).
     pub joined_at_secs: u64,
@@ -1428,7 +1389,6 @@ pub async fn operators_list(
         let record = live.kimei().await;
         operators.push(OperatorsListEntry {
             sid: record.sid.clone(),
-            roles: record.roles.clone(),
             joined_at_secs: record.joined_at_secs,
             connected,
             desc: record.desc.clone(),
@@ -1454,179 +1414,6 @@ pub async fn operators_list(
         .into_response()
 }
 
-/// `DELETE /v1/operators/by-role/:role`. Releases the session currently
-/// holding `role` without requiring the caller to know the sid or its
-/// Bearer token (GH #81 Layer 2 (c)). Recovery route for a stale session
-/// whose driver crashed after minting the sid — pre-#81 the only reliable
-/// recovery was a full server restart, which also dropped every OTHER live
-/// session. Same trust tier as the server-shutdown surface
-/// (`mlua_swarm_server_shutdown`): admin observability, no Bearer.
-///
-/// `404` when no session holds the role, `204` on successful teardown, and
-/// `500` when the persisted row could not be dropped (in which case the
-/// session is left fully intact — see [`teardown_operator_session`]). The
-/// response body on `204` is empty (`teardown_operator_session` performs
-/// the same cleanup as `operators_delete`).
-///
-/// # In-flight protection (`409` unless `?force=true`)
-///
-/// A role name is process-global, so "the session holding `main-ai`" may
-/// well be another driver's live session rather than the stale one the
-/// caller meant to clear — and teardown fails every parked spawn on it
-/// ([`teardown_operator_session`]'s `fail_pending`). When the holding sid is
-/// pinned by at least one `Running` Run (`RunRecord.operator_sid`), this
-/// route refuses with `409` and lists those run ids, so the recovery habit
-/// cannot take a working run down as collateral. `?force=true` performs the
-/// teardown anyway — the escape hatch for a genuinely wedged session whose
-/// runs will never finish.
-///
-/// The check reads through [`crate::AppState::run_store`]; a store read
-/// failure is itself a `409` (refuse rather than tear down blind).
-pub async fn operators_delete_by_role(
-    State(state): State<AppState>,
-    Path(role): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<OperatorsDeleteByRoleQuery>,
-) -> Response {
-    // Same shape as the sibling `:sid` routes' `SessionId::parse`: a path
-    // segment that cannot be a role cannot name a holder of one. Axum does
-    // not match an empty segment, so this arm is unreachable in practice —
-    // it exists so the rest of the handler works in `OperatorRef`.
-    let Ok(role) = OperatorRef::new(role) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "no session holds this role"})),
-        )
-            .into_response();
-    };
-    let sid = {
-        let map = state.roles_to_sid.lock().await;
-        match map.get(role.as_str()) {
-            Some(sid) => sid.clone(),
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "no session holds this role", "role": role})),
-                )
-                    .into_response();
-            }
-        }
-    };
-    let live = {
-        let map = state.operator_sessions.lock().await;
-        map.get(&sid).cloned()
-    };
-    let live = match live {
-        Some(e) => e,
-        None => {
-            // The role was mapped to a sid that has no matching
-            // `operator_sessions` entry. Reachable while a mint is still
-            // in flight: `operators_create` reserves the role names first
-            // and inserts the entry last, with the persist write-through
-            // and the engine registration in between. Release the stale
-            // role mapping so a future mint can reclaim the name, then
-            // report NOT_FOUND.
-            //
-            // Deliberately no unregister here: this branch has no entry,
-            // so it has no `roles` list to unregister and no session to
-            // close. A sid can still arrive here already registered — a
-            // mint cancelled between `register_operator_session` and the
-            // map insert leaves exactly that, both being yield points and
-            // hyper dropping the response future when the peer goes away.
-            //
-            // That residue is bounded rather than permanent. The persisted
-            // row survives it (`put` had succeeded and no `delete` ran), so
-            // the next boot's `restored_login_session` registers
-            // the same sid and roles over the stale keys and this time
-            // publishes a real entry. Until then nothing outside the
-            // process can name the sid: the response carrying it was never
-            // written.
-            let mut map = state.roles_to_sid.lock().await;
-            if map.get(role.as_str()) == Some(&sid) {
-                map.remove(role.as_str());
-            }
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "error": "torn role mapping cleared; role now open",
-                    "role": role,
-                })),
-            )
-                .into_response();
-        }
-    };
-    if !query.force {
-        match active_runs_for_sid(&state, &sid).await {
-            Ok(active_runs) if !active_runs.is_empty() => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "error": "session is driving in-flight runs; \
-                                  tearing it down would fail their parked spawns",
-                        "role": role,
-                        "sid": sid,
-                        "active_runs": active_runs,
-                        "hint": "wait for the runs to finish, or repeat with ?force=true \
-                                 to tear the session down anyway",
-                    })),
-                )
-                    .into_response();
-            }
-            Ok(_) => {}
-            Err(error) => {
-                // Unknown occupancy is not "no occupancy": refusing keeps a
-                // store outage from turning this recovery route into a
-                // silent killer of someone else's runs. `?force=true` still
-                // gets through.
-                tracing::warn!(%role, %sid, %error, "operators_delete_by_role: run occupancy check failed");
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "error": format!(
-                            "cannot verify whether this session is driving in-flight runs: {error}"
-                        ),
-                        "role": role,
-                        "sid": sid,
-                        "hint": "retry, or repeat with ?force=true to tear the session down \
-                                 without the check",
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    }
-    if let Err(error) = teardown_operator_session(&state, &sid, &live).await {
-        return teardown_failed_response(&sid, &error);
-    }
-    StatusCode::NO_CONTENT.into_response()
-}
-
-/// Query string of `DELETE /v1/operators/by-role/:role`.
-#[derive(Debug, Deserialize, Default)]
-pub struct OperatorsDeleteByRoleQuery {
-    /// Tear the session down even while it is driving `Running` runs.
-    /// `false` (the default, and the shape every pre-guard caller sends)
-    /// refuses with `409` in that case.
-    #[serde(default)]
-    pub force: bool,
-}
-
-/// Ids of the `Running` runs pinned to `sid` (`RunRecord.operator_sid`),
-/// ascending by `created_at` so the response order is stable. Empty means
-/// the session drives nothing right now.
-async fn active_runs_for_sid(state: &AppState, sid: &SessionId) -> Result<Vec<String>, String> {
-    let mut running = state
-        .run_store
-        .list_running()
-        .await
-        .map_err(|e| e.to_string())?;
-    running.sort_by_key(|record| record.created_at);
-    Ok(running
-        .into_iter()
-        .filter(|record| record.operator_sid.as_deref() == Some(sid.as_str()))
-        .map(|record| record.id.to_string())
-        .collect())
-}
-
 // ─── GET /v1/operators/:sid (Bearer required) ───────────────────────────────
 
 /// Response for `GET /v1/operators/:sid`.
@@ -1634,8 +1421,6 @@ async fn active_runs_for_sid(state: &AppState, sid: &SessionId) -> Result<Vec<St
 pub struct OperatorsInfoResp {
     /// Echoes the requested session id.
     pub sid: SessionId,
-    /// Role aliases held by this session.
-    pub roles: Vec<OperatorRef>,
     /// Capability manifest pinned when this session joined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capability_manifest: Option<AgentProviderManifest>,
@@ -1685,7 +1470,6 @@ pub async fn operators_info(
         StatusCode::OK,
         Json(OperatorsInfoResp {
             sid: record.sid.clone(),
-            roles: record.roles.clone(),
             capability_manifest: record.capability_manifest.clone(),
             connected,
             desc: record.desc,
@@ -1742,7 +1526,6 @@ mod tests {
     #[test]
     fn operators_create_request_accepts_capability_manifest() {
         let req: OperatorsCreateReq = serde_json::from_value(serde_json::json!({
-            "roles": ["main-ai"],
             "capability_manifest": {
                 "provider_id": "main-ai-self-report",
                 "capabilities": [{
@@ -1753,7 +1536,6 @@ mod tests {
             }
         }))
         .unwrap();
-        assert_eq!(req.roles, ["main-ai"]);
         assert_eq!(
             req.capability_manifest.unwrap().provider_id,
             "main-ai-self-report"
@@ -1762,22 +1544,44 @@ mod tests {
 
     #[test]
     fn operators_create_request_keeps_manifest_optional_on_wire() {
-        let req: OperatorsCreateReq =
-            serde_json::from_value(serde_json::json!({ "roles": [] })).unwrap();
+        let req: OperatorsCreateReq = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(req.capability_manifest.is_none());
     }
 
-    // ── by-role teardown: in-flight protection ───────────────────────────
+    /// A caller still sending the removed `roles` field joins anyway. Join
+    /// is the one step that must never refuse an incoming Assignee
+    /// (**D3**), so an unknown key is ignored rather than made into a
+    /// `422` that would lock an older driver out of a newer server.
+    #[test]
+    fn operators_create_request_ignores_a_stale_roles_field() {
+        let req: OperatorsCreateReq = serde_json::from_value(serde_json::json!({
+            "roles": ["main-ai"],
+            "desc": "an older client that still sends roles",
+        }))
+        .unwrap();
+        assert_eq!(
+            req.desc.as_deref(),
+            Some("an older client that still sends roles")
+        );
+    }
 
-    mod by_role_in_flight {
+    // ── shared fixtures ──────────────────────────────────────────────────
+
+    /// The `AppState` and body helper every test module below builds on.
+    ///
+    /// This used to be `by_role_in_flight`, whose own four tests covered
+    /// `DELETE /v1/operators/by-role/:role`: its `?force=true` escape
+    /// hatch, its in-flight `409`, and the `404` for a role nobody held.
+    /// The route is gone with role declaration, and so are they — what a
+    /// stale session is released by now is its sid, which
+    /// `operators_delete`'s own tests already cover.
+    mod support {
         use super::*;
         use mlua_swarm::core::config::EngineCfg;
         use mlua_swarm::core::engine::Engine;
         use mlua_swarm::store::output::InMemoryOutputStore;
-        use mlua_swarm::store::run::{InMemoryRunStore, RunRecord, RunStatus};
+        use mlua_swarm::store::run::InMemoryRunStore;
         use mlua_swarm::store::task::InMemoryTaskStore;
-        use mlua_swarm::RunId;
-        use mlua_swarm::TaskId;
         use std::collections::HashMap;
 
         pub(super) fn test_state() -> AppState {
@@ -1793,7 +1597,6 @@ mod tests {
                 seat_ledger: Arc::new(crate::operator_ws::SeatLedger::new()),
                 data_store: Arc::new(InMemoryOutputStore::new()),
                 operator_sessions: Arc::new(Mutex::new(HashMap::new())),
-                roles_to_sid: Arc::new(Mutex::new(HashMap::new())),
                 operator_session_store: Arc::new(
                     mlua_swarm::store::operator_session::InMemoryOperatorSessionStore::new(),
                 ),
@@ -1806,154 +1609,11 @@ mod tests {
             }
         }
 
-        /// Seed one live session holding `role`. Its dispatch target has
-        /// never seen a socket; teardown and the guard both work off the
-        /// login record.
-        async fn seed_session(state: &AppState, role: &str) -> SessionId {
-            let role = OperatorRef::new(role).expect("test role literal is never empty");
-            let sid = SessionId::new();
-            let live = LoginSession::new(
-                OperatorSessionRecord {
-                    sid: sid.clone(),
-                    token_digest: OperatorSessionRecord::digest_of("token"),
-                    roles: vec![role.clone()],
-                    capability_manifest: None,
-                    joined_at_secs: 0,
-                    desc: None,
-                    observed: Vec::new(),
-                    observed_total: 0,
-                },
-                None,
-            );
-            state
-                .operator_sessions
-                .lock()
-                .await
-                .insert(sid.clone(), live);
-            state.roles_to_sid.lock().await.insert(role, sid.clone());
-            sid
-        }
-
-        async fn seed_run(state: &AppState, sid: Option<&SessionId>, status: RunStatus) -> RunId {
-            let run_id = RunId::new();
-            state
-                .run_store
-                .create(RunRecord {
-                    id: run_id.clone(),
-                    task_id: TaskId::new(),
-                    status,
-                    step_entries: Vec::new(),
-                    degradations: Vec::new(),
-                    operator_sid: sid.map(|s| s.to_string()),
-                    current: Default::default(),
-                    next_generation: 0,
-                    result_ref: None,
-                    input_json: None,
-                    created_at: 0,
-                    updated_at: 0,
-                })
-                .await
-                .expect("seed run");
-            run_id
-        }
-
         pub(super) async fn body_json(response: Response) -> serde_json::Value {
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("read body");
             serde_json::from_slice(&bytes).expect("json body")
-        }
-
-        async fn session_is_live(state: &AppState, sid: &SessionId) -> bool {
-            state.operator_sessions.lock().await.contains_key(sid)
-        }
-
-        /// No run pins the holder: the recovery route behaves exactly as it
-        /// did before the guard.
-        #[tokio::test]
-        async fn idle_holder_is_still_torn_down() {
-            let state = test_state();
-            let sid = seed_session(&state, "main-ai").await;
-            // A Running run belonging to a DIFFERENT session must not
-            // protect this one.
-            let other = SessionId::new();
-            seed_run(&state, Some(&other), RunStatus::Running).await;
-            // ...and a finished run of this session must not either.
-            seed_run(&state, Some(&sid), RunStatus::Done).await;
-
-            let response = operators_delete_by_role(
-                State(state.clone()),
-                Path("main-ai".to_string()),
-                axum::extract::Query(OperatorsDeleteByRoleQuery::default()),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::NO_CONTENT);
-            assert!(!session_is_live(&state, &sid).await);
-        }
-
-        /// The holder is driving a Running run: refuse, and say which runs
-        /// would have been failed.
-        #[tokio::test]
-        async fn holder_driving_a_running_run_is_refused_with_its_run_ids() {
-            let state = test_state();
-            let sid = seed_session(&state, "main-ai").await;
-            let run_id = seed_run(&state, Some(&sid), RunStatus::Running).await;
-
-            let response = operators_delete_by_role(
-                State(state.clone()),
-                Path("main-ai".to_string()),
-                axum::extract::Query(OperatorsDeleteByRoleQuery::default()),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::CONFLICT);
-            let body = body_json(response).await;
-            assert_eq!(
-                body["active_runs"],
-                serde_json::json!([run_id.to_string()]),
-                "the 409 must name the in-flight runs: {body}"
-            );
-            assert!(
-                session_is_live(&state, &sid).await,
-                "a refused teardown must leave the session (and its parked spawns) alone"
-            );
-            // The role stays claimed — a refused recovery changes nothing.
-            assert_eq!(
-                state.roles_to_sid.lock().await.get("main-ai"),
-                Some(&sid),
-                "a refused teardown must not release the role"
-            );
-        }
-
-        /// `?force=true` is the escape hatch for a wedged session whose runs
-        /// will never finish.
-        #[tokio::test]
-        async fn force_tears_down_despite_in_flight_runs() {
-            let state = test_state();
-            let sid = seed_session(&state, "main-ai").await;
-            seed_run(&state, Some(&sid), RunStatus::Running).await;
-
-            let response = operators_delete_by_role(
-                State(state.clone()),
-                Path("main-ai".to_string()),
-                axum::extract::Query(OperatorsDeleteByRoleQuery { force: true }),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::NO_CONTENT);
-            assert!(!session_is_live(&state, &sid).await);
-        }
-
-        /// Unknown role keeps its pre-guard `404` (the guard runs after the
-        /// lookup, not before it).
-        #[tokio::test]
-        async fn unknown_role_still_404s() {
-            let state = test_state();
-            let response = operators_delete_by_role(
-                State(state),
-                Path("nobody-holds-this".to_string()),
-                axum::extract::Query(OperatorsDeleteByRoleQuery::default()),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
     }
 
@@ -1965,7 +1625,7 @@ mod tests {
     /// These tests are written against that reading — they assert on what
     /// `GET /v1/runs/:id` shows, not on the store call underneath.
     mod o8_cascade {
-        use super::by_role_in_flight::test_state;
+        use super::support::test_state;
         use super::*;
         use mlua_swarm::store::run::{RunRecord, RunStatus};
         use mlua_swarm::{RunId, TaskId};
@@ -1974,20 +1634,15 @@ mod tests {
         /// seat is a lane of the flow, not a job title.
         const SEAT_A: &str = "phase-a-op";
         const SEAT_B: &str = "phase-b-op";
-        /// The role alias the session under test holds, and therefore the
-        /// second name its seats can be filed under.
-        const ROLE: &str = "ws-relay-one";
         /// The bearer every seeded session answers to.
         const TOKEN: &str = "token";
 
-        async fn seed_session(state: &AppState, role: &str) -> SessionId {
-            let role = OperatorRef::new(role).expect("test role literal is never empty");
+        async fn seed_session(state: &AppState) -> SessionId {
             let sid = SessionId::new();
             let live = LoginSession::new(
                 OperatorSessionRecord {
                     sid: sid.clone(),
                     token_digest: OperatorSessionRecord::digest_of(TOKEN),
-                    roles: vec![role.clone()],
                     capability_manifest: None,
                     joined_at_secs: 0,
                     desc: None,
@@ -2001,7 +1656,6 @@ mod tests {
                 .lock()
                 .await
                 .insert(sid.clone(), live);
-            state.roles_to_sid.lock().await.insert(role, sid.clone());
             sid
         }
 
@@ -2062,37 +1716,37 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
         }
 
-        /// **O8, both names.** A session answers to its sid *and* to every
-        /// role it holds, and a seat can be filed under either. Deleting
-        /// it releases both — and leaves a seat held by an unrelated
-        /// operator exactly where it was, because O8 is scoped to the
-        /// operator that was deleted, not to the Run.
+        /// **O8, every seat of every Run.** A launch seats its operator in
+        /// each declared lane, so one delete has several seats to release
+        /// across several Runs. It releases all of them — and leaves a seat
+        /// held by an unrelated operator exactly where it was, because O8
+        /// is scoped to the operator that was deleted, not to the Run.
         #[tokio::test]
-        async fn deleting_an_operator_releases_every_seat_it_held_under_either_name() {
+        async fn deleting_an_operator_releases_every_seat_it_held() {
             let state = test_state();
-            let sid = seed_session(&state, ROLE).await;
+            let sid = seed_session(&state).await;
 
-            let by_sid = seed_run(&state, RunStatus::Running).await;
-            seat(&state, &by_sid, SEAT_A, sid.as_str()).await;
+            let one_lane = seed_run(&state, RunStatus::Running).await;
+            seat(&state, &one_lane, SEAT_A, sid.as_str()).await;
 
-            let by_role = seed_run(&state, RunStatus::Running).await;
-            seat(&state, &by_role, SEAT_A, ROLE).await;
-            seat(&state, &by_role, SEAT_B, "S-somebody-else").await;
+            let two_lanes = seed_run(&state, RunStatus::Running).await;
+            seat(&state, &two_lanes, SEAT_A, sid.as_str()).await;
+            seat(&state, &two_lanes, SEAT_B, "S-somebody-else").await;
 
             delete_session(&state, &sid).await;
 
             assert_eq!(
-                holder_on_the_wire(&state, &by_sid, SEAT_A).await,
+                holder_on_the_wire(&state, &one_lane, SEAT_A).await,
                 None,
-                "the seat held under the sid must not survive the delete"
+                "the seat it held must not survive the delete"
             );
             assert_eq!(
-                holder_on_the_wire(&state, &by_role, SEAT_A).await,
+                holder_on_the_wire(&state, &two_lanes, SEAT_A).await,
                 None,
-                "nor the seat held under one of its role aliases"
+                "nor the one it held on another Run"
             );
             assert_eq!(
-                holder_on_the_wire(&state, &by_role, SEAT_B).await,
+                holder_on_the_wire(&state, &two_lanes, SEAT_B).await,
                 Some("S-somebody-else".to_string()),
                 "another operator's seat on the same Run is none of this delete's business"
             );
@@ -2106,7 +1760,7 @@ mod tests {
         #[tokio::test]
         async fn the_cascade_counts_as_an_assignment_event() {
             let state = test_state();
-            let sid = seed_session(&state, ROLE).await;
+            let sid = seed_session(&state).await;
             let run_id = seed_run(&state, RunStatus::Running).await;
             seat(&state, &run_id, SEAT_A, sid.as_str()).await;
             assert_eq!(
@@ -2131,7 +1785,7 @@ mod tests {
         #[tokio::test]
         async fn every_dispatchable_status_is_swept() {
             let state = test_state();
-            let sid = seed_session(&state, ROLE).await;
+            let sid = seed_session(&state).await;
 
             let mut runs = Vec::new();
             for status in [
@@ -2164,7 +1818,7 @@ mod tests {
         #[tokio::test]
         async fn a_finished_run_keeps_its_record_of_who_held_the_seat() {
             let state = test_state();
-            let sid = seed_session(&state, ROLE).await;
+            let sid = seed_session(&state).await;
             let done = seed_run(&state, RunStatus::Done).await;
             let failed = seed_run(&state, RunStatus::Failed).await;
             seat(&state, &done, SEAT_A, sid.as_str()).await;
@@ -2198,7 +1852,7 @@ mod tests {
             use mlua_swarm::store::trace::{kind as trace_kind, TraceQuery};
 
             let state = test_state();
-            let sid = seed_session(&state, ROLE).await;
+            let sid = seed_session(&state).await;
             let live = seed_run(&state, RunStatus::Running).await;
             let finished = seed_run(&state, RunStatus::Done).await;
             seat(&state, &live, SEAT_A, sid.as_str()).await;
@@ -2228,26 +1882,6 @@ mod tests {
                 "a Done run keeps its holder, so there is no release to record"
             );
         }
-
-        /// The by-role recovery route shares `teardown_operator_session`,
-        /// so it cascades identically — the seats do not depend on which
-        /// door the delete came through.
-        #[tokio::test]
-        async fn the_by_role_route_cascades_too() {
-            let state = test_state();
-            let sid = seed_session(&state, ROLE).await;
-            let run_id = seed_run(&state, RunStatus::Running).await;
-            seat(&state, &run_id, SEAT_A, sid.as_str()).await;
-
-            let response = operators_delete_by_role(
-                State(state.clone()),
-                Path(ROLE.to_string()),
-                axum::extract::Query(OperatorsDeleteByRoleQuery { force: true }),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::NO_CONTENT);
-            assert_eq!(holder_on_the_wire(&state, &run_id, SEAT_A).await, None);
-        }
     }
 
     // ── registration moved to mint: the invariant behind the deleted arm ──
@@ -2262,9 +1896,8 @@ mod tests {
     /// HTTP response is written — and a teardown can land in that gap. The
     /// arm then registered a session under a sid that had already left
     /// `operator_sessions`, which no route could undo: `DELETE
-    /// /v1/operators/:sid` answers `404` without the entry, and the
-    /// by-role route's torn branch clears the role map without
-    /// unregistering. The registration survived until process exit.
+    /// /v1/operators/:sid` answers `404` without the entry. The
+    /// registration survived until process exit.
     ///
     /// Driving that interleaving through a live server is not something a
     /// test can order (the gap is between hyper writing `101` and running
@@ -2274,17 +1907,13 @@ mod tests {
     /// therefore always finds it, and the only thing it can do is
     /// `replace_tx`.
     mod registration_is_owned_by_mint {
-        use super::by_role_in_flight::{body_json, test_state};
+        use super::support::{body_json, test_state};
         use super::*;
-
-        /// convention-token-ok: mlua-swarm public operator role literal.
-        const ROLE: &str = "main-ai";
 
         async fn mint(state: &AppState) -> SessionId {
             let response = operators_create(
                 State(state.clone()),
                 Json(OperatorsCreateReq {
-                    roles: vec![ROLE.to_string()],
                     capability_manifest: None,
                     desc: None,
                 }),
@@ -2310,9 +1939,11 @@ mod tests {
                 "mint must register the sid (this is what makes it usable as an \
                  `operator_sid` pin before any WS connect): {registered:?}"
             );
-            assert!(
-                registered.contains(&ROLE.to_string()),
-                "mint must register the role alias too: {registered:?}"
+            assert_eq!(
+                registered.len(),
+                1,
+                "and nothing else: a session is registered under its sid alone, so a \
+                 second session can never collide with this one's key: {registered:?}"
             );
 
             assert!(
@@ -2350,8 +1981,8 @@ mod tests {
             );
             let registered = state.engine.list_operator_ids().await;
             assert!(
-                !registered.contains(&sid.to_string()) && !registered.contains(&ROLE.to_string()),
-                "teardown must unregister both the sid and its role: {registered:?}"
+                !registered.contains(&sid.to_string()),
+                "teardown must unregister the sid: {registered:?}"
             );
 
             assert!(
@@ -2374,7 +2005,7 @@ mod tests {
         }
 
         /// A minted session must be reachable on both operator-side
-        /// registries, under both of its `OperatorId`s.
+        /// registries, under its `OperatorId`.
         ///
         /// This is what keeps the launch-time guard honest. `POST /v1/tasks`
         /// answers "is this `operator_sid` a live session?" out of
@@ -2392,16 +2023,15 @@ mod tests {
 
             let guard_side = state.engine.list_operator_ids().await;
             let dispatch_side = state.operator_adapters.ids().await;
-            for id in [sid.to_string(), ROLE.to_string()] {
-                assert!(
-                    guard_side.contains(&id),
-                    "the launch guard must know '{id}': {guard_side:?}"
-                );
-                assert!(
-                    dispatch_side.contains(&id),
-                    "a holder recorded as '{id}' must be deliverable to: {dispatch_side:?}"
-                );
-            }
+            let id = sid.to_string();
+            assert!(
+                guard_side.contains(&id),
+                "the launch guard must know '{id}': {guard_side:?}"
+            );
+            assert!(
+                dispatch_side.contains(&id),
+                "a holder recorded as '{id}' must be deliverable to: {dispatch_side:?}"
+            );
 
             let live = state
                 .operator_sessions
@@ -2445,7 +2075,6 @@ mod tests {
                 .expect("a repeat teardown must still report success");
 
             assert!(!state.operator_sessions.lock().await.contains_key(&sid));
-            assert!(state.roles_to_sid.lock().await.get(ROLE).is_none());
             assert!(!state
                 .engine
                 .list_operator_ids()
@@ -2454,9 +2083,9 @@ mod tests {
         }
 
         /// A mint whose persist fails must leave nothing behind — no
-        /// registration, no entry, no role claim. This is why the
-        /// registration sits *after* `store.put` rather than before it
-        /// with a compensating unregister.
+        /// registration and no entry. This is why the registration sits
+        /// *after* `store.put` rather than before it with a compensating
+        /// unregister.
         #[tokio::test]
         async fn a_mint_whose_persist_fails_registers_nothing() {
             let mut state = test_state();
@@ -2465,7 +2094,6 @@ mod tests {
             let response = operators_create(
                 State(state.clone()),
                 Json(OperatorsCreateReq {
-                    roles: vec![ROLE.to_string()],
                     capability_manifest: None,
                     desc: None,
                 }),
@@ -2483,10 +2111,28 @@ mod tests {
                  would ever be able to unregister it"
             );
             assert!(state.operator_sessions.lock().await.is_empty());
-            assert!(
-                state.roles_to_sid.lock().await.get(ROLE).is_none(),
-                "a failed mint must release the role names it reserved"
-            );
+        }
+
+        /// The `409` that is gone: two sessions minted back to back both
+        /// come up live, registered under their own sids. This used to be
+        /// the collision case (`roles conflict`), and it is now simply two
+        /// drivers on one server — the ordinary shape when two tasks run in
+        /// parallel.
+        #[tokio::test]
+        async fn two_joins_in_a_row_both_succeed_and_both_stay_reachable() {
+            let state = test_state();
+            let first = mint(&state).await;
+            let second = mint(&state).await;
+            assert_ne!(first, second, "O4: each join mints a new OperatorId");
+
+            let registered = state.engine.list_operator_ids().await;
+            for sid in [&first, &second] {
+                assert!(
+                    registered.contains(&sid.to_string()),
+                    "the second join must not have displaced the first: {registered:?}"
+                );
+            }
+            assert_eq!(state.operator_sessions.lock().await.len(), 2);
         }
 
         /// Store whose `put` always fails; `delete` / `list` are honest.
@@ -2519,96 +2165,43 @@ mod tests {
 
     // ── the one rule an OperatorRef carries: not empty ───────────────────
 
-    /// `roles: [""]` names no Operator: nothing can hold the role `""`, so a
-    /// session claiming it could never be routed to and every later failure
-    /// would point somewhere other than the caller that sent it. The mint
-    /// rejects it up front with `400`.
+    /// A join that carries nothing at all still mints.
     ///
-    /// The neighbouring case — `roles: []` — is a different thing entirely
-    /// ("claim no alias") and has to keep working; it is asserted here
-    /// alongside so the two can never be conflated by a later change.
-    mod empty_role_is_rejected {
-        use super::by_role_in_flight::{body_json, test_state};
+    /// This module used to hold the `roles: [""]` rejection — an empty
+    /// alias named no Operator, so a session claiming it could never be
+    /// routed to, and the mint answered `400` before reserving anything.
+    /// With no aliases there is no such request to refuse, and what is
+    /// worth pinning instead is the other half of that old pair: the
+    /// emptiest possible join is a valid one, and the route has no `400`
+    /// arm left for anything to fall into.
+    mod a_join_carries_nothing {
+        use super::support::{body_json, test_state};
         use super::*;
 
-        async fn mint_with_roles(state: &AppState, roles: Vec<String>) -> Response {
-            operators_create(
-                State(state.clone()),
-                Json(OperatorsCreateReq {
-                    roles,
-                    capability_manifest: None,
-                    desc: None,
-                }),
-            )
-            .await
-        }
-
         #[tokio::test]
-        async fn an_empty_role_is_rejected_with_400_and_mints_nothing() {
-            let state = test_state();
-
-            let response = mint_with_roles(&state, vec![String::new()]).await;
-            assert_eq!(
-                response.status(),
-                StatusCode::BAD_REQUEST,
-                "an empty role alias must be refused at the boundary"
-            );
-            let body = body_json(response).await;
-            assert!(
-                body["error"].as_str().unwrap_or_default().contains("role"),
-                "the 400 must say what was wrong with the request: {body}"
-            );
-
-            // A refused mint is a mint that never happened — the same
-            // all-or-nothing contract the persist-failure path holds to.
-            assert!(
-                state.engine.list_operator_ids().await.is_empty(),
-                "a refused mint must not register anything"
-            );
-            assert!(state.operator_sessions.lock().await.is_empty());
-            assert!(state.roles_to_sid.lock().await.is_empty());
-            assert!(
-                state
-                    .operator_session_store
-                    .list()
-                    .await
-                    .expect("list the store")
-                    .is_empty(),
-                "a refused mint must not persist a row"
-            );
-        }
-
-        /// One empty element poisons the whole request rather than being
-        /// silently dropped: the caller asked for a role it cannot have.
-        #[tokio::test]
-        async fn an_empty_role_alongside_a_valid_one_still_rejects_the_whole_mint() {
+        async fn an_empty_body_mints_a_session() {
             let state = test_state();
             let response =
-                mint_with_roles(&state, vec!["main-ai".to_string(), String::new()]).await;
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert!(
-                state.roles_to_sid.lock().await.is_empty(),
-                "the valid role must not be reserved by a request that was refused"
-            );
-        }
-
-        /// The regression guard for the distinction above: claiming *no*
-        /// alias is not the same as claiming an empty one, and stays a
-        /// successful mint.
-        #[tokio::test]
-        async fn claiming_no_roles_at_all_still_mints() {
-            let state = test_state();
-            let response = mint_with_roles(&state, Vec::new()).await;
+                operators_create(State(state.clone()), Json(OperatorsCreateReq::default())).await;
             assert_eq!(
                 response.status(),
                 StatusCode::OK,
-                "an empty `roles` array claims no alias and must keep working"
+                "join must never refuse — an incoming Assignee has to be able to get in (D3)"
             );
+
             let body = body_json(response).await;
-            assert_eq!(
-                body["roles"],
-                serde_json::json!([]),
-                "the response still echoes an empty array: {body}"
+            let sid = body["sid"].as_str().expect("the mint answers with a sid");
+            assert!(
+                body.get("roles").is_none(),
+                "the response carries no roles field any more: {body}"
+            );
+            assert!(
+                state
+                    .engine
+                    .list_operator_ids()
+                    .await
+                    .contains(&sid.to_string()),
+                "and the sid it answered with is registered"
             );
         }
     }
@@ -2633,7 +2226,7 @@ mod tests {
     /// What is deliberately *not* re-done between the two dispatches: the
     /// compile, the registration, the routers. Only `Run.current` moves.
     mod the_spine {
-        use super::by_role_in_flight::{body_json, test_state};
+        use super::support::{body_json, test_state};
         use super::*;
         use crate::operator_ws::router::WsOperatorWiring;
         use mlua_swarm::blueprint::Blueprint;
@@ -2697,13 +2290,12 @@ mod tests {
             inbox: UnboundedReceiver<ServerMsg>,
         }
 
-        async fn mint_client(state: &AppState, role: &str, name: &'static str) -> Client {
+        async fn mint_client(state: &AppState, name: &'static str) -> Client {
             let response = operators_create(
                 State(state.clone()),
                 Json(OperatorsCreateReq {
-                    roles: vec![role.to_string()],
                     capability_manifest: None,
-                    desc: None,
+                    desc: Some(format!("spine test client: {name}")),
                 }),
             )
             .await;
@@ -2900,8 +2492,8 @@ mod tests {
             let factory = wire_operator_axis(&mut state);
             compile_through(&factory);
 
-            let mut first = mint_client(&state, "ws-relay-one", "first").await;
-            let mut second = mint_client(&state, "ws-relay-two", "second").await;
+            let mut first = mint_client(&state, "first").await;
+            let mut second = mint_client(&state, "second").await;
             let (run_id, _task_id) = seeded_run(&state).await;
 
             // The one `Arc<dyn Operator>` under test: the same lookup
@@ -2975,8 +2567,8 @@ mod tests {
             let factory = wire_operator_axis(&mut state);
             compile_through(&factory);
 
-            let mut first = mint_client(&state, "ws-relay-one", "first").await;
-            let mut second = mint_client(&state, "ws-relay-two", "second").await;
+            let mut first = mint_client(&state, "first").await;
+            let mut second = mint_client(&state, "second").await;
             let (run_id, _task_id) = seeded_run(&state).await;
 
             let router_a = factory
@@ -3039,141 +2631,33 @@ mod tests {
             );
         }
 
-        /// A seat whose holder is a role alias routes like one held by a
-        /// sid: both are `OperatorId`s, and the mint registers the session
-        /// as an adapter under both.
-        #[tokio::test]
-        async fn a_seat_held_by_a_role_alias_routes_to_that_sessions_socket() {
-            let mut state = test_state();
-            let factory = wire_operator_axis(&mut state);
-            let mut first = mint_client(&state, "ws-relay-one", "first").await;
-            let mut second = mint_client(&state, "ws-relay-two", "second").await;
-            let (run_id, _task_id) = seeded_run(&state).await;
-
-            state
-                .run_store
-                .acquire_assignee(&run_id, SEAT_A, "ws-relay-two", "assigned by role")
-                .await
-                .expect("assign by role alias");
-
-            assert_eq!(
-                dispatch_and_name_the_receiver(
-                    factory
-                        .resolve_operator(SEAT_A, AGENT_A)
-                        .expect("seat A resolves"),
-                    ctx_for(&run_id, AGENT_A),
-                    &mut first,
-                    &mut second,
-                )
-                .await,
-                "second",
-                "a role-alias holder must reach the session that holds the role"
-            );
-        }
-
-        /// **The unpinned launch reaches its operator.** Every bundled
-        /// sample launches with no `operator_sid`, and this is the path that
-        /// carries it.
+        /// **The launch reaches its operator, in every lane.** A pinned
+        /// launch seats the pinning session in the seat it named *and* in
+        /// every other declared seat, so a multi-seat Blueprint comes up
+        /// fully dispatchable rather than with one lane seated and the rest
+        /// Vacant.
         ///
-        /// The regression this locks in: routing moved from the factory's
-        /// role lookup (`lookup_key = pin.unwrap_or(operator_ref)`) to
-        /// `Run.current`, and for a moment the only writer of `current` was
-        /// a launch that carried a pin. An unpinned launch then compiled and
-        /// died on its first dispatch, naming a `Vacant` seat. The launch
-        /// now seats every declared seat whose role has a holder
-        /// (`tasks::seat_declared_operators`), so the same driver is reached
-        /// — through `current`, where a handover can still move it.
+        /// The regression this locks in has moved once already. Routing
+        /// went from the factory's role lookup
+        /// (`lookup_key = pin.unwrap_or(operator_ref)`) to `Run.current`,
+        /// and the only writer of `current` was a launch carrying a pin —
+        /// so a launch without one compiled and died on its first dispatch
+        /// naming a `Vacant` seat. That was patched by seating each
+        /// declared seat from whoever held the *role* of the same name;
+        /// with roles gone, it is the launching operator that takes them
+        /// (model §5), which is the same guarantee without the name lookup.
         ///
-        /// Both lanes are asserted: a multi-seat Blueprint comes up fully
-        /// dispatchable, not with one lane seated and the rest Vacant.
+        /// The seat the pin named keeps the caller's own `desc`; the rest
+        /// carry the server-authored one, so `GET /v1/runs/:id` can tell
+        /// which lane was actually asked for (**A9**).
         #[tokio::test]
-        async fn an_unpinned_launch_seats_every_declared_seat_and_reaches_it() {
+        async fn a_launch_seats_its_operator_in_every_declared_seat_and_reaches_it() {
             let mut state = test_state();
             let factory = wire_operator_axis(&mut state);
             compile_through(&factory);
 
-            // Two drivers, each claiming the role one seat is named after —
-            // what `mse_operator_join(roles=["phase-a-op"])` produces.
-            let mut a = mint_client(&state, SEAT_A, "lane-a-driver").await;
-            let mut b = mint_client(&state, SEAT_B, "lane-b-driver").await;
-            let (run_id, task_id) = seeded_run(&state).await;
-
-            // The launch. No `operator_sid`, so no pinned seat to exclude.
-            crate::tasks::seat_declared_operators(
-                &state,
-                &run_id,
-                &task_id,
-                &two_seat_blueprint().operators,
-                None,
-            )
-            .await
-            .expect("seating declared seats whose roles have holders");
-
-            let record = state.run_store.get(&run_id).await.expect("run get");
-            for seat in [SEAT_A, SEAT_B] {
-                let seated = record.current.get(seat).unwrap_or_else(|| {
-                    panic!("seat '{seat}' must be seated by an unpinned launch")
-                });
-                assert_eq!(
-                    seated.op, seat,
-                    "the holder is the role alias the seat is named after"
-                );
-                assert!(
-                    seated.desc.starts_with("auto-seated at launch"),
-                    "A9: the server-authored desc must say the seat was not chosen by a \
-                     caller, so `GET /v1/runs/:id` can tell it from a pin: {}",
-                    seated.desc
-                );
-            }
-            assert_eq!(
-                state.run_store.get(&run_id).await.expect("run get").current[SEAT_A].gen,
-                1,
-                "A4: the first seating of the launch is generation 1"
-            );
-
-            // And it dispatches — measured at the socket, both lanes.
-            assert_eq!(
-                dispatch_and_name_the_receiver(
-                    factory
-                        .resolve_operator(SEAT_A, AGENT_A)
-                        .expect("seat A resolves"),
-                    ctx_for(&run_id, AGENT_A),
-                    &mut a,
-                    &mut b,
-                )
-                .await,
-                "lane-a-driver",
-                "an unpinned launch must still reach the driver holding the seat's role"
-            );
-            assert_eq!(
-                dispatch_and_name_the_receiver(
-                    factory
-                        .resolve_operator(SEAT_B, AGENT_B)
-                        .expect("seat B resolves"),
-                    ctx_for(&run_id, AGENT_B),
-                    &mut a,
-                    &mut b,
-                )
-                .await,
-                "lane-b-driver",
-                "the second lane is seated too — a multi-seat Blueprint has no permanently \
-                 Vacant lane"
-            );
-        }
-
-        /// The pin outranks the role holder for the seat it names, and a
-        /// seat nobody holds stays `Vacant` rather than being filled with a
-        /// guess.
-        #[tokio::test]
-        async fn a_pin_wins_its_own_seat_and_an_unheld_seat_stays_vacant() {
-            let mut state = test_state();
-            let factory = wire_operator_axis(&mut state);
-            compile_through(&factory);
-
-            // `pinned` claims no seat's role; `role_holder` claims seat A's.
-            // Nobody claims seat B's.
-            let mut pinned = mint_client(&state, "ws-relay-one", "pinned").await;
-            let mut role_holder = mint_client(&state, SEAT_A, "role-holder").await;
+            let mut launcher = mint_client(&state, "launcher").await;
+            let mut bystander = mint_client(&state, "bystander").await;
             let (run_id, task_id) = seeded_run(&state).await;
 
             // A launch carrying `operator_sid` + `operator_desc`, in the
@@ -3184,7 +2668,7 @@ mod tests {
                 &run_id,
                 &task_id,
                 SEAT_A,
-                pinned.sid.as_str(),
+                launcher.sid.as_str(),
                 "pinned by the launch request",
             )
             .await
@@ -3194,67 +2678,122 @@ mod tests {
                 &run_id,
                 &task_id,
                 &two_seat_blueprint().operators,
-                Some(SEAT_A),
+                Some((SEAT_A, launcher.sid.as_str())),
             )
             .await
             .expect("seating the seats the pin did not name");
 
             let record = state.run_store.get(&run_id).await.expect("run get");
-            assert_eq!(
-                record.current[SEAT_A].op,
-                pinned.sid.to_string(),
-                "the pin must not be displaced by the holder of the seat's role"
-            );
+            for seat in [SEAT_A, SEAT_B] {
+                let seated = record
+                    .current
+                    .get(seat)
+                    .unwrap_or_else(|| panic!("seat '{seat}' must be seated by the launch"));
+                assert_eq!(
+                    seated.op,
+                    launcher.sid.to_string(),
+                    "every lane goes to the launching operator, and `op` is its sid"
+                );
+            }
             assert_eq!(
                 record.current[SEAT_A].desc, "pinned by the launch request",
-                "the caller's own desc survives — it is not overwritten by the seating literal"
+                "the caller's own desc survives on the seat it named"
             );
             assert!(
-                !record.current.contains_key(SEAT_B),
-                "seat B's role has no holder, so it stays Vacant rather than being guessed at"
+                record.current[SEAT_B]
+                    .desc
+                    .starts_with("auto-seated at launch"),
+                "A9: the lane the caller did not name says the server chose it: {}",
+                record.current[SEAT_B].desc
             );
-
             assert_eq!(
-                dispatch_and_name_the_receiver(
-                    factory
-                        .resolve_operator(SEAT_A, AGENT_A)
-                        .expect("seat A resolves"),
-                    ctx_for(&run_id, AGENT_A),
-                    &mut pinned,
-                    &mut role_holder,
-                )
-                .await,
-                "pinned",
-                "the pinned session receives the dispatch, not the role's holder"
+                record.current[SEAT_A].gen, 1,
+                "A4: the launch pin is the Run's first assignment event"
             );
 
-            // The Vacant lane fails loudly instead of borrowing seat A's
-            // holder, and the message says where the seat would have come
-            // from.
+            // And both lanes dispatch — measured at the socket.
+            for (seat, agent) in [(SEAT_A, AGENT_A), (SEAT_B, AGENT_B)] {
+                assert_eq!(
+                    dispatch_and_name_the_receiver(
+                        factory
+                            .resolve_operator(seat, agent)
+                            .expect("the seat resolves"),
+                        ctx_for(&run_id, agent),
+                        &mut launcher,
+                        &mut bystander,
+                    )
+                    .await,
+                    "launcher",
+                    "lane '{seat}' must reach the operator that launched the Run"
+                );
+            }
+            assert!(
+                bystander.inbox.try_recv().is_err(),
+                "a session that launched nothing receives nothing"
+            );
+        }
+
+        /// **An unpinned launch seats nobody, and the first dispatch says
+        /// so.** Nothing in a pin-less `POST /v1/tasks` names an operator,
+        /// so filling a seat would mean picking one — and the pick would be
+        /// invisible in the Run, right until a second driver made it wrong.
+        /// The seat stays `Vacant` and fails loudly instead.
+        #[tokio::test]
+        async fn an_unpinned_launch_leaves_every_seat_vacant_and_fails_loudly() {
+            let mut state = test_state();
+            let factory = wire_operator_axis(&mut state);
+            compile_through(&factory);
+
+            // A live, connected session exists — so the only thing keeping
+            // it out of the seat is the refusal to guess.
+            let mut only_driver = mint_client(&state, "the only driver here").await;
+            let (run_id, task_id) = seeded_run(&state).await;
+
+            crate::tasks::seat_declared_operators(
+                &state,
+                &run_id,
+                &task_id,
+                &two_seat_blueprint().operators,
+                None,
+            )
+            .await
+            .expect("an unpinned launch has nothing to seat, which is not a failure");
+
+            let record = state.run_store.get(&run_id).await.expect("run get");
+            assert!(
+                record.current.is_empty(),
+                "no lane may be filled from a launch that named no operator: {:?}",
+                record.current
+            );
+            assert_eq!(
+                record.next_generation, 0,
+                "A4: nothing was assigned, so no assignment event happened"
+            );
+
             let err = factory
-                .resolve_operator(SEAT_B, AGENT_B)
-                .expect("seat B resolves")
+                .resolve_operator(SEAT_A, AGENT_A)
+                .expect("seat A resolves")
                 .execute(
-                    &ctx_for(&run_id, AGENT_B),
+                    &ctx_for(&run_id, AGENT_A),
                     None,
                     serde_json::json!("go"),
                     Some(worker_binding()),
-                    cap_token(AGENT_B),
+                    cap_token(AGENT_A),
                 )
                 .await
                 .expect_err("a Vacant seat has no holder to dispatch to");
             let msg = err.to_string();
             assert!(
-                msg.contains(SEAT_B) && msg.contains("Vacant"),
+                msg.contains(SEAT_A) && msg.contains("Vacant"),
                 "the failure must name the Vacant seat: {msg}"
             );
             assert!(
-                msg.contains("registered under its own name") && msg.contains("operator_sid"),
-                "and say both ways the seat could have been filled: {msg}"
+                msg.contains("operator_sid"),
+                "and say how the seat could have been filled: {msg}"
             );
             assert!(
-                role_holder.inbox.try_recv().is_err(),
-                "no other session may absorb the Vacant lane's dispatch"
+                only_driver.inbox.try_recv().is_err(),
+                "the one live session must not absorb a dispatch nobody addressed to it"
             );
         }
     }
@@ -3264,7 +2803,7 @@ mod tests {
     /// The two devices §4.5 leaves standing once **A8** removed
     /// exclusivity, from the read end.
     mod kimei {
-        use super::by_role_in_flight::{body_json, test_state};
+        use super::support::{body_json, test_state};
         use super::*;
         use mlua_swarm::blueprint::Blueprint;
         use mlua_swarm::store::run::{RunRecord, RunStatus};
@@ -3274,15 +2813,10 @@ mod tests {
         pub(super) const SEAT_A: &str = "phase-a-op";
         pub(super) const SEAT_B: &str = "phase-b-op";
 
-        pub(super) async fn mint(
-            state: &AppState,
-            role: &str,
-            desc: Option<&str>,
-        ) -> (SessionId, String) {
+        pub(super) async fn mint(state: &AppState, desc: Option<&str>) -> (SessionId, String) {
             let response = operators_create(
                 State(state.clone()),
                 Json(OperatorsCreateReq {
-                    roles: vec![role.to_string()],
                     capability_manifest: None,
                     desc: desc.map(str::to_string),
                 }),
@@ -3369,17 +2903,22 @@ mod tests {
         }
 
         /// **D2**: what the server could actually read at the moment of the
-        /// `Assign` lands on the assigned session, addressed by role alias
-        /// as well as by sid.
+        /// `Assign` lands on the assigned session.
         #[tokio::test]
         async fn an_assign_writes_what_the_task_row_says_onto_the_holders_kimei() {
             let state = test_state();
-            let (sid, _token) = mint(&state, SEAT_A, Some("seating lane A")).await;
+            let (sid, _token) = mint(&state, Some("seating lane A")).await;
             let (run_id, task_id) = seed_task_and_run(&state).await;
 
-            // Addressed by the role alias, which is what an auto-seat uses.
-            crate::handover::record_observed_assignment(&state, &run_id, &task_id, SEAT_A, SEAT_A)
-                .await;
+            // Addressed by the sid, which is what every `Assign` records.
+            crate::handover::record_observed_assignment(
+                &state,
+                &run_id,
+                &task_id,
+                SEAT_A,
+                sid.as_str(),
+            )
+            .await;
 
             let live = state
                 .operator_sessions
@@ -3447,13 +2986,12 @@ mod tests {
         /// counter) makes a coin flip. The assertion below is about
         /// activity order; it must not be decided by which random sid came
         /// out smaller.
-        async fn seed_idle_session(state: &AppState, role: &str, desc: &str) -> SessionId {
+        async fn seed_idle_session(state: &AppState, desc: &str) -> SessionId {
             let sid = SessionId::new();
             let live = LoginSession::new(
                 OperatorSessionRecord {
                     sid: sid.clone(),
                     token_digest: OperatorSessionRecord::digest_of("idle-token"),
-                    roles: vec![OperatorRef::new(role).expect("test role literal is never empty")],
                     capability_manifest: None,
                     joined_at_secs: 0,
                     desc: Some(desc.to_string()),
@@ -3474,11 +3012,17 @@ mod tests {
         #[tokio::test]
         async fn the_list_is_ordered_by_last_activity_and_capped() {
             let state = test_state();
-            let idle_sid = seed_idle_session(&state, "idle-op", "has done nothing yet").await;
-            let (busy_sid, token) = mint(&state, SEAT_A, Some("seating lane A")).await;
+            let idle_sid = seed_idle_session(&state, "has done nothing yet").await;
+            let (busy_sid, token) = mint(&state, Some("seating lane A")).await;
             let (run_id, task_id) = seed_task_and_run(&state).await;
-            crate::handover::record_observed_assignment(&state, &run_id, &task_id, SEAT_A, SEAT_A)
-                .await;
+            crate::handover::record_observed_assignment(
+                &state,
+                &run_id,
+                &task_id,
+                SEAT_A,
+                busy_sid.as_str(),
+            )
+            .await;
 
             let body = body_json(
                 operators_list(
@@ -3534,7 +3078,7 @@ mod tests {
         #[tokio::test]
         async fn the_list_refuses_without_a_live_session_bearer() {
             let state = test_state();
-            let (_sid, _token) = mint(&state, SEAT_A, None).await;
+            let (_sid, _token) = mint(&state, None).await;
 
             let anonymous = operators_list(
                 State(state.clone()),
@@ -3558,11 +3102,11 @@ mod tests {
         #[tokio::test]
         async fn the_holder_list_reports_a_declared_but_unheld_seat_as_vacant() {
             let state = test_state();
-            let (_sid, token) = mint(&state, SEAT_A, Some("seating lane A")).await;
+            let (sid, token) = mint(&state, Some("seating lane A")).await;
             let (run_id, _task_id) = seed_task_and_run(&state).await;
             state
                 .run_store
-                .acquire_assignee(&run_id, SEAT_A, SEAT_A, "took lane A")
+                .acquire_assignee(&run_id, SEAT_A, sid.as_str(), "took lane A")
                 .await
                 .expect("seat lane A");
 
@@ -3582,7 +3126,7 @@ mod tests {
             assert_eq!(seats.len(), 2, "both declared seats are listed");
             assert_eq!(seats[0]["slot"], SEAT_A);
             assert_eq!(seats[0]["vacant"], false);
-            assert_eq!(seats[0]["holder"]["op"], SEAT_A);
+            assert_eq!(seats[0]["holder"]["op"], sid.to_string());
             assert_eq!(seats[0]["holder"]["gen"], 1);
             assert_eq!(seats[1]["slot"], SEAT_B);
             assert_eq!(seats[1]["vacant"], true);
@@ -3613,7 +3157,7 @@ mod tests {
         #[tokio::test]
         async fn a_run_holding_nothing_still_names_its_seats() {
             let state = test_state();
-            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (_sid, token) = mint(&state, None).await;
             let (run_id, _task_id) = seed_task_and_run(&state).await;
 
             let body = body_json(
@@ -3665,8 +3209,8 @@ mod tests {
     /// 関わらず"*, and what **W1** / **W2** / **W3** / **R5** say must not
     /// appear alongside it.
     mod w5_four_axes {
-        use super::by_role_in_flight::{body_json, test_state};
         use super::kimei::{mint, seed_task_and_run, SEAT_A, SEAT_B};
+        use super::support::{body_json, test_state};
         use super::*;
         use crate::operator_ws::router::{Liveness, OperatorAdapter, PendingRequest};
         use crate::operator_ws::PendingKind;
@@ -3733,18 +3277,14 @@ mod tests {
                 .await;
         }
 
-        /// Register **one** adapter under several `OperatorId`s, owing
-        /// `requests` — the shape `register_operator_session` produces for a
-        /// session that claimed more than one role, and the shape a Run
-        /// reaches when two of its seats are auto-seated from it.
-        async fn one_adapter_seats(state: &AppState, ops: &[&str], requests: Vec<PendingRequest>) {
-            let adapter = Arc::new(OwesReplies { requests });
-            for op in ops {
-                state
-                    .operator_adapters
-                    .register(*op, adapter.clone() as Arc<dyn OperatorAdapter>)
-                    .await;
-            }
+        /// Register one adapter owing `requests` — the shape a Run reaches
+        /// when a launch seats the same operator in several of its lanes,
+        /// which is every multi-seat launch.
+        async fn one_adapter_seats(state: &AppState, op: &str, requests: Vec<PendingRequest>) {
+            state
+                .operator_adapters
+                .register(op, Arc::new(OwesReplies { requests }))
+                .await;
         }
 
         async fn handover(state: &AppState, run_id: &RunId, token: &str) -> serde_json::Value {
@@ -3769,16 +3309,16 @@ mod tests {
         #[tokio::test]
         async fn the_unanswered_list_joins_the_holder_onto_each_waiting_request() {
             let state = test_state();
-            let (_sid, token) = mint(&state, SEAT_A, Some("seating lane A")).await;
+            let (sid, token) = mint(&state, Some("seating lane A")).await;
             let (run_id, _task_id) = seed_task_and_run(&state).await;
             state
                 .run_store
-                .acquire_assignee(&run_id, SEAT_A, SEAT_A, "took lane A")
+                .acquire_assignee(&run_id, SEAT_A, sid.as_str(), "took lane A")
                 .await
                 .expect("seat lane A");
             seat_owes(
                 &state,
-                SEAT_A,
+                sid.as_str(),
                 vec![
                     waiting(PendingKind::Spawn, "S-1-spawn-aaa", STEP_ONE, 1),
                     waiting(PendingKind::HookBefore, "S-1-hb-bbb", STEP_TWO, 2),
@@ -3792,6 +3332,7 @@ mod tests {
                 &StepId::parse(STEP_ONE).expect("step id"),
                 1,
                 SEAT_A,
+                1,
             );
 
             let body = handover(&state, &run_id, &token).await;
@@ -3800,7 +3341,7 @@ mod tests {
             let seats = body["seats"].as_array().expect("seats");
             assert_eq!(seats.len(), 2);
             assert_eq!(seats[0]["slot"], SEAT_A);
-            assert_eq!(seats[0]["holder"]["op"], SEAT_A);
+            assert_eq!(seats[0]["holder"]["op"], sid.to_string());
             assert_eq!(seats[1]["slot"], SEAT_B);
             assert_eq!(seats[1]["vacant"], true);
 
@@ -3814,7 +3355,8 @@ mod tests {
             assert_eq!(waiting[0]["attempt"], 1);
             assert_eq!(waiting[0]["slot"], SEAT_A);
             assert_eq!(
-                waiting[0]["op"], SEAT_A,
+                waiting[0]["op"],
+                sid.to_string(),
                 "the OperatorId is joined from the seat, not read from below the SAP"
             );
             assert_eq!(
@@ -3851,28 +3393,28 @@ mod tests {
             assert!(body["unread_seats"].as_array().expect("unread").is_empty());
         }
 
-        /// **Each waiting request appears once.** Two seats of one Run can
-        /// resolve to the same adapter — a session is registered under its
-        /// sid *and* under each of its roles, and a launch auto-seats each
-        /// declared slot from the adapter answering to that slot's name.
-        /// Asking per seat asked that one object twice and stamped the two
-        /// copies with two different `slot` / `op` / `generation` triples,
-        /// at most one of which was true.
+        /// **Each waiting request appears once.** Two seats of one Run
+        /// resolve to the same adapter whenever one operator holds both —
+        /// which every multi-seat launch produces, since the launching
+        /// operator takes each declared lane. Asking per seat asked that
+        /// one object twice and stamped the two copies with two different
+        /// `slot` / `op` / `generation` triples, at most one of which was
+        /// true.
         #[tokio::test]
         async fn a_request_owed_through_two_seats_is_listed_once() {
             let state = test_state();
-            let (_sid, token) = mint(&state, SEAT_A, Some("driving both lanes")).await;
+            let (sid, token) = mint(&state, Some("driving both lanes")).await;
             let (run_id, _task_id) = seed_task_and_run(&state).await;
             for seat in [SEAT_A, SEAT_B] {
                 state
                     .run_store
-                    .acquire_assignee(&run_id, seat, seat, "one driver, both lanes")
+                    .acquire_assignee(&run_id, seat, sid.as_str(), "one driver, both lanes")
                     .await
                     .expect("seat");
             }
             one_adapter_seats(
                 &state,
-                &[SEAT_A, SEAT_B],
+                sid.as_str(),
                 vec![
                     waiting(PendingKind::Spawn, "S-1-spawn-aaa", STEP_ONE, 1),
                     waiting(PendingKind::Spawn, "S-1-spawn-bbb", STEP_TWO, 1),
@@ -3884,12 +3426,14 @@ mod tests {
                 &StepId::parse(STEP_ONE).expect("step id"),
                 1,
                 SEAT_A,
+                1,
             );
             let _on_b = state.seat_ledger.record(
                 &run_id,
                 &StepId::parse(STEP_TWO).expect("step id"),
                 1,
                 SEAT_B,
+                2,
             );
 
             let body = handover(&state, &run_id, &token).await;
@@ -3925,16 +3469,16 @@ mod tests {
         #[tokio::test]
         async fn an_unanswered_entry_carries_nothing_that_grades_the_wait() {
             let state = test_state();
-            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (sid, token) = mint(&state, None).await;
             let (run_id, _task_id) = seed_task_and_run(&state).await;
             state
                 .run_store
-                .acquire_assignee(&run_id, SEAT_A, SEAT_A, "took lane A")
+                .acquire_assignee(&run_id, SEAT_A, sid.as_str(), "took lane A")
                 .await
                 .expect("seat lane A");
             seat_owes(
                 &state,
-                SEAT_A,
+                sid.as_str(),
                 vec![waiting(PendingKind::Spawn, "S-1-spawn-aaa", STEP_ONE, 1)],
             )
             .await;
@@ -3968,16 +3512,16 @@ mod tests {
         #[tokio::test]
         async fn an_attempt_that_already_has_a_final_says_so_without_the_value() {
             let state = test_state();
-            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (sid, token) = mint(&state, None).await;
             let (run_id, _task_id) = seed_task_and_run(&state).await;
             state
                 .run_store
-                .acquire_assignee(&run_id, SEAT_A, SEAT_A, "took lane A")
+                .acquire_assignee(&run_id, SEAT_A, sid.as_str(), "took lane A")
                 .await
                 .expect("seat lane A");
             seat_owes(
                 &state,
-                SEAT_A,
+                sid.as_str(),
                 vec![waiting(PendingKind::Spawn, "S-1-spawn-aaa", STEP_ONE, 1)],
             )
             .await;
@@ -4012,7 +3556,7 @@ mod tests {
         #[tokio::test]
         async fn a_held_seat_with_no_adapter_is_reported_rather_than_skipped() {
             let state = test_state();
-            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (_sid, token) = mint(&state, None).await;
             let (run_id, _task_id) = seed_task_and_run(&state).await;
             state
                 .run_store
@@ -4045,7 +3589,7 @@ mod tests {
         #[tokio::test]
         async fn a_vacant_seat_is_not_reported_as_unread() {
             let state = test_state();
-            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (_sid, token) = mint(&state, None).await;
             let (run_id, _task_id) = seed_task_and_run(&state).await;
 
             let body = handover(&state, &run_id, &token).await;
@@ -4093,7 +3637,7 @@ mod tests {
         #[tokio::test]
         async fn material_for_a_step_the_engine_does_not_know_is_a_miss() {
             let state = test_state();
-            let (_sid, token) = mint(&state, SEAT_A, None).await;
+            let (_sid, token) = mint(&state, None).await;
             let (run_id, _task_id) = seed_task_and_run(&state).await;
 
             let response = crate::handover::run_step_material(

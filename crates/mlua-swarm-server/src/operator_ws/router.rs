@@ -200,12 +200,10 @@ pub struct PendingRequest {
 /// # The unit an operator's work belongs to is the seat, not the Run
 ///
 /// One `Arc<dyn OperatorAdapter>` can back **several seats of one Run**.
-/// `login::register_operator_session` files a session under its sid *and*
-/// under every role it claimed, all pointing at the same `Arc`, and
-/// `tasks::seat_declared_operators` auto-seats each declared slot from the
-/// adapter answering to that slot's own name — so a single
-/// `mse_operator_join(roles = ["phase-a-op", "phase-b-op"])` produces one
-/// session holding two seats of one Run.
+/// `tasks::seat_declared_operators` puts the launching operator in every
+/// seat the Blueprint declares, so a two-lane Blueprint launched by one
+/// driver is one session holding two seats of one Run — the ordinary case,
+/// not a corner of it.
 ///
 /// Everything that acts on "an operator's work on a Run" therefore has to
 /// say *which seat*, or it acts on more than it means to:
@@ -268,7 +266,46 @@ pub struct PendingRequest {
 /// panicked would turn a panic into silent mis-attribution.
 #[derive(Default)]
 pub struct SeatLedger {
-    entries: std::sync::Mutex<HashMap<DispatchKey, String>>,
+    entries: std::sync::Mutex<HashMap<DispatchKey, SeatEntry>>,
+}
+
+/// What one in-flight dispatch recorded about itself: the seat it went out
+/// through, and the acquisition it is speaking on behalf of.
+///
+/// # Why the generation is written here rather than joined later
+///
+/// The seat can be joined from `Run.current` at any time, because a slot
+/// is a name that does not move. The **generation is the opposite**: it is
+/// the one fact about a dispatch that `Run.current` stops being able to
+/// answer the moment the seat changes hands, since re-reading it yields
+/// the *new* holder's `gen` — the very value **A6** is comparing against.
+/// A reader that arrives after the dispatch left has no other source for
+/// it.
+///
+/// That reader is `/v1/worker/submit`. **A6** is checked in
+/// [`AssigneeRouter::execute`] on the way back from `adapter.execute`, but
+/// the worker's HTTP POST lands *inside* that await — it has already been
+/// folded by the time the router re-reads the seat. Making A6 hold at
+/// submit time therefore needs `addressed_gen` at a point where only the
+/// `(run, step, attempt)` key is in hand, which is exactly what this map
+/// is keyed by.
+///
+/// **T1 is untouched.** This is written by the router, above the SAP, and
+/// read by an HTTP handler, also above it. No primitive gained an
+/// argument, no adapter is told a generation, and nothing here travels on
+/// the wire to an operator — the alternative (putting `gen` on the worker
+/// token or in `AgentContextView`) would have pushed it *below* the
+/// boundary, where the model says it does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatEntry {
+    /// The Blueprint-declared Operator seat this dispatch was routed
+    /// through (`Run.current`'s key).
+    pub slot: String,
+    /// The `Assignee.gen` the dispatch read before delegating — **A6**'s
+    /// `a.gen`. Compared against the seat's *current* generation to decide
+    /// whether a reply belongs to the holder that was addressed or to the
+    /// one that has since displaced it.
+    pub gen: u64,
 }
 
 /// What a dispatch and the pending entry it produces have in common: the
@@ -288,14 +325,14 @@ impl SeatLedger {
 
     /// Take the lock, adopting it when a previous holder panicked. See the
     /// type doc.
-    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<DispatchKey, String>> {
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<DispatchKey, SeatEntry>> {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Record that `slot` is dispatching `(run, step, attempt)`, for as
-    /// long as the returned ticket lives.
+    /// Record that `slot`, held at generation `gen`, is dispatching
+    /// `(run, step, attempt)`, for as long as the returned ticket lives.
     ///
     /// Public because the recording *is* the contract — a router that did
     /// not call this would leave every one of its dispatches seatless, and
@@ -308,10 +345,44 @@ impl SeatLedger {
         step: &mlua_swarm::StepId,
         attempt: u32,
         slot: &str,
+        gen: u64,
     ) -> SeatTicket<'_> {
         let key = (run.clone(), step.clone(), attempt);
-        self.entries().insert(key.clone(), slot.to_string());
+        self.entries().insert(
+            key.clone(),
+            SeatEntry {
+                slot: slot.to_string(),
+                gen,
+            },
+        );
         SeatTicket { ledger: self, key }
+    }
+
+    /// What the dispatch addressed at `(run, step, attempt)` recorded about
+    /// itself, or `None` when nothing is in flight under that key.
+    ///
+    /// The `(run, step, attempt)`-keyed sibling of [`Self::slot_of`], for
+    /// the reader that holds the key itself rather than a
+    /// [`PendingRequest`] to derive it from — `/v1/worker/submit`, whose
+    /// Bearer resolves to a `(task_id, attempt)` and whose Run comes from
+    /// the dispatch's `AgentContextView`.
+    ///
+    /// `None` means the same thing it means for [`Self::slot_of`]: this
+    /// layer cannot name a seat for that key, because the dispatch did not
+    /// go through a router (an in-process spawner, a `SpawnerAdapter`) or
+    /// because its delegation has already returned and the ticket is gone.
+    /// A caller enforcing **A6** must read that as "no seat term to
+    /// evaluate", not as "the seat is Vacant" — the two are different
+    /// answers and only the second is a refusal.
+    pub fn dispatch_of(
+        &self,
+        run: &RunId,
+        step: &mlua_swarm::StepId,
+        attempt: u32,
+    ) -> Option<SeatEntry> {
+        self.entries()
+            .get(&(run.clone(), step.clone(), attempt))
+            .cloned()
     }
 
     /// The seat `request` was dispatched through, or `None` when it was not
@@ -330,7 +401,7 @@ impl SeatLedger {
         }
         let attempt = request.attempt?;
         let key = (run.clone(), request.step_id.clone(), attempt);
-        self.entries().get(&key).cloned()
+        self.entries().get(&key).map(|entry| entry.slot.clone())
     }
 }
 
@@ -1057,16 +1128,25 @@ impl Operator for AssigneeRouter {
 
         // A6: which acquisition this dispatch is speaking on behalf of.
         let addressed_gen = assignee.gen;
-        // Which seat this delegation belongs to, for as long as it is in
-        // flight. Taken *before* delegating, because the adapter's pending
-        // entry is created inside the call below — there is no instant at
-        // which that entry exists and this record does not. Dropped on the
-        // way out of the block, however the call returns (`?` included).
-        // See `SeatLedger`.
+        // Which seat this delegation belongs to, and under which
+        // acquisition, for as long as it is in flight. Taken *before*
+        // delegating, because the adapter's pending entry is created inside
+        // the call below — there is no instant at which that entry exists
+        // and this record does not. Dropped on the way out of the block,
+        // however the call returns (`?` included).
+        //
+        // `addressed_gen` rides along because the worker's own
+        // `/v1/worker/submit` lands inside the await below, before the A6
+        // re-read at the bottom of this method can refuse anything — see
+        // `SeatEntry`, and `worker::reject_if_seat_moved` for the reader.
         let result = {
-            let _seat = self
-                .seats
-                .record(&run_id, &ctx.task_id, ctx.attempt, &self.slot);
+            let _seat = self.seats.record(
+                &run_id,
+                &ctx.task_id,
+                ctx.attempt,
+                &self.slot,
+                addressed_gen,
+            );
             adapter
                 .execute(ctx, system, prompt, worker, worker_token)
                 .await?
@@ -1559,7 +1639,7 @@ mod tests {
         let seats = SeatLedger::new();
         let run_id = RunId::new();
         let step = StepId::parse("ST-shared").expect("step id");
-        let _seat = seats.record(&run_id, &step, 1, SLOT);
+        let _seat = seats.record(&run_id, &step, 1, SLOT, 1);
 
         let hook = PendingRequest {
             req_id: "S-1-hb-aaa".to_string(),
@@ -1970,22 +2050,30 @@ mod tests {
         );
     }
 
-    /// The registry is keyed by `OperatorId`, so a role alias is a
-    /// first-class holder — not a second-class one that needs a session id
-    /// to be resolved through first.
+    /// **The router does not parse the holder, it looks it up.** An
+    /// `OperatorId` is whatever `Run.current` recorded, and the registry is
+    /// keyed by that string — so the router asks the map and delivers to
+    /// whatever answers.
+    ///
+    /// Every holder is a session id (`S-<hex>`) in production now that a
+    /// join claims no alias, and this test deliberately uses a string that
+    /// is *not* one: what it pins is that nothing on this path narrows the
+    /// key space on its own. A router that started parsing sids would move
+    /// the "who is this?" decision below the SAP, where **T1** says only
+    /// the `OperatorId` is known.
     #[tokio::test]
-    async fn a_role_alias_holder_routes_like_a_session_id_holder() {
+    async fn the_router_delivers_to_whatever_the_registry_answers_for() {
         let store: Arc<dyn RunStore> = Arc::new(InMemoryRunStore::new());
         let run_id = seeded_run(&store).await;
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let adapters = Arc::new(OperatorAdapterRegistry::new());
         adapters
-            .register("main-ai", adapter("by-alias", &seen))
+            .register("not-a-session-id", adapter("by-key", &seen))
             .await;
         let router = AssigneeRouter::new(store.clone(), SLOT, adapters);
 
         store
-            .acquire_assignee(&run_id, SLOT, "main-ai", "assigned by role")
+            .acquire_assignee(&run_id, SLOT, "not-a-session-id", "seated by key")
             .await
             .expect("acquire");
         let out = router
@@ -1997,8 +2085,8 @@ mod tests {
                 cap_token(),
             )
             .await
-            .expect("an alias holder routes");
-        assert_eq!(delivered_to(&out), "by-alias");
+            .expect("the holder resolves through the registry");
+        assert_eq!(delivered_to(&out), "by-key");
     }
 
     /// The router fronts WS thin-path sessions, so it inherits their

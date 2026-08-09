@@ -37,7 +37,7 @@ Attempt (u32 counter)                        retry counter inside a step
 | `resume_key` | `ResumeKey` newtype | `RK-<hex>` / `RK-senior-<step_id>` (moved off `R-` in issue #14 so run-id prefix checks can't be shadowed) | engine `query_senior` | one suspend/resume cycle (in-memory) | `TaskState.suspended_on`, `pending_resumes` key |
 | `req_id` | `String` | `<sid>-<ask\|hb\|ha\|spawn>-<uuid>` | server per outbound operator frame | one server→operator request | echoed back in `mse_ack`; `parent_req_id` chains |
 | `capability_token` | `CapToken` (base64 JSON) | opaque | `TokenSigner::mint` (HMAC-SHA256) | until `expire_at` / `max_uses` (Operator session tokens: neither — see the lifecycle block) | spawn frames; full-token Bearer on `/v1/worker/*` |
-| token fingerprint | `String` (SHA-256 hex of `nonce`) | 64 hex chars | derived (`CapToken::fingerprint`) | server-side lookup key + loggable token identity | `EngineState.tokens` key, `worker_handles` values, `OperatorSession.token_fp`, `TokenNotFound` diagnostics |
+| token fingerprint | `String` (SHA-256 hex of `nonce`) | 64 hex chars | derived (`CapToken::fingerprint`) | server-side lookup key + loggable token identity | `EngineState.tokens` key, `worker_handles` values, `LaunchEnvelope.token_fp`, `TokenNotFound` diagnostics |
 | `agent_id` | `String` (inside `CapToken`) | free-form (`worker-of-<step_id>` for workers) | token mint | token lifetime | role × verb gate, task-ownership check |
 | `br-` / `hk-` / `ob-` ids | `String` | `br-<hex>` / `hk-<hex>` / `ob-<hex>` | engine `attach_with` inline registration | process lifetime | bridge / hook / operator-backend registries |
 

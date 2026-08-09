@@ -759,104 +759,83 @@ enforcement of `fail` is a follow-up.
 
 ---
 
-## Operator naming: three layers, one string
+## Operator naming: a seat is a place, not a person
 
-The BP's `OperatorDef.name`, the mint-time `roles: [...]` alias, and the
-engine's `register_operator(id, ...)` key are three separate layers that
-are only connected by **string equality**. Getting this wrong (or thinking
-`main-ai` is a hard-coded system name) is the usual source of "why can't
-I run two MainAIs in parallel?".
+A Blueprint's `OperatorDef.name` is a **seat**: a lane of the flow that
+`AgentDef.spec.operator_ref` points at. It is an address within the Run,
+and it names nobody. Who is sitting in it is `Run.current[seat]`, written
+by a launch pin or an acquire, and always a **session id**.
 
 ```
 BP (design-time)                    Runtime (per Operator process)
 ─────────────────────               ──────────────────────────────
 operators:                          POST /v1/operators
-  - name: "planner_bot"    ◄──┐       { roles: ["planner_bot"],
-    kind: MainAi              │         capability_manifest: {...} }  # optional
-                              │        → mints sid, reserves alias (+ manifest if sent)
-                              │        → register_operator("planner_bot", ...)
-agents:                       │
-  - name: task-planner        │     WS /v1/operators/:sid/ws
-    spec:                     │        → attaches the socket (no registration)
-      operator_ref: ──────────┘
-        "planner_bot"
+  - name: "planner_bot"               { capability_manifest: {...},   # optional
+    kind: MainAi                        desc: "..." }                 # 記名
+                                      → mints sid + token
+agents:                               → register_operator("S-<hex>", ...)
+  - name: task-planner
+    spec:                           POST /v1/tasks { operator_sid: "S-<hex>", ... }
+      operator_ref:                   → seats that sid in the Blueprint's seats
+        "planner_bot"    ◄──────────────┘
+                                    WS /v1/operators/:sid/ws
+                                      → attaches the socket (no registration)
 ```
 
 Rules that fall out of this:
 
-1. **The name is arbitrary.** `"planner_bot"`, `"XXX"`, `"main-ai"` are
-   all valid — nothing in the engine treats `main-ai` specially. It only
-   became a convention because the default scaffold uses it.
-2. **The three sites must be the same literal.** `OperatorDef.name` ==
-   the mint's `roles[]` entry == the `register_operator` id. Under
-   `strict_binding = true` a typo in the binding target is rejected before
-   Spawn (no manifest-owning session resolves for that role). In the default
-   non-strict mode the mismatch is not a pre-Spawn gate — the agent binds
-   `DeclarationOnly`, and the missing role instead surfaces when the Spawn's
-   own routing finds no session claiming it.
-   A **run-scoped pin** (§ Two drivers, one role) changes only the third
-   site: the launch names the session, so the run resolves against that sid
-   instead of the role's current holder. The BP-side pair
-   (`OperatorDef.name` == `spec.operator_ref`) is unaffected, and the
-   mint's `roles[]` becomes optional on pinned runs.
+1. **The seat name is arbitrary.** `"planner_bot"`, `"XXX"`, `"main-ai"`
+   are all valid — nothing in the engine treats `main-ai` specially. It
+   only became a convention because the default scaffold uses it.
+2. **The BP-side pair must match:** `OperatorDef.name` ==
+   `spec.operator_ref`. That is the whole of the string matching now.
+   A join used to have to spell the same literal a third time
+   (`roles: ["planner_bot"]`) and the engine registered the session under
+   it; that layer is gone, so a typo can no longer silently route an agent
+   to whoever happened to claim the misspelling.
 3. **`kind: MainAi` is the *type*, not the *name*.** It says "when an
-   agent references this role, dispatch via the WS thin-path". Multiple
+   agent references this seat, dispatch via the WS thin-path". Multiple
    `OperatorDef`s can have `kind: MainAi` under different names.
-4. **The "1 role = 1 sid" exclusivity is per-alias, not global.**
-   `POST /v1/operators` returns `409 CONFLICT` only when the same alias
-   string is already claimed by a live session (`login.rs` role check
-   under `roles_to_sid`). Distinct alias strings never conflict.
-5. **The 409 conflict body names the holding session (GH #81 Layer 2 (a)).**
-   Alongside the pre-#81 `conflicts: [<role>]` array, the response now
-   carries `conflicts_detail: [{role, sid}]` so a recovery driver can
-   read the holder sid directly:
-   ```json
-   {
-     "error": "roles conflict",
-     "conflicts": ["main-ai"],
-     "conflicts_detail": [{"role": "main-ai", "sid": "S-..."}]
-   }
-   ```
-   Existing clients that only read `conflicts` are unaffected.
+4. **A join claims nothing and cannot conflict.** `POST /v1/operators`
+   has no `409`: it used to reserve role aliases server-wide and refuse a
+   name another live session held, which made two drivers on one server a
+   collision instead of the ordinary case. Runs are concurrent, so a name
+   never needed to be globally unique — and with the reservation gone,
+   `Assignee.op` is a session id on every path. A caller still sending
+   `roles` is not refused; the field is ignored.
 
-### Recovery: enumerate and release stale sessions (GH #81 Layer 2)
+### Recovery: find the stale session on the list, and know it is harmless
 
-Two surfaces close the pre-#81 recovery gap where a driver that crashed
-after minting a session could only be recovered by a full `mse serve`
-restart (which also dropped every OTHER live session):
+A driver that crashed after minting leaves its session behind. Read
+**`GET /v1/operators`** — every live session's `{sid, joined_at_secs,
+connected}` plus its 記名 (see below), Bearer-gated with any live
+session's token — and you can tell which one it is by the sentence it
+wrote at join. MCP counterpart: `mse_operator_list(sid?, limit?)`.
 
-- **`GET /v1/operators`** — every live session's
-  `{sid, roles, joined_at_secs, connected}` plus its 記名 (see below).
-  Answers "which sid holds `main-ai`?" without probing every sid
-  individually. **Bearer required** — any live session's token opens it.
-  This is a breaking change: the route answered anonymously up to
-  v0.24.0. The token itself never surfaces in the response.
-  MCP counterpart: `mse_operator_list(sid?, limit?)`.
-- **`DELETE /v1/operators/by-role/:role`** — release the session
-  currently holding `role` without knowing the sid or its Bearer token.
-  `404` when no session holds the role, `204` on successful teardown.
-  Same trust tier as `mlua_swarm_server_shutdown` (no Bearer — admin
-  observability + recovery for stale-session drift). MCP counterpart:
-  `mse_operator_leave_by_role(role)`.
-  Teardown fails every spawn parked on the session, and a role name is
-  process-global — so the holder may be a working session rather than the
-  stale one you meant. When at least one `Running` run is pinned to the
-  holder, the route refuses with `409` and lists them:
-  ```json
-  {
-    "error": "session is driving in-flight runs; ...",
-    "role": "main-ai",
-    "sid": "S-...",
-    "active_runs": ["R-..."]
-  }
-  ```
-  Repeat with `?force=true` to tear down anyway — the escape hatch for a
-  genuinely wedged session whose runs will never finish.
+**It is not urgent, and usually there is nothing to do.** A stale session
+used to hold a role name against the whole server, so a replacement
+driver could not join until somebody released it; recovery was mandatory,
+and `DELETE /v1/operators/by-role/:role` existed to perform it without
+the sid or Bearer the crashed driver had lost. That route is gone with
+the roles, and so is the need for it *for assignment*: a stale session
+holds no seat anyone else needs. You join freely, your launches pin
+themselves, and `POST /v1/runs/:id/acquire` never refuses (**A8**) — so
+if the dead driver was holding a seat you want, you simply take it.
 
-The pre-#81 `DELETE /v1/operators/:sid` (Bearer required) is unchanged
-and remains the correct path for a session's own driver to leave
-cleanly. `by-role` is the recovery escape hatch when the sid is
-unknown, not a replacement for the sid-scoped route.
+**`DELETE /v1/operators/:sid`** (Bearer required) remains the way a
+session's own driver leaves cleanly, and it cascades: every seat that
+session held goes `Vacant` (**O8**).
+
+**But nobody else can leave on its behalf.** That route checks the Bearer
+against the session's own digest, and the token lives only in the client
+process — a crash loses it. So a stale session's sid is one you can read
+off `GET /v1/operators` and identify by its 記名, and cannot delete: the
+delete answers `401` for everyone except the driver that is gone. The row
+also survives a server restart, because boot restores every persisted
+session with no age filter. The model's answer is the 24h expiry from last
+access (**O1**), which is not implemented yet — so on a long-lived server
+these rows accumulate, one per crashed driver. They cost you a line on the
+list, not a seat.
 
 ### Telling parallel sessions apart: the 記名 and the holder list
 
@@ -934,9 +913,9 @@ at a handover. Two more Bearer-gated reads answer it.
   now. All three are `null` when the request belongs to no seat — a
   `hook_before` goes to the session directly rather than through a seat,
   so there is none to name, and naming the one that happened to answer
-  would be a guess. (One driver can hold several seats of a Run: a session
-  is registered under its sid *and* under each of its roles, and a launch
-  seats each declared slot from whoever answers to that slot's name.)
+  would be a guess. (One driver routinely holds several seats of a Run: a
+  launch seats the operator that made it in every seat the Blueprint
+  declares.)
 
   Nothing on an entry grades the wait — no age, no deadline, no
   sent/unsent split. A step whose driver went away is *waiting*, not
@@ -980,14 +959,25 @@ becomes **mandatory** only when the Blueprint sets `strict_binding = true`;
 there a missing or insufficient manifest fails the launch before any Spawn.
 
 When a manifest *is* submitted it is not copied blindly into a Run. The Server
-selects exactly one capability by role alias and `launch_variant`, returns a
+selects exactly one capability by `launch_variant`, returns a
 `BindReceipt`, and Core checks the requested tool subset, model presence,
 variant equality, and request digest before creating the final
 `BindingAttestation`.
 
+**Which session's manifest is read: the launch's pin, and only that.**
+`operator_sid` on `POST /v1/tasks` names the session whose environment is
+attesting, so a launch that carries no pin has no manifest to attest
+through and every Runner-backed agent binds `Unbound` (harmless under the
+default `strict_binding = false`, a launch failure under `true`). This
+used to fall back to "whoever holds the agent's `operator_ref` role", and
+that is exactly what an attestation must not do — the receipt would
+describe a different process's environment than the one about to run the
+work. `mse mcp` pins every launch it makes, explicitly or from its sole
+live session.
+
 ```json
 {
-  "roles": ["planner_bot"],
+  "desc": "planner lane, rewriting the seat resolver",
   "capability_manifest": {
     "provider_id": "main-ai-self-report",
     "provider_revision": "2026-07-22",
@@ -1052,8 +1042,9 @@ whether an absent attestation is tolerated.
 
 ### Running multiple MainAI sessions in parallel
 
-The exclusivity above is the only structural constraint — split the role
-into per-lane aliases and each lane gets its own MainAI:
+Nothing structural stands in the way — no name is claimed, so no two
+drivers can collide on one. Declare a seat per lane and each lane gets its
+own MainAI:
 
 ```lua
 operators = {
@@ -1066,16 +1057,26 @@ agents = {
 },
 ```
 
-Then two Operator processes join independently:
+Then two Operator processes join independently and each takes the lane it
+is there for:
 
 ```
-Process A:  mse_operator_join(roles={"phase_a_op"}, capability_manifest={...}) → sid=S-aaa
-Process B:  mse_operator_join(roles={"phase_b_op"}, capability_manifest={...}) → sid=S-bbb
+Process A:  mse_operator_join(desc="phase A: planning")  → sid=S-aaa
+Process B:  mse_operator_join(desc="phase B: impl")      → sid=S-bbb
+
+Process A:  POST /v1/tasks { operator_sid: "S-aaa", operator_slot: "phase_a_op", ... }
+Process B:  POST /v1/runs/:id/acquire { op: "S-bbb", slot: "phase_b_op", desc: "..." }
 ```
 
-Spawns on the `planner` agent land on process A; spawns on `impl` land
-on process B. No lock, no queue, no conflict — the two aliases are
-independent registry keys.
+Spawns on the `planner` agent land on process A; spawns on `impl` land on
+process B. No lock, no queue, no conflict — the seats are independent keys
+of one Run's `current`, and B's acquire displaces A from lane B without
+touching lane A.
+
+Note the second line: A's launch seats A in **both** lanes (a Run goes to
+whoever launched it), so B does not wait for a vacancy — it takes the lane
+it wants, which is what **A8** is for. Read `GET /v1/runs/:id/assignees`
+first if you need to know what you are displacing.
 
 Within **one** MainAI session, concurrent Spawns are already multiplexed
 over the single WS by `req_id` (see `WSOperatorSession.pending` in
@@ -1085,23 +1086,17 @@ side: the reference `mse_pending_wait` loop pops one frame at a time
 to drive many concurrent spawns you need to fan out that pop loop
 yourself.
 
-### Two drivers, one role: run-scoped session pins
+### Two drivers, one Blueprint: run-scoped session pins
 
-Splitting the role per lane (above) works when the lanes are part of one
+Splitting the seats per lane (above) works when the lanes are part of one
 design. It does not cover the other common shape: **two independent
-drivers running the same Blueprint against one `mse serve`**. Both want
-`main-ai`, and a role is a process-global claim — so without a pin:
+drivers running the same Blueprint against one `mse serve`**. Both
+dispatch through the seat called `main-ai`, and each needs its own Run's
+frames to come back to itself.
 
-- the second driver's `POST /v1/operators` is a `409`, and if it takes
-  the role instead, the first driver's next launch compiles against
-  *its* session — Spawn frames leave for the wrong process, silently;
-- the usual recovery, `DELETE /v1/operators/by-role/main-ai`, fails
-  every spawn parked on whoever holds it, including runs that were
-  perfectly healthy.
-
-The fix is a launch-time fact rather than a naming scheme: **the
-Blueprint declares the logical role; the launch declares which session
-that role means for this run.**
+This is what the pin is for, and it is why the seat name never had to be
+unique: **the Blueprint declares the seat; the launch declares which
+session that seat means for this run.**
 
 ```
 Blueprint (design-time)         Launch (per run)              Run
@@ -1128,43 +1123,43 @@ whole Spawn stream:
   Operator seat named by `spec.operator_ref`, recorded on
   `RunRecord.current`. Every dispatch through a `kind = Operator` agent
   reads that seat's holder afresh, so the run goes to the pinned session
-  rather than to whoever else holds the role — and re-assigning the seat
-  mid-run moves the next dispatch with it. Nothing about the session is
-  baked into the compiled Blueprint;
+  — and re-assigning the seat mid-run moves the next dispatch with it.
+  Nothing about the session is baked into the compiled Blueprint;
 - **attestation** — capability manifests resolve through the pinned
-  session too, so `strict_binding` Blueprints stay `Bound` under pinning;
+  session too, and *only* through it, so `strict_binding` Blueprints need
+  a pin;
 - **resume** — the pin travels in the run's launch snapshot, so
   `POST /v1/runs/:id/resume` continues on the same session.
 
 A pin that names no live session **fails the launch**. There is
-deliberately no fallback to the role: falling back is how a run ends up
-on another driver's session in the first place, and it does so silently.
+deliberately no fallback: falling back is how a run ends up on another
+driver's session in the first place, and it does so silently.
 
-Unpinned launches still reach the role's holder, but they now reach it
-*through* `RunRecord.current` rather than beside it. At launch, every
-Operator seat the Blueprint declares is filled from its own name: a
-session is registered under its sid **and** under each role it claims, so
-if anyone holds the role `operators[].name` spells, that holder is
-assigned the seat at generation 1 — same holder the old role lookup
-found, now recorded where every dispatch reads it. What it is *not* is
-byte-for-byte: the assignment is a real `Assign`, so it carries a
-generation and a `desc`, and a later handover moves it like any other.
-
-The `desc` is server-authored, because an unpinned launch has no caller
-text to use:
+The pinned operator also takes every **other** seat the Blueprint
+declares, at generation 1, so a multi-lane Blueprint comes up fully
+dispatchable rather than with one lane seated and the rest `Vacant`. The
+`desc` on those is server-authored, since the caller only described the
+lane it named:
 
 ```
-"auto-seated at launch from the Blueprint-declared operator role
- 'main-ai' (no operator_sid pin in the launch request)"
+"auto-seated at launch: the launching operator takes the
+ Blueprint-declared seat 'phase_b_op' along with the one its
+ operator_sid named"
 ```
 
 Read `GET /v1/runs/:id` and that opening — `auto-seated at launch` — is
-how you tell a seat nobody chose from one a caller pinned; a pin's `desc`
-is whatever the caller wrote in `operator_desc`.
+how you tell a lane the caller did not ask for from the one it pinned; a
+pin's `desc` is whatever the caller wrote in `operator_desc`.
 
-A seat whose role nobody holds at launch stays `Vacant`. Nothing is
-invented for it, and the first dispatch that needs it fails naming the
-seat.
+**An unpinned launch seats nobody.** Every seat stays `Vacant`, and the
+first dispatch through one fails naming it. That is the honest outcome
+rather than a regression: a launch with no `operator_sid` carries no
+operator identity at all (`POST /v1/tasks` takes no Bearer, and
+`operator.id` is a free-form label), so seating anyone would mean the
+server picking a session nobody named. It used to pick the holder of the
+seat's own role, which read as correct on a one-driver server and was
+silently wrong the moment a second driver joined. Take a seat with
+`POST /v1/runs/:id/acquire` if you launched without a pin.
 
 ##### `operator_desc` — pinning assigns, and an assignment is recorded
 
@@ -1213,14 +1208,12 @@ the pre-`operator_slot` body. Multi-lane Blueprints name the lane they are
 assigning, and the lanes hand over independently: re-assigning
 `phase-a-op` moves only the dispatches that resolve through `phase-a-op`.
 
-A pin names **one** lane, but it is not the only lane a launch fills: the
-seats it does not name are auto-seated from their own roles, exactly as in
-an unpinned launch. So a two-lane Blueprint launched with a driver holding
-`phase-a-op` and another holding `phase-b-op` comes up with both lanes
-dispatchable, whether the launch pins one of them or neither. A pin always
-wins the seat it names — the role holder for that lane is not seated over
-it. A lane whose role nobody holds, and which no pin names, stays `Vacant`
-until it is assigned.
+A pin names **one** lane, but it fills all of them: the seats it does not
+name go to the same operator with a server-authored `desc` (above), so a
+two-lane Blueprint launched by one driver comes up with both lanes
+dispatchable. The seat the pin named keeps the caller's own `desc`. A
+second driver that wants one of those lanes acquires it — that is the
+handover path, and it never refuses.
 
 #### Auto-pin from `mse mcp`
 
@@ -1247,25 +1240,23 @@ So the everyday driver loop is unchanged: join, launch, `mse_pending_wait`
 — and the frames come back to the driver that launched, even with a
 second driver on the same server.
 
-#### `roles: []` is the canonical join under pinning
-
-Because a pinned run resolves by sid, a driver that always pins does not
-need the role claim at all:
+#### A join carries a 記名, and nothing else
 
 ```
-mse_operator_join(roles={}, capability_manifest={...})  → sid=S-aaa
+mse_operator_join(desc="...", capability_manifest={...})  → sid=S-aaa
 ```
 
-An empty `roles` never conflicts (nothing is claimed), so any number of
-drivers can join the same server for the same Blueprint. The Blueprint
-still declares `operators[].name` / `spec.operator_ref` — those are
-design-time symbols and unaffected. What the empty claim gives up is the
-*unpinned* path: launch-time seating looks for a holder of the seat's own
-role and an empty claim registers none, so an unpinned launch of that
-Blueprint compiles fine, leaves the seat `Vacant`, and then fails on its
-first Operator dispatch — loudly, naming the seat. Claim the role and
-pin to it when you want a launch-time answer; leave it empty when every
-launch carries its own `operator_sid`.
+There is no role to claim, so any number of drivers can join the same
+server for the same Blueprint. The Blueprint still declares
+`operators[].name` / `spec.operator_ref` — those are design-time symbols
+and unaffected.
+
+What this leaves you responsible for is the pin: a launch without
+`operator_sid` seats nobody, so if you drive Operator agents, either
+launch through `swarm_run` (which pins your session automatically) or
+send the sid yourself. `desc` is what makes your session findable on
+`mse_operator_list` afterwards; write it for the reader who has to tell
+your session from the one running in the next worktree.
 
 #### Relationship to the delegate layer
 

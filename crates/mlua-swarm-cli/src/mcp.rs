@@ -2523,16 +2523,6 @@ struct ServerUninstallReq {}
 
 #[derive(Deserialize, JsonSchema)]
 struct OperatorJoinReq {
-    /// Logical operator role alias(es), e.g. `["main-ai"]`. Checked for
-    /// exclusivity server-side (`POST /v1/operators` returns 409 on
-    /// conflict). Omitted/empty = no alias claimed.
-    ///
-    /// Stays `String` on the tool boundary (like the server's own request
-    /// body) so an unusable alias is reported as an invalid-params tool
-    /// error naming the problem, rather than as a schema-level decode
-    /// failure; `mse_operator_join` converts to `OperatorRef` before use.
-    #[serde(default)]
-    roles: Option<Vec<String>>,
     /// Effective model/tool/variant capabilities enforced by this
     /// Operator/MainAI. Required for fail-closed Runner binding.
     #[serde(default)]
@@ -2631,15 +2621,6 @@ struct OperatorAckReq {
 struct OperatorLeaveReq {
     /// sid returned by `mse_operator_join`.
     sid: String,
-}
-
-/// GH #81 Layer 2 (c): request schema for the by-role recovery route —
-/// release a stale session holding `role` when the sid is unknown.
-#[derive(Deserialize, JsonSchema)]
-struct OperatorLeaveByRoleReq {
-    /// Role name held by the stale session (e.g. `"main-ai"`) — matches
-    /// the values passed as `mse_operator_join(roles=[...])`.
-    role: String,
 }
 
 // ---- worker HTTP tool param schemas ----
@@ -3157,34 +3138,22 @@ struct SwarmCancelReq {
 #[tool_router]
 impl MseServer {
     #[tool(
-        description = "Join as an Operator session: POST /v1/operators (mint sid+token, submit capability_manifest and the `desc` line that identifies this session) then connect WS /v1/operators/:sid/ws with the returned Bearer token. `desc` is mandatory here — see its schema description; it is what a later reader (you, or whoever takes over) tells your session apart by on mse_operator_list. The token stays process-local (never returned to the caller). Runner-backed launches resolve the manifest fail-closed by logical role, launch_variant, model, and tools. Returns {sid, roles}. Use `sid` with mse_pending_wait / mse_ack / mse_operator_leave. On a `roles conflict` (409), the response body carries both the pre-#81 `conflicts: [<role>]` array and the GH #81 Layer 2 `conflicts_detail: [{role, sid}]` array identifying the holding session — pair with `mse_operator_leave_by_role(role)` to recover from a stale session whose original driver crashed."
+        description = "Join as an Operator session: POST /v1/operators (mint sid+token, submit capability_manifest and the `desc` line that identifies this session) then connect WS /v1/operators/:sid/ws with the returned Bearer token. `desc` is mandatory here — see its schema description; it is what a later reader (you, or whoever takes over) tells your session apart by on mse_operator_list. The token stays process-local (never returned to the caller). Runner-backed launches resolve the manifest fail-closed by launch_variant, model, and tools. Returns {sid} — use it with mse_pending_wait / mse_ack / mse_operator_leave. A join claims no role and can never conflict: which Run you drive is decided per Run, by launching it (swarm_run pins this session) or by taking a seat on one (POST /v1/runs/:id/acquire), so joining twice for two parallel tasks is the ordinary case rather than a collision."
     )]
     async fn mse_operator_join(
         &self,
         Parameters(req): Parameters<OperatorJoinReq>,
     ) -> Result<CallToolResult, McpError> {
-        let roles = req
-            .roles
-            .unwrap_or_default()
-            .into_iter()
-            .map(mlua_swarm::OperatorRef::new)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                McpError::invalid_params(
-                    format!("mse_operator_join: invalid role alias: {error}"),
-                    None,
-                )
-            })?;
-        let (sid, roles) = self
+        let sid = self
             .op_client
-            .join(roles, req.capability_manifest, Some(req.desc))
+            .join(req.capability_manifest, Some(req.desc))
             .await
             .map_err(client_error_to_mcp)?;
-        json_result(&serde_json::json!({ "sid": sid, "roles": roles }))
+        json_result(&serde_json::json!({ "sid": sid }))
     }
 
     #[tool(
-        description = "List every live Operator session with its 記名 (the join-time description each session wrote about itself, plus the seats it has been assigned: Run, goal, project_root, work_dir, task_metadata, time). GET /v1/operators, which is Bearer-gated — this tool presents the token of `sid` (default: this process's sole live session). Read it before acquiring a Run seat: with exclusivity removed, this list and the per-Run holder list (GET /v1/runs/:id/assignees) are what tell two parallel tasks in the same worktree apart. Ordered by most recent activity first; `limit` caps the page (server default 50, ceiling 200). Returns the server's response body verbatim: {operators: [...], total, limit}."
+        description = "List every live Operator session with its 記名 (the join-time description each session wrote about itself, plus the seats it has been assigned: Run, goal, project_root, work_dir, task_metadata, time). GET /v1/operators, which is Bearer-gated — this tool presents the token of `sid` (default: this process's sole live session). Read it before acquiring a Run seat: with exclusivity removed, this list and the per-Run holder list (GET /v1/runs/:id/assignees) are what tell two parallel tasks in the same worktree apart. It is also the recovery path for a stale session whose driver crashed: find it by its 記名, then mse_operator_leave(sid) — there is no by-role release, because a session claims no name to be released by. Ordered by most recent activity first; `limit` caps the page (server default 50, ceiling 200). Returns the server's response body verbatim: {operators: [...], total, limit}."
     )]
     async fn mse_operator_list(
         &self,
@@ -3250,20 +3219,6 @@ impl MseServer {
             .await
             .map_err(client_error_to_mcp)?;
         json_result(&serde_json::json!({ "removed": true }))
-    }
-
-    #[tool(
-        description = "GH #81 Layer 2 (c): release the Operator session currently holding `role` without knowing the sid or its Bearer token. Recovery route for a stale session whose driver crashed after minting the sid — pre-#81 the only reliable recovery was a full server restart, which also dropped every OTHER live session. Proxies DELETE /v1/operators/by-role/:role (same trust tier as `mlua_swarm_server_shutdown` — no Bearer). Returns {removed: true} on 204, and surfaces the server's 404 (no session holds this role) as an invalid_params McpError. Sibling `GET /v1/operators` route (not yet exposed as an MCP tool — call the HTTP endpoint directly) enumerates every live session's {sid, roles, joined_at_secs, connected} to identify which role to release."
-    )]
-    async fn mse_operator_leave_by_role(
-        &self,
-        Parameters(req): Parameters<OperatorLeaveByRoleReq>,
-    ) -> Result<CallToolResult, McpError> {
-        self.op_client
-            .leave_by_role(&req.role)
-            .await
-            .map_err(client_error_to_mcp)?;
-        json_result(&serde_json::json!({ "removed": true, "role": req.role }))
     }
 
     #[tool(
@@ -3759,10 +3714,10 @@ impl MseServer {
             operator_kind,
             bridge_id: None,
             hook_id: None,
-            operator_backend_id: None,
-            // The in-process path has no Operator session registry to pin
-            // to (an explicit `operator_sid` was rejected above).
-            operator_pin: None,
+            // The in-process path has no Operator session registry to name
+            // (an explicit `operator_sid` was rejected above), and no
+            // delegate backend registered either.
+            operator_sid: None,
             operator_kind_overrides,
             task_input: None,
             // Local MCP run path does not expose a check_policy override;
@@ -4211,6 +4166,17 @@ impl MseServer {
                     "bound_version": parsed.get("bound_version").cloned().unwrap_or(JsonValue::Null),
                     "effective_ttl_secs": parsed.get("effective_ttl_secs").cloned().unwrap_or(JsonValue::Null),
                     "ttl_source": parsed.get("ttl_source").cloned().unwrap_or(JsonValue::Null),
+                    // Model §5's launch announcement, passed through
+                    // verbatim: who the server seated for this Run and
+                    // which project_root / work_dir it is bound to. This
+                    // proxy is the surface that announcement has to reach —
+                    // there is no `mse launch` subcommand, so `swarm_run`'s
+                    // return IS the launch output an AI reads. Forwarded as
+                    // a whole rather than field by field so the `note` (it
+                    // is an announcement, not a guarantee) cannot be
+                    // dropped on the way. `null` from a server that predates
+                    // it.
+                    "info": parsed.get("info").cloned().unwrap_or(JsonValue::Null),
                     "head": id,
                     "resolved_via": "http",
                 }),

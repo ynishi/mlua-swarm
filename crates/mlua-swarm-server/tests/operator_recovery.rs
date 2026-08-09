@@ -1,21 +1,26 @@
-//! GH #81 Layer 2 integration coverage: the new operator-recovery
-//! surfaces that close the pre-#81 gap where a stale session could only
-//! be cleared by a full server restart.
+//! Operator-session recovery, integration level: what a driver does when
+//! it finds a session it may or may not own, against a live
+//! `axum::serve` instance.
 //!
-//! Three surfaces exercised against a live `axum::serve` instance:
+//! The surfaces exercised:
 //!
-//! 1. `POST /v1/operators` with a role already held returns 409, and the
-//!    body carries the additive `conflicts_detail: [{role, sid}]` array
-//!    identifying the holding session (Layer 2 (a)).
+//! 1. `POST /v1/operators` never refuses. It used to answer `409 roles
+//!    conflict` when the requested role was already held — with a
+//!    `conflicts_detail: [{role, sid}]` array naming the holder, so a
+//!    recovery driver could go and release it. Role declaration moved onto
+//!    the Run, so there is no name to collide on and the whole exchange is
+//!    gone: two drivers on one server is the ordinary case now.
 //! 2. `GET /v1/operators` enumerates every live session's identity and
-//!    its 記名 (model §4.2), and is **Bearer-gated** (**D3**) — a
-//!    breaking change from the Layer 2 (b) shape, which answered
-//!    anonymously. Any live session's token opens it (**W5**).
-//! 3. `DELETE /v1/operators/by-role/:role` releases the stale role
-//!    holder without knowing the sid or its Bearer, and a subsequent
-//!    `POST /v1/operators` with the same role succeeds (Layer 2 (c)).
+//!    its 記名 (model §4.2), and is **Bearer-gated** (**D3**) — any live
+//!    session's token opens it (**W5**). With the `409` gone this is *the*
+//!    recovery surface: a driver reads it, recognises the stale session by
+//!    the sentence it wrote at join, and releases that sid.
+//! 3. `DELETE /v1/operators/:sid` is the release. The sibling
+//!    `DELETE /v1/operators/by-role/:role` — which released a holder
+//!    without knowing its sid, because a role name was a handle a crashed
+//!    driver still had — went with the roles.
 //!
-//! Plus the two teardown-lifecycle regressions that live on the same
+//! Plus the two teardown-lifecycle regressions on the same
 //! `teardown_operator_session` path:
 //!
 //! 4. Teardown closes the holder's WebSocket (a session torn down out from
@@ -85,8 +90,8 @@ async fn spawn_server() -> ServerHandle {
     }
 }
 
-async fn mint(client: &reqwest::Client, base_url: &str, role: &str) -> serde_json::Value {
-    mint_with_desc(client, base_url, role, None).await
+async fn mint(client: &reqwest::Client, base_url: &str) -> serde_json::Value {
+    mint_with_desc(client, base_url, None).await
 }
 
 /// Mint carrying the 記名's confirmed part (**D1**). `None` exercises the
@@ -95,54 +100,75 @@ async fn mint(client: &reqwest::Client, base_url: &str, role: &str) -> serde_jso
 async fn mint_with_desc(
     client: &reqwest::Client,
     base_url: &str,
-    role: &str,
     desc: Option<&str>,
 ) -> serde_json::Value {
-    // convention-token-ok: role names are mlua-swarm public operator role literals.
     let resp = client
         .post(format!("{base_url}/v1/operators"))
-        .json(&json!({ "roles": [role], "desc": desc }))
+        .json(&json!({ "desc": desc }))
         .send()
         .await
         .expect("mint request");
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
-        "POST /v1/operators must mint successfully with a free role"
+        "POST /v1/operators must mint successfully"
     );
     resp.json().await.expect("mint json")
 }
 
+/// **The 409 is gone because its subject is.** Two joins in a row both
+/// succeed and both stay live, where the second used to be refused as a
+/// `roles conflict` naming the first as the holder.
+///
+/// A driver still sending `roles` is not refused either: it is an unknown
+/// key on the request body now, and join is the one step that must never
+/// turn an incoming Assignee away (**D3**).
 #[tokio::test]
-async fn conflict_body_names_the_holding_session_id() {
+async fn a_second_join_no_longer_conflicts_with_the_first() {
     let server = spawn_server().await;
     let client = reqwest::Client::new();
 
-    // convention-token-ok: mlua-swarm public operator role literal.
-    let holder = mint(&client, &server.base_url, "main-ai").await;
-    let holder_sid = holder["sid"].as_str().expect("holder sid").to_string();
+    let first = mint(&client, &server.base_url).await;
+    let first_sid = first["sid"].as_str().expect("first sid").to_string();
 
-    // Second mint with the same role → 409 with conflicts_detail carrying
-    // the holder sid (GH #81 Layer 2 (a)).
-    let conflict = client
+    let second = client
         .post(format!("{}/v1/operators", server.base_url))
+        // The shape the old conflict was raised over, sent verbatim.
         // convention-token-ok: mlua-swarm public operator role literal.
-        .json(&json!({ "roles": ["main-ai"] }))
+        .json(&json!({ "roles": ["main-ai"], "desc": "the second driver" }))
         .send()
         .await
-        .expect("conflict request");
-    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
-    let body: serde_json::Value = conflict.json().await.expect("conflict json");
-    assert_eq!(body["error"], "roles conflict");
-    // Pre-#81 wire shape preserved.
-    assert_eq!(body["conflicts"], serde_json::json!(["main-ai"]));
-    // New Layer 2 (a) field.
-    let detail = body["conflicts_detail"]
+        .expect("second mint request");
+    assert_eq!(
+        second.status(),
+        reqwest::StatusCode::OK,
+        "a join can no longer collide with another session"
+    );
+    let second: serde_json::Value = second.json().await.expect("second mint json");
+    let second_sid = second["sid"].as_str().expect("second sid").to_string();
+    assert_ne!(first_sid, second_sid, "O4: every join mints a new sid");
+    assert!(
+        second.get("roles").is_none(),
+        "the mint response carries no roles field: {second}"
+    );
+
+    // Both are live: the second join displaced nothing.
+    let list: serde_json::Value = client
+        .get(format!("{}/v1/operators", server.base_url))
+        .bearer_auth(second["token"].as_str().expect("second token"))
+        .send()
+        .await
+        .expect("list request")
+        .json()
+        .await
+        .expect("list json");
+    let sids: Vec<&str> = list["operators"]
         .as_array()
-        .expect("conflicts_detail must be an array");
-    assert_eq!(detail.len(), 1);
-    assert_eq!(detail[0]["role"], "main-ai");
-    assert_eq!(detail[0]["sid"], holder_sid);
+        .expect("operators")
+        .iter()
+        .map(|e| e["sid"].as_str().expect("sid"))
+        .collect();
+    assert!(sids.contains(&first_sid.as_str()) && sids.contains(&second_sid.as_str()));
 
     server.shutdown();
 }
@@ -155,15 +181,13 @@ async fn list_route_enumerates_live_sessions_with_any_live_bearer() {
     let server = spawn_server().await;
     let client = reqwest::Client::new();
 
-    // convention-token-ok: mlua-swarm public operator role literals.
     let a = mint_with_desc(
         &client,
         &server.base_url,
-        "main-ai",
         Some("  rewriting the seat resolver in mlua-swarm-server  "),
     )
     .await;
-    let b = mint(&client, &server.base_url, "auditor").await;
+    let b = mint(&client, &server.base_url).await;
     let sid_a = a["sid"].as_str().unwrap().to_string();
     let sid_b = b["sid"].as_str().unwrap().to_string();
     let token_b = b["token"].as_str().unwrap().to_string();
@@ -212,7 +236,10 @@ async fn list_route_enumerates_live_sessions_with_any_live_bearer() {
     assert!(sids.contains(&sid_b.as_str()));
     // Every entry must expose the identity fields the guide names.
     for entry in ops {
-        assert!(entry["roles"].is_array());
+        assert!(
+            entry.get("roles").is_none(),
+            "a session claims no role, so the list reports none: {entry}"
+        );
         assert!(entry["joined_at_secs"].as_u64().is_some());
         assert!(entry["connected"].as_bool().is_some());
         assert!(entry["last_activity_secs"].as_u64().is_some());
@@ -247,52 +274,79 @@ async fn list_route_enumerates_live_sessions_with_any_live_bearer() {
     server.shutdown();
 }
 
+/// **Recovery, end to end, without a role.** A driver that lost its own
+/// state joins fresh, reads the 記名 list, and recognises the stale
+/// session by the sentence it wrote at join.
+///
+/// # What it can and cannot do with it
+///
+/// It can identify it. It cannot release it: `DELETE /v1/operators/:sid`
+/// wants that session's own bearer, which is exactly what a crashed driver
+/// lost. The by-role route existed for this and was unauthenticated for
+/// this reason — so it is worth being explicit that removing it leaves no
+/// hole, because the thing recovery was *for* went with it.
+///
+/// A stale session used to hold a role name against the whole server, so a
+/// replacement driver could not join at all until someone released it —
+/// recovery was mandatory and urgent. It now holds nothing anybody else
+/// needs: a new driver joins freely (asserted above), launches pin
+/// themselves, and an acquire is unrefusable (**A8**). What is left is a
+/// row on a list that says what a session was doing, which the reader
+/// skips over.
 #[tokio::test]
-async fn by_role_delete_releases_stale_session_and_role_reopens() {
+async fn a_stale_session_is_identifiable_on_the_list_and_blocks_nobody() {
     let server = spawn_server().await;
     let client = reqwest::Client::new();
 
-    // A pretend-crashed driver: mint, then discard the sid/token (simulating
-    // a driver that lost its local state).
-    // convention-token-ok: mlua-swarm public operator role literal.
-    let _stale = mint(&client, &server.base_url, "main-ai").await;
+    // A pretend-crashed driver: mint with a 記名, then discard the sid and
+    // token, exactly as a driver that lost its local state would.
+    let _stale = mint_with_desc(
+        &client,
+        &server.base_url,
+        Some("teardown/dispatch-1, halfway through the seat rework"),
+    )
+    .await;
 
-    let release = client
-        .delete(format!("{}/v1/operators/by-role/main-ai", server.base_url))
+    // The recovering driver joins — unguarded, D3 — and reads the list
+    // with its own fresh bearer.
+    let recovering = mint_with_desc(&client, &server.base_url, Some("recovering the above")).await;
+    let list: serde_json::Value = client
+        .get(format!("{}/v1/operators", server.base_url))
+        .bearer_auth(recovering["token"].as_str().expect("token"))
         .send()
         .await
-        .expect("by-role delete request");
+        .expect("list request")
+        .json()
+        .await
+        .expect("list json");
+    let stale_sid = list["operators"]
+        .as_array()
+        .expect("operators")
+        .iter()
+        .find(|e| {
+            e["desc"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("teardown/dispatch-1"))
+        })
+        .expect("the stale session is identifiable by its 記名")["sid"]
+        .as_str()
+        .expect("sid")
+        .to_string();
+
+    // Releasing it needs that session's own bearer, which the recovering
+    // driver does not have — so the release is refused, and the token it
+    // does have is no substitute.
+    let refused = client
+        .delete(format!("{}/v1/operators/{stale_sid}", server.base_url))
+        .bearer_auth(recovering["token"].as_str().expect("token"))
+        .send()
+        .await
+        .expect("delete with the wrong bearer");
     assert_eq!(
-        release.status(),
-        reqwest::StatusCode::NO_CONTENT,
-        "DELETE /v1/operators/by-role/:role must return 204 on successful teardown"
+        refused.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "DELETE /v1/operators/:sid is the session's own door, not an admin one"
     );
-
-    // The role is now open — a fresh mint succeeds with a different sid.
-    // convention-token-ok: mlua-swarm public operator role literal.
-    let remint = mint(&client, &server.base_url, "main-ai").await;
-    assert!(remint["sid"].as_str().is_some());
-
-    server.shutdown();
-}
-
-#[tokio::test]
-async fn by_role_delete_returns_404_when_no_session_holds_the_role() {
-    let server = spawn_server().await;
-    let client = reqwest::Client::new();
-
-    let resp = client
-        .delete(format!(
-            "{}/v1/operators/by-role/no-such-role",
-            server.base_url
-        ))
-        .send()
-        .await
-        .expect("by-role delete request");
-    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
-    let body: serde_json::Value = resp.json().await.expect("404 body json");
-    assert_eq!(body["error"], "no session holds this role");
-    assert_eq!(body["role"], "no-such-role");
 
     server.shutdown();
 }
@@ -343,8 +397,8 @@ async fn wait_until_connected(client: &reqwest::Client, base_url: &str, sid: &st
     panic!("the WS never became `connected` on the server side");
 }
 
-/// A session torn down by a third party (`by-role`, no Bearer needed) must
-/// have its socket **closed**, not merely unregistered.
+/// A torn-down session must have its socket **closed**, not merely
+/// unregistered.
 ///
 /// Before this fix teardown dropped the session's own sender and removed
 /// the `operator_sessions` entry, but `handle_operator_socket`'s local
@@ -353,12 +407,11 @@ async fn wait_until_connected(client: &reqwest::Client, base_url: &str, sid: &st
 /// ever arrive on again, with no error to notice: the session it belonged
 /// to was already gone.
 #[tokio::test]
-async fn by_role_delete_closes_the_holders_socket() {
+async fn a_delete_closes_the_holders_socket() {
     let server = spawn_server().await;
     let client = reqwest::Client::new();
 
-    // convention-token-ok: mlua-swarm public operator role literal.
-    let holder = mint(&client, &server.base_url, "main-ai").await;
+    let holder = mint(&client, &server.base_url).await;
     let sid = holder["sid"].as_str().expect("sid").to_string();
     let token = holder["token"].as_str().expect("token").to_string();
 
@@ -366,11 +419,11 @@ async fn by_role_delete_closes_the_holders_socket() {
     wait_until_connected(&client, &server.base_url, &sid, &token).await;
 
     let release = client
-        // convention-token-ok: mlua-swarm public operator role literal.
-        .delete(format!("{}/v1/operators/by-role/main-ai", server.base_url))
+        .delete(format!("{}/v1/operators/{sid}", server.base_url))
+        .bearer_auth(&token)
         .send()
         .await
-        .expect("by-role delete request");
+        .expect("delete request");
     assert_eq!(release.status(), reqwest::StatusCode::NO_CONTENT);
 
     let next = tokio::time::timeout(Duration::from_secs(5), socket.next())
@@ -507,15 +560,12 @@ async fn spawn_server_with_session_store(
 
 /// Seed one persisted session for [`spawn_server_with_session_store`] to
 /// restore, authenticated by [`SEEDED_BEARER`].
-async fn seed_persisted_session(store: &FaultyDeleteStore, role: &str) -> SessionId {
+async fn seed_persisted_session(store: &FaultyDeleteStore) -> SessionId {
     let sid = SessionId::new();
     store
         .put(OperatorSessionRecord {
             sid: sid.clone(),
             token_digest: OperatorSessionRecord::digest_of(SEEDED_BEARER),
-            roles: vec![
-                mlua_swarm::OperatorRef::new(role).expect("test role literal is never empty")
-            ],
             capability_manifest: None,
             joined_at_secs: 0,
             desc: None,
@@ -539,8 +589,7 @@ async fn seed_persisted_session(store: &FaultyDeleteStore, role: &str) -> Sessio
 #[tokio::test]
 async fn persisted_row_delete_failure_aborts_the_teardown() {
     let store = Arc::new(FaultyDeleteStore::new());
-    // convention-token-ok: mlua-swarm public operator role literal.
-    let sid = seed_persisted_session(&store, "main-ai").await;
+    let sid = seed_persisted_session(&store).await;
 
     let (server, engine) = spawn_server_with_session_store(store.clone()).await;
     let client = reqwest::Client::new();
@@ -578,17 +627,18 @@ async fn persisted_row_delete_failure_aborts_the_teardown() {
         engine.list_operator_ids().await.contains(&sid.to_string()),
         "an aborted teardown must leave the engine registration in place"
     );
-    let conflict = client
-        .post(format!("{}/v1/operators", server.base_url))
-        // convention-token-ok: mlua-swarm public operator role literal.
-        .json(&json!({ "roles": ["main-ai"] }))
+    let still_there: serde_json::Value = client
+        .get(format!("{}/v1/operators", server.base_url))
+        .bearer_auth(SEEDED_BEARER)
         .send()
         .await
-        .expect("conflicting mint request");
+        .expect("list request")
+        .json()
+        .await
+        .expect("list json");
     assert_eq!(
-        conflict.status(),
-        reqwest::StatusCode::CONFLICT,
-        "an aborted teardown must not release the role"
+        still_there["total"], 1,
+        "an aborted teardown must leave the session on the 記名 list: {still_there}"
     );
 
     // ...and once the store is healthy again the same DELETE goes through,
@@ -636,20 +686,15 @@ async fn connecting_a_socket_adds_nothing_to_the_engine_registry() {
     let (server, engine) = spawn_server_with_engine().await;
     let client = reqwest::Client::new();
 
-    // convention-token-ok: mlua-swarm public operator role literal.
-    let holder = mint(&client, &server.base_url, "main-ai").await;
+    let holder = mint(&client, &server.base_url).await;
     let sid = holder["sid"].as_str().expect("sid").to_string();
     let token = holder["token"].as_str().expect("token").to_string();
 
     let before = registered_ids(&engine).await;
-    assert!(
-        before.contains(&sid),
-        "the mint alone must register the sid: {before:?}"
-    );
-    assert!(
-        // convention-token-ok: mlua-swarm public operator role literal.
-        before.contains(&"main-ai".to_string()),
-        "the mint alone must register the role alias: {before:?}"
+    assert_eq!(
+        before,
+        vec![sid.clone()],
+        "the mint alone must register the sid, and nothing but the sid"
     );
 
     let _socket = connect_ws(&server.base_url, &sid, &token).await;
@@ -673,9 +718,9 @@ async fn connecting_a_socket_adds_nothing_to_the_engine_registry() {
 /// right there used to leave the late handler looking at an entry with no
 /// session, which it answered by minting one and **registering** it: a
 /// registration under a sid already gone from `operator_sessions`, so
-/// `DELETE /v1/operators/:sid` could only `404` and the by-role route could
-/// only clear the role map. It survived until the process exited, and the
-/// client sat on a socket that would never be spoken on or closed.
+/// `DELETE /v1/operators/:sid` could only `404`. It survived until the
+/// process exited, and the client sat on a socket that would never be
+/// spoken on or closed.
 ///
 /// Both interleavings now land in the same place, which is what makes this
 /// test stable: if the bind wins, teardown closes an attached socket; if
@@ -688,8 +733,7 @@ async fn a_teardown_racing_a_connect_registers_nothing_and_still_closes_the_sock
     let (server, engine) = spawn_server_with_engine().await;
     let client = reqwest::Client::new();
 
-    // convention-token-ok: mlua-swarm public operator role literal.
-    let holder = mint(&client, &server.base_url, "main-ai").await;
+    let holder = mint(&client, &server.base_url).await;
     let sid = holder["sid"].as_str().expect("sid").to_string();
     let token = holder["token"].as_str().expect("token").to_string();
 
@@ -698,11 +742,11 @@ async fn a_teardown_racing_a_connect_registers_nothing_and_still_closes_the_sock
     let mut socket = connect_ws(&server.base_url, &sid, &token).await;
 
     let release = client
-        // convention-token-ok: mlua-swarm public operator role literal.
-        .delete(format!("{}/v1/operators/by-role/main-ai", server.base_url))
+        .delete(format!("{}/v1/operators/{sid}", server.base_url))
+        .bearer_auth(&token)
         .send()
         .await
-        .expect("by-role delete request");
+        .expect("delete request");
     assert_eq!(release.status(), reqwest::StatusCode::NO_CONTENT);
 
     // The socket must be closed either way. Reaching this point also means
@@ -727,14 +771,9 @@ async fn a_teardown_racing_a_connect_registers_nothing_and_still_closes_the_sock
 
     let after = registered_ids(&engine).await;
     assert!(
-        !after.contains(&sid),
+        after.is_empty(),
         "a connect completing after the teardown must not re-register the sid — \
          nothing could ever unregister it again: {after:?}"
-    );
-    assert!(
-        // convention-token-ok: mlua-swarm public operator role literal.
-        !after.contains(&"main-ai".to_string()),
-        "...nor its role alias: {after:?}"
     );
 
     server.shutdown();
@@ -812,8 +851,7 @@ async fn minted_session_is_launch_pinnable_before_any_ws_connect() {
     let (server, _engine) = spawn_server_with_engine().await;
     let client = reqwest::Client::new();
 
-    // convention-token-ok: mlua-swarm public operator role literal.
-    let holder = mint(&client, &server.base_url, "main-ai").await;
+    let holder = mint(&client, &server.base_url).await;
     let sid = holder["sid"].as_str().expect("sid").to_string();
     let token = holder["token"].as_str().expect("token").to_string();
 
@@ -871,8 +909,7 @@ async fn minted_session_is_launch_pinnable_before_any_ws_connect() {
 #[tokio::test]
 async fn persisted_row_already_gone_is_still_a_successful_teardown() {
     let store = Arc::new(FaultyDeleteStore::new());
-    // convention-token-ok: mlua-swarm public operator role literal.
-    let sid = seed_persisted_session(&store, "main-ai").await;
+    let sid = seed_persisted_session(&store).await;
 
     let (server, engine) = spawn_server_with_session_store(store.clone()).await;
     let client = reqwest::Client::new();

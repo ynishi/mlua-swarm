@@ -3,8 +3,6 @@
 //! configured. Byte-for-byte the pre-persistence behaviour: sessions die
 //! with the process.
 
-#[cfg(test)]
-use super::OperatorRef;
 use super::{
     Inner, OperatorSessionRecord, OperatorSessionStore, OperatorSessionStoreError, SessionId,
     SharedInner,
@@ -71,16 +69,10 @@ impl OperatorSessionStore for InMemoryOperatorSessionStore {
 mod tests {
     use super::*;
 
-    /// convention-token-ok: mlua-swarm public operator role literal.
-    fn role(name: &str) -> OperatorRef {
-        OperatorRef::new(name).expect("test role literal is never empty")
-    }
-
     fn mk(sid: &str, joined_at_secs: u64) -> OperatorSessionRecord {
         OperatorSessionRecord {
             sid: SessionId::parse(sid).unwrap(),
             token_digest: OperatorSessionRecord::digest_of(&format!("bearer-{sid}")),
-            roles: vec![role("main-ai")],
             capability_manifest: None,
             joined_at_secs,
             desc: None,
@@ -133,11 +125,11 @@ mod tests {
         let s = InMemoryOperatorSessionStore::new();
         s.put(mk("S-1", 100)).await.unwrap();
         let mut updated = mk("S-1", 100);
-        updated.roles = vec![role("other-role")];
+        updated.desc = Some("the same session, re-put".to_string());
         s.put(updated).await.unwrap();
         let list = s.list().await.unwrap();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].roles, vec![role("other-role")]);
+        assert_eq!(list[0].desc.as_deref(), Some("the same session, re-put"));
     }
 
     #[tokio::test]

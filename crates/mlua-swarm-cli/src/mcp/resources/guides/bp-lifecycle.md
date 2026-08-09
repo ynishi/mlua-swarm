@@ -156,12 +156,13 @@ runs both side by side. The full three-hop responsibility model is
     first`. Pre-#81 this fell through to a generic `400` with no
     recovery hint. `bp_unarchive` is the corresponding MCP tool.
   - **Stale operator session** (a driver crashed after
-    `mse_operator_join`). `GET /v1/operators` enumerates every live
-    session's `{sid, roles, joined_at_secs, connected}` without
-    Bearer; `DELETE /v1/operators/by-role/:role` (MCP:
-    `mse_operator_leave_by_role`) releases the holder without knowing
-    the sid or its Bearer, so recovery no longer needs a full server
-    restart. Full contract:
+    `mse_operator_join`). `GET /v1/operators` (MCP:
+    `mse_operator_list`) enumerates every live session's
+    `{sid, joined_at_secs, connected}` plus its 記名 — Bearer
+    required, any live session's token — so you can tell which one it
+    is by what it wrote at join. It blocks nothing in the meantime: a
+    session claims no name, so your own join, your pins and your
+    acquires are all unaffected by it. Full contract:
     `mse://guides/operator-execution-model` § Recovery.
 
 ---

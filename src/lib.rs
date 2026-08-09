@@ -142,7 +142,7 @@ pub use core::projection_placement::{
     ProjectionPlacement, ProjectionPlacementError, RootPreference,
 };
 pub use core::state::{
-    CapTokenConsumeError, CapTokenRecord, DispatchOutcome, Event, EventStream, OperatorSession,
+    CapTokenConsumeError, CapTokenRecord, DispatchOutcome, Event, EventStream, LaunchEnvelope,
     ResumeKey, ResumePending, TaskSpec, TaskState, TaskStatus,
 };
 pub use core::step_naming::{StepNameEntry, StepNaming, StepNamingError, StepNamingWarning};

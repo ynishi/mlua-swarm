@@ -786,10 +786,11 @@ effective grant. The generic path is for the Operator/MainAI to implement
 that interface. `ManifestBindingProvider` is the reusable reference
 implementation: Claude Code and Codex plugins inspect only their own
 environment, produce `AgentProviderManifest`, and delegate the common
-request-to-receipt mapping to it. The standard Server maps
-`AgentDef.spec.operator_ref` to the role claimed by `mse_operator_join` and
-resolves the submitted `capability_manifest`; it never reads wrapper files
-from the Server filesystem. Core validates one receipt
+request-to-receipt mapping to it. The standard Server resolves the
+`capability_manifest` submitted by the session the launch pinned
+(`operator_sid`) — the environment that is about to run the work, rather
+than whichever session a name might resolve to; it never reads wrapper
+files from the Server filesystem. Core validates one receipt
 per requested agent, requires every requested tool and the exact launch
 variant, then pins the accepted model, tools, provider revision, and optional
 capability snapshot digest as `BindingAttestation`. That attestation is included in the
@@ -941,7 +942,8 @@ one Blueprint-level switch, `strategy.strict_binding` (default **false**):
 
 - **`strict_binding = false` (default)** — the Blueprint runs without any
   capability manifest at all. An agent whose provider offers no attestation
-  (no manifest, the role never joined, or the manifest declares no matching
+  (the launch carried no `operator_sid`, the pinned session is gone, or its
+  manifest declares no matching
   launch variant) stays `DeclarationOnly` — its `runner.tools` / `model`
   remain requested/declarative, the Run launches, and the unattested state is
   recorded on `RunRecord.degradations` for after-the-fact observation. The
@@ -952,7 +954,10 @@ one Blueprint-level switch, `strategy.strict_binding` (default **false**):
   attestation for **every** Runner-backed agent. A missing manifest, a missing
   variant, an insufficient tool grant, or no provider at all fails the launch
   before any Spawn, and the error names the agent plus the requested
-  variant/tools it could not satisfy.
+  variant/tools it could not satisfy. Such a launch must carry
+  `operator_sid`: the manifest is read off the pinned session, so an
+  unpinned launch has nothing to attest through and fails on every
+  Runner-backed agent.
 
 This default is deliberately the opposite of `strict_refs` / `strict_kind`
 (both default `true`): those guard the Blueprint's *structural* integrity,

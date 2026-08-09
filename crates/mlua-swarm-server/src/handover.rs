@@ -227,20 +227,16 @@ fn task_input_spec(task: &TaskRecord) -> Option<TaskInputSpec> {
     }
 }
 
-/// `OperatorId` → the live session it names, by sid then by role alias.
+/// `OperatorId` → the live session it names.
+///
+/// One lookup, because an `OperatorId` is a session id and nothing else.
+/// This used to fall through to a role-alias map when the sid lookup
+/// missed, back when a seat could be held under a name a session had
+/// claimed at join; an `op` that does not parse or does not resolve is now
+/// simply a session that is not here (**Q2** — a seat can be taken for an
+/// operator nobody is), and the caller records nothing.
 async fn resolve_session(state: &AppState, op: &str) -> Option<Arc<LoginSession>> {
-    let sessions = state.operator_sessions.lock().await;
-    if let Ok(sid) = mlua_swarm::SessionId::parse(op.to_string()) {
-        if let Some(live) = sessions.get(&sid) {
-            return Some(live.clone());
-        }
-    }
-    drop(sessions);
-
-    let sid = {
-        let roles = state.roles_to_sid.lock().await;
-        roles.get(op).cloned()
-    }?;
+    let sid = mlua_swarm::SessionId::parse(op.to_string()).ok()?;
     let sessions = state.operator_sessions.lock().await;
     sessions.get(&sid).cloned()
 }
@@ -383,9 +379,10 @@ async fn run_assignees_inner(state: &AppState, id: String) -> Result<RunAssignee
 /// Every seat of `run` — the union of the seats its Blueprint declares and
 /// the seats it actually holds — with where the declared half came from.
 ///
-/// Shared by `/assignees` and the axis-2 half of `/handover` so the two
-/// routes cannot drift into disagreeing about who holds what.
-async fn seat_list(
+/// Shared by `/assignees`, the axis-2 half of `/handover`, and the launch
+/// announcement (`tasks::build_launch_info`, model §5) so the three cannot
+/// drift into disagreeing about who holds what.
+pub(crate) async fn seat_list(
     state: &AppState,
     run: &RunRecord,
 ) -> (Vec<RunSeat>, SeatsSource, Option<String>) {
@@ -724,16 +721,16 @@ async fn trace_ref(state: &AppState, run_id: &RunId) -> TraceRef {
 ///
 /// The seats are the reason to ask, but they are not the unit that
 /// answers: one `Arc<dyn OperatorAdapter>` can back several seats of one
-/// Run (a session is registered under its sid *and* under each of its
-/// roles, and `seat_declared_operators` auto-seats each declared slot from
-/// the adapter answering to that slot's own name). Asking per seat asked
-/// the same object twice and got the same requests twice, and the join
-/// then stamped each copy with a different seat's `op` and `gen` — two
-/// rows for one waiting request, at most one of them true.
+/// Run, because `seat_declared_operators` puts the launching operator in
+/// every declared seat the pin did not name — so one session's adapter is
+/// the destination of several lanes. Asking per seat asked the same object
+/// twice and got the same requests twice, and the join then stamped each
+/// copy with a different seat's `op` and `gen` — two rows for one waiting
+/// request, at most one of them true.
 ///
 /// So adapters are visited once, identified by pointer rather than by the
-/// `OperatorId` that reached them (two `OperatorId`s resolving to one
-/// object is exactly the case being handled). Which seat a request belongs
+/// `OperatorId` that reached them (several seats resolving to one object
+/// is exactly the case being handled). Which seat a request belongs
 /// to is then a separate question, answered by
 /// [`SeatLedger`](crate::operator_ws::SeatLedger) — the fact the router
 /// recorded on the way down — rather than by which key was used to find

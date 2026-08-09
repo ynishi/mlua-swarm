@@ -9,7 +9,7 @@
 //! pin pointed at a sid the server no longer knew, `GET /v1/operators/:sid`
 //! answered `404 unknown sid`, and the sole recovery was a forced re-login
 //! that still could not reclaim the old pin. Persisting the login record
-//! (sid / token / roles / manifest) closes that asymmetry.
+//! (sid / token / manifest / 記名) closes that asymmetry.
 //!
 //! What is still deliberately NOT persisted: the WS adapter state
 //! (`tx` sender / `pending` oneshot map) — process-lifetime objects whose
@@ -160,8 +160,7 @@ async fn operator_sid_survives_server_restart() {
 
     let mint = client
         .post(format!("{}/v1/operators", server_a.base_url))
-        // convention-token-ok: "main-ai" is a mlua-swarm public operator role name.
-        .json(&json!({ "roles": ["main-ai"] }))
+        .json(&json!({ "desc": "the session this restart has to carry over" }))
         .send()
         .await
         .expect("mint request");
@@ -224,7 +223,7 @@ async fn operator_sid_survives_server_restart() {
     let bundle_b = StoreBundle::open(&shared_dir).await;
     let server_b = spawn_server(&bundle_b).await;
 
-    // The session must be back: same sid, same token, roles intact,
+    // The session must be back: same sid, same token, 記名 intact,
     // `connected: false` (the WS adapter state is process-lifetime and is
     // correctly rebuilt empty — the client reconnects, it does not re-mint).
     let get_after = client
@@ -241,30 +240,32 @@ async fn operator_sid_survives_server_restart() {
     );
     let get_body: serde_json::Value = get_after.json().await.expect("get json");
     assert_eq!(get_body["sid"], sid.as_str());
-    assert_eq!(get_body["roles"], json!(["main-ai"]));
+    assert_eq!(
+        get_body["desc"], "the session this restart has to carry over",
+        "D1: the 記名's confirmed part is what identifies a restored session"
+    );
     assert_eq!(
         get_body["connected"], false,
         "no WS is attached yet on server B — the adapter state is rebuilt empty"
     );
 
-    // Roles exclusivity must be rehydrated too: the restored session still
-    // owns `main-ai`, so a competing mint conflicts instead of silently
-    // double-claiming the role.
-    let conflicting_mint = client
+    // A second mint alongside the restored one is not a conflict: a
+    // session claims no name, so nothing about the restore can be
+    // double-claimed.
+    let second_mint = client
         .post(format!("{}/v1/operators", server_b.base_url))
-        // convention-token-ok: "main-ai" is a mlua-swarm public operator role name.
-        .json(&json!({ "roles": ["main-ai"] }))
+        .json(&json!({ "desc": "a second driver, after the restart" }))
         .send()
         .await
-        .expect("conflicting mint request");
+        .expect("second mint request");
     assert_eq!(
-        conflicting_mint.status(),
-        reqwest::StatusCode::CONFLICT,
-        "the restored session must still hold the role after restart"
+        second_mint.status(),
+        reqwest::StatusCode::OK,
+        "a restored session blocks nobody else's join"
     );
 
     // DELETE with the pre-restart token must work — and must also remove
-    // the persisted row, re-opening the role for a fresh mint.
+    // the persisted row.
     let delete_after = client
         .delete(format!("{}/v1/operators/{sid}", server_b.base_url))
         .bearer_auth(&token)
@@ -277,17 +278,16 @@ async fn operator_sid_survives_server_restart() {
         "DELETE /v1/operators/:sid must tear down the restored session"
     );
 
-    let remint = client
-        .post(format!("{}/v1/operators", server_b.base_url))
-        // convention-token-ok: "main-ai" is a mlua-swarm public operator role name.
-        .json(&json!({ "roles": ["main-ai"] }))
+    let gone = client
+        .get(format!("{}/v1/operators/{sid}", server_b.base_url))
+        .bearer_auth(&token)
         .send()
         .await
-        .expect("remint request");
+        .expect("get after delete");
     assert_eq!(
-        remint.status(),
-        reqwest::StatusCode::OK,
-        "after teardown the role is claimable again"
+        gone.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "the torn-down session must not answer any more"
     );
 
     server_b.shutdown();
@@ -309,7 +309,7 @@ async fn deleted_session_does_not_resurrect_on_restart() {
 
     let mint = client
         .post(format!("{}/v1/operators", server_a.base_url))
-        .json(&json!({ "roles": [] }))
+        .json(&json!({ "desc": "a session that leaves before the restart" }))
         .send()
         .await
         .expect("mint request");
@@ -431,8 +431,7 @@ async fn restored_session_is_launch_pinnable_before_any_ws_connect() {
 
     let mint = client
         .post(format!("{}/v1/operators", server_a.base_url))
-        // convention-token-ok: "main-ai" is a mlua-swarm public operator role name.
-        .json(&json!({ "roles": ["main-ai"] }))
+        .json(&json!({ "desc": "pinnable before any WS connect" }))
         .send()
         .await
         .expect("mint request");

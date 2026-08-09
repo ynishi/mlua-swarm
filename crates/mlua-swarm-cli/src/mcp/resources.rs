@@ -490,7 +490,7 @@ pub fn http_endpoints_schema_value() -> Result<serde_json::Value, serde_json::Er
                 "response": run_material_response,
             },
             "GET /v1/operators": {
-                "$comment": "Every live Operator session with its 記名: `sid` / `roles` / `joined_at_secs` / `connected`, the join-time `desc` the session wrote about itself (null when it wrote none — the key is always present), and `observed[]`, one entry per Operator seat it has been assigned ({run_id, slot, goal, project_root, work_dir, task_metadata, task_metadata_omitted, text_truncated, at_secs}). Every entry field is bounded so the ring has a stated size: `task_metadata` over 4 KiB is dropped with `task_metadata_omitted: true`, and `goal` / `project_root` / `work_dir` over 1 KiB are cut to fit, ending in `…` with `text_truncated: true`. Auth: Bearer of any live session — this route was unauthenticated before and is now gated. Ordered by `last_activity_secs` descending, then by sid. Query: `limit` (default 50, clamped to 200). Response body is {\"operators\": [...], \"total\": N, \"limit\": N}; `total` is the count before the page cut, and `observed_total > observed.length` means older entries have aged out of the per-session ring. No token or capability manifest is ever on this surface.",
+                "$comment": "Every live Operator session with its 記名: `sid` / `joined_at_secs` / `connected`, the join-time `desc` the session wrote about itself (null when it wrote none — the key is always present), and `observed[]`, one entry per Operator seat it has been assigned ({run_id, slot, goal, project_root, work_dir, task_metadata, task_metadata_omitted, text_truncated, at_secs}). Every entry field is bounded so the ring has a stated size: `task_metadata` over 4 KiB is dropped with `task_metadata_omitted: true`, and `goal` / `project_root` / `work_dir` over 1 KiB are cut to fit, ending in `…` with `text_truncated: true`. Auth: Bearer of any live session — this route was unauthenticated before and is now gated. Ordered by `last_activity_secs` descending, then by sid. Query: `limit` (default 50, clamped to 200). Response body is {\"operators\": [...], \"total\": N, \"limit\": N}; `total` is the count before the page cut, and `observed_total > observed.length` means older entries have aged out of the per-session ring. No token or capability manifest is ever on this surface.",
             },
             "POST /v1/worker/stats": {
                 "$comment": "Worker self-reported per-attempt stats. Auth: `Authorization: Bearer <worker_handle>` (short handle from the Spawn frame, or full capability_token). `worker_kind` defaults to \"operator\". Every field is optional and an all-empty body is accepted and dropped. Call it BEFORE the attempt's final `POST /v1/worker/submit`: the dispatcher folds the recorded stats into the step's StepEntry at outcome time, so stats arriving after that fold never reach the Run record. 204 on success; 410 once the addressed Run is terminal. Also reachable via `mse_worker_submit`'s `stats` object, which POSTs here before its own submit; aggregate a run's reports with the `swarm_run_stats` tool.",
@@ -1037,6 +1037,54 @@ mod tests {
                     audit.agent
                 );
             }
+        }
+    }
+
+    /// **Every bundled sample stays launchable by `swarm_run` alone.**
+    ///
+    /// A sample with `kind = operator` agents only reaches an operator if
+    /// the launch pins one — an unpinned `POST /v1/tasks` seats nobody, so
+    /// its first Operator dispatch fails naming a `Vacant` seat. `swarm_run`
+    /// supplies that pin from this process's sole live session, and it
+    /// deliberately does **not** supply `operator_slot`: which lane a pin
+    /// fills is the Blueprint's business, and the server refuses to guess
+    /// when several are declared.
+    ///
+    /// So the property a bundled sample has to keep is that it declares at
+    /// most **one** Operator seat. Declare a second and the sample stops
+    /// being launchable by the tool the guides tell readers to launch it
+    /// with — it starts requiring a hand-rolled HTTP call naming a lane.
+    #[test]
+    fn bundled_operator_samples_declare_at_most_one_seat() {
+        for entry in RESOURCES.iter().filter(|e| e.uri.contains("/samples/")) {
+            let body = body_for(entry).expect("sample body must generate");
+            // The `.bp.lua` samples go through the DSL builder first; the
+            // JSON ones are already Blueprint-shaped.
+            let value: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(value) => value,
+                Err(_) => match mlua_swarm_cli::dsl::build_bp_from_script(&body) {
+                    Ok(value) => value,
+                    // Not a Blueprint at all (a guide, a doc): nothing to check.
+                    Err(_) => continue,
+                },
+            };
+            let Ok(bp) = serde_json::from_value::<Blueprint>(value) else {
+                continue;
+            };
+            let uses_operator_agents = bp
+                .agents
+                .iter()
+                .any(|agent| agent.kind == mlua_swarm::blueprint::AgentKind::Operator);
+            if !uses_operator_agents {
+                continue;
+            }
+            let seats: Vec<&str> = bp.operators.iter().map(|o| o.name.as_str()).collect();
+            assert!(
+                seats.len() <= 1,
+                "{}: an Operator-backed sample must declare at most one seat so a \
+                 `swarm_run` auto-pin can fill it without naming a lane; declares {seats:?}",
+                entry.uri
+            );
         }
     }
 

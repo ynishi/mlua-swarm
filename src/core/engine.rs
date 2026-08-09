@@ -14,7 +14,7 @@ use crate::core::ctx::{Ctx, OperatorInfo, OperatorKind, SeniorBridge, SpawnHook}
 use crate::core::errors::EngineError;
 use crate::core::state::{
     unwrap_skip_marker, wrap_skip_marker, CapTokenRecord, DispatchOutcome, EngineState, Event,
-    EventStream, OperatorSession, ResumeKey, ResumePending, SubmitOutcome, TaskSpec, TaskState,
+    EventStream, LaunchEnvelope, ResumeKey, ResumePending, SubmitOutcome, TaskSpec, TaskState,
     TaskStatus,
 };
 use crate::store::replay::{hash_input_value, ReplayEntry};
@@ -1183,7 +1183,7 @@ impl Engine {
     /// path when persistence is in play.
     ///
     /// `kind` is the "Runtime Global" tier of the `OperatorKind` cascade
-    /// (stored verbatim on `OperatorSession.operator_kind`): `Some(_)` is
+    /// (stored verbatim on `LaunchEnvelope.operator_kind`): `Some(_)` is
     /// an explicit request (including `Some(OperatorKind::Automate)`) that
     /// outranks the BP-level tiers; `None` leaves it unspecified so the
     /// BP-level tiers / final default decide. See
@@ -1225,7 +1225,7 @@ impl Engine {
                 .insert(fp.clone(), CapTokenRecord::from_token(token_for_store));
             s.sessions.insert(
                 session_id.clone(),
-                OperatorSession {
+                LaunchEnvelope {
                     id: session_id.clone(),
                     operator_id: operator_id.clone(),
                     role,
@@ -1265,7 +1265,7 @@ impl Engine {
     /// does not fire and the default behaviour applies.
     async fn resolve_operator_info(
         &self,
-        session: &OperatorSession,
+        session: &LaunchEnvelope,
         agent_name: &str,
     ) -> OperatorInfo {
         let senior_bridge = if let Some(id) = &session.bridge_id {
@@ -1285,7 +1285,7 @@ impl Engine {
         };
         let runtime_agent = session.runtime_agent_kinds.get(agent_name).copied();
         // "Runtime Global" tier: `Some(_)` is always an explicit request
-        // (see the field doc on `OperatorSession.operator_kind`).
+        // (see the field doc on `LaunchEnvelope.operator_kind`).
         let runtime_global = session.operator_kind;
         let bp_agent = session.bp_agent_kinds.get(agent_name).copied();
         let bp_global = session.bp_global_kind;
@@ -1344,7 +1344,7 @@ impl Engine {
         // Global" tier request (`Some(kind)`) — this path never persists
         // BP-level tiers (both stay empty below), so `Some(kind)` resolves
         // to the same `kind` at dispatch either way; see
-        // `OperatorSession.operator_kind` doc.
+        // `LaunchEnvelope.operator_kind` doc.
         let kind = operator_info.kind;
         // BridgeRegistry auto-register: when the caller hands in an
         // `Arc<dyn>` directly, register it under a synthesised ID (the inline
@@ -1404,7 +1404,7 @@ impl Engine {
                 .insert(fp.clone(), CapTokenRecord::from_token(token_for_store));
             s.sessions.insert(
                 session_id.clone(),
-                OperatorSession {
+                LaunchEnvelope {
                     id: session_id.clone(),
                     operator_id,
                     role,
@@ -3830,7 +3830,7 @@ mod verify_token_expiry_role_gate_tests {
 // ─── UT: `OperatorKind` "Runtime Global" tier — `Option` semantics ─────────
 //
 // Regression coverage for the "explicit Automate is indistinguishable from
-// unspecified" defect: `OperatorSession.operator_kind` (and the
+// unspecified" defect: `LaunchEnvelope.operator_kind` (and the
 // `attach_with_ids` `kind` parameter it stores) is `Option<OperatorKind>`,
 // so `Some(Automate)` is an explicit Runtime Global request that must
 // outrank `bp_global`, while `None` must let `bp_global` decide. Exercises

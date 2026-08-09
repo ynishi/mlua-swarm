@@ -1,7 +1,7 @@
 //! `OperatorSessionStore` — persistence for Operator login-flow sessions.
 //!
 //! One row per minted `POST /v1/operators` session: the sid / bearer token /
-//! role aliases / capability manifest / mint time. This is the record that
+//! capability manifest / mint time / 記名. This is the record that
 //! lets a single-server restart keep every logged-in Operator logged in —
 //! the sibling stores (task / run / replay / trace / …) already persist,
 //! and `RunRecord.operator_sid` persists a *pointer* into this session
@@ -19,7 +19,7 @@
 //! - [`SqliteOperatorSessionStore`] — file-backed persistence via
 //!   `rusqlite-isle` (same shape as [`crate::store::task::SqliteTaskStore`]).
 
-use crate::types::{OperatorRef, SessionId};
+use crate::types::SessionId;
 use crate::AgentProviderManifest;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -121,10 +121,6 @@ pub struct OperatorSessionRecord {
     /// [`Self::verify_bearer`]. The plaintext bearer is deliberately absent
     /// (see the type doc).
     pub token_digest: String,
-    /// Role aliases claimed exclusively by this session. Each element
-    /// serializes as the plain role string it always was — the wire and
-    /// at-rest forms are unchanged by the [`OperatorRef`] typing.
-    pub roles: Vec<OperatorRef>,
     /// Provider-owned effective capability manifest submitted at join.
     pub capability_manifest: Option<AgentProviderManifest>,
     /// Unix epoch seconds when `POST /v1/operators` minted this session.
@@ -403,9 +399,8 @@ pub enum OperatorSessionStoreError {
 ///
 /// Write-through contract on the server side: `POST /v1/operators` calls
 /// [`put`](Self::put) before answering the mint, teardown (`DELETE
-/// /v1/operators/:sid` / `by-role`) calls [`delete`](Self::delete), and a
-/// fresh boot calls [`list`](Self::list) once to rehydrate its in-memory
-/// session map.
+/// /v1/operators/:sid`) calls [`delete`](Self::delete), and a fresh boot
+/// calls [`list`](Self::list) once to rehydrate its in-memory session map.
 #[async_trait]
 pub trait OperatorSessionStore: Send + Sync {
     /// Backend name — for diagnostics/logging.
@@ -436,13 +431,13 @@ pub trait OperatorSessionStore: Send + Sync {
     /// its own error path is fatal: an `Err` here takes `mse serve` down
     /// and every healthy session with it. Undecodable rows are reachable
     /// in practice — an older build could persist shapes a newer one
-    /// rejects (`roles: [""]` predates the [`OperatorRef`] typing) — so
+    /// rejects (`sid: "op-<uuid>"` predates the `S-<hex>` shape) — so
     /// all-or-nothing decoding means one stale row bricks the boot.
     ///
     /// Skipping the row rather than defaulting the field is deliberate: a
-    /// session restored minus its role aliases would come back claiming
-    /// less than it was minted with, and would fail later, elsewhere, and
-    /// quietly. Dropping it is the observable choice.
+    /// session restored minus a field it was minted with would come back
+    /// claiming something other than what it is, and would fail later,
+    /// elsewhere, and quietly. Dropping it is the observable choice.
     ///
     /// # Backends that never decode
     ///
@@ -480,7 +475,6 @@ mod record_tests {
         OperatorSessionRecord {
             sid: SessionId::parse("S-1").expect("a well-formed sid"),
             token_digest: OperatorSessionRecord::digest_of("bearer"),
-            roles: Vec::new(),
             capability_manifest: None,
             joined_at_secs: 100,
             desc: None,
