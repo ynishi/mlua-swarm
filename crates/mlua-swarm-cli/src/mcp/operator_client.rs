@@ -1,9 +1,12 @@
 //! WS client embedding for mse mcp (S3, design
 //! (see the WS multi-session design).
 //!
-//! Owns the in-process `sid → SessionEntry` map backing the 4 MCP tools
+//! Owns the in-process `sid → SessionEntry` map backing the session tools
 //! (`mse_operator_join` / `mse_pending_wait` / `mse_ack` / `mse_operator_leave`,
-//! wired in `main.rs`). Each `join()` mints an Operator session via
+//! wired in `main.rs`) and, through the token those entries hold, every
+//! Bearer-gated read this client proxies — the 記名 list and the handover
+//! surface (`mse_operator_list` / `mse_run_assignees` / `mse_run_handover` /
+//! `mse_run_material`). Each `join()` mints an Operator session via
 //! `POST /v1/operators`, then attaches a `tokio-tungstenite` WS client to
 //! `WS /v1/operators/:sid/ws` with the returned Bearer token; a background
 //! reader task drains incoming frames into a per-session pending queue.
@@ -23,7 +26,7 @@ use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use mlua_swarm::StepId;
+use mlua_swarm::{RunId, StepId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpStream;
@@ -722,41 +725,135 @@ impl OperatorClientState {
         sid: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Value, ClientError> {
-        let sid = match sid {
-            Some(sid) => sid.to_string(),
+        let mut url = format!("{}/v1/operators", self.http_base);
+        if let Some(limit) = limit {
+            url.push_str(&format!("?limit={limit}"));
+        }
+        self.get_as_operator(sid, &url).await
+    }
+
+    /// `GET /v1/runs/:id/assignees` (Bearer) — who holds each of the Run's
+    /// Operator seats, and which seats nobody holds, verbatim.
+    ///
+    /// Same bearer rule as [`Self::list_operators`] (**D3**: any live
+    /// session's token opens it), and the same `sid` selection.
+    pub async fn run_assignees(
+        &self,
+        sid: Option<&str>,
+        run_id: &RunId,
+    ) -> Result<Value, ClientError> {
+        let url = format!("{}/v1/runs/{run_id}/assignees", self.http_base);
+        self.get_as_operator(sid, &url).await
+    }
+
+    /// `GET /v1/runs/:id/handover` (Bearer) — the four-axis snapshot,
+    /// verbatim.
+    ///
+    /// Verbatim matters more here than anywhere else on this client: the
+    /// server answers axes 2 and 3 from **one** `RunRecord` read precisely
+    /// so a seat cannot change hands between them, and re-assembling the
+    /// body from separate calls would put that skew back.
+    pub async fn run_handover(
+        &self,
+        sid: Option<&str>,
+        run_id: &RunId,
+    ) -> Result<Value, ClientError> {
+        let url = format!("{}/v1/runs/{run_id}/handover", self.http_base);
+        self.get_as_operator(sid, &url).await
+    }
+
+    /// `GET /v1/runs/:id/material?step_id=<id>` (Bearer) — the material for
+    /// one step, verbatim.
+    ///
+    /// The step id is required: the route answers about one step, and the
+    /// server has no default for "which one".
+    pub async fn run_material(
+        &self,
+        sid: Option<&str>,
+        run_id: &RunId,
+        step_id: &StepId,
+    ) -> Result<Value, ClientError> {
+        let url = format!(
+            "{}/v1/runs/{run_id}/material?step_id={step_id}",
+            self.http_base
+        );
+        self.get_as_operator(sid, &url).await
+    }
+
+    /// `POST /v1/runs/:id/acquire` — take one of the Run's Operator seats.
+    /// The server's response body is returned verbatim.
+    ///
+    /// # No Bearer, on purpose
+    ///
+    /// This is the one call in this module that presents no token, and it
+    /// takes no `sid` to present one from. The route is deliberately
+    /// ungated (**B2**: the bearer takes no part in assignment; **B3**: an
+    /// acquire does not need the outgoing holder's credential), and
+    /// attaching a token here would make the bearer decide who holds a
+    /// seat — the mistaken-handover guard is the *reading* that comes
+    /// first, not this call.
+    ///
+    /// `op` is therefore whoever the caller says takes the seat, not
+    /// whoever this process happens to be joined as.
+    pub async fn run_acquire(
+        &self,
+        run_id: &RunId,
+        op: &str,
+        desc: &str,
+        slot: Option<&str>,
+    ) -> Result<Value, ClientError> {
+        let url = format!("{}/v1/runs/{run_id}/acquire", self.http_base);
+        let resp = http_client()?
+            .post(&url)
+            .json(&serde_json::json!({
+                "op": op,
+                "desc": desc,
+                "slot": slot,
+            }))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        json_or_http_error(resp, "POST", &url).await
+    }
+
+    /// One Bearer-gated `GET` presented as an Operator: resolve which
+    /// session's token to show, show it, and hand back the server's body
+    /// untouched.
+    ///
+    /// Shared by every read on this client that **D3** gates, so the sid
+    /// rule and the "verbatim body" contract are written once. A response
+    /// this process re-shaped would be a second, quietly different account
+    /// of who holds what.
+    async fn get_as_operator(&self, sid: Option<&str>, url: &str) -> Result<Value, ClientError> {
+        let sid = self.bearer_sid(sid).await?;
+        let entry = self.get_entry(&sid).await?;
+        let resp = http_client()?
+            .get(url)
+            .bearer_auth(&entry.token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        json_or_http_error(resp, "GET", url).await
+    }
+
+    /// Which session's Bearer token a **D3**-gated read presents: the one
+    /// named, or this process's sole live session.
+    ///
+    /// Zero or several is a loud [`ClientError::UnknownSid`] rather than a
+    /// pick — the same reasoning as [`Self::sole_live_sid`]: presenting
+    /// some *other* task's session would answer the caller's question
+    /// under an identity it did not choose.
+    async fn bearer_sid(&self, sid: Option<&str>) -> Result<String, ClientError> {
+        match sid {
+            Some(sid) => Ok(sid.to_string()),
             None => self.sole_live_sid().await.ok_or_else(|| {
                 ClientError::UnknownSid(
                     "no sid given and this process does not hold exactly one live session; \
                      pass the sid whose Bearer token should be presented"
                         .to_string(),
                 )
-            })?,
-        };
-        let entry = self.get_entry(&sid).await?;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| ClientError::Http(e.to_string()))?;
-        let mut url = format!("{}/v1/operators", self.http_base);
-        if let Some(limit) = limit {
-            url.push_str(&format!("?limit={limit}"));
+            }),
         }
-        let resp = client
-            .get(&url)
-            .bearer_auth(&entry.token)
-            .send()
-            .await
-            .map_err(|e| ClientError::Http(e.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Http(format!(
-                "GET {url} failed: {status} {body}"
-            )));
-        }
-        resp.json()
-            .await
-            .map_err(|e| ClientError::Http(e.to_string()))
     }
 
     /// `DELETE /v1/operators/:sid` (Bearer) + abort the reader task + drop
@@ -790,6 +887,38 @@ impl OperatorClientState {
         }
         Ok(())
     }
+}
+
+/// The `reqwest` client every plain HTTP call on this module uses — the
+/// same 10s budget the join and leave paths already build inline.
+fn http_client() -> Result<reqwest::Client, ClientError> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| ClientError::Http(e.to_string()))
+}
+
+/// The server's body as JSON on success, or the status and body it
+/// answered with as a [`ClientError::Http`].
+///
+/// Deserializing straight into [`Value`] is what makes "verbatim" true:
+/// nothing here names a field, so a route that grows one carries it
+/// through to the caller without this client being taught about it.
+async fn json_or_http_error(
+    resp: reqwest::Response,
+    method: &str,
+    url: &str,
+) -> Result<Value, ClientError> {
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ClientError::Http(format!(
+            "{method} {url} failed: {status} {body}"
+        )));
+    }
+    resp.json()
+        .await
+        .map_err(|e| ClientError::Http(e.to_string()))
 }
 
 /// The auto-pin rule of [`OperatorClientState::sole_live_sid`], split out
@@ -1354,11 +1483,48 @@ mod tests {
             Refuse,
         }
 
+        /// The body the stub answers each handover-surface route with,
+        /// and what the client presented to get it.
+        ///
+        /// The pair is the point: what a test needs to see is that a read
+        /// carried a Bearer, that the acquire carried none, and that the
+        /// caller got these bytes back unaltered either way.
+        pub(super) struct StubRequest {
+            /// Which route was hit.
+            pub label: &'static str,
+            /// The `Authorization` header as received — `None` when the
+            /// request carried none.
+            pub authorization: Option<String>,
+            /// The query string (GET) or the request body (POST).
+            pub detail: String,
+        }
+
+        /// A seat list with one held and one vacant seat. The vacant one
+        /// carries `holder: null` **as a key**, which is the property a
+        /// verbatim proxy has to preserve.
+        pub(super) const ASSIGNEES_BODY: &str = r#"{"run_id":"R-stub","generation":2,"seats":[{"slot":"phase_a_op","vacant":false,"holder":{"op":"S-held","desc":"driving phase a","gen":2},"declared":true},{"slot":"phase_b_op","vacant":true,"holder":null,"declared":true}],"seats_source":"blueprint","note":null}"#;
+
+        /// A four-axis snapshot: the seats above, a trace reference, and
+        /// one un-answered step whose `final_present` is the field a
+        /// re-run decision hangs on.
+        pub(super) const HANDOVER_BODY: &str = r#"{"run_id":"R-stub","generation":2,"trace":{"route":"/v1/runs/R-stub/trace","latest_seq":41},"seats":[{"slot":"phase_a_op","vacant":true,"holder":null,"declared":true}],"seats_source":"blueprint","note":null,"unanswered":[{"slot":"phase_a_op","op":null,"generation":null,"req_id":"rq-1","kind":"spawn","step_id":"ST-7","attempt":1,"final_present":true,"final_ok":false,"material_route":"/v1/runs/R-stub/material?step_id=ST-7"}],"unread_seats":[]}"#;
+
+        pub(super) const MATERIAL_BODY: &str = r#"{"run_id":"R-stub","run_link":"confirmed","note":null,"payload":{"task_id":"ST-7","attempt":1,"agent":"impl","prompt":"do the thing"},"final_present":true,"final_ok":false}"#;
+
+        /// **Q4**'s three: the generation the acquirer dispatches under,
+        /// the holder it displaced, and what became of that holder's
+        /// in-flight requests.
+        pub(super) const ACQUIRE_BODY: &str = r#"{"run_id":"R-stub","slot":"phase_a_op","gen":3,"previous":{"op":"S-held","desc":"driving phase a","gen":2},"t_discard":{"discarded":2,"not_discarded":"requests with no run and requests with no seat"}}"#;
+
         struct StubState {
             script: Vec<WsBehavior>,
             upgrades: AtomicUsize,
             authorized_upgrades: AtomicUsize,
             healthy: AtomicBool,
+            /// Every handover-surface request received, in order.
+            /// `std::sync` rather than `tokio`: the handlers touch it
+            /// without awaiting, and so do the assertions.
+            handover_requests: std::sync::Mutex<Vec<StubRequest>>,
         }
 
         pub(super) struct StubServer {
@@ -1399,6 +1565,34 @@ mod tests {
             }
         }
 
+        /// Records one handover-surface request and answers with the
+        /// canned body for that route.
+        fn answer(
+            state: &Arc<StubState>,
+            label: &'static str,
+            headers: &HeaderMap,
+            detail: String,
+            body: &'static str,
+        ) -> Response {
+            state
+                .handover_requests
+                .lock()
+                .expect("stub request log")
+                .push(StubRequest {
+                    label,
+                    authorization: headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                    detail,
+                });
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response()
+        }
+
         impl StubServer {
             /// Binds an ephemeral port and starts serving `script`.
             pub(super) async fn start(script: Vec<WsBehavior>) -> Self {
@@ -1407,6 +1601,7 @@ mod tests {
                     upgrades: AtomicUsize::new(0),
                     authorized_upgrades: AtomicUsize::new(0),
                     healthy: AtomicBool::new(true),
+                    handover_requests: std::sync::Mutex::new(Vec::new()),
                 });
                 let app = Router::new()
                     .route(
@@ -1433,6 +1628,48 @@ mod tests {
                         delete(|| async { StatusCode::NO_CONTENT }),
                     )
                     .route("/v1/operators/:sid/ws", get(ws_stub))
+                    .route(
+                        "/v1/runs/:id/assignees",
+                        get(
+                            |State(state): State<Arc<StubState>>, headers: HeaderMap| async move {
+                                answer(&state, "assignees", &headers, String::new(), ASSIGNEES_BODY)
+                            },
+                        ),
+                    )
+                    .route(
+                        "/v1/runs/:id/handover",
+                        get(
+                            |State(state): State<Arc<StubState>>, headers: HeaderMap| async move {
+                                answer(&state, "handover", &headers, String::new(), HANDOVER_BODY)
+                            },
+                        ),
+                    )
+                    .route(
+                        "/v1/runs/:id/material",
+                        get(
+                            |State(state): State<Arc<StubState>>,
+                             axum::extract::RawQuery(query): axum::extract::RawQuery,
+                             headers: HeaderMap| async move {
+                                answer(
+                                    &state,
+                                    "material",
+                                    &headers,
+                                    query.unwrap_or_default(),
+                                    MATERIAL_BODY,
+                                )
+                            },
+                        ),
+                    )
+                    .route(
+                        "/v1/runs/:id/acquire",
+                        post(
+                            |State(state): State<Arc<StubState>>,
+                             headers: HeaderMap,
+                             body: String| async move {
+                                answer(&state, "acquire", &headers, body, ACQUIRE_BODY)
+                            },
+                        ),
+                    )
                     .with_state(state.clone());
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                     .await
@@ -1459,6 +1696,21 @@ mod tests {
                 self.state.authorized_upgrades.load(Ordering::SeqCst)
             }
 
+            /// The handover-surface request the stub received last, or
+            /// `None` when it received none.
+            pub(super) fn last_handover_request(&self) -> Option<StubRequest> {
+                let log = self
+                    .state
+                    .handover_requests
+                    .lock()
+                    .expect("stub request log");
+                log.last().map(|request| StubRequest {
+                    label: request.label,
+                    authorization: request.authorization.clone(),
+                    detail: request.detail.clone(),
+                })
+            }
+
             /// Flips ② `GET /v1/healthz` between `200 ok` and `503`.
             pub(super) fn set_healthy(&self, healthy: bool) {
                 self.state.healthy.store(healthy, Ordering::SeqCst);
@@ -1471,6 +1723,236 @@ mod tests {
     }
 
     use stub::{StubServer, WsBehavior};
+
+    // ─── the handover surface (§4.3 / §4.5 / W5) ─────────────────────────
+    //
+    // What these pin down is the asymmetry the routes were built with: the
+    // three reads present a Bearer (which is why an AI can reach them at
+    // all — the token lives only in this process), and the acquire
+    // presents none (**B2**: the bearer takes no part in assignment).
+    // Plus: every one of the four hands the server's body back untouched.
+
+    fn run_id(id: &str) -> RunId {
+        RunId::parse(id.to_string()).expect("valid run id")
+    }
+
+    /// A joined stub server whose ③ socket stays up, ready for the HTTP
+    /// reads to present its token.
+    async fn joined_stub() -> (StubServer, OperatorClientState, String) {
+        let stub = StubServer::start(vec![WsBehavior::Hold]).await;
+        let state = OperatorClientState::with_http_base(stub.base());
+        let sid = state.join(None, None).await.expect("join");
+        (stub, state, sid)
+    }
+
+    #[tokio::test]
+    async fn run_assignees_presents_a_bearer_and_returns_the_body_verbatim() {
+        let (stub, state, sid) = joined_stub().await;
+        let body = state
+            .run_assignees(Some(&sid), &run_id("R-stub"))
+            .await
+            .expect("the read succeeds");
+
+        let request = stub.last_handover_request().expect("the stub was called");
+        assert_eq!(request.label, "assignees");
+        assert!(
+            request.authorization.is_some(),
+            "the route is Bearer-gated, and presenting the token is the whole reason this tool \
+             exists — without it the AI gets the 401 it got before"
+        );
+        assert_eq!(
+            body,
+            serde_json::from_str::<Value>(stub::ASSIGNEES_BODY).unwrap(),
+            "the server's body is handed back untouched"
+        );
+        let vacant = &body["seats"][1];
+        assert_eq!(vacant["vacant"], true);
+        assert!(
+            vacant.get("holder").is_some() && vacant["holder"].is_null(),
+            "a vacant seat keeps its explicit null holder: dropping the key would make \
+             'nobody is on this' read as 'holders were not reported': {vacant}"
+        );
+        stub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn run_handover_returns_the_whole_snapshot_as_one_value() {
+        let (stub, state, sid) = joined_stub().await;
+        let body = state
+            .run_handover(Some(&sid), &run_id("R-stub"))
+            .await
+            .expect("the read succeeds");
+
+        let request = stub.last_handover_request().expect("the stub was called");
+        assert_eq!(request.label, "handover");
+        assert!(
+            request.authorization.is_some(),
+            "Bearer-gated, like /assignees"
+        );
+        assert_eq!(
+            body,
+            serde_json::from_str::<Value>(stub::HANDOVER_BODY).unwrap(),
+            "one read, one value: re-assembling the axes client-side is what the single \
+             server-side read exists to prevent"
+        );
+        // The two fields a next-action decision is actually made on.
+        assert_eq!(body["trace"]["latest_seq"], 41);
+        assert_eq!(body["unanswered"][0]["final_present"], true);
+        stub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn run_material_sends_the_step_id_and_presents_a_bearer() {
+        let (stub, state, sid) = joined_stub().await;
+        let step_id = StepId::parse("ST-7".to_string()).expect("valid step id");
+        let body = state
+            .run_material(Some(&sid), &run_id("R-stub"), &step_id)
+            .await
+            .expect("the read succeeds");
+
+        let request = stub.last_handover_request().expect("the stub was called");
+        assert_eq!(request.label, "material");
+        assert_eq!(
+            request.detail, "step_id=ST-7",
+            "the route answers about one step, so the id has to reach it"
+        );
+        assert!(
+            request.authorization.is_some(),
+            "Bearer-gated, like /assignees"
+        );
+        assert_eq!(
+            body,
+            serde_json::from_str::<Value>(stub::MATERIAL_BODY).unwrap()
+        );
+        stub.shutdown();
+    }
+
+    /// **B2** / **B3**: taking a seat is ungated, and this client must not
+    /// quietly gate it. A bearer here would make the token decide who
+    /// holds a seat — and would make an acquire impossible from a process
+    /// holding no session, which is exactly the driver that has to be able
+    /// to take over.
+    #[tokio::test]
+    async fn run_acquire_presents_no_bearer_and_reports_what_it_displaced() {
+        let stub = StubServer::start(vec![]).await;
+        let state = OperatorClientState::with_http_base(stub.base());
+        assert_eq!(
+            state.sole_live_sid().await,
+            None,
+            "no session was joined: an acquire must work anyway"
+        );
+
+        let body = state
+            .run_acquire(
+                &run_id("R-stub"),
+                "S-taker",
+                "picking up the stalled fix",
+                None,
+            )
+            .await
+            .expect("an acquire needs no session of its own");
+
+        let request = stub.last_handover_request().expect("the stub was called");
+        assert_eq!(request.label, "acquire");
+        assert!(
+            request.authorization.is_none(),
+            "the bearer must take no part in assignment; got: {:?}",
+            request.authorization
+        );
+        let sent: Value = serde_json::from_str(&request.detail).expect("the body is JSON");
+        assert_eq!(sent["op"], "S-taker");
+        assert_eq!(sent["desc"], "picking up the stalled fix");
+        assert!(
+            sent["slot"].is_null(),
+            "an unnamed seat is left to the server's rule"
+        );
+
+        assert_eq!(
+            body,
+            serde_json::from_str::<Value>(stub::ACQUIRE_BODY).unwrap(),
+            "Q4 / Q5 are the response's own fields — a client that summarised them would \
+             hide who was displaced"
+        );
+        assert_eq!(body["gen"], 3);
+        assert_eq!(body["previous"]["op"], "S-held");
+        assert_eq!(body["t_discard"]["discarded"], 2);
+        stub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn run_acquire_names_the_seat_when_the_caller_does() {
+        let stub = StubServer::start(vec![]).await;
+        let state = OperatorClientState::with_http_base(stub.base());
+        state
+            .run_acquire(
+                &run_id("R-stub"),
+                "S-taker",
+                "taking phase b",
+                Some("phase_b_op"),
+            )
+            .await
+            .expect("acquire");
+
+        let request = stub.last_handover_request().expect("the stub was called");
+        let sent: Value = serde_json::from_str(&request.detail).expect("the body is JSON");
+        assert_eq!(sent["slot"], "phase_b_op");
+        stub.shutdown();
+    }
+
+    /// The reads fail loudly rather than picking a session for the caller
+    /// — the same rule `list_operators` follows, now shared by all four
+    /// through `bearer_sid`.
+    #[tokio::test]
+    async fn a_bearer_read_without_a_sid_fails_when_this_process_holds_no_session() {
+        let state = OperatorClientState::with_http_base("http://127.0.0.1:1");
+        for error in [
+            state.run_assignees(None, &run_id("R-x")).await.unwrap_err(),
+            state.run_handover(None, &run_id("R-x")).await.unwrap_err(),
+            state
+                .run_material(
+                    None,
+                    &run_id("R-x"),
+                    &StepId::parse("ST-1".to_string()).unwrap(),
+                )
+                .await
+                .unwrap_err(),
+            state.list_operators(None, None).await.unwrap_err(),
+        ] {
+            assert!(
+                matches!(error, ClientError::UnknownSid(_)),
+                "got: {error:?} — a read must not guess whose token to present"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bearer_read_with_an_unknown_sid_errors_before_any_request() {
+        let state = OperatorClientState::with_http_base("http://127.0.0.1:1");
+        let error = state
+            .run_handover(Some("S-nope"), &run_id("R-x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ClientError::UnknownSid(s) if s == "S-nope"));
+    }
+
+    /// A non-2xx answer surfaces with its status and body rather than as a
+    /// silently empty snapshot.
+    #[tokio::test]
+    async fn a_failed_read_reports_the_status_and_body() {
+        let stub = StubServer::start(vec![WsBehavior::Hold]).await;
+        let state = OperatorClientState::with_http_base(stub.base());
+        let sid = state.join(None, None).await.expect("join");
+        // `/v1/runs/:id/steps` is not a route this stub serves, so the
+        // reqwest call gets a real 404 off the same server.
+        let error = state
+            .get_as_operator(Some(&sid), &format!("{}/v1/runs/R-stub/nope", stub.base()))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(error, ClientError::Http(_)), "got: {message}");
+        assert!(message.contains("404"), "the status is named: {message}");
+        stub.shutdown();
+    }
 
     /// Blocks until `sid`'s ③ reader task has observed the drop. The close
     /// travels over a real socket, so "the server closed it" and "this

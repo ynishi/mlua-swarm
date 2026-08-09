@@ -67,6 +67,29 @@ the two worker report routes `POST /v1/worker/stats` /
 | `mse_operator_leave` | Leave an Operator session: `DELETE /v1/operators/:sid`, abort the WS reader task, drop the local `sid` entry. Params: `sid`. | Mutating — closes the WS session. |
 | `mse_operator_list` | List every live Operator session with its 記名 — the join-time `desc` each session wrote about itself, plus `observed[]`, one entry per Operator seat it has been assigned (`run_id` / `slot` / `goal` / `project_root` / `work_dir` / `task_metadata` / `at_secs`). Proxies `GET /v1/operators`, which is Bearer-gated; this tool presents the token of `sid` (default: this process's sole live session). Read it before acquiring a Run seat — with exclusivity removed from acquire, this list and `GET /v1/runs/:id/assignees` are what tell two parallel tasks in the same worktree apart. It is also how you identify a stale session left by a crashed driver: there is no by-role release any more (a session claims no name to be released by), and none is needed — a stale session blocks no join, no pin and no acquire. Ordered by most recent activity first; `limit` caps the page (server default 50, ceiling 200). Params: `sid?`, `limit?`. | Read-only; requires a live session in this process. |
 
+## Run seats and handover
+
+Taking a Run's Operator seat excludes nobody — `mse_run_acquire` never
+refuses and never enquires. The reads below are therefore not a handover
+ritual but the only thing standing between you and somebody else's Run, so
+the order is **read, then take**: `mse_operator_list` says which session is
+doing what, `mse_run_assignees` / `mse_run_handover` say who is on this Run
+and what is in flight on it, and only then `mse_run_acquire`.
+
+The three reads are Bearer-gated and present the token of `sid` (default:
+this process's sole live session, which fails if it holds none or several)
+— the token itself never leaves this process. `mse_run_acquire` presents
+none and takes no `sid`: the bearer must not decide who holds a seat, and
+a handover must never be lockable-out. Every one of the four returns the
+server's response body verbatim.
+
+| tool | purpose | side effect |
+|---|---|---|
+| `mse_run_assignees` | Who holds each Operator seat of one Run, and which seats nobody holds. Proxies `GET /v1/runs/:id/assignees`. A seat nobody holds is **present** with `vacant: true` / `holder: null` rather than omitted, so "nobody is on this Run" and "this answer did not report holders" are different bytes. `seats_source: "run_current_only"` means the Blueprint could not be resolved and declared-but-vacant seats are missing from the list; `note` says why. Params: `run_id`, `sid?`. | Read-only; requires a live session in this process. |
+| `mse_run_handover` | The four axes in one call: `trace` (a `{route, latest_seq}` **reference**, not the events — `latest_seq` is the watermark separating this snapshot from what happened after it), `seats` / `seats_source` / `note` (the `mse_run_assignees` body, from the same server-side read), `unanswered[]` (every request a current holder still owes this Run, listed once; `slot` / `op` / `generation` are all `null` for a request that belongs to no seat), and per entry `final_present` / `final_ok` + `material_route`. `unread_seats[]` names a held seat whose holder could not be asked, so an empty `unanswered` means everyone was asked and owed nothing. One call on purpose: the axes come from one server-side read, so a seat cannot change hands between them. Params: `run_id`, `sid?`. | Read-only; requires a live session in this process. |
+| `mse_run_material` | The material for one step — the same `WorkerPayload` a SubAgent self-fetches, plus that attempt's `final_present` / `final_ok` and a `run_link` (`confirmed` / `unconfirmed`). Proxies `GET /v1/runs/:id/material?step_id=<id>`; the step is typically one `mse_run_handover` named. It exists beside `mse_worker_fetch` because the **gate** differs, not the payload: the worker route is held by a per-task CapToken an Assignee does not have and must not be issued. The `Final`'s value is deliberately not returned — presence and the `ok` flag are what the decision needs. Params: `run_id`, `step_id`, `sid?`. | Read-only; requires a live session in this process. |
+| `mse_run_acquire` | Take one Operator seat: `POST /v1/runs/:id/acquire` with `op` (who takes it — normally your own `sid`), `desc` (why, mandatory and non-empty), `slot?` (omit when the Blueprint declares exactly one Operator). No Bearer, no queue, no wait, and no refusal — a held seat is taken from its holder, last writer wins. Read the response in full: `gen` is the generation your seat is stamped at and the number your later replies are accepted under, `previous` is the holder you displaced (`null` if the seat was vacant), and `t_discard` says what happened to that holder's in-flight requests for this seat (`discarded: null` = the discard could not be addressed, not "nothing to drop"). Params: `run_id`, `op`, `desc`, `slot?`. | Mutating — reassigns a seat, and discards the displaced holder's in-flight requests for it. |
+
 ## Worker HTTP client
 
 Pure-MCP replacements for the two `curl` steps a spawned worker performs,

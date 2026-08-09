@@ -888,6 +888,12 @@ token):
   not decide assignment), and it is *reading who is on it* that
   requires one.
 
+  MCP counterparts: `mse_run_assignees(run_id, sid?)` for the read, and
+  `mse_run_acquire(run_id, op, desc, slot?)` for the acquire — which
+  presents no bearer and takes no `sid`, for the reason just given. Both
+  return the server's body verbatim. The order is the point: the acquire
+  never refuses, so the read in front of it is the whole guard.
+
 ### Deciding what to do next: the four-axis read
 
 Recognising the Run is one question; knowing what state it is in is
@@ -930,6 +936,11 @@ at a handover. Two more Bearer-gated reads answer it.
   asked, so an empty `unanswered` always means "everyone was asked and
   owed nothing".
 
+  MCP counterpart: `mse_run_handover(run_id, sid?)`, returning the body
+  verbatim. Do not rebuild it out of `mse_run_assignees` plus something
+  else — the axes are answered from one server-side read precisely so a
+  seat cannot change hands between them.
+
 - **`GET /v1/runs/:id/material?step_id=<id>`** — the material for one
   step: the same `WorkerPayload` a SubAgent self-fetches, plus that
   attempt's `final_present` / `final_ok`. `run_link` is `confirmed` when
@@ -945,6 +956,10 @@ at a handover. Two more Bearer-gated reads answer it.
   no credential, so any caller that can reach the server can mint one.
   The gate is a shape check, not confidentiality; bind the server
   accordingly.
+
+  MCP counterpart: `mse_run_material(run_id, step_id, sid?)`. `step_id`
+  is required — the route answers about one step — and is normally one an
+  `unanswered[]` entry named.
 
 ### Capability manifest at join
 
@@ -1159,7 +1174,8 @@ operator identity at all (`POST /v1/tasks` takes no Bearer, and
 server picking a session nobody named. It used to pick the holder of the
 seat's own role, which read as correct on a one-driver server and was
 silently wrong the moment a second driver joined. Take a seat with
-`POST /v1/runs/:id/acquire` if you launched without a pin.
+`POST /v1/runs/:id/acquire` — `mse_run_acquire(run_id, op, desc, slot?)`
+over MCP — if you launched without a pin.
 
 ##### `operator_desc` — pinning assigns, and an assignment is recorded
 

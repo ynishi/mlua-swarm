@@ -461,6 +461,16 @@ fn client_error_to_mcp(e: ClientError) -> McpError {
     }
 }
 
+/// Parse a tool argument as a `RunId` before any network I/O.
+///
+/// The server's own `/v1/runs/:id/*` handlers open with the same
+/// `RunId::parse` and answer `400`, so this adds no rule of its own — it
+/// just spends the round trip only when there is a chance of an answer,
+/// the way `mse_worker_fetch` treats a `task_id`.
+fn parse_run_id(run_id: String) -> Result<RunId, McpError> {
+    RunId::parse(run_id).map_err(|e| McpError::invalid_params(format!("invalid run_id: {e}"), None))
+}
+
 /// One `audit:<step_ref>` artifact spotted by `mse_doctor`'s `audit_findings`
 /// scan (GH #34) — an after-run audit agent (`AfterRunAuditMiddleware`,
 /// `mlua-swarm` core) left a finding on a tracked run's step output.
@@ -2623,6 +2633,74 @@ struct OperatorLeaveReq {
     sid: String,
 }
 
+// ---- handover surface tool param schemas (server model §4.3 / §4.5 / W5) ----
+//
+// The three reads are Bearer-gated and take a `sid` on the same rule
+// `OperatorListReq` does; the acquire deliberately takes none, because the
+// bearer plays no part in assignment (**B2**) — see `RunAcquireReq`.
+
+#[derive(Deserialize, JsonSchema)]
+struct RunAssigneesReq {
+    /// The Run to read the holder list of (`R-<hex>`).
+    run_id: String,
+    /// sid whose Bearer token this process presents. Any live session's
+    /// token opens the route; omitted = this process's sole live session,
+    /// which fails if it holds none or several.
+    #[serde(default)]
+    sid: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RunHandoverReq {
+    /// The Run to take the snapshot of (`R-<hex>`).
+    run_id: String,
+    /// sid whose Bearer token this process presents — same rule as
+    /// `mse_run_assignees`.
+    #[serde(default)]
+    sid: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RunMaterialReq {
+    /// The Run the step belongs to (`R-<hex>`).
+    run_id: String,
+    /// The step to fetch the material for (`ST-<hex>`) — typically one
+    /// `mse_run_handover` listed in `unanswered[]`, whose entries carry
+    /// the same id in `step_id`. Required: the route answers about one
+    /// step and has no default for which.
+    step_id: String,
+    /// sid whose Bearer token this process presents — same rule as
+    /// `mse_run_assignees`.
+    #[serde(default)]
+    sid: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RunAcquireReq {
+    /// The Run whose seat to take (`R-<hex>`).
+    run_id: String,
+    /// Who takes the seat: the `OperatorId` recorded as the holder —
+    /// normally the `sid` returned by `mse_operator_join`, i.e. the
+    /// session that intends to drive this Run.
+    ///
+    /// Required, and not defaulted from this process's live session on
+    /// purpose. The seat's holder is a decision the caller makes; the
+    /// server stores this verbatim without checking it against the
+    /// registry (**Q2** — an acquire does not enquire), so a wrong value
+    /// here surfaces as a Run whose dispatches reach nobody.
+    op: String,
+    /// Why this operator is taking the seat (**A9** / **Q1**). Mandatory
+    /// and non-empty at the server too — it is the line a later reader of
+    /// the holder list tells two concurrent takeovers apart by, so write
+    /// what you are about to do with the Run rather than "takeover".
+    desc: String,
+    /// Which Blueprint-declared seat to take. Omit when the Blueprint
+    /// declares exactly one Operator; name it when it declares several
+    /// (omitting it then is a `400` listing the candidates).
+    #[serde(default)]
+    slot: Option<String>,
+}
+
 // ---- worker HTTP tool param schemas ----
 // Pure-MCP replacements for the two Bash curl steps in the mse-worker
 // wrapper agents, so their tools list can drop `Bash` entirely (the curl
@@ -3162,6 +3240,72 @@ impl MseServer {
         let body = self
             .op_client
             .list_operators(req.sid.as_deref(), req.limit)
+            .await
+            .map_err(client_error_to_mcp)?;
+        json_result(&body)
+    }
+
+    #[tool(
+        description = "Who holds each Operator seat of ONE Run, and which seats nobody holds. GET /v1/runs/:id/assignees, Bearer-gated — this tool presents the token of `sid` (default: this process's sole live session), which is why the route is reachable from here at all. A seat nobody holds is present in `seats[]` with `vacant: true` and `holder: null`; it is never omitted, so \"nobody is on this Run\" and \"this answer did not report holders\" are different bytes. `seats_source: \"run_current_only\"` means the Blueprint could not be resolved and declared-but-vacant seats are therefore missing — `note` says why. This is the narrow half of the pair that prevents a wrong takeover: read it (and mse_operator_list, which names the sessions) BEFORE mse_run_acquire, because acquire itself never refuses and never asks — nothing downstream of this read will stop you taking somebody else's Run. Returns the server's response body verbatim."
+    )]
+    async fn mse_run_assignees(
+        &self,
+        Parameters(req): Parameters<RunAssigneesReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let run_id = parse_run_id(req.run_id)?;
+        let body = self
+            .op_client
+            .run_assignees(req.sid.as_deref(), &run_id)
+            .await
+            .map_err(client_error_to_mcp)?;
+        json_result(&body)
+    }
+
+    #[tool(
+        description = "The four things you need in order to decide what to do next on a Run, in ONE read — whether or not you are taking over from anybody. GET /v1/runs/:id/handover, Bearer-gated; this tool presents the token of `sid` (default: this process's sole live session). Body: (1) `trace` is a REFERENCE {route, latest_seq}, not the events — `latest_seq` is the watermark telling what is in this snapshot from what happened after it; (2) `seats` / `seats_source` / `note` are the mse_run_assignees body, taken from the same server-side read; (3) `unanswered[]` is every request a current holder still owes this Run, listed once, where `slot` / `op` / `generation` name the seat it went out through and whoever holds that seat now (all three are null for a request that belongs to no seat — a hook_before never passes through one, so naming a seat would be a guess); (4) each entry's `final_present` / `final_ok` say whether that (step_id, attempt) ALREADY produced a value — the difference between re-running a step and doubling its side effect — and `material_route` points at mse_run_material for the rest. `unread_seats[]` names a held seat whose holder could not be asked, so an empty `unanswered` means everyone was asked and owed nothing, never that nobody was asked. Nothing here grades the wait and nothing here acts: a step whose driver went away is waiting, not broken, and the next move is an ordinary mse_run_acquire followed by an ordinary dispatch. Returns the server's response body verbatim — the axes are answered from one read so a seat cannot change hands between them, and re-assembling them from separate calls would put that skew back."
+    )]
+    async fn mse_run_handover(
+        &self,
+        Parameters(req): Parameters<RunHandoverReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let run_id = parse_run_id(req.run_id)?;
+        let body = self
+            .op_client
+            .run_handover(req.sid.as_deref(), &run_id)
+            .await
+            .map_err(client_error_to_mcp)?;
+        json_result(&body)
+    }
+
+    #[tool(
+        description = "What one step of a Run needs in order to be run — the second half of \"what do I do next\", pointed at by each mse_run_handover `unanswered[].material_route`. GET /v1/runs/:id/material?step_id=<id>, Bearer-gated; this tool presents the token of `sid` (default: this process's sole live session). `step_id` is required. Body: `payload` is the same WorkerPayload a SubAgent self-fetches from GET /v1/worker/prompt (this route exists beside it because the GATE differs, not the payload — the worker route is held by a per-task CapToken an Assignee does not have and must not be issued); `run_link` is `confirmed` when the payload's own context names the Run in the path and `unconfirmed` when it carries no Run identity to check against (`note` says why); `final_present` / `final_ok` repeat axis 4's first half so this answers \"what do I do next\" on its own. The Final's VALUE is deliberately not here — presence and the ok flag are what the decision needs, and the value is unbounded. 404 when the step is unknown to the engine or belongs to a different Run. Returns the server's response body verbatim."
+    )]
+    async fn mse_run_material(
+        &self,
+        Parameters(req): Parameters<RunMaterialReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let run_id = parse_run_id(req.run_id)?;
+        let step_id = StepId::parse(req.step_id)
+            .map_err(|e| McpError::invalid_params(format!("invalid step_id: {e}"), None))?;
+        let body = self
+            .op_client
+            .run_material(req.sid.as_deref(), &run_id, &step_id)
+            .await
+            .map_err(client_error_to_mcp)?;
+        json_result(&body)
+    }
+
+    #[tool(
+        description = "Take one Operator seat of a Run: POST /v1/runs/:id/acquire with `op` (who takes it) / `desc` (why) / `slot` (which seat — omit when the Blueprint declares exactly one Operator). Read FIRST, then take: this call presents no Bearer and needs none, it does not enquire, and it never refuses — a held seat is taken from its holder, last writer wins. That is deliberate (the bearer must not decide who holds a seat), and it means nothing here will catch you acquiring the wrong Run. What catches it is the pair of reads in front: mse_operator_list to see which session is doing what, and mse_run_assignees / mse_run_handover to see who is on this Run and what is in flight on it. Returns the server's response body verbatim, and read all of it: `gen` is the generation your seat is stamped at and the number every later reply of yours is accepted under; `previous` is the holder you displaced (`null` if the seat was vacant) — that is the answer to \"did I take this from someone\"; `t_discard` reports what happened to that holder's in-flight requests for this seat (`discarded: null` means the discard could not be addressed at all, not that there was nothing to drop). Taking a seat is a read-then-act, not a lock: no queue, no wait, and no route that empties a seat."
+    )]
+    async fn mse_run_acquire(
+        &self,
+        Parameters(req): Parameters<RunAcquireReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let run_id = parse_run_id(req.run_id)?;
+        let body = self
+            .op_client
+            .run_acquire(&run_id, &req.op, &req.desc, req.slot.as_deref())
             .await
             .map_err(client_error_to_mcp)?;
         json_result(&body)
@@ -7279,6 +7423,140 @@ mod tests {
             !names.contains(&"mse_ctx_get"),
             "mse_ctx_get must be retired: {names:?}"
         );
+    }
+
+    // ─── handover surface tool registration (§4.3 / §4.5 / W5) ──────────
+
+    /// The four routes the handover surface is made of must each have a
+    /// tool. Before they did, the three reads answered `401` to every
+    /// caller that was not this process (the Bearer never leaves it) while
+    /// the acquire stayed wide open — the guard unreachable and the verb
+    /// it guards reachable, which is the inversion this family fixes.
+    #[test]
+    fn handover_surface_tools_are_registered() {
+        let tools = MseServer::tool_router().list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        for expected in [
+            "mse_run_assignees",
+            "mse_run_handover",
+            "mse_run_material",
+            "mse_run_acquire",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} must be registered: {names:?}"
+            );
+        }
+    }
+
+    /// **B2**: the bearer takes no part in assignment. The three reads
+    /// select which session's token to present with `sid`; the acquire has
+    /// no such argument at all, because there is no token in it to select
+    /// — a `sid` on that surface would be the first step towards the
+    /// bearer deciding who holds a seat.
+    #[test]
+    fn only_the_handover_reads_take_a_sid() {
+        let tools = MseServer::tool_router().list_all();
+        let properties = |name: &str| -> JsonValue {
+            tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("tool {name} not registered"))
+                .input_schema
+                .get("properties")
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} must declare properties"))
+        };
+        for read in ["mse_run_assignees", "mse_run_handover", "mse_run_material"] {
+            let props = properties(read);
+            assert!(
+                props.get("sid").is_some(),
+                "{read} presents a Bearer, so it has to be able to say whose: {props}"
+            );
+            assert!(props.get("run_id").is_some(), "{read} is Run-scoped");
+        }
+        let acquire = properties("mse_run_acquire");
+        assert!(
+            acquire.get("sid").is_none(),
+            "an acquire presents no Bearer and must not ask for one: {acquire}"
+        );
+        for field in ["run_id", "op", "desc", "slot"] {
+            assert!(
+                acquire.get(field).is_some(),
+                "mse_run_acquire.{field} must be on the tool surface: {acquire}"
+            );
+        }
+    }
+
+    /// `mse_run_material` answers about one step and has no default for
+    /// which, so `step_id` is required rather than optional — and `slot`
+    /// on the acquire is the opposite (the server resolves the sole
+    /// declared Operator when it is omitted).
+    #[test]
+    fn handover_tool_required_arguments_match_the_routes() {
+        let tools = MseServer::tool_router().list_all();
+        let required = |name: &str| -> Vec<String> {
+            tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("tool {name} not registered"))
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| {
+                    r.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let material = required("mse_run_material");
+        for field in ["run_id", "step_id"] {
+            assert!(
+                material.contains(&field.to_string()),
+                "mse_run_material.{field} must be required: {material:?}"
+            );
+        }
+        assert!(
+            !material.contains(&"sid".to_string()),
+            "sid defaults to this process's sole live session: {material:?}"
+        );
+        let acquire = required("mse_run_acquire");
+        for field in ["run_id", "op", "desc"] {
+            assert!(
+                acquire.contains(&field.to_string()),
+                "mse_run_acquire.{field} must be required — an acquire with no `desc` is one a \
+                 later reader cannot tell from any other: {acquire:?}"
+            );
+        }
+        assert!(
+            !acquire.contains(&"slot".to_string()),
+            "a Blueprint with one declared Operator needs no seat named: {acquire:?}"
+        );
+    }
+
+    /// The descriptions are what an AI reads to learn the order. The
+    /// acquire's is the one that has to carry it: nothing downstream of it
+    /// refuses, so "read first" is the whole guard and it exists only as
+    /// text.
+    #[test]
+    fn the_acquire_description_names_the_reads_that_come_first() {
+        let tools = MseServer::tool_router().list_all();
+        let acquire = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "mse_run_acquire")
+            .expect("mse_run_acquire registered");
+        let description = acquire
+            .description
+            .as_ref()
+            .expect("mse_run_acquire must carry a description")
+            .to_string();
+        for expected in ["mse_operator_list", "mse_run_assignees", "never refuses"] {
+            assert!(
+                description.contains(expected),
+                "the acquire description must point at {expected:?}: {description}"
+            );
+        }
     }
 
     // ─── GH #69 launchd lifecycle tool registration ────────
