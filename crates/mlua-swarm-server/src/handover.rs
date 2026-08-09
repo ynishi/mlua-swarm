@@ -926,6 +926,17 @@ pub struct StepMaterialResp {
 /// principals, and a bug in it would hand every operator token the
 /// worker's `EmitOutput` / `PostResult` surface too.
 ///
+/// # What the bearer here is worth
+///
+/// `POST /v1/operators` takes no credential — deliberately, so a handover
+/// is never locked out (**D3**) — which means any caller that can reach
+/// the server can mint the bearer this route asks for. The gate is a
+/// shape check, not confidentiality: it says the caller is a registered
+/// operator, not that it is an authorised one. Keeping unauthorised
+/// readers away from the material is the deployment's job (bind the
+/// server accordingly), not this route's, and it is not something a
+/// stricter check here could buy back while join stays open.
+///
 /// # Why the `Final` is presence and flag, never the value
 ///
 /// `model.md:378-379` says what the reader is deciding: *"値があるのに
