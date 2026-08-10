@@ -1548,6 +1548,56 @@ pub struct RunResumeResponse {
     pub replayed_steps: usize,
 }
 
+/// Best-effort rollback of the `Running` flip, for a dispatch path that
+/// fails between its compare-and-set and the driver `tokio::spawn`.
+///
+/// [`run_resume`] and [`run_rerun_from`] both flip the Run to `Running`
+/// with a compare-and-set and only spawn the driver several store calls
+/// later. A store fault inside that window used to leave the row
+/// `Running` with nothing behind it: the run-TTL ceiling lives *inside*
+/// the task that was never created, so nothing reclaimed it, and both
+/// entry points then refused the row on their own status gate — resume
+/// wants `Interrupted`, rerun-from wants a terminal status. That left
+/// `POST /v1/runs/:id/cancel` as the only way out of a state no driver
+/// had ever entered.
+///
+/// Rolling back to the status the compare-and-set moved away from keeps
+/// the record honest in both directions. Resume returns to `Interrupted`,
+/// whose replay log is untouched at every one of its failure sites.
+/// Rerun-from returns to the terminal status it started from — including
+/// the site past `delete_from`, where the log really has been truncated:
+/// that loss is a replay loss, not a run failure, and recording it as a
+/// run failure would be its own lie. A later rerun-from against the same
+/// run reports the truncation from the evidence (an empty log beside a
+/// non-empty `step_entries`, see [`run_rerun_from`]) rather than from a
+/// status this rollback overwrote.
+///
+/// Best-effort by the [`finalize_run`] convention: a rollback that itself
+/// fails is logged and swallowed, because the caller is already returning
+/// the store fault that caused it and that outcome must not be masked.
+async fn rollback_running_flip(state: &AppState, run_id: &RunId, to: RunStatus, site: &str) {
+    match state
+        .run_store
+        .try_transition(run_id, RunStatus::Running, to)
+        .await
+    {
+        Ok(true) => tracing::warn!(
+            %run_id, site, rolled_back_to = ?to,
+            "dispatch failed after the Running flip; the run was rolled back"
+        ),
+        Ok(false) => tracing::warn!(
+            %run_id, site,
+            "dispatch failed after the Running flip, but the run had already left Running \
+             — leaving it where it is"
+        ),
+        Err(error) => tracing::warn!(
+            %run_id, site, %error,
+            "dispatch failed after the Running flip and the rollback itself failed; the run \
+             stays Running with no driver behind it (end it with POST /v1/runs/:id/cancel)"
+        ),
+    }
+}
+
 /// `POST /v1/runs/:id/resume`. Resumes an `Interrupted` Run under the SAME
 /// `run_id` (no new `RunId` is minted): the stored launch-input snapshot
 /// (`RunRecord.input_json`) is rebuilt into a `TaskApplicationInput`, a
@@ -1635,11 +1685,23 @@ pub async fn run_resume(
     // Build the replay cursor from the Run's logged step snapshots. An
     // empty log is fine — the cursor has zero hits and every step is
     // dispatched fresh (a from-scratch re-run under the same run_id).
-    let entries = state
-        .replay_store
-        .list_by_run(&run_id)
-        .await
-        .map_err(|e| ApiError::engine(format!("replay list_by_run: {e}")))?;
+    //
+    // Past the compare-and-set, every early return owes the row a
+    // rollback (see `rollback_running_flip`): the driver that would have
+    // carried this Run to a terminal status does not exist yet.
+    let entries = match state.replay_store.list_by_run(&run_id).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            rollback_running_flip(
+                &state,
+                &run_id,
+                RunStatus::Interrupted,
+                "replay list_by_run",
+            )
+            .await;
+            return Err(ApiError::engine(format!("replay list_by_run: {e}")));
+        }
+    };
     let replayed_steps = entries.len();
     let cursor = ReplayCursor::from_entries(entries);
 
@@ -1667,11 +1729,20 @@ pub async fn run_resume(
 
     // A resumed Task is running again; finalize_run resets it to
     // Done/Failed at the end, same as the rekick path.
-    state
+    if let Err(e) = state
         .task_store
         .update_status(&task_id, TaskRecordStatus::Running)
         .await
-        .map_err(ApiError::engine)?;
+    {
+        rollback_running_flip(
+            &state,
+            &run_id,
+            RunStatus::Interrupted,
+            "task update_status",
+        )
+        .await;
+        return Err(ApiError::engine(e));
+    }
 
     // Detached dispatch — same `tokio::spawn` + run-TTL-ceiling shape as
     // the detached rekick path; `finalize_run` (or the ttl-expiry `Failed`
@@ -1981,11 +2052,18 @@ pub async fn run_rerun_from(
     // so the rerun dispatch's `append` cannot collide with the pre-rerun
     // row and `list_by_run` reflects the rerun's real history rather than
     // the pre-rerun ghost.
-    let dropped_steps = state
-        .replay_store
-        .delete_from(&run_id, cut)
-        .await
-        .map_err(|e| ApiError::engine(format!("replay delete_from: {e}")))?;
+    //
+    // A failure here rolls the row back to `current` (see
+    // `rollback_running_flip`). Whether the truncate landed partially is
+    // not knowable from the error, so the rollback says nothing about the
+    // log — it only returns the status the compare-and-set took.
+    let dropped_steps = match state.replay_store.delete_from(&run_id, cut).await {
+        Ok(dropped) => dropped,
+        Err(e) => {
+            rollback_running_flip(&state, &run_id, current, "replay delete_from").await;
+            return Err(ApiError::engine(format!("replay delete_from: {e}")));
+        }
+    };
 
     // Cursor is built from the pre-cut prefix; every retained entry hits
     // verbatim in the engine's replay path.
@@ -2016,11 +2094,25 @@ pub async fn run_rerun_from(
 
     // A rerun-from is a running Run again; finalize_run resets it to
     // Done/Failed at the end, same as the rekick / resume paths.
-    state
+    //
+    // This site sits past `delete_from`, so the rollback returns a run
+    // whose replay log really is truncated. That is deliberate — see
+    // `rollback_running_flip` on why the loss is not recorded as a run
+    // failure.
+    if let Err(e) = state
         .task_store
         .update_status(&task_id, TaskRecordStatus::Running)
         .await
-        .map_err(ApiError::engine)?;
+    {
+        rollback_running_flip(
+            &state,
+            &run_id,
+            current,
+            "task update_status (post-truncate)",
+        )
+        .await;
+        return Err(ApiError::engine(e));
+    }
 
     let ttl_secs = crate::default_run_ttl();
     let bg_state = state.clone();
