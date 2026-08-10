@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0](https://github.com/ynishi/mlua-swarm/compare/v0.24.0...v0.25.0) - 2026-08-10
+
+### Added
+
+- *(server)* [**breaking**] stop claiming a name at join, and take the seat instead
+- *(server)* [**breaking**] give a driver the material to tell its own work apart
+- *(server)* [**breaking**] let a Run's seat be taken over, and released when its holder is gone
+- *(engine)* [**breaking**] resolve a Run's operator per dispatch instead of baking it
+- *(engine)* [**breaking**] make the worker-token TTL configurable
+- *(server)* persist operator login sessions across restart
+- *(mcp)* let the reader the lists were written for actually read them
+
+### Fixed
+
+- *(engine)* stop expiring operator tokens
+- *(server)* park operator sends across a disconnect instead of failing them
+- *(mcp)* re-establish the operator WS instead of reporting a timeout
+
+### Other
+
+- *(schema)* [**breaking**] give the operator role alias one type
+- *(server)* say at the route what its operator bearer is worth
+- *(server)* correct the disconnect docs the park change invalidated
+- Merge branch 'topic/operator-session-lifecycle' into main
+- *(serve)* [**breaking**] drop the periodic stale-run sweeper
+
 ## [0.24.0](https://github.com/ynishi/mlua-swarm/compare/v0.23.1...v0.24.0) - 2026-08-06
 
 ### Added
