@@ -318,6 +318,33 @@ fn fold_final_and_parts(
     Some((value, ok))
 }
 
+/// Log a backend id that the launch envelope declares but whose registry
+/// no longer holds it.
+///
+/// These ids are declared-then-resolved: one only reaches the envelope
+/// because a launch named it, so a miss is not "nothing was asked for" —
+/// it is a named capability that will not fire on this dispatch. Left
+/// silent, the delegate axis degrades into `inner.spawn`
+/// (`OperatorDelegateWrapped::spawn` reads `None` as "no operator is
+/// attached") and a declared hook or bridge simply never runs, with
+/// nothing in the log to say a shipped feature was dropped on the way.
+///
+/// A `warn!` rather than a dispatch failure, deliberately. A session that
+/// leaves after its launch validated it is an ordinary operational event
+/// — the server gates `operator_sid` against `Engine::list_operator_ids`
+/// at request time, and the holder of a seat is free to leave afterwards
+/// — so failing the dispatch here would turn a driver's departure into a
+/// run failure.
+fn warn_unresolved_backend(registry: &str, backend_id: &str, agent: &str) {
+    tracing::warn!(
+        registry,
+        backend_id,
+        agent,
+        "launch declared this backend id but its registry no longer holds it; the \
+         capability will not fire for this dispatch"
+    );
+}
+
 impl Engine {
     /// Backwards-compatible constructor that starts the engine without a
     /// layer registry, preserving the signature already used by ~88
@@ -1260,26 +1287,42 @@ impl Engine {
     /// Build an `OperatorInfo` by looking up the session's registered IDs
     /// on the `BridgeRegistry`, plus resolving the 4-tier `OperatorKind`
     /// cascade for `agent_name` via `crate::core::ctx::collapse_operator_kind`.
-    /// Used when `dispatch_attempt` injects `Ctx`. An unresolved ID
-    /// (nothing registered) is silently `None` — the bridge / hook simply
-    /// does not fire and the default behaviour applies.
+    /// Used when `dispatch_attempt` injects `Ctx`.
+    ///
+    /// An id that resolves to nothing still yields `None` — the bridge /
+    /// hook does not fire and the default behaviour applies — but it is no
+    /// longer silent about it. See [`warn_unresolved_backend`] for why a
+    /// declared-but-missing backend is logged rather than either ignored
+    /// outright or escalated into a dispatch failure.
     async fn resolve_operator_info(
         &self,
         session: &LaunchEnvelope,
         agent_name: &str,
     ) -> OperatorInfo {
         let senior_bridge = if let Some(id) = &session.bridge_id {
-            self.inner.senior_bridges.read().await.get(id).cloned()
+            let resolved = self.inner.senior_bridges.read().await.get(id).cloned();
+            if resolved.is_none() {
+                warn_unresolved_backend("senior_bridges", id, agent_name);
+            }
+            resolved
         } else {
             None
         };
         let spawn_hook = if let Some(id) = &session.hook_id {
-            self.inner.spawn_hooks.read().await.get(id).cloned()
+            let resolved = self.inner.spawn_hooks.read().await.get(id).cloned();
+            if resolved.is_none() {
+                warn_unresolved_backend("spawn_hooks", id, agent_name);
+            }
+            resolved
         } else {
             None
         };
         let operator = if let Some(id) = &session.operator_backend_id {
-            self.inner.operators.read().await.get(id).cloned()
+            let resolved = self.inner.operators.read().await.get(id).cloned();
+            if resolved.is_none() {
+                warn_unresolved_backend("operators", id, agent_name);
+            }
+            resolved
         } else {
             None
         };
@@ -3899,6 +3942,143 @@ mod resolve_operator_info_runtime_global_tests {
             info.kind,
             OperatorKind::MainAi,
             "None runtime_global must let bp_global MainAi win"
+        );
+    }
+}
+
+// ─── UT: a declared backend id that resolves to nothing is logged ─────────
+//
+// `resolve_operator_info` used to answer `None` for a declared id exactly
+// as it does for an absent one, so a launch whose operator session had gone
+// lost its delegate axis (`OperatorDelegateWrapped::spawn` falls through to
+// `inner.spawn` on `None`) with nothing in the log to say a shipped feature
+// had been dropped. These pin the log, the unchanged `None` outcome, and
+// the silence when nothing was declared in the first place.
+#[cfg(test)]
+mod unresolved_backend_warning_tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct CaptureBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CaptureBuf {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CaptureBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Attach carrying the three backend ids the caller passes, then
+    /// resolve while capturing what that resolve logged. Nothing is ever
+    /// registered on the engine, so every `Some(id)` reaching this helper
+    /// is a declared-but-missing backend.
+    ///
+    /// `#[tokio::test]` runs on a current-thread runtime, so the future is
+    /// polled on this thread throughout and the thread-local subscriber
+    /// covers the whole call.
+    async fn resolve_capturing_warnings(
+        bridge_id: Option<String>,
+        hook_id: Option<String>,
+        operator_backend_id: Option<String>,
+    ) -> (OperatorInfo, String) {
+        let engine = Engine::new(EngineCfg::default());
+        let token = engine
+            .attach_with_ids(
+                "ut-op",
+                Role::Operator,
+                Duration::from_secs(30),
+                None,
+                bridge_id,
+                hook_id,
+                operator_backend_id,
+                HashMap::new(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("attach_with_ids ok");
+        let session = engine
+            .with_state("test.find_session", |s| {
+                s.sessions
+                    .values()
+                    .find(|sess| sess.token_fp == token.fingerprint())
+                    .cloned()
+            })
+            .await
+            .expect("with_state ok")
+            .expect("session present after attach_with_ids");
+
+        let buf = CaptureBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let info = engine.resolve_operator_info(&session, "agent-x").await;
+        drop(guard);
+        (info, buf.contents())
+    }
+
+    #[tokio::test]
+    async fn declared_but_missing_operator_backend_is_logged() {
+        let (info, logged) = resolve_capturing_warnings(None, None, Some("S-gone".into())).await;
+        assert!(
+            info.operator.is_none(),
+            "resolution still answers None — this is a log, not a new outcome"
+        );
+        assert!(
+            logged.contains("operators") && logged.contains("S-gone"),
+            "an operator backend the launch declared, which no longer resolves, must name \
+             itself in the log rather than degrading the delegate axis in silence; \
+             got: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_but_missing_bridge_and_hook_are_logged() {
+        let (info, logged) =
+            resolve_capturing_warnings(Some("B-gone".into()), Some("H-gone".into()), None).await;
+        assert!(
+            info.senior_bridge.is_none() && info.spawn_hook.is_none(),
+            "resolution still answers None for both"
+        );
+        assert!(
+            logged.contains("senior_bridges") && logged.contains("B-gone"),
+            "got: {logged}"
+        );
+        assert!(
+            logged.contains("spawn_hooks") && logged.contains("H-gone"),
+            "got: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_that_declares_no_backend_logs_nothing() {
+        // The counterpart that keeps the warning worth reading: an absent
+        // id is not a dropped capability, and must not put a line in the
+        // log on every dispatch of every operator-less run.
+        let (info, logged) = resolve_capturing_warnings(None, None, None).await;
+        assert!(info.operator.is_none() && info.senior_bridge.is_none());
+        assert!(
+            logged.is_empty(),
+            "nothing was declared, so nothing was lost; got: {logged}"
         );
     }
 }
