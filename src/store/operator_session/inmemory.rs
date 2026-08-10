@@ -49,15 +49,35 @@ impl OperatorSessionStore for InMemoryOperatorSessionStore {
         Ok(())
     }
 
-    async fn list(&self) -> Result<Vec<OperatorSessionRecord>, OperatorSessionStoreError> {
+    /// Unfiltered by design (see the trait's contract): this backend's map
+    /// is the whole of what it stores, so handing back what is under the
+    /// key is exactly "the row as stored".
+    async fn get(
+        &self,
+        sid: &SessionId,
+    ) -> Result<Option<OperatorSessionRecord>, OperatorSessionStoreError> {
         let inner = self.inner.lock().unwrap();
+        Ok(inner.records.get(sid).cloned())
+    }
+
+    /// Expired rows are dropped from the answer **and** from the map (see
+    /// the trait's contract). This backend can do both under the one lock
+    /// it already takes, so the removal is atomic with the read that
+    /// judged it.
+    async fn list(&self) -> Result<Vec<OperatorSessionRecord>, OperatorSessionStoreError> {
+        let mut inner = self.inner.lock().unwrap();
         let mut records: Vec<OperatorSessionRecord> = inner
             .order
             .iter()
             .filter_map(|sid| inner.records.get(sid).cloned())
             .collect();
         records.sort_by_key(|r| r.joined_at_secs);
-        Ok(records)
+        let (live, expired) = super::partition_expired(records, super::expiry_now(), "in-memory");
+        for sid in expired {
+            inner.records.remove(&sid);
+            inner.order.retain(|s| s != &sid);
+        }
+        Ok(live)
     }
 }
 
@@ -69,12 +89,19 @@ impl OperatorSessionStore for InMemoryOperatorSessionStore {
 mod tests {
     use super::*;
 
+    /// A live record joined at `joined_at_secs`.
+    ///
+    /// The join time stays a small literal — the tests below are about
+    /// ordering by it — while the access clock is set to now, because
+    /// `list()` deletes what the 24h horizon has expired and a record last accessed
+    /// at second 100 of 1970 is expired by any real clock.
     fn mk(sid: &str, joined_at_secs: u64) -> OperatorSessionRecord {
         OperatorSessionRecord {
             sid: SessionId::parse(sid).unwrap(),
             token_digest: OperatorSessionRecord::digest_of(&format!("bearer-{sid}")),
             capability_manifest: None,
             joined_at_secs,
+            last_access_secs: super::super::expiry_now(),
             desc: None,
             observed: Vec::new(),
             observed_total: 0,

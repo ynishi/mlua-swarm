@@ -43,3 +43,6 @@ toml.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 rusqlite-isle.workspace = true
+# For asserting on what the server *logs*: a dropped `hook_after` leaves no
+# other trace by design, so the warn is the behaviour under test.
+tracing-subscriber.workspace = true

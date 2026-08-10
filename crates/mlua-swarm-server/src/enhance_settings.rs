@@ -113,10 +113,45 @@ async fn list_settings(
     Ok(Json(ids.into_iter().map(|id| id.0).collect()))
 }
 
+/// Refuses a `ttl_secs` of `0` at write time, before anything is stored.
+///
+/// `EnhanceSettingInput.ttl_secs` is the wall-clock ceiling on one enhance
+/// epoch, applied as `tokio::time::timeout` in
+/// `EnhanceApplication::dispatch_one`. A zero duration elapses on its first
+/// poll, so a stored `0` does not mean "unbounded" — it means every epoch
+/// this setting drives is aborted before its first step. A setting that can
+/// never run should not be storable.
+///
+/// The dispatcher refuses it too (`EnhanceApplicationError::ZeroTtl`), and
+/// that check stays: it is the last line of defence for rows written before
+/// this one existed. This is the earlier of the two, and the only one that
+/// can tell the author while they still have the request in hand.
+///
+/// Zero is rejected rather than read as a sentinel because no TTL in this
+/// repo reads it as one — `mse serve` refuses `worker_token_ttl_secs: 0` at
+/// startup and `POST /v1/tasks` answers `400` to `timeout_secs: 0`.
+/// Accepting it here would make this the single place where `0` quietly
+/// meant something other than zero.
+fn reject_zero_ttl(input: &EnhanceSettingInput) -> Result<(), (StatusCode, String)> {
+    if input.ttl_secs == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "ttl_secs must be greater than 0; it is the wall-clock ceiling on one enhance \
+             epoch, and 0 would abort every epoch before its first step"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn post_setting(
     State(state): State<EnhanceSettingsState>,
     Json(input): Json<EnhanceSettingInput>,
 ) -> Result<(StatusCode, Json<EnhanceSetting>), (StatusCode, String)> {
+    // Before `into_ref`, so a refused setting commits no Blueprint either
+    // (the write ordering in this module is commit-then-K-V, and a `400`
+    // must leave neither half behind).
+    reject_zero_ttl(&input)?;
     let (blueprint, setting) = input.into_ref();
     let rationale = format!(
         "enhance-setting POST id={} blueprint_id={}",
@@ -160,6 +195,9 @@ async fn put_setting(
             format!("path id {id:?} != body id {:?}", input.id),
         ));
     }
+    // Same guard as the create path: an update may not turn a runnable
+    // setting into one whose every epoch aborts on its first poll.
+    reject_zero_ttl(&input)?;
     let (blueprint, setting) = input.into_ref();
     let rationale = format!(
         "enhance-setting PUT id={} blueprint_id={}",

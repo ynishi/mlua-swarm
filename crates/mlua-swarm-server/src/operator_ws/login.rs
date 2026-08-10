@@ -119,7 +119,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::protocol::{ClientMsg, PendingReply, ServerMsg};
 use super::router::{OperatorAdapter, OperatorAdapterRegistry};
-use super::session::WSOperatorSession;
+use super::session::{WSOperatorSession, WorkerTokenMinter};
 use crate::assignee_trace::{append_released, ReleaseReason};
 use crate::AppState;
 
@@ -160,6 +160,25 @@ pub struct LoginSession {
     /// it is held except the store's own internals — so there is no order
     /// to invert.
     observed: tokio::sync::Mutex<ObservedLog>,
+    /// The 24h expiry's clock: when this session was last accessed, live.
+    ///
+    /// The horizon is model §4.1's state diagram
+    /// (`最終アクセスから 24h ──▶ ╳ 削除`) and carries no predicate number
+    /// — see
+    /// [`OPERATOR_SESSION_MAX_IDLE_SECS`](mlua_swarm::store::operator_session::OPERATOR_SESSION_MAX_IDLE_SECS)
+    /// for why this file does not call it `O1`.
+    ///
+    /// Split out of [`Self::record`] for the same reason
+    /// [`Self::observed`] is — the record's other fields are fixed at join
+    /// and this one is not. An `AtomicU64` rather than a `Mutex` because
+    /// every write is a monotone `fetch_max` of a `u64` and no reader needs
+    /// it consistent with anything else; `Relaxed` is enough for the same
+    /// reason (the value is a timestamp compared against a 24h horizon, not
+    /// a lock or a flag ordering other memory).
+    last_access_secs: std::sync::atomic::AtomicU64,
+    /// The value of [`Self::last_access_secs`] as last written through to
+    /// the store — the other half of [`Self::touch`]'s write-coalescing.
+    last_access_persisted_secs: std::sync::atomic::AtomicU64,
     /// Shared, not owned — the same object the engine's registries hold and a
     /// teardown latches.
     dispatch_target: Arc<WSOperatorSession>,
@@ -185,18 +204,36 @@ impl LoginSession {
     /// The record's observed part is lifted into [`Self::observed`], so a
     /// session restored at boot resumes with the log it was persisted with
     /// (**D2**: nothing removes entries, and a restart is not a removal).
-    pub(crate) fn new(record: OperatorSessionRecord, base_url: Option<Arc<str>>) -> Arc<Self> {
+    ///
+    /// `token_minter` is handed to the WS session so a Spawn frame that
+    /// parked across a disconnect can have its worker capability re-minted
+    /// before it goes out (see
+    /// [`WorkerTokenMinter`](super::session::WorkerTokenMinter)). Both
+    /// production callers pass the engine; `None` sends parked frames
+    /// exactly as they were built.
+    pub(crate) fn new(
+        record: OperatorSessionRecord,
+        base_url: Option<Arc<str>>,
+        token_minter: Option<Arc<dyn WorkerTokenMinter>>,
+    ) -> Arc<Self> {
         let dispatch_target = Arc::new(WSOperatorSession::disconnected_with_base_url(
             record.sid.clone(),
             base_url,
+            token_minter,
         ));
         let observed = ObservedLog {
             entries: record.observed.clone(),
             total: record.observed_total,
         };
+        // Seeded from what was persisted, so a restored session resumes
+        // the expiry clock where it left off rather than looking freshly
+        // accessed — a restart is not an access.
+        let last_access = record.last_access_secs();
         Arc::new(Self {
             record,
             observed: tokio::sync::Mutex::new(observed),
+            last_access_secs: std::sync::atomic::AtomicU64::new(last_access),
+            last_access_persisted_secs: std::sync::atomic::AtomicU64::new(last_access),
             dispatch_target,
         })
     }
@@ -217,7 +254,96 @@ impl LoginSession {
         let mut record = self.record.clone();
         record.observed = observed.entries.clone();
         record.observed_total = observed.total;
+        record.last_access_secs = self
+            .last_access_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
         record
+    }
+
+    /// Record that something reached this session — §4.1's "最終アクセス".
+    ///
+    /// # What counts as an access
+    ///
+    /// Every call that proves the driver behind this session is still
+    /// there: attaching a socket, reading the session's own row, and being
+    /// assigned a seat (which [`Self::record_observed`] persists anyway, so
+    /// it needs no separate touch). Reading *somebody else's* row does not
+    /// touch theirs — a recovery driver enumerating the 記名 list must not
+    /// keep the corpses it is reading alive.
+    ///
+    /// # The durable write is coalesced
+    ///
+    /// In memory the value always advances; the store is written at most
+    /// once per [`TOUCH_PERSIST_INTERVAL_SECS`]. A busy driver would
+    /// otherwise put a full session row — 記名 ring included — per HTTP
+    /// call, to move a number the expiry compares against a 24-hour
+    /// horizon. The staleness that buys is bounded by the interval and is
+    /// four orders of magnitude below the horizon it feeds.
+    ///
+    /// A store failure is logged and swallowed, exactly as in
+    /// [`Self::record_observed`] and for the same reason: an observability
+    /// write must not decide whether a live session keeps working.
+    pub(crate) async fn touch(
+        &self,
+        store: &Arc<dyn mlua_swarm::store::operator_session::OperatorSessionStore>,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = now_secs();
+        // Monotone: a clock that stepped back must not age the session.
+        if self.last_access_secs.fetch_max(now, Relaxed) >= now {
+            return;
+        }
+        if now.saturating_sub(self.last_access_persisted_secs.load(Relaxed))
+            < TOUCH_PERSIST_INTERVAL_SECS
+        {
+            return;
+        }
+        // Held across the write for the same reason `record_observed`
+        // holds it: both write the whole row, and serialising them on this
+        // leaf lock is what stops a touch's snapshot from landing after —
+        // and therefore erasing — an `Assign` appended beside it.
+        let observed = self.observed.lock().await;
+        let mut record = self.record.clone();
+        record.observed = observed.entries.clone();
+        record.observed_total = observed.total;
+        record.last_access_secs = self.last_access_secs.load(Relaxed);
+        self.last_access_persisted_secs
+            .store(record.last_access_secs, Relaxed);
+        if let Err(error) = store.put(record).await {
+            tracing::warn!(
+                sid = %self.record.sid,
+                %error,
+                "touch: the last-access clock could not be persisted; it is live in this \
+                 process but the durable copy still reads older, so a restart in the next \
+                 24h could expire a session that is in use"
+            );
+        }
+    }
+
+    /// The 24h horizon: is this session expired as of `now`?
+    ///
+    /// Two conditions, and the second is not in the model's text:
+    ///
+    /// - the record's own predicate
+    ///   ([`OperatorSessionRecord::is_expired_at`]) — 24h since the last
+    ///   access;
+    /// - **and no socket is attached right now.**
+    ///
+    /// The connectivity clause is what stops the expiry from reaping a
+    /// driver that is plainly present. §4.1's O7 says connectedness is not
+    /// the Operator's *state*, and this does not make it one — the state is
+    /// still `Registered`, and a disconnect still changes nothing. It is
+    /// read as evidence about the *access* clock instead: a client holding
+    /// a socket open is in contact with the server continuously, whether or
+    /// not it has said anything, so treating that as an access is closer to
+    /// 最終アクセス than pretending the last HTTP call was the last contact.
+    /// Without it, a driver that connected, took no seat and sat idle for a
+    /// day would have its session deleted out from under its live socket.
+    pub(crate) async fn is_expired(&self, now: u64) -> bool {
+        if self.dispatch_target.is_connected().await {
+            return false;
+        }
+        self.kimei().await.is_expired_at(now)
     }
 
     /// Append one `Assign` to this session's observed part (**D2**) and
@@ -239,6 +365,19 @@ impl LoginSession {
         let mut record = self.record.clone();
         record.observed = std::mem::take(&mut observed.entries);
         record.observed_total = observed.total;
+        // An `Assign` is an access, and this write is the one that
+        // is happening anyway — so the clock rides along rather than
+        // needing a `touch` of its own.
+        let now = now_secs();
+        self.last_access_secs
+            .fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+        record.last_access_secs = self
+            .last_access_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.last_access_persisted_secs.store(
+            record.last_access_secs,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         record.record_observed(entry);
         observed.entries = record.observed.clone();
         observed.total = record.observed_total;
@@ -268,6 +407,90 @@ impl LoginSession {
     /// stored token digest.
     pub fn verify_bearer(&self, bearer: &str) -> bool {
         self.record.verify_bearer(bearer)
+    }
+}
+
+/// Wall-clock seconds since the epoch, or `0` from a clock that cannot
+/// answer.
+///
+/// `0` is the oldest possible mint and the oldest possible access, which
+/// makes such a session the one a recovery driver always picks — and, for
+/// the expiry, one that `saturating_sub` can never age (the horizon is
+/// measured *from* `now`, so a `now` of `0` expires nothing). Both are the
+/// conservative direction for a broken clock.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The shortest gap between two durable writes of the expiry's last-access
+/// clock (see [`LoginSession::touch`]).
+///
+/// Sized as a fraction of the horizon it feeds
+/// ([`mlua_swarm::store::operator_session::OPERATOR_SESSION_MAX_IDLE_SECS`],
+/// 24h): a value this coarse can make a session look at most 60s more idle
+/// than it is across a restart, against a horizon of 86,400. What it buys
+/// is that a driver polling its own session every second writes one row a
+/// minute instead of sixty.
+const TOUCH_PERSIST_INTERVAL_SECS: u64 = 60;
+
+/// The 24h horizon at the moment of observation: tear `live` down if it has gone
+/// [`OPERATOR_SESSION_MAX_IDLE_SECS`](mlua_swarm::store::operator_session::OPERATOR_SESSION_MAX_IDLE_SECS)
+/// unaccessed, and report whether it did.
+///
+/// # Why the expiry lives at the reads instead of on a timer
+///
+/// §4.1's state diagram ends `Registered` two ways, `leave` and
+/// `最終アクセスから 24h`. The first has a route; the second had nothing
+/// implementing it, and could not be given the obvious implementation: a
+/// periodic scan is the shape `31fefc1` removed for the stale-`Run`
+/// sweeper, which produced false positives against Runs nobody was
+/// dispatching to. A session reaper would run against the same kind of
+/// quiet state on the same kind of timer.
+///
+/// So the rule is enforced where it is *read* — here, and in the store's
+/// boot-time `list`. That is the same shape the two sibling judgments
+/// already use: **A7** decides a seat's liveness at reference time, and
+/// **O8**'s cascade fires at delete time and "nowhere else". The observable
+/// promise is identical to a sweeper's — an expired session is never
+/// returned to anybody — and it is made by the code that is about to
+/// answer for the session rather than by a job that woke up on its own.
+///
+/// # It is the same teardown a leave performs
+///
+/// [`teardown_operator_session`], so an expiry drops the persisted row,
+/// all four registrations, the socket and the map entry, and cascades
+/// **O8** over every seat the session still held. An expiry that left
+/// seats behind would put the model's own `╳ 削除 ── cascade ──▶` arrow
+/// (§4.1) in a state it does not have.
+///
+/// A teardown that fails is logged and the session is left intact — the
+/// caller then answers about a session that still exists, which is true.
+/// The next read judges it again.
+async fn reap_if_expired(state: &AppState, sid: &SessionId, live: &Arc<LoginSession>) -> bool {
+    if !live.is_expired(now_secs()).await {
+        return false;
+    }
+    match teardown_operator_session(state, sid, live).await {
+        Ok(()) => {
+            tracing::info!(
+                %sid,
+                desc = live.record().desc.as_deref().unwrap_or("<none>"),
+                "operator session expired (24h since last access, no socket attached); \
+                 released with the same teardown a leave performs"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                %sid, %error,
+                "expired operator session could not be released; it stays live and will be \
+                 judged again on the next read"
+            );
+            false
+        }
     }
 }
 
@@ -382,14 +605,11 @@ pub async fn operators_create(
     // at the end of this function and never stored anywhere.
     let token_digest = OperatorSessionRecord::digest_of(&token);
 
-    // A clock that cannot answer yields `0`, which `GET /v1/operators`
-    // reads as the oldest possible mint — so such a session is the one a
-    // recovery driver picking "the oldest stale session" always picks,
-    // permanently.
-    let joined_at_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // A clock that cannot answer yields `0` (see `now_secs`), which
+    // `GET /v1/operators` reads as the oldest possible mint — so such a
+    // session is the one a recovery driver picking "the oldest stale
+    // session" always picks, permanently.
+    let joined_at_secs = now_secs();
 
     // Write-through BEFORE the in-memory insert and the mint response: a
     // sid the client can see must already be durable, or a crash between
@@ -400,6 +620,8 @@ pub async fn operators_create(
         token_digest,
         capability_manifest,
         joined_at_secs,
+        // The expiry clock starts at the join: minting is the first access.
+        last_access_secs: joined_at_secs,
         desc,
         // D2: the observed part starts empty and only ever grows, from the
         // `Assign` sites. A mint has assigned nothing yet.
@@ -441,21 +663,57 @@ pub async fn operators_create(
     // it as the map insert below, and the failure path above stays exactly
     // as it was: answer `500`, leave nothing behind.
     //
-    // # The window this ordering leaves
+    // # Reachable last: the map before the registries
     //
-    // Between the registration below and the map insert after it, the sid
-    // resolves in the engine while `operator_sessions` does not yet hold
-    // the session. Both exits a parked send has —
-    // `replace_tx` (reached only via `operators_ws_connect`) and
+    // These two writes publish different things, and the order between
+    // them decides what a half-built session can do. The registries are
+    // what a *dispatch* resolves through — the engine's three by sid, the
+    // adapter registry by holder — so registering is what makes a session
+    // routable. `operator_sessions` is where a routed send finds its two
+    // exits: `replace_tx` (reached only via `operators_ws_connect`) and
     // `ConnState::TornDown` (published only by `teardown_operator_session`)
-    // — look the sid up in that map first, so a dispatch landing in the
-    // window parks with neither exit reachable. It is bounded, not stuck:
-    // the park sits inside the run driver, which ends at its own
-    // `sync_timeout_secs` or detach TTL. The cost is a run that burns its
-    // full ceiling and then reports a timeout, naming the wrong cause.
-    // Reaching the window needs this request to die between the two
-    // statements (see the dropped-response-future note below).
-    let live = LoginSession::new(record, state.base_url.clone());
+    // both look the sid up in that map first.
+    //
+    // Registering first therefore opened a window in which a session was
+    // routable with neither exit reachable. A dispatch landing in it parked
+    // and stayed parked: the map had no entry for a connect to attach to
+    // or for a teardown to close. It was bounded, not stuck — the park sits
+    // inside the run driver, which ends at its own `sync_timeout_secs` or
+    // detach TTL — but the run burned its whole ceiling and then reported a
+    // timeout naming the wrong cause, where a session that had simply not
+    // finished being built should fail in milliseconds. Reaching the window
+    // needed this request to die between the two statements, which hyper
+    // does for us whenever the peer disconnects mid-request (see the
+    // dropped-response-future note on `operators_delete`).
+    //
+    // Publishing the map entry first closes it by making the map a
+    // superset of the registries: *registered implies reachable-exits*. A
+    // request that dies between the two now leaves a session that no
+    // dispatch can reach at all — an `operator_sid` pin is refused at
+    // launch with `400 no such registered operator session`, and a seat
+    // naming it fails its next dispatch at the registry lookup, repaired by
+    // an `acquire` (**A8**). Both are immediate and say what happened,
+    // which is the trade: a loud failure at the start instead of a silent
+    // one at the ceiling.
+    //
+    // # Why this does not reopen the durable-write question
+    //
+    // The `put` above still gates *both* in-memory effects — it is the
+    // reordering of two writes on the same side of that gate, not a move
+    // across it. The failure path is unchanged: answer `500`, leave
+    // nothing behind.
+    let live = LoginSession::new(
+        record,
+        state.base_url.clone(),
+        Some(Arc::new(state.engine.clone())),
+    );
+
+    state
+        .operator_sessions
+        .lock()
+        .await
+        .insert(sid.clone(), live.clone());
+
     register_operator_session(
         &state.engine,
         Some(&state.operator_adapters),
@@ -463,12 +721,6 @@ pub async fn operators_create(
         live.dispatch_target(),
     )
     .await;
-
-    state
-        .operator_sessions
-        .lock()
-        .await
-        .insert(sid.clone(), live);
 
     (StatusCode::OK, Json(OperatorsCreateResp { sid, token })).into_response()
 }
@@ -521,8 +773,21 @@ pub async fn operators_ws_connect(
     if !live.verify_bearer(&bearer) {
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
+    // The horizon is judged before the connect is honoured, not after: a session
+    // that went 24h without contact was due for deletion at some point in
+    // that window, and letting a late arrival cancel that would make the
+    // horizon mean "24h unless somebody eventually turns up". The client
+    // is not stranded — a join is unauthenticated (**D3**), so re-minting
+    // is one call, and `acquire` (**A8**) takes the seat back.
+    if reap_if_expired(&state, &sid, &live).await {
+        return (StatusCode::NOT_FOUND, "unknown sid").into_response();
+    }
+    // Attaching is the strongest access there is; from here on the socket
+    // itself holds the session alive (see `LoginSession::is_expired`).
+    live.touch(&state.operator_session_store).await;
 
-    ws.on_upgrade(move |socket| handle_operator_socket(socket, live))
+    let store = state.operator_session_store.clone();
+    ws.on_upgrade(move |socket| handle_operator_socket(socket, live, store, KeepAlive::DEFAULT))
 }
 
 /// Binds a session's dispatch target into every registry an Operator
@@ -545,12 +810,14 @@ pub async fn operators_ws_connect(
 ///
 /// They answer different questions and are read at different times:
 ///
-/// - **`engine.register_operator`** — the Blueprint-global *delegate* axis
-///   (`OperatorDelegateMiddleware`). A launch names a backend id (its
-///   `operator_sid`, stored on the `LaunchEnvelope`) and the engine
-///   resolves it once at attach time; an id that resolves to nothing makes
-///   the middleware fall through to `inner.spawn` silently, so a session
-///   missing here is a quiet loss of a shipped feature.
+/// - **`engine.register_operator`** — the id space a launch is validated
+///   against. `POST /v1/tasks` answers "is this `operator_sid` a live
+///   session?" out of [`Engine::list_operator_ids`], which reads exactly
+///   this map, so a session missing here cannot be pinned at all: the
+///   launch is refused with `400 no such registered operator session`.
+///   (The `ctx`-mediated reader this used to name, the Blueprint-global
+///   `operator_delegate` layer, was removed — the entry is now read by the
+///   launch gate and the seat resolver, not by a middleware.)
 /// - **`adapters`** — the AgentSpec axis's delivery side. A dispatch
 ///   through a `kind = Operator` agent resolves its seat's *current holder*
 ///   off `Run.current` and turns that `OperatorId` into a destination
@@ -573,11 +840,26 @@ pub async fn operators_ws_connect(
 /// axis (`GET /v1/operators/:sid`) and missing on another (an
 /// `operator_sid` pin, a seat that names it).
 ///
-/// Both callers run **before** their [`LoginSession`] reaches
-/// `operator_sessions`, so every one of them is registered by the time
-/// anything can look it up. Nothing on the WS connect path calls this: a
-/// connect that races a teardown must not be able to put a registration
-/// back.
+/// # Registering is the last step of publishing a session
+///
+/// A registration is what makes a session routable, and a routed send
+/// finds its exits (connect, teardown) through `operator_sessions` — so
+/// the mint puts the session in that map **before** calling this, and the
+/// invariant to preserve is *registered implies present in
+/// `operator_sessions`*. See [`operators_create`]'s ordering note for the
+/// failure the other order produced.
+///
+/// The boot path is the one place the two land in the opposite order:
+/// [`restored_login_session`] registers and hands the session back, and
+/// the map it goes into is built from the returned values by
+/// `build_router_full_with_operator_session_persistence`. Nothing is
+/// serving during that gap — the router being assembled *is* the thing
+/// that would route — so the window has no observer, which is why the
+/// restore path is left as it is rather than given a map to write into
+/// before one exists.
+///
+/// Nothing on the WS connect path calls this: a connect that races a
+/// teardown must not be able to put a registration back.
 async fn register_operator_session(
     engine: &Engine,
     adapters: Option<&Arc<OperatorAdapterRegistry>>,
@@ -642,7 +924,7 @@ pub(crate) async fn restored_login_session(
     base_url: Option<Arc<str>>,
     record: OperatorSessionRecord,
 ) -> Arc<LoginSession> {
-    let live = LoginSession::new(record, base_url);
+    let live = LoginSession::new(record, base_url, Some(Arc::new(engine.clone())));
     register_operator_session(engine, adapters, &live.record().sid, live.dispatch_target()).await;
     live
 }
@@ -660,6 +942,91 @@ const SESSION_CLOSED_REASON: &str = "operator session closed";
 /// sink that refuses to make progress ever reaches this bound; the ordinary
 /// path finishes as soon as the last sender drops.
 const WRITE_TASK_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// How the server keeps asking a still-attached socket whether anybody is
+/// behind it.
+///
+/// # Why an attached socket needed a probe at all
+///
+/// [`LoginSession::is_expired`] short-circuits on "a socket is attached",
+/// and that clause is only as good as `tx` being cleared when the peer
+/// goes. `tx` is cleared in exactly one place — the read loop's exit — so
+/// what clears it is the *stream ending*: a Close frame, a FIN, or a read
+/// error.
+///
+/// A peer that vanishes without any of those (power cut, NAT table reap,
+/// a cable) sends nothing and ends nothing. `ws_stream.next()` parks
+/// forever; the write half is not sending, and even when it does, a TCP
+/// write into a black hole buffers rather than errors. So `tx` stayed
+/// `Some`, [`LoginSession::is_expired`] answered `false` on every read,
+/// no reap path could touch the session — and the bearer had died with
+/// the peer, so `DELETE /v1/operators/:sid` could not either. That is an
+/// immortal row: precisely the thing the 24h horizon was added to
+/// eliminate, reachable by the one failure mode a horizon cannot see.
+///
+/// A server-side Ping closes it because it makes the peer *produce*
+/// something on a schedule the server chooses. Any inbound frame answers
+/// the question — the Pong a conforming client sends back is the usual
+/// one, but a client that happens to be talking anyway has already
+/// answered it.
+///
+/// # It doubles as the connected session's access clock
+///
+/// The same tick is where a connected session is
+/// [touched](LoginSession::touch). Without that, "a session with a socket
+/// attached is never expired" was true only in this process: the durable
+/// `last_access_secs` stopped moving at the connect, so a driver that
+/// stayed attached and quiet for a day had a row the next boot's
+/// `list` — which reads the record alone and knows nothing about sockets
+/// — deleted out from under its live connection. **R6** (再起動は担当を
+/// 落とさない) is the predicate that was against, and a Ping cadence is
+/// exactly the periodic event the durable clock was missing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KeepAlive {
+    /// Gap between two server-sent Pings, and the resolution at which
+    /// [`Self::silence_before_dead`] is checked.
+    ping_every: Duration,
+    /// How long a socket may go without a single inbound frame before the
+    /// read loop treats the peer as gone and exits, which clears `tx` and
+    /// hands the session back to the ordinary expiry.
+    silence_before_dead: Duration,
+}
+
+impl KeepAlive {
+    /// What every route-driven socket uses.
+    ///
+    /// 30s between Pings and five of them missed before a socket is
+    /// declared dead. The tolerance is deliberately several intervals
+    /// wide: the cost of declaring a live driver dead is that its seats
+    /// cascade `Vacant` under it, while the cost of waiting is a couple of
+    /// minutes of an already-broken socket looking attached. Those are not
+    /// symmetric, so the threshold is set by the expensive side.
+    ///
+    /// It is stated in intervals rather than as a bare duration because
+    /// that is the quantity that means anything here — "150 seconds" is a
+    /// number, "five missed Pings" is a claim about how much evidence is
+    /// required.
+    pub(crate) const DEFAULT: Self = Self {
+        ping_every: Duration::from_secs(OPERATOR_WS_PING_INTERVAL_SECS),
+        silence_before_dead: Duration::from_secs(
+            OPERATOR_WS_PING_INTERVAL_SECS * OPERATOR_WS_MISSED_PINGS_BEFORE_DEAD,
+        ),
+    };
+}
+
+/// Gap between two server-sent WS Pings on an attached Operator socket.
+///
+/// Sized against what it feeds rather than picked for its own sake: it is
+/// also the cadence at which a connected session's durable access clock is
+/// advanced, and [`TOUCH_PERSIST_INTERVAL_SECS`] coalesces those writes to
+/// one a minute regardless — so anything at or below that interval costs
+/// the store nothing extra.
+const OPERATOR_WS_PING_INTERVAL_SECS: u64 = 30;
+
+/// How many consecutive Pings may go unanswered — with no other inbound
+/// frame either — before the peer is treated as gone. See
+/// [`KeepAlive::DEFAULT`] for why the tolerance is this wide.
+const OPERATOR_WS_MISSED_PINGS_BEFORE_DEAD: u64 = 5;
 
 /// Resolves once [`WSOperatorSession::close`] has been called on this
 /// session, yielding the reason to hand the client.
@@ -689,7 +1056,28 @@ async fn close_requested(signal: &mut watch::Receiver<Option<Arc<str>>>) -> Arc<
 /// Close frame, the read half stops waiting on a client that may never
 /// reply to one. Without that the local `tx` below outlives the session's
 /// own sender, keeping the channel — and the socket — alive after teardown.
-async fn handle_operator_socket(socket: WebSocket, live: Arc<LoginSession>) {
+///
+/// # The third thing both halves do
+///
+/// The write half sends a Ping every [`KeepAlive::ping_every`]; the read
+/// half holds the deadline, ends the loop when nothing has come back for
+/// [`KeepAlive::silence_before_dead`], and advances the session's access
+/// clock on every tick that finds the peer answering. See [`KeepAlive`]
+/// for the failure that needs — a peer that vanishes without closing
+/// anything otherwise leaves `tx` set forever, and a session whose `tx` is
+/// set is one nothing may expire.
+///
+/// A liveness timeout exits by exactly the same path a Close frame does:
+/// the loop breaks, `clear_tx_if` runs, the write task drains. There is no
+/// second teardown to keep in step, and the session is left in the state
+/// the ordinary expiry already knows how to judge — disconnected, with
+/// whatever last-access clock it had.
+async fn handle_operator_socket(
+    socket: WebSocket,
+    live: Arc<LoginSession>,
+    store: Arc<dyn mlua_swarm::store::operator_session::OperatorSessionStore>,
+    keepalive: KeepAlive,
+) {
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
 
     // Attach to the dispatch target this session has carried since it was
@@ -711,13 +1099,29 @@ async fn handle_operator_socket(socket: WebSocket, live: Arc<LoginSession>) {
 
     // write task: mpsc → WebSocket, until the channel ends or the session
     // is closed out from under it (which the client is told about).
+    let ping_every = keepalive.ping_every;
     let mut write_task = tokio::spawn(async move {
+        let mut ping = tokio::time::interval(ping_every);
+        // A tokio interval's first tick is immediate, and a Ping the
+        // instant the socket attaches proves nothing the upgrade has not
+        // already proved — so it is consumed rather than sent.
+        ping.tick().await;
+        // A write half that was parked on a slow sink must not owe a burst
+        // of Pings when it comes back; the peer is asked again on the next
+        // whole interval instead.
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 // Invariant: whenever both branches are ready, close wins.
                 // The `recv()` arm's channel-end exit closes the socket
                 // with no reason, silently degrading the frame below — so
                 // `biased;` is load-bearing here, not an optimisation.
+                //
+                // The Ping arm sits above `recv()` for the same kind of
+                // reason: with `biased;` a permanently-ready `recv()` would
+                // starve the arms below it, and the one thing that must not
+                // stop while frames are flowing is the probe that decides
+                // whether anyone is receiving them.
                 biased;
 
                 reason = close_requested(&mut write_close_signal) => {
@@ -731,6 +1135,15 @@ async fn handle_operator_socket(socket: WebSocket, live: Arc<LoginSession>) {
                         })))
                         .await;
                     break;
+                }
+                _ = ping.tick() => {
+                    // An empty payload: the frame is the question, and
+                    // nothing about *which* Ping this is would be read.
+                    // A send error here is the ordinary "the socket is
+                    // gone" exit, not a keepalive-specific one.
+                    if ws_sink.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
                 }
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
@@ -749,6 +1162,22 @@ async fn handle_operator_socket(socket: WebSocket, live: Arc<LoginSession>) {
 
     // read task: WS message → ClientMsg parse → session.resolve_pending
     let session_for_read = session.clone();
+    // When the newest inbound frame arrived. A monotonic `Instant` rather
+    // than the wall clock this file measures **everything else** in: the
+    // 24h horizon is a statement about calendar time and has to survive a
+    // process restart, while this is a stopwatch over one socket's life,
+    // and a wall clock that stepped mid-window would either fake silence
+    // or hide it. Confined to this loop — the write half only sends the
+    // Pings that provoke the frames — so it needs no synchronization.
+    let mut last_inbound = tokio::time::Instant::now();
+    let mut liveness = tokio::time::interval(keepalive.ping_every);
+    // Same two adjustments as the write half's ticker, for the same
+    // reasons: the immediate first tick would judge a socket that has had
+    // no time to answer anything, and a burst of catch-up ticks after a
+    // long `resolve_pending` would spend the tolerance without any of the
+    // waiting the tolerance is made of.
+    liveness.tick().await;
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let item = tokio::select! {
             item = ws_stream.next() => match item {
@@ -758,7 +1187,35 @@ async fn handle_operator_socket(socket: WebSocket, live: Arc<LoginSession>) {
             // The write half is sending the Close frame; a client that
             // never answers it must not keep this half parked forever.
             _ = close_requested(&mut read_close_signal) => break,
+            _ = liveness.tick() => {
+                let silent_for = last_inbound.elapsed();
+                if silent_for >= keepalive.silence_before_dead {
+                    tracing::info!(
+                        sid = %live.record().sid,
+                        silent_for_ms = silent_for.as_millis() as u64,
+                        window_ms = keepalive.silence_before_dead.as_millis() as u64,
+                        "operator socket answered no Ping within the keepalive window; \
+                         treating the peer as gone and detaching, which hands the session \
+                         back to the 24h expiry"
+                    );
+                    break;
+                }
+                // The peer is answering, so the driver behind this session
+                // is present — and this is the only periodic moment that
+                // knows it. Writing it through is what makes an attached
+                // socket hold the session alive across a restart and not
+                // only inside this process (see `KeepAlive`).
+                live.touch(&store).await;
+                continue;
+            }
         };
+        // Any inbound frame is proof the peer is still there, whatever it
+        // carries: a Pong answering our Ping is the expected one, but a
+        // client that is answering an `Ask` has said the same thing. The
+        // deadline above is therefore about silence, not about Pongs.
+        if item.is_ok() {
+            last_inbound = tokio::time::Instant::now();
+        }
         match item {
             Ok(Message::Text(t)) => {
                 let parsed: ClientMsg = match serde_json::from_str(&t) {
@@ -806,6 +1263,9 @@ async fn handle_operator_socket(socket: WebSocket, live: Arc<LoginSession>) {
                     }
                 }
             }
+            // Nothing more to do with either: axum answers an inbound
+            // Ping with a Pong itself, and the liveness both of them carry
+            // was recorded above, before the match.
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
             Ok(Message::Close(_)) | Err(_) => break,
             _ => {}
@@ -1173,13 +1633,18 @@ async fn cascade_vacate_seats(state: &AppState, sid: &SessionId) {
 ///
 /// That is survivable for **assignment** — a replacement driver joins
 /// freely, pins its own launches, and `acquire` never refuses, so the
-/// stale session holds no seat anyone needs. It is not survivable for
-/// **storage**: the persisted row has no other deleter, and
-/// `OperatorSessionPersistence::restore` re-materializes every row at
-/// boot with no age filter, so the set grows once per crashed driver and
-/// survives restarts. The model's answer is O1 (§4.1, the 24h expiry from
-/// last access), which is not implemented — there is no reaper in this
-/// crate. Until there is, a long-lived server accumulates them.
+/// stale session holds no seat anyone needs. It used not to be survivable
+/// for **storage**: the persisted row has no other deleter, and boot
+/// restore re-materialized every row with no age filter, so the set grew
+/// once per crashed driver and survived every restart.
+///
+/// That half is closed. §4.1's other exit from `Registered`
+/// (`最終アクセスから 24h ──▶ ╳ 削除`, unnumbered) is enforced at every
+/// read of a session — this crate's [`reap_if_expired`] and the store's
+/// boot-time `list` — so a stale row is released a day after its driver
+/// stopped, by the same teardown this route performs, cascade included.
+/// There is still no reaper; see [`reap_if_expired`] for why the rule
+/// lives at the reads instead.
 ///
 /// `500` when the persisted row cannot be dropped: the session is then
 /// still live and fully intact (see [`teardown_operator_session`]), and the
@@ -1315,6 +1780,39 @@ pub const OPERATORS_LIST_MAX_LIMIT: usize = 200;
 /// This is what makes the list a *handover* device: an incoming Assignee
 /// joins (unguarded, **D3**'s own carve-out), and its fresh bearer is
 /// immediately good enough to read who else is here.
+///
+/// # The horizon is judged before the presenter is touched
+///
+/// This route is the third reader of a session, and the two others
+/// ([`operators_ws_connect`], [`operators_info`]) both judge the 24h
+/// horizon *before* recording the access. This one used to do the
+/// opposite — find the session by bearer and touch it, with no expiry
+/// judgment at all — and the ordering was load-bearing rather than
+/// incidental: the reap loop in [`operators_list`] then ran against a
+/// clock that had been reset one statement earlier, so it always found
+/// the presenter fresh.
+///
+/// The observable failure was that a driver's own session lived or died
+/// by which route it happened to call first. Given a session 25h past its
+/// last access with its socket down, `GET /v1/operators/:sid` tore it
+/// down and cascaded its seats `Vacant`, while `GET /v1/operators` with
+/// the same bearer revived it — and this guard also covers the handover
+/// routes, including the `acquire` a recovering driver is told to call,
+/// so the reviving path was the one a real recovery takes.
+///
+/// The rule is the one [`operators_ws_connect`] states: a session that
+/// went 24h without contact was due for deletion at some point in that
+/// window, and letting a late arrival cancel that would make the horizon
+/// mean "24h unless somebody eventually turns up". So an expired
+/// presenter is reaped and answered `401` — its session is gone, and a
+/// join is one unauthenticated call away.
+///
+/// Reaping the presenter out of the list it is asking for reads like
+/// self-harm and is not: the caller is past the horizon, so the row it
+/// would have been shown as is one no reader may see. What the answer
+/// owes it is knowing *which* `401` it got, which is why the two carry
+/// different `error` / `hint` pairs — "your token is not a session's" and
+/// "your session expired, re-join" call for different next moves.
 pub(crate) async fn authorize_any_operator(
     state: &AppState,
     headers: &HeaderMap,
@@ -1324,7 +1822,26 @@ pub(crate) async fn authorize_any_operator(
         let map = state.operator_sessions.lock().await;
         map.values().cloned().collect()
     };
-    if sessions.iter().any(|live| live.verify_bearer(&bearer)) {
+    if let Some(live) = sessions.iter().find(|live| live.verify_bearer(&bearer)) {
+        // Judged first, touched second — see the "horizon" section above.
+        if reap_if_expired(state, &live.record().sid, live).await {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "the operator session this token belongs to expired and was released",
+                    "hint": "the session went 24h without contact, so it was torn down (§4.1's \
+                             state diagram) and every seat it held went Vacant (O8); the token \
+                             is not malformed and re-presenting it will not help. Join again \
+                             with POST /v1/operators (no Bearer needed), then take back the \
+                             seats you were driving with POST /v1/runs/:id/acquire (A8)",
+                })),
+            )
+                .into_response());
+        }
+        // The presenter is demonstrably alive, so this is an access. Only
+        // the matching session is touched: reading the 記名 list must not
+        // keep the stale rows it is being read to find alive.
+        live.touch(&state.operator_session_store).await;
         return Ok(());
     }
     Err((
@@ -1332,7 +1849,9 @@ pub(crate) async fn authorize_any_operator(
         Json(json!({
             "error": "token matches no live operator session",
             "hint": "join with POST /v1/operators (no Bearer needed) and present the token it \
-                     mints; any live session's token opens this list (model D3/W5)",
+                     mints; any live session's token opens this list (model D3/W5). A token \
+                     that used to work may have belonged to a session released at the 24h \
+                     horizon — re-join rather than retrying it",
         })),
     )
         .into_response())
@@ -1382,9 +1901,22 @@ pub async fn operators_list(
         let map = state.operator_sessions.lock().await;
         map.values().cloned().collect()
     };
-    let total = entries.len();
-    let mut operators = Vec::with_capacity(total);
+    // The horizon, at the read that would otherwise be the one place these sessions
+    // are visible forever. This route is where a crashed driver's row
+    // accumulates — it cannot be deleted by anyone but the driver that is
+    // gone — so it is also where the horizon has to bite. The list is
+    // built from what survives, and `total` counts the same set, so an
+    // expired session is not merely hidden from the page: it is gone, and
+    // the count says so.
+    let mut alive = Vec::with_capacity(entries.len());
     for live in entries {
+        if !reap_if_expired(&state, &live.record().sid, &live).await {
+            alive.push(live);
+        }
+    }
+    let total = alive.len();
+    let mut operators = Vec::with_capacity(total);
+    for live in alive {
         let connected = live.dispatch_target().is_connected().await;
         let record = live.kimei().await;
         operators.push(OperatorsListEntry {
@@ -1463,6 +1995,13 @@ pub async fn operators_info(
     if !live.verify_bearer(&bearer) {
         return (StatusCode::UNAUTHORIZED, "token mismatch").into_response();
     }
+    // Same ordering as the WS connect: the expiry is judged against the
+    // access clock as it stood *before* this call, then this call becomes
+    // the newest access.
+    if reap_if_expired(&state, &sid, &live).await {
+        return (StatusCode::NOT_FOUND, "unknown sid").into_response();
+    }
+    live.touch(&state.operator_session_store).await;
 
     let connected = live.dispatch_target().is_connected().await;
     let record = live.kimei().await;
@@ -1644,11 +2183,16 @@ mod tests {
                     sid: sid.clone(),
                     token_digest: OperatorSessionRecord::digest_of(TOKEN),
                     capability_manifest: None,
-                    joined_at_secs: 0,
+                    // Wall clock rather than `0`: `0` is 1970, which
+                    // the 24h horizon expires on sight, and these tests are about a
+                    // live session.
+                    joined_at_secs: now_secs(),
+                    last_access_secs: now_secs(),
                     desc: None,
                     observed: Vec::new(),
                     observed_total: 0,
                 },
+                None,
                 None,
             );
             state
@@ -1952,6 +2496,87 @@ mod tests {
             );
         }
 
+        /// **Nothing is routable before its exits exist.**
+        ///
+        /// A mint publishes two things: the `operator_sessions` entry a
+        /// routed send finds its exits through (a connect's `replace_tx`, a
+        /// teardown's `TornDown`), and the registrations that make the sid
+        /// routable at all. Registering first left a window — a request
+        /// dying between the two statements, which hyper does whenever the
+        /// peer disconnects mid-request — in which a dispatch could reach
+        /// the sid, park, and never be woken by either exit, burning the
+        /// run's whole `sync_timeout_secs` before reporting a timeout that
+        /// named the wrong cause.
+        ///
+        /// Holding the map's lock is what makes that window observable
+        /// without racing anything: the mint blocks at exactly the
+        /// statement whose ordering is under test, and the assertion is
+        /// that **nothing is registered** while it is stuck there. Under
+        /// the old order the four registrations had already landed by this
+        /// point, with the map entry they need still unwritten.
+        #[tokio::test]
+        async fn a_mint_registers_nothing_until_its_session_is_in_the_map() {
+            let state = test_state();
+
+            let guard = state.operator_sessions.lock().await;
+            let minting = tokio::spawn({
+                let state = state.clone();
+                async move {
+                    operators_create(
+                        State(state),
+                        Json(OperatorsCreateReq {
+                            capability_manifest: None,
+                            desc: Some("a mint held at the map insert".to_string()),
+                        }),
+                    )
+                    .await
+                }
+            });
+
+            // Long enough for the mint to have reached — and blocked on —
+            // the map insert. Under the old order it is also long enough
+            // for the registrations it did first to be observable.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let registered = state.engine.list_operator_ids().await;
+            assert!(
+                registered.is_empty(),
+                "a session must not be routable before the map holds it: a send routed \
+                 here would park with neither of its two exits reachable, and wait out \
+                 the run's whole ceiling: {registered:?}"
+            );
+            let adapters = state.operator_adapters.ids().await;
+            assert!(
+                adapters.is_empty(),
+                "the same holds for the adapter registry a seat's holder resolves \
+                 through: {adapters:?}"
+            );
+
+            drop(guard);
+            let response = minting.await.expect("the mint task must not panic");
+            assert_eq!(response.status(), StatusCode::OK);
+            let sid = SessionId::parse(
+                body_json(response).await["sid"]
+                    .as_str()
+                    .expect("sid")
+                    .to_string(),
+            )
+            .expect("parse sid");
+
+            // ...and once the lock is released both halves land, so the
+            // ordering costs the finished session nothing.
+            assert!(state.operator_sessions.lock().await.contains_key(&sid));
+            assert!(state
+                .engine
+                .list_operator_ids()
+                .await
+                .contains(&sid.to_string()));
+            assert!(state
+                .operator_adapters
+                .ids()
+                .await
+                .contains(&sid.to_string()));
+        }
+
         /// Half 2: teardown closes the dispatch target but leaves it on the
         /// session, so a socket still holding that session finds the very
         /// same object and is answered with the latched Close — rather than
@@ -2155,6 +2780,15 @@ mod tests {
 
             async fn delete(&self, sid: &SessionId) -> Result<(), OperatorSessionStoreError> {
                 Err(OperatorSessionStoreError::NotFound(sid.clone()))
+            }
+
+            /// Honest about what a store whose every `put` failed holds:
+            /// nothing.
+            async fn get(
+                &self,
+                _sid: &SessionId,
+            ) -> Result<Option<OperatorSessionRecord>, OperatorSessionStoreError> {
+                Ok(None)
             }
 
             async fn list(&self) -> Result<Vec<OperatorSessionRecord>, OperatorSessionStoreError> {
@@ -2993,11 +3627,17 @@ mod tests {
                     sid: sid.clone(),
                     token_digest: OperatorSessionRecord::digest_of("idle-token"),
                     capability_manifest: None,
-                    joined_at_secs: 0,
+                    // Ten seconds older, not a literal `0`: the horizon deletes
+                    // a session 24h past its last access, and this one has
+                    // to be idle in D5's sense (holding no seat) while
+                    // still being live.
+                    joined_at_secs: now_secs() - 10,
+                    last_access_secs: now_secs() - 10,
                     desc: Some(desc.to_string()),
                     observed: Vec::new(),
                     observed_total: 0,
                 },
+                None,
                 None,
             );
             state
@@ -3650,6 +4290,662 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    // ── the 24h horizon, judged where sessions are read ──────────────────
+
+    /// §4.1's second exit from `Registered` — `最終アクセスから 24h ──▶ ╳
+    /// 削除`, which carries no predicate number (the `O1` these tests used
+    /// to cite is `join は無認証`) — and which had no implementation at
+    /// all: `DELETE
+    /// /v1/operators/:sid` wants the session's own bearer, and a crashed
+    /// driver lost it, so the row it left behind could never be removed by
+    /// anybody. There is still no sweeper; the rule is applied where a
+    /// session is read.
+    mod o1_expiry {
+        use super::kimei::mint;
+        use super::support::{body_json, test_state};
+        use super::*;
+        use mlua_swarm::store::operator_session::{
+            OperatorSessionStore, OPERATOR_SESSION_MAX_IDLE_SECS,
+        };
+
+        /// Put a session into the map with its access clock placed
+        /// explicitly — the state a driver that crashed `idle_secs` ago
+        /// leaves behind. Registered as well as published, so the reap can
+        /// be observed to undo both.
+        async fn seed_session_idle_for(
+            state: &AppState,
+            desc: &str,
+            idle_secs: u64,
+        ) -> (SessionId, Arc<LoginSession>) {
+            let sid = SessionId::new();
+            let accessed_at = now_secs() - idle_secs;
+            let record = OperatorSessionRecord {
+                sid: sid.clone(),
+                token_digest: OperatorSessionRecord::digest_of("stale-bearer"),
+                capability_manifest: None,
+                joined_at_secs: accessed_at,
+                last_access_secs: accessed_at,
+                desc: Some(desc.to_string()),
+                observed: Vec::new(),
+                observed_total: 0,
+            };
+            state
+                .operator_session_store
+                .put(record.clone())
+                .await
+                .expect("seed the persisted row");
+            let live = LoginSession::new(record, None, None);
+            register_operator_session(
+                &state.engine,
+                Some(&state.operator_adapters),
+                &sid,
+                live.dispatch_target(),
+            )
+            .await;
+            state
+                .operator_sessions
+                .lock()
+                .await
+                .insert(sid.clone(), live.clone());
+            (sid, live)
+        }
+
+        /// The accumulation this closes: one row per crashed driver, on a
+        /// list with a count ceiling (50 by default), pushing live sessions
+        /// off the page a recovery driver reads.
+        #[tokio::test]
+        async fn the_list_releases_a_session_that_has_not_been_accessed_for_a_day() {
+            let state = test_state();
+            let (stale_sid, _stale) = seed_session_idle_for(
+                &state,
+                "crashed halfway through the seat rework",
+                OPERATOR_SESSION_MAX_IDLE_SECS + 60,
+            )
+            .await;
+            let (live_sid, token) = mint(&state, Some("the driver reading this list")).await;
+
+            let body = body_json(
+                operators_list(
+                    State(state.clone()),
+                    headers_with_bearer(&token),
+                    axum::extract::Query(OperatorsListQuery { limit: None }),
+                )
+                .await,
+            )
+            .await;
+
+            let sids: Vec<&str> = body["operators"]
+                .as_array()
+                .expect("operators")
+                .iter()
+                .map(|e| e["sid"].as_str().expect("sid"))
+                .collect();
+            assert_eq!(
+                sids,
+                vec![live_sid.to_string().as_str()],
+                "the expired session must be gone from the list, not merely sorted last"
+            );
+            assert_eq!(
+                body["total"], 1,
+                "and gone from the count as well: the row was released, not hidden"
+            );
+
+            // Released by the same teardown a leave performs, on every axis.
+            assert!(
+                !state
+                    .operator_sessions
+                    .lock()
+                    .await
+                    .contains_key(&stale_sid),
+                "the expired session must leave the map"
+            );
+            let registered = state.engine.list_operator_ids().await;
+            assert!(
+                !registered.contains(&stale_sid.to_string()),
+                "and the engine registries: {registered:?}"
+            );
+            // Through `get`, not `list`: `list` filters the expired
+            // unconditionally, so their absence from it is true of a
+            // backend that never deleted anything. What has to be true
+            // here is that the row left the file.
+            assert!(
+                state
+                    .operator_session_store
+                    .get(&stale_sid)
+                    .await
+                    .expect("store get")
+                    .is_none(),
+                "and the persisted row, which is what stops it coming back at the next boot"
+            );
+        }
+
+        /// A session inside the horizon is left alone. Without this the
+        /// assertion above would also pass on a reaper that deleted
+        /// everything it read.
+        #[tokio::test]
+        async fn a_session_accessed_within_the_horizon_survives_the_list() {
+            let state = test_state();
+            let (recent_sid, _recent) = seed_session_idle_for(
+                &state,
+                "quiet, but not for a day",
+                OPERATOR_SESSION_MAX_IDLE_SECS - 600,
+            )
+            .await;
+            let (_live_sid, token) = mint(&state, None).await;
+
+            let body = body_json(
+                operators_list(
+                    State(state.clone()),
+                    headers_with_bearer(&token),
+                    axum::extract::Query(OperatorsListQuery { limit: None }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                body["total"], 2,
+                "a session inside the horizon stays: {body}"
+            );
+            assert!(state
+                .operator_sessions
+                .lock()
+                .await
+                .contains_key(&recent_sid));
+        }
+
+        /// **O7 is not violated by the connectivity clause.** A driver that
+        /// attached a socket and then held a Blueprint open all day is
+        /// present — the socket *is* contact — so expiring it would be the
+        /// reaper causing the outage it exists to prevent.
+        #[tokio::test]
+        async fn a_connected_session_is_never_expired_however_quiet() {
+            let state = test_state();
+            let (sid, live) = seed_session_idle_for(
+                &state,
+                "attached and quiet",
+                OPERATOR_SESSION_MAX_IDLE_SECS * 3,
+            )
+            .await;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            live.dispatch_target().replace_tx(tx).await;
+
+            let (_live_sid, token) = mint(&state, None).await;
+            let body = body_json(
+                operators_list(
+                    State(state.clone()),
+                    headers_with_bearer(&token),
+                    axum::extract::Query(OperatorsListQuery { limit: None }),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(body["total"], 2, "an attached socket is an access: {body}");
+            assert!(state.operator_sessions.lock().await.contains_key(&sid));
+        }
+
+        /// The write path the expiry reads. Without it `last_access_secs`
+        /// would never move off the join time, and every session would be
+        /// deleted 24h after minting however hard its driver was working.
+        #[tokio::test]
+        async fn reading_a_session_is_an_access_and_moves_its_expiry() {
+            let state = test_state();
+            // Five seconds short of the horizon: still alive, and about to
+            // cross it.
+            let (sid, live) = seed_session_idle_for(
+                &state,
+                "about to expire",
+                OPERATOR_SESSION_MAX_IDLE_SECS - 5,
+            )
+            .await;
+            let horizon_without_a_touch = now_secs() + 10;
+            assert!(
+                live.is_expired(horizon_without_a_touch).await,
+                "precondition: ten seconds from now this session is past the horizon"
+            );
+
+            let response = operators_info(
+                State(state.clone()),
+                Path(sid.to_string()),
+                headers_with_bearer("stale-bearer"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            assert!(
+                !live.is_expired(horizon_without_a_touch).await,
+                "the read must have restarted the expiry clock: the session was still here to \
+                 answer, which is what 最終アクセス means"
+            );
+            // ...and durably, so a restart inside the next 24h does not
+            // expire a session that is in use.
+            let persisted = state
+                .operator_session_store
+                .list()
+                .await
+                .expect("store list")
+                .into_iter()
+                .find(|r| r.sid == sid)
+                .expect("the row is still there");
+            assert!(
+                persisted.last_access_secs() >= now_secs() - 5,
+                "the touch must be written through, or the next boot reads the old clock"
+            );
+        }
+
+        /// Reading the 記名 list must not keep alive the very rows it is
+        /// being read to find. Only the bearer's own session is touched.
+        #[tokio::test]
+        async fn listing_touches_only_the_reader_s_own_session() {
+            let state = test_state();
+            let (_stale_sid, stale) = seed_session_idle_for(
+                &state,
+                "somebody else's corpse",
+                OPERATOR_SESSION_MAX_IDLE_SECS - 5,
+            )
+            .await;
+            let (reader_sid, token) = mint(&state, Some("the reader")).await;
+            let horizon = now_secs() + 10;
+
+            let _ = operators_list(
+                State(state.clone()),
+                headers_with_bearer(&token),
+                axum::extract::Query(OperatorsListQuery { limit: None }),
+            )
+            .await;
+
+            assert!(
+                stale.is_expired(horizon).await,
+                "being enumerated is not being accessed: a recovery driver reading the \
+                 list must not postpone the expiry of what it is reading about"
+            );
+            let reader = state
+                .operator_sessions
+                .lock()
+                .await
+                .get(&reader_sid)
+                .cloned()
+                .expect("the reader is live");
+            assert!(
+                !reader.is_expired(horizon).await,
+                "the presenter of the bearer is demonstrably alive, so its own clock moves"
+            );
+        }
+
+        /// **The route that used to revive what the other two destroyed.**
+        ///
+        /// `authorize_any_operator` found the presenter by bearer and
+        /// touched it with no expiry judgment at all, so the reap loop in
+        /// `operators_list` then ran against a clock reset one statement
+        /// earlier and always found it fresh. The outcome for one and the
+        /// same session therefore depended on which route its driver
+        /// called first: `GET /v1/operators/:sid` tore it down and
+        /// cascaded its seats `Vacant`, `GET /v1/operators` revived it —
+        /// and this guard also covers `acquire`, which is the call a
+        /// recovering driver is told to make.
+        #[tokio::test]
+        async fn presenting_an_expired_bearer_does_not_revive_the_session() {
+            let state = test_state();
+            let (stale_sid, _stale) = seed_session_idle_for(
+                &state,
+                "crashed a day and an hour ago",
+                OPERATOR_SESSION_MAX_IDLE_SECS + 3600,
+            )
+            .await;
+
+            let response = operators_list(
+                State(state.clone()),
+                headers_with_bearer("stale-bearer"),
+                axum::extract::Query(OperatorsListQuery { limit: None }),
+            )
+            .await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "an expired session is not a session: presenting its bearer must not open \
+                 the list"
+            );
+            let body = body_json(response).await;
+            assert!(
+                body["hint"]
+                    .as_str()
+                    .expect("the 401 carries a hint")
+                    .contains("POST /v1/operators"),
+                "the hint must send the caller to a re-join rather than leaving it to read \
+                 the 401 as a malformed token: {body}"
+            );
+
+            // Judged *before* the touch, so the presenter was reaped by
+            // its own call rather than kept alive by it.
+            assert!(
+                !state
+                    .operator_sessions
+                    .lock()
+                    .await
+                    .contains_key(&stale_sid),
+                "the expired presenter must leave the map, exactly as it does on the two \
+                 routes that always judged first"
+            );
+            assert!(
+                state
+                    .operator_session_store
+                    .get(&stale_sid)
+                    .await
+                    .expect("store get")
+                    .is_none(),
+                "and the persisted row with it"
+            );
+
+            // The single-session read agrees, which is the whole point:
+            // one session, one outcome, whichever route asks.
+            let info = operators_info(
+                State(state.clone()),
+                Path(stale_sid.to_string()),
+                headers_with_bearer("stale-bearer"),
+            )
+            .await;
+            assert_eq!(
+                info.status(),
+                StatusCode::NOT_FOUND,
+                "the collection route must not have left the session readable"
+            );
+        }
+
+        /// The other half of the pair above: a presenter inside the
+        /// horizon still opens the list. Without this the fix would also
+        /// be satisfied by refusing every bearer.
+        #[tokio::test]
+        async fn presenting_a_live_bearer_still_opens_the_list() {
+            let state = test_state();
+            let (recent_sid, _recent) = seed_session_idle_for(
+                &state,
+                "quiet, but not for a day",
+                OPERATOR_SESSION_MAX_IDLE_SECS - 600,
+            )
+            .await;
+
+            let response = operators_list(
+                State(state.clone()),
+                headers_with_bearer("stale-bearer"),
+                axum::extract::Query(OperatorsListQuery { limit: None }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(state
+                .operator_sessions
+                .lock()
+                .await
+                .contains_key(&recent_sid));
+        }
+
+        /// A boot that restored expired rows was the other half of the
+        /// accumulation: `OperatorSessionPersistence::restore` reads the
+        /// store once, so a row that survives that read is back for another
+        /// restart. The store drops and deletes it instead.
+        #[tokio::test]
+        async fn the_store_neither_returns_nor_keeps_an_expired_row() {
+            let store = mlua_swarm::store::operator_session::InMemoryOperatorSessionStore::new();
+            let stale = SessionId::new();
+            let fresh = SessionId::new();
+            let record = |sid: &SessionId, accessed_at: u64| OperatorSessionRecord {
+                sid: sid.clone(),
+                token_digest: OperatorSessionRecord::digest_of("bearer"),
+                capability_manifest: None,
+                joined_at_secs: accessed_at,
+                last_access_secs: accessed_at,
+                desc: None,
+                observed: Vec::new(),
+                observed_total: 0,
+            };
+            store
+                .put(record(
+                    &stale,
+                    now_secs() - OPERATOR_SESSION_MAX_IDLE_SECS - 1,
+                ))
+                .await
+                .expect("put");
+            store.put(record(&fresh, now_secs())).await.expect("put");
+
+            let restored = store.list().await.expect("list");
+            let sids: Vec<String> = restored.iter().map(|r| r.sid.to_string()).collect();
+            assert_eq!(
+                sids,
+                vec![fresh.to_string()],
+                "an expired row must not come back at boot"
+            );
+
+            // The distinction this test exists for, and the one a second
+            // `list()` cannot make: `list` filters the expired every time
+            // it runs, so a filter-only backend answers it identically.
+            // `get` reports the row as stored.
+            assert!(
+                store.get(&stale).await.expect("get").is_none(),
+                "and it must be gone from the store, not filtered on every read forever"
+            );
+            assert!(
+                store.get(&fresh).await.expect("get").is_some(),
+                "while the row inside the horizon stays — without this, a store that \
+                 deleted everything it listed would pass the assertion above"
+            );
+        }
+    }
+
+    // ── the keepalive behind "a connected session is never expired" ──────
+
+    /// `LoginSession::is_expired` short-circuits on "a socket is
+    /// attached", and `tx` is cleared in exactly one place: the read
+    /// loop's exit. A peer that vanishes without a FIN ends nothing, so
+    /// `ws_stream.next()` parked forever, `tx` stayed `Some`, and the row
+    /// became immortal — unreapable (never expired) and undeletable (the
+    /// bearer died with the peer). These tests are about the probe that
+    /// closes it, and about the durable clock that rides along with it.
+    mod keepalive {
+        use super::support::test_state;
+        use super::*;
+        use mlua_swarm::store::operator_session::OPERATOR_SESSION_MAX_IDLE_SECS;
+        use std::time::Duration;
+
+        /// Fast enough to run in a test, wide enough that the tolerance is
+        /// still several intervals — the same shape as
+        /// [`KeepAlive::DEFAULT`], four orders of magnitude down.
+        const TEST_KEEPALIVE: KeepAlive = KeepAlive {
+            ping_every: Duration::from_millis(40),
+            silence_before_dead: Duration::from_millis(200),
+        };
+
+        /// A session whose durable row says it was last accessed
+        /// `idle_secs` ago, published into the store and returned with the
+        /// live handle.
+        async fn seed(state: &AppState, idle_secs: u64) -> (SessionId, Arc<LoginSession>) {
+            let sid = SessionId::new();
+            let accessed_at = now_secs() - idle_secs;
+            let record = OperatorSessionRecord {
+                sid: sid.clone(),
+                token_digest: OperatorSessionRecord::digest_of("keepalive-bearer"),
+                capability_manifest: None,
+                joined_at_secs: accessed_at,
+                last_access_secs: accessed_at,
+                desc: Some("holding a socket open".to_string()),
+                observed: Vec::new(),
+                observed_total: 0,
+            };
+            state
+                .operator_session_store
+                .put(record.clone())
+                .await
+                .expect("seed the persisted row");
+            let live = LoginSession::new(record, None, None);
+            state
+                .operator_sessions
+                .lock()
+                .await
+                .insert(sid.clone(), live.clone());
+            (sid, live)
+        }
+
+        /// Serve exactly one route that upgrades into
+        /// [`handle_operator_socket`] with test-sized keepalive params, and
+        /// answer with its `ws://` URL.
+        ///
+        /// A local `axum::serve` rather than the real router because the
+        /// route hands [`KeepAlive::DEFAULT`] in, and a test that waited
+        /// out five 30-second Pings would be a test nobody runs.
+        async fn serve_one_socket(state: &AppState, live: Arc<LoginSession>) -> String {
+            let store = state.operator_session_store.clone();
+            let app = axum::Router::new().route(
+                "/ws",
+                axum::routing::get(move |ws: WebSocketUpgrade| {
+                    let live = live.clone();
+                    let store = store.clone();
+                    async move {
+                        ws.on_upgrade(move |socket| {
+                            handle_operator_socket(socket, live, store, TEST_KEEPALIVE)
+                        })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind an ephemeral port");
+            let addr = listener.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            format!("ws://{addr}/ws")
+        }
+
+        /// Poll `is_connected` until it answers `want`, or give up after
+        /// `within`. Returns what it last saw, so the assertion reads as a
+        /// statement about the session rather than about the sleep.
+        async fn connected_becomes(live: &Arc<LoginSession>, want: bool, within: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + within;
+            loop {
+                let now = live.dispatch_target().is_connected().await;
+                if now == want || tokio::time::Instant::now() >= deadline {
+                    return now;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// A peer that answers stays attached however quiet it is — and
+        /// its **durable** access clock moves, which is the half that was
+        /// missing.
+        ///
+        /// Before the keepalive there was no periodic event on a connected
+        /// socket at all, so `last_access_secs` on disk stopped at the
+        /// connect. A driver attached and quiet for over a day therefore
+        /// had a row the next boot deleted (the store's predicate is
+        /// `is_expired_at` over the record alone; it knows nothing about
+        /// sockets) — the guide claimed the opposite, and **R6**
+        /// (再起動は担当を落とさない) is what it was against.
+        #[tokio::test]
+        async fn a_peer_that_answers_stays_attached_and_keeps_its_durable_clock_moving() {
+            let state = test_state();
+            // An hour idle: inside the horizon, and far enough behind that
+            // a write-through is unmistakable (`touch` coalesces durable
+            // writes to one per `TOUCH_PERSIST_INTERVAL_SECS`).
+            let (sid, live) = seed(&state, 3600).await;
+            let url = serve_one_socket(&state, live.clone()).await;
+
+            let (socket, _resp) = tokio_tungstenite::connect_async(url)
+                .await
+                .expect("the client connects");
+            // Driving the stream is what makes tungstenite emit the Pong
+            // it queues on an inbound Ping — i.e. this is an ordinary,
+            // conforming client.
+            let (sink, mut source) = futures_util::StreamExt::split(socket);
+            let pump = tokio::spawn(async move {
+                while let Some(Ok(_)) = futures_util::StreamExt::next(&mut source).await {}
+            });
+
+            assert!(
+                connected_becomes(&live, true, Duration::from_secs(2)).await,
+                "precondition: the socket attached"
+            );
+            // Three full silence windows: a probe that judged wrongly has
+            // had every chance to.
+            tokio::time::sleep(TEST_KEEPALIVE.silence_before_dead * 3).await;
+
+            assert!(
+                live.dispatch_target().is_connected().await,
+                "a peer that answers must stay attached, however quiet the protocol is"
+            );
+            let persisted = state
+                .operator_session_store
+                .get(&sid)
+                .await
+                .expect("store get")
+                .expect("the row is still there");
+            assert!(
+                persisted.last_access_secs() >= now_secs() - 5,
+                "the connected session's durable clock must move, or a boot inside the \
+                 next 24h deletes the row out from under a live socket (R6); it still \
+                 reads {} against a now of {}",
+                persisted.last_access_secs(),
+                now_secs()
+            );
+
+            pump.abort();
+            drop(sink);
+        }
+
+        /// The immortal row, reproduced: a peer that stops answering
+        /// without closing anything.
+        ///
+        /// The client below holds its socket open and never polls it, so
+        /// it emits nothing — no Pong, no FIN, no error. That is what a
+        /// vanished host looks like from the server end, and before the
+        /// keepalive it left `tx` set forever, which made the session
+        /// permanently un-expirable.
+        #[tokio::test]
+        async fn a_peer_that_stops_answering_is_detached_and_becomes_expirable_again() {
+            let state = test_state();
+            let (_sid, live) = seed(&state, 0).await;
+            let url = serve_one_socket(&state, live.clone()).await;
+
+            let socket = tokio_tungstenite::connect_async(url)
+                .await
+                .expect("the client connects")
+                .0;
+
+            // A `now` past any horizon this session could reach. While a
+            // socket is attached the record's own predicate is not even
+            // consulted, so this is the sharpest form of the
+            // short-circuit: no future whatsoever expires an attached
+            // session, which is what made a dead peer's row immortal.
+            let past_every_horizon = now_secs() + OPERATOR_SESSION_MAX_IDLE_SECS * 2;
+
+            assert!(
+                connected_becomes(&live, true, Duration::from_secs(2)).await,
+                "precondition: the socket attached"
+            );
+            assert!(
+                !live.is_expired(past_every_horizon).await,
+                "precondition: an attached socket is never expired at any now — which is \
+                 exactly why a peer that dies with `tx` still set is unreachable by every \
+                 reaper there is"
+            );
+
+            // From here the client is a corpse holding a file descriptor:
+            // it is never polled again, so tungstenite never answers the
+            // Pings, and nothing closes the connection.
+            assert!(
+                !connected_becomes(&live, false, Duration::from_secs(5)).await,
+                "a socket whose peer answered nothing for {:?} must be detached",
+                TEST_KEEPALIVE.silence_before_dead
+            );
+            assert!(
+                live.is_expired(past_every_horizon).await,
+                "and with `tx` cleared the record's own predicate decides again: the \
+                 session is back under the 24h horizon instead of outside every horizon"
+            );
+
+            drop(socket);
         }
     }
 }

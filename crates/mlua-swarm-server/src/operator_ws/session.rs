@@ -27,9 +27,15 @@
 //!   reconnect ([`ConnState::Connected`]) or session teardown
 //!   ([`ConnState::TornDown`], published by [`WSOperatorSession::fail_pending`]),
 //!   which fails it loud. Bounding the wait is infra's call, not this layer's.
+//! - A frame that *waited* is refreshed before it goes out. The wait has no
+//!   deadline but the capability inside a Spawn frame does, so
+//!   [`WSOperatorSession::refresh_parked_frame`] re-mints a worker token
+//!   that would otherwise arrive expired. Nothing else in any frame ages.
 //! - `after` (fire-and-forget, [`WSOperatorSession::send_oneway`]) is
-//!   deliberately excluded — it has no reply to wait for and keeps its
-//!   drop-on-disconnect behaviour.
+//!   deliberately excluded — it has no reply to wait for, and parking it
+//!   would stall the step's completion rather than a reply (see
+//!   [`SpawnHook::after`]'s doc on this type). It keeps its
+//!   drop-on-disconnect behaviour, now with a `warn!` naming what was lost.
 //!
 //! For the detailed S↔C message flow, see the overview figure in `mod.rs`.
 
@@ -253,6 +259,55 @@ impl PendingScope {
     }
 }
 
+/// Reissues a `Role::Worker` capability that is about to be delivered late.
+///
+/// The park in [`WSOperatorSession::send_when_connected`] has no deadline,
+/// and the Spawn frame it holds was built before the wait began — token
+/// included. That token's TTL (`EngineCfg::worker_token_ttl_secs`,
+/// default 1800s) has been running since the engine minted it, so a park
+/// longer than the TTL used to hand the SubAgent a capability that was
+/// already expired: it did the whole job and failed on the last call. The
+/// session refreshes the frame instead, through this seam.
+///
+/// A trait rather than an `Engine` field so the session's dependency is
+/// the one operation it actually needs — and so a test can hand it a
+/// minter that counts calls without standing up an engine.
+#[async_trait]
+pub(crate) trait WorkerTokenMinter: Send + Sync {
+    /// Mint a replacement for `expiring`, carrying the same grant with a
+    /// fresh expiry. `Err` is the human-readable reason; the caller logs
+    /// it and sends the frame it already has.
+    async fn remint_worker_token(&self, expiring: &CapToken) -> Result<CapToken, String>;
+}
+
+/// The production minter. `Engine::remint_worker_token` is the authority —
+/// it re-derives every field of the reissue from the record it already
+/// holds, so this impl adds nothing but the error rendering.
+#[async_trait]
+impl WorkerTokenMinter for mlua_swarm::Engine {
+    async fn remint_worker_token(&self, expiring: &CapToken) -> Result<CapToken, String> {
+        mlua_swarm::Engine::remint_worker_token(self, expiring)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// How much life a parked frame's capability must have left for the frame
+/// to go out unchanged.
+///
+/// The refresh is not unconditional: re-minting on every wake would put a
+/// token record in engine state per disconnect flap, for frames whose
+/// token has 29 minutes left. Below this margin the token is reissued, and
+/// since a reissue carries the full TTL, a flapping client re-mints at
+/// most once per TTL rather than once per flap.
+///
+/// 60s is sized against what has to happen after the send: the MainAI
+/// relays the frame, a SubAgent starts, fetches its prompt and submits.
+/// A token with less than a minute left would not survive that, so
+/// delivering one is the same failure as delivering an expired one — just
+/// later.
+const PARKED_TOKEN_MIN_REMAINING_SECS: u64 = 60;
+
 /// 1 sid = 1 session. Looked up by sid in the `operator_sessions` store on reconnect.
 pub struct WSOperatorSession {
     sid: SessionId,
@@ -284,6 +339,15 @@ pub struct WSOperatorSession {
     /// when `Some`; `None` falls back to a `mse_doctor`-pointer
     /// placeholder (issue #8).
     base_url: Option<std::sync::Arc<str>>,
+    /// Refreshes a parked Spawn frame's worker capability before it goes
+    /// out — see [`WorkerTokenMinter`].
+    ///
+    /// `None` for a session built without one (the test constructors, and
+    /// any future caller that has no engine to hand): the frame is then
+    /// sent exactly as it was built, which is the pre-refresh behaviour.
+    /// It is not an error state, so it is not logged as one; what *is*
+    /// logged is a refresh that was wanted and failed.
+    token_minter: Option<Arc<dyn WorkerTokenMinter>>,
 }
 
 impl WSOperatorSession {
@@ -316,6 +380,7 @@ impl WSOperatorSession {
             pending: Mutex::new(HashMap::new()),
             close: watch::Sender::new(None),
             base_url,
+            token_minter: None,
         }
     }
 
@@ -362,9 +427,14 @@ impl WSOperatorSession {
     ///
     /// `send_oneway` (`after`) still drops during the gap, as it does on
     /// any disconnect.
+    ///
+    /// `token_minter` is the seam a parked Spawn frame's capability is
+    /// refreshed through ([`WorkerTokenMinter`]); pass the engine that
+    /// minted the token, or `None` to send parked frames exactly as built.
     pub(super) fn disconnected_with_base_url(
         sid: SessionId,
         base_url: Option<std::sync::Arc<str>>,
+        token_minter: Option<Arc<dyn WorkerTokenMinter>>,
     ) -> Self {
         Self {
             sid,
@@ -373,6 +443,7 @@ impl WSOperatorSession {
             pending: Mutex::new(HashMap::new()),
             close: watch::Sender::new(None),
             base_url,
+            token_minter,
         }
     }
 
@@ -763,9 +834,26 @@ impl WSOperatorSession {
     /// landing mid-attempt cannot be missed; the `Connected` arm re-loops
     /// instead of waiting for the *next* change, which closes the same
     /// window on the state read.
-    async fn send_when_connected(&self, msg: ServerMsg) -> Result<(), String> {
+    ///
+    /// # A frame that waited is refreshed before it goes
+    ///
+    /// The message is built by the caller before the park and could sit
+    /// here for the length of a disconnect, so anything time-bounded
+    /// inside it is stale by the time a sender appears. Exactly one field
+    /// is: `Spawn.capability_token`. After a wait — and only after one —
+    /// [`Self::refresh_parked_frame`] re-mints it when it is close enough
+    /// to expiry to matter. The refresh runs **outside** the `tx` guard,
+    /// for the same reason the park does: it awaits the engine, and
+    /// holding the guard across an await would deadlock
+    /// [`Self::replace_tx`].
+    async fn send_when_connected(&self, mut msg: ServerMsg) -> Result<(), String> {
         let mut conn_rx = self.conn.subscribe();
+        let mut waited = false;
         loop {
+            if waited {
+                self.refresh_parked_frame(&mut msg).await;
+                waited = false;
+            }
             {
                 let guard = self.tx.lock().await;
                 if let Some(tx) = guard.as_ref() {
@@ -790,17 +878,84 @@ impl WSOperatorSession {
             if conn_rx.changed().await.is_err() {
                 return Err("ws operator: connection state channel closed".to_string());
             }
+            waited = true;
+        }
+    }
+
+    /// Re-mint a parked [`ServerMsg::Spawn`]'s worker capability when it is
+    /// within [`PARKED_TOKEN_MIN_REMAINING_SECS`] of expiring.
+    ///
+    /// Every other frame passes through untouched: `Ask` / `HookBefore` /
+    /// `HookAfter` carry nothing that ages, and a Spawn whose token still
+    /// has most of its TTL is delivered exactly as it was built.
+    ///
+    /// # Every failure keeps the original frame
+    ///
+    /// An undecodable token, no minter wired, or a minter that refuses —
+    /// each leaves `msg` alone and lets the send proceed. That is the
+    /// pre-refresh behaviour, and it is the right fallback: a token that
+    /// might still work beats a spawn failed here on the strength of a
+    /// refresh that did not. A refusal is `warn!`-logged with the reason,
+    /// because it means the SubAgent is about to receive a capability the
+    /// server itself judged too old.
+    async fn refresh_parked_frame(&self, msg: &mut ServerMsg) {
+        let ServerMsg::Spawn {
+            capability_token,
+            task_id,
+            attempt,
+            ..
+        } = msg
+        else {
+            return;
+        };
+        let Some(minter) = self.token_minter.as_ref() else {
+            return;
+        };
+        let current = match CapToken::decode(capability_token) {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(
+                    sid = %self.sid, %task_id, attempt, %error,
+                    "parked spawn: its capability token could not be decoded, so its \
+                     remaining life is unknown; sending the frame as it was built"
+                );
+                return;
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if current.expire_at > now.saturating_add(PARKED_TOKEN_MIN_REMAINING_SECS) {
+            return;
+        }
+        match minter.remint_worker_token(&current).await {
+            Ok(fresh) => {
+                tracing::info!(
+                    sid = %self.sid, %task_id, attempt,
+                    "parked spawn: its capability token was re-minted before delivery \
+                     (the park outlived the worker-token TTL)"
+                );
+                *capability_token = fresh.encode();
+            }
+            Err(error) => tracing::warn!(
+                sid = %self.sid, %task_id, attempt, %error,
+                "parked spawn: its capability token is at or past expiry and could not be \
+                 re-minted; the SubAgent will be handed it anyway and may fail at submit"
+            ),
         }
     }
 
     /// Fire-and-forget send for `after` (= no reply expected).
     ///
     /// Deliberately **not** on the reconnect-wait path
-    /// ([`Self::send_when_connected`]): `after` has no reply to wait for and
-    /// its caller already swallows the error, so a disconnect drops the
-    /// notification silently. Whether that drop is acceptable is a separate
-    /// question from issue abcb43e2, whose scope is the three reply-expecting
-    /// verbs (`spawn` / `ask` / `hook_before`).
+    /// ([`Self::send_when_connected`]): `after` has no reply to wait for,
+    /// and parking it would hold the step's completion open for the length
+    /// of the disconnect. Issue abcb43e2's scope was the three
+    /// reply-expecting verbs (`spawn` / `ask` / `hook_before`); the
+    /// question it left open for this one — is dropping acceptable? — is
+    /// answered on [`SpawnHook::after`]'s doc for this type. The `Err` is
+    /// no longer swallowed there.
     async fn send_oneway(&self, msg: ServerMsg) -> Result<(), String> {
         let guard = self.tx.lock().await;
         match guard.as_ref() {
@@ -875,6 +1030,35 @@ impl SpawnHook for WSOperatorSession {
         }
     }
 
+    /// Fire-and-forget completion notice. A send failure is reported and
+    /// dropped — it is **not** parked, and it is no longer silent.
+    ///
+    /// # Why it is dropped rather than parked
+    ///
+    /// Its three siblings (`spawn` / `ask` / `before`) park across a
+    /// disconnect because each owes its caller a reply. `after` owes
+    /// nothing: the server holds no `pending` entry for it, and the frame's
+    /// only consumer is the MainAI's `mse_pending_wait` queue, which reads
+    /// it and answers nothing (`mse_ack` has no `hook_after` reply to
+    /// give). Nothing anywhere holds state on its arrival.
+    ///
+    /// Parking it would not be free, either. `after` is awaited inside the
+    /// completion wrapper `SpawnHookMiddleware` puts around the worker's
+    /// join (`mse::middleware`, the `wrap_join` closure that calls
+    /// `hook.after` before returning the signal), so a park would hold the
+    /// step's completion — and therefore the Run — for the entire
+    /// disconnect window, with the same two exits as any other park
+    /// (reconnect, or teardown). That trades a lost notification for a
+    /// stalled Run, which is a worse failure and a less visible one.
+    ///
+    /// # What changed
+    ///
+    /// The drop stays; the silence does not. The result used to be
+    /// discarded here *and* at the engine's call site, so a disconnect ate
+    /// the notice with no error, no log and no retry — and the operator
+    /// had no way to tell "no step finished" from "a step finished while I
+    /// was away". A `warn!` naming the step is the whole fix, because the
+    /// loss is observability and only observability.
     async fn after(&self, ctx: &Ctx, result: &Value) -> Result<(), String> {
         let req_id = format!("{}-ha-{}", self.sid, uuid::Uuid::new_v4());
         let msg = ServerMsg::HookAfter {
@@ -885,8 +1069,17 @@ impl SpawnHook for WSOperatorSession {
             attempt: ctx.attempt,
             result: result.clone(),
         };
-        // `after` is fire-and-forget — swallow send failures.
-        let _ = self.send_oneway(msg).await;
+        if let Err(error) = self.send_oneway(msg).await {
+            tracing::warn!(
+                sid = %self.sid,
+                task_id = %ctx.task_id,
+                agent = %ctx.agent,
+                attempt = ctx.attempt,
+                %error,
+                "hook_after dropped: the operator never learned this step completed \
+                 (fire-and-forget, so it is not parked and not retried)"
+            );
+        }
         Ok(())
     }
 }
@@ -2142,6 +2335,327 @@ mod tests {
             .expect("execute Ok");
         assert!(result.ok);
         assert_eq!(result.value["delivered"], true);
+    }
+
+    // ── a parked capability is re-minted before it is delivered ──────────
+
+    /// A [`WorkerTokenMinter`] that hands back a token distinguishable
+    /// from the one it was given, and counts how often it was asked.
+    ///
+    /// The reissue keeps subject / role / scopes and moves only
+    /// `expire_at` — the same contract `Engine::remint_worker_token`
+    /// implements against its own records. The nonce changes so the test
+    /// can tell the two apart on the wire.
+    struct CountingMinter {
+        calls: std::sync::atomic::AtomicUsize,
+        fresh_expire_at: u64,
+    }
+
+    impl CountingMinter {
+        fn new(fresh_expire_at: u64) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fresh_expire_at,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl WorkerTokenMinter for CountingMinter {
+        async fn remint_worker_token(&self, expiring: &CapToken) -> Result<CapToken, String> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(CapToken {
+                expire_at: self.fresh_expire_at,
+                nonce: "re-minted-nonce".into(),
+                ..expiring.clone()
+            })
+        }
+    }
+
+    /// A minter that refuses, to prove the frame still goes out.
+    struct RefusingMinter;
+
+    #[async_trait]
+    impl WorkerTokenMinter for RefusingMinter {
+        async fn remint_worker_token(&self, _expiring: &CapToken) -> Result<CapToken, String> {
+            Err("token not found in store".to_string())
+        }
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock at or after the epoch")
+            .as_secs()
+    }
+
+    /// A worker token expiring `in_secs` from now, in the shape
+    /// `Engine::dispatch_attempt_with` mints.
+    fn cap_token_expiring_in(in_secs: u64) -> CapToken {
+        CapToken {
+            expire_at: now_secs() + in_secs,
+            ..test_cap_token()
+        }
+    }
+
+    /// Park a spawn on a disconnected `session`, reconnect, and return the
+    /// `capability_token` string the frame carried when it finally went
+    /// out.
+    async fn parked_spawn_token(
+        session: std::sync::Arc<WSOperatorSession>,
+        token: CapToken,
+    ) -> String {
+        use mlua_swarm::Operator;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let session_bg = session.clone();
+        let mut handle = tokio::spawn(async move {
+            session_bg
+                .execute(
+                    &test_ctx("ST-token-refresh"),
+                    None,
+                    "".into(),
+                    Some(test_worker_binding()),
+                    token,
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut handle)
+                .await
+                .is_err(),
+            "precondition: the spawn is parked"
+        );
+
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+        session.replace_tx(new_tx).await;
+        let sent = tokio::time::timeout(Duration::from_secs(5), new_rx.recv())
+            .await
+            .expect("the parked Spawn must be delivered once reconnected")
+            .expect("Spawn sent");
+        handle.abort();
+        match sent {
+            ServerMsg::Spawn {
+                capability_token, ..
+            } => capability_token,
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    /// A disconnected session wired to `minter`.
+    fn disconnected_with_minter(
+        sid: &str,
+        minter: Option<Arc<dyn WorkerTokenMinter>>,
+    ) -> std::sync::Arc<WSOperatorSession> {
+        std::sync::Arc::new(WSOperatorSession::disconnected_with_base_url(
+            SessionId::parse(sid).unwrap(),
+            None,
+            minter,
+        ))
+    }
+
+    /// **The failure this locks in.** A spawn frame is built before the
+    /// park and the worker token inside it keeps ageing while the park
+    /// waits, so a disconnect longer than `worker_token_ttl_secs` used to
+    /// deliver an already-expired capability — and the SubAgent only found
+    /// out at submit, after doing the entire job.
+    #[tokio::test]
+    async fn a_parked_spawn_re_mints_a_capability_that_would_arrive_expired() {
+        let minter = CountingMinter::new(now_secs() + 1800);
+        let session = disconnected_with_minter(
+            "S-token-stale",
+            Some(minter.clone() as Arc<dyn WorkerTokenMinter>),
+        );
+
+        // Expired while it waited: this is the state a park longer than the
+        // TTL leaves the frame in.
+        let delivered = parked_spawn_token(session, cap_token_expiring_in(0)).await;
+
+        assert_eq!(minter.calls(), 1, "the parked frame must be refreshed once");
+        let token = CapToken::decode(&delivered).expect("the frame carries a decodable token");
+        assert_eq!(
+            token.nonce, "re-minted-nonce",
+            "the frame must carry the reissue, not the token it was built with"
+        );
+        assert!(
+            token.expire_at > now_secs(),
+            "the delivered capability must still be alive when it arrives"
+        );
+        // Nothing here asserts that the reissue carries the grant it
+        // replaces. It cannot: `CountingMinter` builds its answer as
+        // `CapToken { expire_at, nonce, ..expiring.clone() }`, so role and
+        // scopes come back unchanged by construction and the assertions
+        // would hold against any implementation whatsoever — including one
+        // that widened the grant, since the double is not that
+        // implementation. That property belongs to the real minter and is
+        // checked there, against `Engine::remint_worker_token`, by
+        // `a_remint_carries_the_grant_it_replaces_and_widens_nothing` in
+        // `src/core/engine.rs`. What this test owns is the *parking* side:
+        // that a frame whose token expired while parked is refreshed once
+        // before it goes out.
+    }
+
+    /// The refresh is conditional. A park that ended well inside the
+    /// token's life delivers exactly the frame that was built — re-minting
+    /// every wake would put a token record in engine state per disconnect
+    /// flap, for a capability with 29 minutes left on it.
+    #[tokio::test]
+    async fn a_parked_spawn_whose_token_is_still_fresh_is_delivered_unchanged() {
+        let minter = CountingMinter::new(now_secs() + 1800);
+        let session = disconnected_with_minter(
+            "S-token-fresh",
+            Some(minter.clone() as Arc<dyn WorkerTokenMinter>),
+        );
+
+        let original = cap_token_expiring_in(1800);
+        let delivered = parked_spawn_token(session, original.clone()).await;
+
+        assert_eq!(minter.calls(), 0, "a live capability must not be re-minted");
+        assert_eq!(
+            delivered,
+            original.encode(),
+            "the frame must go out byte-identical to the one that was built"
+        );
+    }
+
+    /// A refusal is not a spawn failure. The frame still goes out with the
+    /// token it had — which might yet work — instead of failing the step
+    /// here on the strength of a refresh that did not happen.
+    #[tokio::test]
+    async fn a_refused_re_mint_still_delivers_the_original_frame() {
+        let session = disconnected_with_minter(
+            "S-token-refused",
+            Some(Arc::new(RefusingMinter) as Arc<dyn WorkerTokenMinter>),
+        );
+
+        let original = cap_token_expiring_in(0);
+        let delivered = parked_spawn_token(session, original.clone()).await;
+
+        assert_eq!(
+            delivered,
+            original.encode(),
+            "a refused refresh must leave the frame alone rather than fail the spawn"
+        );
+    }
+
+    // ── a dropped hook_after is reported ─────────────────────────────────
+
+    /// `after` is fire-and-forget, so a disconnect drops it — that part is
+    /// deliberate (parking it would hold the step's completion open for the
+    /// whole disconnect window). What was not deliberate is that the drop
+    /// was **silent**: `send_oneway`'s `Err` was discarded here and again
+    /// at the engine's call site, so nothing anywhere said a completion
+    /// notice had been lost.
+    #[tokio::test]
+    async fn a_hook_after_dropped_while_disconnected_says_so() {
+        use mlua_swarm::SpawnHook;
+        use tokio::sync::mpsc;
+
+        let buf = CaptureBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-after-drop").unwrap(),
+            tx.clone(),
+            None,
+        );
+        session.clear_tx_if(&tx).await;
+
+        let outcome = session
+            .after(&test_ctx("ST-after-drop"), &serde_json::json!({"ok": true}))
+            .await;
+        drop(guard);
+
+        assert!(
+            outcome.is_ok(),
+            "a lost notification must not fail the step it is about"
+        );
+        let logged = buf.contents();
+        assert!(
+            logged.contains("hook_after dropped") && logged.contains("ST-after-drop"),
+            "the drop must name the step whose completion the operator never heard about: \
+             {logged}"
+        );
+    }
+
+    /// The counter-case: connected, so nothing is lost and nothing is
+    /// logged. Without it the assertion above would also pass on an
+    /// implementation that warned unconditionally.
+    #[tokio::test]
+    async fn a_delivered_hook_after_logs_nothing() {
+        use mlua_swarm::SpawnHook;
+        use tokio::sync::mpsc;
+
+        let buf = CaptureBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = WSOperatorSession::new_with_base_url(
+            SessionId::parse("S-after-sent").unwrap(),
+            tx,
+            None,
+        );
+        session
+            .after(&test_ctx("ST-after-sent"), &serde_json::json!({"ok": true}))
+            .await
+            .expect("after is infallible to its caller");
+        drop(guard);
+
+        assert!(
+            matches!(rx.try_recv(), Ok(ServerMsg::HookAfter { .. })),
+            "a connected session delivers the notice"
+        );
+        assert!(
+            buf.contents().is_empty(),
+            "nothing was lost, so nothing is reported: {}",
+            buf.contents()
+        );
+    }
+
+    /// A capturing `MakeWriter`, so a test can assert on what was logged.
+    /// `#[tokio::test]` runs on a current-thread runtime, so the
+    /// thread-local subscriber covers the whole call.
+    #[derive(Clone, Default)]
+    struct CaptureBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CaptureBuf {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CaptureBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     /// The other exit: teardown. A send parked BEFORE it ever reached

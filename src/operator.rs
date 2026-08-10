@@ -178,13 +178,16 @@ pub trait OperatorSlotResolver: Send + Sync {
 /// in `routes[agent_name]`. Agents flowing in through the `agent.md`
 /// loader default to `kind = Operator`, so they land here.
 ///
-/// The paired **Blueprint-global (session) axis** is
-/// `crate::middleware::OperatorDelegateMiddleware` — a single operator
-/// backend registered on the session and applied uniformly across every
-/// agent. When both are effective, the delegate middleware sits at the
-/// outer end of the stack and bypasses `inner.spawn`; this type is inert
-/// and no double fire can occur. See the `OperatorSpawnerFactory` doc
-/// for the exclusivity narrative.
+/// This is now the **only** way a dispatch reaches an `Operator`. There
+/// used to be a paired Blueprint-global (session) axis,
+/// `crate::middleware::OperatorDelegateMiddleware`, which registered one
+/// backend on the session and applied it uniformly to every agent; when
+/// both were effective it sat at the outer end of the stack and bypassed
+/// `inner.spawn`, leaving this type inert. It was removed — it resolved
+/// its destination from the launch record rather than the Run's seat (so
+/// a handover could not move it) and, having no per-agent spawner, could
+/// not render or bake an agent's `system_prompt`. With one axis left,
+/// the exclusivity question it created goes away with it.
 pub struct OperatorSpawner {
     operator: Arc<dyn Operator>,
     /// The compile-time-baked `AgentDef.profile.system_prompt` — the
@@ -282,8 +285,8 @@ impl SpawnerAdapter for OperatorSpawner {
             // engine so the dispatcher's outcome fold lands it on the
             // terminal StepEntry. Even without stats attached,
             // `ensure_worker_kind` guarantees the `worker_kind:
-            // "operator"` label always rides (mirrors the sibling
-            // `OperatorDelegateMiddleware` fold site).
+            // "operator"` label always rides (same funnel as the InProc /
+            // subprocess fold sites).
             let result = result.map(|wr| wr.ensure_worker_kind("operator"));
             if let Ok(wr) = &result {
                 if let Some(stats) = wr.stats.clone() {
@@ -311,8 +314,54 @@ impl SpawnerAdapter for OperatorSpawner {
                         },
                         ok: wr.ok,
                     };
-                    // GH #51: `submit_output` now embeds the
-                    // completion-time verdict-contract check (see
+                    // The capability this closure captured was minted
+                    // before `execute` was called, and `execute` is where
+                    // the wait lives: the WS backend parks a spawn frame
+                    // for the length of a client disconnect with no
+                    // deadline, while the token counts down
+                    // `EngineCfg::worker_token_ttl_secs`. Past that,
+                    // `submit_output`'s `verify_token_for_task` rejects it
+                    // with `TokenExpired` — and because this emit is the
+                    // fallback for a SubAgent that never POSTed a `Final`
+                    // of its own, nothing else would write one: the
+                    // attempt's whole result would be lost to the clock,
+                    // not to anything about the work. Re-mint against the
+                    // record the engine already holds, which cannot widen
+                    // the grant (same subject / role / scopes / bound
+                    // task; only `expire_at` moves — see
+                    // `Engine::remint_worker_token`).
+                    //
+                    // The un-lapsed case is left alone deliberately rather
+                    // than re-minting unconditionally: every operator
+                    // dispatch reaches this line, and `remint` leaves the
+                    // old record in place by design, so minting on each
+                    // one would grow `EngineState.tokens` by a spare entry
+                    // per step for no gain.
+                    let submit_token = if token_clone.is_expired(crate::types::now_unix()) {
+                        match engine_clone.remint_worker_token(&token_clone).await {
+                            Ok(fresh) => fresh,
+                            Err(e) => {
+                                // Nothing here is retryable with the token
+                                // in hand — it is already past its TTL, so
+                                // submitting with it is a call known to
+                                // fail. Say what was lost instead.
+                                tracing::error!(
+                                    step_id = %task_id_clone,
+                                    attempt,
+                                    error = %e,
+                                    "operator fallback Final dropped: the worker capability \
+                                     lapsed while the spawn frame was parked and could not be \
+                                     re-minted; this attempt has no Final"
+                                );
+                                let _ = tx.send(result.map(|_| ()));
+                                return;
+                            }
+                        }
+                    } else {
+                        token_clone.clone()
+                    };
+                    // GH #51: `submit_output` embeds the completion-time
+                    // verdict-contract check (see
                     // `Engine::verdict_contract_completion_check`'s doc)
                     // — this fallback emit is gated by it exactly like
                     // the HTTP routes are, with zero new WS protocol
@@ -324,15 +373,37 @@ impl SpawnerAdapter for OperatorSpawner {
                     // deliberate "Zero flow-ir changes" design choice, not
                     // a gap to fill).
                     if let Err(e) = engine_clone
-                        .submit_output(&token_clone, &task_id_clone, attempt, ev)
+                        .submit_output(&submit_token, &task_id_clone, attempt, ev)
                         .await
                     {
-                        tracing::warn!(
-                            step_id = %task_id_clone,
-                            attempt,
-                            error = %e,
-                            "operator fallback Final rejected by verdict-contract completion gate"
-                        );
+                        // A contract rejection is this gate working, and
+                        // reads as a `warn`. Anything else means the
+                        // `Final` went missing for a reason nobody chose,
+                        // and the old wording — which named the verdict
+                        // gate unconditionally — would have reported a
+                        // lapsed token as a rejected value. Split them so
+                        // the log says which happened.
+                        if matches!(
+                            e,
+                            crate::core::errors::EngineError::VerdictValueRejected { .. }
+                                | crate::core::errors::EngineError::VerdictPartMissing { .. }
+                        ) {
+                            tracing::warn!(
+                                step_id = %task_id_clone,
+                                attempt,
+                                error = %e,
+                                "operator fallback Final rejected by verdict-contract \
+                                 completion gate"
+                            );
+                        } else {
+                            tracing::error!(
+                                step_id = %task_id_clone,
+                                attempt,
+                                error = %e,
+                                "operator fallback Final was not written; this attempt has \
+                                 no Final"
+                            );
+                        }
                     }
                 }
             }
@@ -370,5 +441,167 @@ impl Worker for OperatorWorker {
     }
     async fn join(self: Box<Self>) -> Result<(), WorkerError> {
         self.handler.await_completion().await
+    }
+}
+
+// ─── the fallback Final outliving its capability ──────────────────────────
+//
+// `OperatorSpawner::spawn`'s completion path writes a `Final` for the
+// operator whose SubAgent never POSTed one. It does that with the token it
+// was handed at spawn time — and `Operator::execute` is allowed to take
+// arbitrarily long (the WS backend parks a spawn frame across a client
+// disconnect with no deadline), so by the time the fallback runs, that
+// token may be past `EngineCfg::worker_token_ttl_secs`. These tests hold
+// the two halves apart: the parked case must still land its `Final`, and
+// the ordinary case must not start paying for a re-mint it does not need.
+#[cfg(test)]
+mod parked_fallback_capability_tests {
+    use super::*;
+    use crate::core::config::EngineCfg;
+    use crate::core::state::TaskSpec;
+    use crate::types::Role;
+    use crate::worker::adapter::SpawnerAdapter;
+    use std::time::Duration;
+
+    /// The worker-token TTL these tests run against. One second is short
+    /// enough to outlive in a unit test and long enough that the dispatch
+    /// preamble (mint → `fetch_prompt` → spawn) is comfortably inside it,
+    /// so a park is what expires the token and not test scheduling.
+    const TTL_SECS: u64 = 1;
+
+    /// An `Operator` that succeeds without ever writing a `Final` of its
+    /// own — the only shape for which the fallback emit exists — after
+    /// holding for `hold`. `hold` past the TTL reproduces the park.
+    struct SilentOperator {
+        hold: Duration,
+    }
+
+    #[async_trait]
+    impl Operator for SilentOperator {
+        async fn execute(
+            &self,
+            _ctx: &Ctx,
+            _system: Option<String>,
+            _prompt: Value,
+            _worker: Option<WorkerBinding>,
+            _worker_token: CapToken,
+        ) -> Result<WorkerResult, WorkerError> {
+            tokio::time::sleep(self.hold).await;
+            Ok(WorkerResult {
+                value: serde_json::json!({"held": true}),
+                ok: true,
+                stats: None,
+            })
+        }
+    }
+
+    /// Dispatch one attempt through an `OperatorSpawner` wrapping a
+    /// [`SilentOperator`] that holds for `hold`, and hand back the engine
+    /// and the task it ran, for the caller to read state off.
+    async fn dispatch_holding_for(hold: Duration) -> (Engine, StepId) {
+        let engine = Engine::new(EngineCfg {
+            worker_token_ttl_secs: TTL_SECS,
+            ..EngineCfg::default()
+        });
+        let op_token = engine
+            .attach(
+                "op-parked-fallback",
+                Role::Operator,
+                Duration::from_secs(600),
+            )
+            .await
+            .expect("attach");
+        let task_id = engine
+            .start_task(
+                &op_token,
+                TaskSpec {
+                    agent: "held-agent".to_string(),
+                    initial_directive: Value::String("go".to_string()),
+                    step_ctx: None,
+                    check_policy: None,
+                },
+            )
+            .await
+            .expect("start_task");
+        let spawner: Arc<dyn SpawnerAdapter> = Arc::new(OperatorSpawner::new(
+            Arc::new(SilentOperator { hold }),
+            None,
+            None,
+        ));
+        engine
+            .dispatch_attempt_with(&op_token, &task_id, &spawner, None)
+            .await
+            .expect("dispatch_attempt_with");
+        (engine, task_id)
+    }
+
+    /// How many stored capability records bind `task_id` — one after an
+    /// ordinary dispatch, two once the fallback has re-minted (the reissue
+    /// is added and the original deliberately left in place; see
+    /// `Engine::remint_worker_token`). This is the mechanism the test
+    /// below asserts on, as opposed to the outcome alone.
+    async fn records_bound_to(engine: &Engine, task_id: &StepId) -> usize {
+        let wanted = task_id.clone();
+        engine
+            .with_state("test.count_bound_records", move |s| {
+                s.tokens
+                    .values()
+                    .filter(|r| r.task_id.as_ref() == Some(&wanted))
+                    .count()
+            })
+            .await
+            .expect("read token records")
+    }
+
+    fn has_final(tail: &[OutputEvent]) -> bool {
+        tail.iter()
+            .any(|ev| matches!(ev, OutputEvent::Final { .. }))
+    }
+
+    /// The failure this fix is for. A hold past the TTL leaves the spawn
+    /// token expired by the time the fallback writes, `submit_output`'s
+    /// `verify_token_for_task` rejects an expired Worker token, and the
+    /// attempt's only `Final` would be lost to the clock rather than to
+    /// anything about the work — `dispatch_attempt_with` then folds the
+    /// empty tail into "no Final in output_tail". Re-minting at the moment
+    /// of the write is what keeps it.
+    #[tokio::test]
+    async fn a_hold_past_the_ttl_still_lands_the_fallback_final() {
+        let (engine, task_id) =
+            dispatch_holding_for(Duration::from_millis(TTL_SECS * 1000 + 500)).await;
+
+        let tail = engine.output_tail(&task_id, 1).await;
+        assert!(
+            has_final(&tail),
+            "the fallback Final must survive a hold longer than the worker-token TTL, \
+             got tail: {tail:?}"
+        );
+        assert_eq!(
+            records_bound_to(&engine, &task_id).await,
+            2,
+            "the surviving Final must be the re-minted capability's doing — one record \
+             for the spawn token, one for the reissue"
+        );
+    }
+
+    /// Control, and the reason the re-mint is conditional: a dispatch that
+    /// returns inside the TTL writes its `Final` with the token it already
+    /// holds and mints nothing extra. Without this, "always re-mint" would
+    /// pass the test above while adding a spare token record to every
+    /// operator step in the process.
+    #[tokio::test]
+    async fn a_dispatch_inside_the_ttl_lands_its_final_without_re_minting() {
+        let (engine, task_id) = dispatch_holding_for(Duration::from_millis(10)).await;
+
+        let tail = engine.output_tail(&task_id, 1).await;
+        assert!(
+            has_final(&tail),
+            "an un-parked operator's fallback Final must land unchanged, got tail: {tail:?}"
+        );
+        assert_eq!(
+            records_bound_to(&engine, &task_id).await,
+            1,
+            "a live token needs no reissue — only the spawn token should be on record"
+        );
     }
 }

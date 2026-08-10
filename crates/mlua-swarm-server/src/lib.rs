@@ -143,9 +143,9 @@ use mlua_swarm::store::run::{RunContext, RunRecord, RunStatus, RunStore};
 use mlua_swarm::store::task::{TaskRecord, TaskRecordStatus, TaskStore};
 use mlua_swarm::{
     AgentBlockInProcessSpawnerFactory, CapToken, Compiler, Engine, LayerRegistry,
-    LongHoldMiddleware, LuaInProcessSpawnerFactory, MainAIMiddleware, OperatorDelegateMiddleware,
-    OperatorSpawnerFactory, Role, RunId, RustFnInProcessSpawnerFactory, SeniorEscalationMiddleware,
-    SessionId, SpawnerRegistry, SubprocessProcessSpawnerFactory, TaskId,
+    LongHoldMiddleware, LuaInProcessSpawnerFactory, MainAIMiddleware, OperatorSpawnerFactory, Role,
+    RunId, RustFnInProcessSpawnerFactory, SeniorEscalationMiddleware, SessionId, SpawnerRegistry,
+    SubprocessProcessSpawnerFactory, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -285,7 +285,16 @@ pub fn build_router(engine: Engine) -> Router {
 /// Default `LayerRegistry` for the server. Hint keys:
 /// - `"main_ai"` → `MainAIMiddleware` (= fires SpawnHook before/after)
 /// - `"senior_escalation"` → `SeniorEscalationMiddleware` (= on `ok=false`, escalates via `SeniorBridge.ask`)
-/// - `"operator_delegate"` → `OperatorDelegateMiddleware` (= when an operator backend is registered, delegates the entire spawn)
+///
+/// `"operator_delegate"` used to be the third key here, resolving to
+/// `OperatorDelegateMiddleware`. Both are gone; a Blueprint that still
+/// declares the key is refused at compile time with the
+/// `removed-spawner-hint` lint rather than quietly losing the layer, because
+/// `service::linker::link` skips hint keys this registry does not answer
+/// (deliberately — it keeps a Blueprint portable across deployments that
+/// install different layers). See `mlua_swarm::middleware`'s removal note for
+/// why the axis went, and `mse://guides/blueprint-authoring` for the
+/// AgentSpec-axis replacement an author should write instead.
 ///
 /// Including any of these keys in `Blueprint.spawner_hints.layers` causes them to
 /// be wrapped into a `SpawnerStack` at `service::linker::link` time (= per-launch;
@@ -321,9 +330,6 @@ pub fn default_layer_registry_with(options: LayerOptions) -> LayerRegistry {
         .with_hint("main_ai", |_engine| Arc::new(MainAIMiddleware::new()))
         .with_hint("senior_escalation", |_engine| {
             Arc::new(SeniorEscalationMiddleware::new())
-        })
-        .with_hint("operator_delegate", |_engine| {
-            Arc::new(OperatorDelegateMiddleware::new())
         });
     if let Some(ms) = options.long_hold_warn_ms {
         // Bake the millisecond threshold into the factory closure so it
@@ -939,24 +945,115 @@ async fn status_get(State(state): State<AppState>) -> Json<StatusResponse> {
     })
 }
 
+/// Request body for `POST /v1/sessions`.
 #[derive(Deserialize)]
 struct AttachReq {
     agent_id: String,
     role: String,
+    /// Session lifetime in seconds, stamped onto the minted token's
+    /// `CapToken::expire_at`.
+    ///
+    /// **Whether it gates anything depends on `role`.** `82d9da9` ("stop
+    /// expiring operator tokens") made `Engine::verify_token`'s expiry
+    /// check role-conditional (`src/core/engine.rs`, step (2)): a
+    /// `Role::Operator` token verifies past its `expire_at`, every other
+    /// role still fails with `TokenExpired`. So for
+    /// `role: "worker" | "senior" | "observer"` this field is enforced
+    /// exactly as before, on every verb those tokens can reach. For
+    /// `role: "operator"` it is stamped and then ignored, and the session
+    /// lives until `DELETE /v1/sessions` or process exit.
+    ///
+    /// The field is therefore not deprecated: three of the four roles it
+    /// accepts still enforce it, and removing it (or refusing it for
+    /// Operator, which would break every existing caller) would take a
+    /// live bound away to fix a documentation problem. What it owed the
+    /// caller was to say which of the two it just did — hence
+    /// [`AttachResp::ttl_enforced`], which reports the answer in the
+    /// response to the very request that set it.
+    ///
+    /// One thing this TTL is **not**, despite being the obvious thing to
+    /// claim for it: it is not what bounds a Worker token on
+    /// `/v1/worker/*`. A Worker token minted here cannot reach those routes
+    /// at all. `sessions_attach` mints through `Engine::attach`, which
+    /// stores a `CapTokenRecord` with `task_id: None`
+    /// (`src/core/state.rs`), and every `/v1/worker/*` handler resolves its
+    /// task through `task_id_from_handle` / `task_id_from_token` — both
+    /// `Engine::task_id_from_token` and `verify_token_for_task`'s Worker
+    /// branch return `TokenNotFound` when no task is bound
+    /// (`src/core/engine.rs`). The ownership gate refuses the token before
+    /// `expire_at` is ever consulted. That is fail-closed, so it is not a
+    /// hole — but it means the justification for keeping this field is the
+    /// surviving expiry check itself, not that route. Worker tokens that
+    /// *do* reach `/v1/worker/*` are the task-bound ones minted during
+    /// dispatch, and their TTL is `EngineCfg::worker_token_ttl_secs`, a
+    /// different knob.
     ttl_secs: u64,
 }
 
+/// Response body for `POST /v1/sessions`.
 #[derive(Serialize)]
 struct AttachResp {
     session_id: String,
     role: String,
+    /// Whether the request's `ttl_secs` gates this session.
+    ///
+    /// `false` for `role: "operator"` — the TTL was stamped on the token
+    /// and `Engine::verify_token` will not read it (see
+    /// [`AttachReq::ttl_secs`]). `true` for every other role.
+    ///
+    /// This exists because an accepted-and-ignored parameter is
+    /// indistinguishable from an honored one at the wire, and the caller
+    /// who set a 600-second Operator TTL has no other way to learn that
+    /// nothing will act on it. A Blueprint lint was the wrong surface: the
+    /// lint registry (`mlua_swarm_diag::LINT_DECLS`) describes findings
+    /// about a Blueprint document, and this value never appears in one —
+    /// it arrives on an HTTP request that no compile or `bp_doctor` run
+    /// ever sees. A response field reaches the one party who can act on
+    /// it, at the moment they can act on it; the paired `tracing::warn!`
+    /// covers the operator reading logs rather than response bodies.
+    ttl_enforced: bool,
 }
 
+/// `POST /v1/sessions` — mint a capability token for `agent_id` under
+/// `role` and hand back its nonce as the Bearer `session_id`.
+///
+/// See [`AttachReq::ttl_secs`] for why the TTL binds a Worker / Senior /
+/// Observer session but not an Operator one, and [`AttachResp::ttl_enforced`]
+/// for how that is reported back.
 async fn sessions_attach(
     State(state): State<AppState>,
     Json(req): Json<AttachReq>,
 ) -> Result<Json<AttachResp>, ApiError> {
     let role = parse_role(&req.role)?;
+    // Mirrors the `token.role != Role::Operator` condition guarding step
+    // (2) of `Engine::verify_token`. Kept as a plain comparison rather
+    // than a shared helper because the engine's condition is the
+    // authority and a helper here would read as if this were the
+    // definition.
+    //
+    // Duplicating a condition is only safe if something notices when the
+    // two copies disagree, so `session_attach_ttl.rs` carries
+    // `ttl_enforced_matches_what_the_engine_actually_does_per_role`: for
+    // each of the four roles it mints an already-expired token
+    // (`ttl_secs: 0` — `CapToken::is_expired` is `now >= expire_at`) and
+    // asks `Engine::verify_token` what it does with it, then asserts the
+    // value reported here equals that observation. Because the expected
+    // side is a runtime probe rather than a literal, widening the engine's
+    // exemption — say to also exempt `Role::Observer` — fails that test
+    // without anyone having to remember this line exists.
+    //
+    // A test asserting `true`/`false` literals per role would not do that:
+    // it would stay green through exactly that change and this route would
+    // then report `ttl_enforced: true` for a session nothing expires.
+    let ttl_enforced = role != Role::Operator;
+    if !ttl_enforced {
+        tracing::warn!(
+            agent_id = %req.agent_id,
+            ttl_secs = req.ttl_secs,
+            "POST /v1/sessions: ttl_secs is not enforced for role=operator (operator tokens \
+             are expiry-exempt); this session lives until DELETE /v1/sessions or process exit"
+        );
+    }
     let token = state
         .engine
         .attach(req.agent_id, role, Duration::from_secs(req.ttl_secs))
@@ -970,6 +1067,7 @@ async fn sessions_attach(
     Ok(Json(AttachResp {
         session_id: sid,
         role: req.role,
+        ttl_enforced,
     }))
 }
 
@@ -1046,9 +1144,7 @@ pub struct TaskLaunchRequest {
     /// When `Some`, it is validated at request time against
     /// `state.engine.list_operator_ids()` (the live `engine.operators`
     /// registry key set): an unknown/never-registered id returns `400`
-    /// immediately — this is a deliberate hard-fail, in contrast to
-    /// `OperatorDelegateWrapped::spawn`, which silently falls through to
-    /// `inner.spawn` on a registry miss. A sid that *was* registered but has
+    /// immediately. A sid that *was* registered but has
     /// since disconnected (WS `tx` cleared, session entry retained for
     /// reconnect) passes this check and surfaces as an explicit dispatch-time
     /// error instead (`WSOperatorSession::send_and_await` returns `Err` when
@@ -1058,13 +1154,13 @@ pub struct TaskLaunchRequest {
     /// On success this value **supersedes** `operator.operator_backend_id`:
     /// the two are folded into the launch's single
     /// `TaskLaunchInput::operator_sid`, and this field wins — see
-    /// `run_flow_form`. Dispatch still only delegates if the Blueprint opts
-    /// into `spawner_hints.layers = ["operator_delegate"]` (unchanged
-    /// precondition, same as the older `operator_backend_id` field).
+    /// `run_flow_form`. The older spelling now says nothing more than this
+    /// one does: the `operator_delegate` layer it used to feed was removed,
+    /// so both spellings reach exactly one axis.
     ///
-    /// The field also drives the **AgentSpec axis** (the per-agent
+    /// That axis is the **AgentSpec axis** (the per-agent
     /// `spec.operator_ref` route every Blueprint with `kind = Operator`
-    /// agents uses, whether or not it declares the delegate layer): the sid
+    /// agents uses): the sid
     /// becomes the holder of this run's Operator seat
     /// (`RunRecord.current`, see [`Self::operator_slot`]), which is what
     /// every dispatch through such an agent resolves — freshly, each time —
@@ -1077,10 +1173,11 @@ pub struct TaskLaunchRequest {
     /// driver's session.
     ///
     /// When unset, the launch names whatever `operator.operator_backend_id`
-    /// names — which reaches the delegate layer exactly as before, and
-    /// reaches the AgentSpec axis only if it happens to be a live session
-    /// id (otherwise the binding provider reports `Unbound`, the same
-    /// outcome an unnamed launch gets).
+    /// names, which reaches the AgentSpec axis only if it happens to be a
+    /// live session id (otherwise the binding provider reports `Unbound`,
+    /// the same outcome an unnamed launch gets). Note that the older
+    /// spelling skips the `400` guard above, so it is the weaker of the two
+    /// — prefer `operator_sid`.
     #[serde(default)]
     operator_sid: Option<String>,
     /// Why this launch is assigned to [`Self::operator_sid`] — the model's
@@ -1179,18 +1276,44 @@ pub struct OperatorReq {
     /// Name of a bridge pre-registered via `engine.register_senior_bridge`; `None` if unspecified.
     #[serde(default)]
     senior_bridge_id: Option<String>,
-    /// Name of an Operator backend pre-registered via `engine.register_operator`
-    /// (= the path that delegates the entire spawn to an external Operator);
-    /// `None` if unspecified. When `kind == MainAi/Composite` and this id is `Some`,
-    /// `OperatorDelegateMiddleware` bypasses `inner.spawn` and calls `operator.execute` instead.
-    /// This is a different axis from `operator.id` (= session tracking label);
-    /// `operator_backend_id` is the registry lookup key.
+    /// Name of an Operator backend pre-registered via `engine.register_operator`;
+    /// `None` if unspecified. This is a different axis from `operator.id`
+    /// (= session tracking label); `operator_backend_id` is the registry
+    /// lookup key.
     ///
-    /// The older of the two spellings of [`TaskLaunchRequest::operator_sid`]
-    /// — it names the same registry, and loses to that field when both are
-    /// sent. Prefer `operator_sid`: it is validated at the door and it also
-    /// seats the operator on the Run. This one remains for the launch that
-    /// has a registered backend but no seat to pin it to.
+    /// The older of the two spellings of [`TaskLaunchRequest::operator_sid`].
+    /// Both name the same registry, and this one loses when both are sent
+    /// (they are folded into a single value in `run_flow_form`, with
+    /// `operator_sid` winning). It used to mean something that field did
+    /// not: it fed the `operator_delegate` layer, which dispatched through
+    /// the named backend without seating anyone on the Run. That layer is
+    /// gone — but what survives is not a difference in strictness alone.
+    /// The two spellings reach different parts of the launch:
+    ///
+    /// | | `operator_sid` | `operator_backend_id` |
+    /// |---|---|---|
+    /// | checked at the door | yes — `400` on an id no live session holds | no |
+    /// | the folded value: binding attestation, persisted `LaunchEnvelope` | yes | yes |
+    /// | seats the operator on the Run (the launch's first `Assign`) | yes | **no** |
+    ///
+    /// The seat is resolved from `req.operator_sid` alone
+    /// (`tasks::resolve_launch_assign`), so a launch naming only this
+    /// field is attested and persisted as operator-bound while its Run's
+    /// seat stays Vacant.
+    ///
+    /// That asymmetry is deliberate rather than an omission, and it
+    /// follows from the row above it: seating writes a holder that every
+    /// later dispatch resolves through (`AssigneeRouter::execute`), and
+    /// this spelling is never checked against the live registry. Seating
+    /// off an unchecked id would put a holder on the Run naming a session
+    /// that may not exist, and the failure would surface later and further
+    /// away — "run is held by operator 'x', which has no registered
+    /// Operator adapter" — instead of at the door. An unchecked name does
+    /// not get to seat anyone.
+    ///
+    /// **Prefer `operator_sid`**: it is the checked spelling and the only
+    /// one that seats the operator, which is what lets a later handover
+    /// move the destination.
     #[serde(default)]
     operator_backend_id: Option<String>,
     /// "Runtime Agent-level" tier (highest priority) of the `OperatorKind`
@@ -1317,13 +1440,18 @@ async fn tasks_start(
 /// two fail-loud guards keep a bad launch from hanging the HTTP request
 /// forever:
 ///
-/// - **Guard 1 (readiness precheck, `503`)**: when the request/BP
-///   references an operator backend (`operator.operator_backend_id`, set
-///   directly or via `operator_sid`) and `state.engine.list_operator_ids()`
-///   is empty, the request fails immediately rather than dispatching into
-///   a session with nothing attached to serve it. Coarse by design — a
-///   launch that cannot be cheaply determined to route through an operator
-///   is never rejected here (Guard 2 still covers the hang in that case).
+/// - **Guard 1 (readiness precheck, `503`)**: when *the request* names an
+///   operator backend (`operator.operator_backend_id`, or `operator_sid`
+///   folded into it) and `state.engine.list_operator_ids()` is empty, the
+///   request fails immediately rather than dispatching into a session with
+///   nothing attached to serve it. The signal is the request and only the
+///   request: the Blueprint is not consulted, because which agents route
+///   through an Operator is per-`AgentDef` and resolved at dispatch time.
+///   Coarse by design — a launch that cannot be cheaply determined to
+///   route through an operator is never rejected here (Guard 2 still
+///   covers the hang in that case). `task_rekick` has no counterpart; it
+///   carries Guard 2 alone, for the reasons set out where its Guard 1
+///   stood (`tasks::task_rekick`).
 /// - **Guard 2 (sync timeout, `504`)**: the `handle_with_run` driver is
 ///   wrapped in `tokio::time::timeout`. Ceiling cascade, highest priority
 ///   first: request `timeout_secs` (rejecting `Some(0)` with `400`), then
@@ -1419,10 +1547,10 @@ async fn run_flow_form(
     // The one Operator this launch names, from the two wire spellings that
     // can say it. `operator_sid` wins — it is the validated one, and it is
     // the only one that also assigns a seat. `operator.operator_backend_id`
-    // is the older spelling, kept for the delegate-layer launch that names
-    // a registered backend without pinning a seat (a Blueprint declaring no
-    // `operators[]` cannot use `operator_sid` at all: `resolve_launch_slot`
-    // refuses a pin with no seat to land in).
+    // is the older spelling; it used to be the delegate layer's own input
+    // (name a registered backend, seat nobody), and with that layer removed
+    // it survives only as a back-compatible alias for callers that still
+    // send it.
     //
     // Downstream they were already the same value on this route — the
     // sid was copied into `operator_backend_id` here and into
@@ -1470,14 +1598,13 @@ async fn run_flow_form(
 
     // GH #33 Guard 1: operator readiness precheck. Coarse signal — this
     // handler can cheaply see whether the request names an operator at all
-    // (either wire spelling, folded above), but not the full
-    // `OperatorDelegateMiddleware` routing decision (that also considers
-    // BP-level `kind` tiers, resolved only at dispatch time). When one is
-    // named and *zero* operators are attached at all, fail fast rather than
-    // dispatching into a session nothing can serve.
-    // A launch this coarse check cannot positively identify as
-    // operator-delegate is never rejected here — Guard 2 (the timeout
-    // wrap below) still covers the hang in that case.
+    // (either wire spelling, folded above), but not which agents will
+    // actually route through one (that is per-`AgentDef`, resolved only at
+    // dispatch time). When one is named and *zero* operators are attached
+    // at all, fail fast rather than dispatching into a session nothing can
+    // serve. A launch this coarse check cannot positively identify as
+    // operator-bound is never rejected here — Guard 2 (the timeout wrap
+    // below) still covers the hang in that case.
     //
     // What it still catches after the fold: only the
     // `operator.operator_backend_id` spelling. The `operator_sid` one is

@@ -29,6 +29,77 @@ All fields except `id` and `flow` are optional and fall back to sensible
 defaults. `deny_unknown_fields` is enforced throughout the schema — a typo in
 a field name is a hard parse error, not a silently-ignored key.
 
+### `spawner_hints.layers` {#removed-spawner-hint-layers}
+
+`spawner_hints.layers` is a list of **capability keys**, not implementation
+names: the Blueprint says which middleware capability it needs, and the
+engine-side `LayerRegistry` resolves each key to a factory when the spawner
+stack is built. The keys `mse serve` answers today:
+
+| key | effect |
+|---|---|
+| `"main_ai"` | fires the registered `SpawnHook` before/after each spawn |
+| `"senior_escalation"` | on `ok = false`, escalates through `SeniorBridge.ask` |
+
+A key this deployment does not install is **skipped**, not rejected — that
+leniency is deliberate, so one Blueprint stays portable across deployments
+that install different layer sets.
+
+#### Removed: `"operator_delegate"`
+
+`"operator_delegate"` used to select the Blueprint-global Operator delegate
+axis: when the launching session carried an Operator backend, the layer
+bypassed the normal spawn path entirely and called the operator itself, for
+every agent in the Blueprint. **The layer is gone, and declaring the key is
+now a compile error** (`removed-spawner-hint`) rather than a skipped
+unknown key — a withdrawn capability is not the same as an unrecognised
+one, and skipping it would change how the Blueprint executes without
+telling anyone.
+
+It went because of where it read its destination from:
+
+- **It could not follow a handover.** The axis resolved its operator from
+  the launch-time backend id and never consulted the Run's current seat
+  holder, so re-assigning a Run left delegate-axis spawns still arriving at
+  whoever the launch first named.
+- **It could not carry a persona.** It had no per-agent spawner, so it
+  passed no `system` value and never baked one — an agent's
+  `profile.system_prompt` (and therefore any `$agent_md` body) was
+  unreachable through that path by either route.
+
+**What to write instead — the AgentSpec axis.** Declare the seat once, point
+each operator-backed agent at it, and let the launch say who holds it:
+
+```jsonc
+{
+  "spawner_hints": { "layers": [] },
+  "operators": [
+    { "name": "main_ai", "kind": "main_ai" }
+  ],
+  "agents": [
+    {
+      "name": "planner",
+      "kind": "operator",
+      "spec": { "operator_ref": "main_ai" },
+      "profile": { "system_prompt": "..." }
+    }
+  ]
+}
+```
+
+Then pin the seat's holder per launch with `operator_sid` on
+`POST /v1/tasks` (with the `operator_desc` that records *why* this run went
+to that session). Every dispatch resolves the seat's holder afresh, so a
+later handover moves the destination with no recompile — and because the
+route is per-agent, each agent's `system_prompt` is rendered and baked for
+it. There is one destination-resolution path now, and it is the one that
+follows re-assignment.
+
+If the removed key is still on an **already-registered** Blueprint, note
+that registering does not compile: `bp_doctor` reports the same
+`removed-spawner-hint` kind as a WARN so the problem is visible before the
+next dispatch turns it into a launch failure.
+
 ## Flow node kinds (`flow.ir` `Node`)
 
 Every node is tagged with a `kind` discriminator:

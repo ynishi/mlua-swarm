@@ -804,6 +804,39 @@ Rules that fall out of this:
    `Assignee.op` is a session id on every path. A caller still sending
    `roles` is not refused; the field is ignored.
 
+### While your socket is away
+
+Losing the WebSocket is not losing the session. The session stays
+registered (**O7**: connectedness is not its state), and what happens to
+work aimed at it splits three ways:
+
+| Aimed at your session | While you are away | On reconnect |
+|---|---|---|
+| `spawn` / `ask` / `hook_before` | **parked** — held, not failed, with no deadline | delivered, and you answer normally |
+| `hook_after` | **dropped** — it is fire-and-forget, and parking it would hold the step's completion open for the whole outage | nothing to resend; the server logs a warning naming the step |
+| a dispatch routed through a **seat** you hold | the seat is released the moment the dispatch reads it as disconnected (**A7**), and that dispatch fails as `Vacant` | take the seat back with `POST /v1/runs/:id/acquire` (**A8**) — it never refuses |
+
+So the sends addressed to your session by sid wait for you, while the
+seat-routed ones do not. That asymmetry is deliberate: a seat is a
+position somebody else may legitimately take over, and **A7** is what lets
+them.
+
+Two things follow for a long disconnect:
+
+- **A parked spawn's capability is re-minted before it goes out.** The
+  worker token in a Spawn frame carries `worker_token_ttl_secs`
+  (default 1800s) from the moment the engine minted it, so a park longer
+  than the TTL would hand your SubAgent a capability that was already
+  expired — and it would only find out at `mse_worker_submit`, after
+  doing the entire job. The server refreshes the frame at the moment of
+  delivery instead, so the TTL bounds the token's life *in the wild*
+  rather than its wait in the server. You do not have to do anything, and
+  the frame you pop from `mse_pending_wait` is always the current one.
+- **The park has no deadline of its own.** It ends when you reconnect, or
+  when the session is torn down (a `DELETE`, or the 24h expiry below),
+  whichever comes first — otherwise the enclosing run's own ceiling
+  (`sync_timeout_secs`, or the detach TTL) is what ends the wait.
+
 ### Recovery: find the stale session on the list, and know it is harmless
 
 A driver that crashed after minting leaves its session behind. Read
@@ -830,12 +863,55 @@ session held goes `Vacant` (**O8**).
 against the session's own digest, and the token lives only in the client
 process — a crash loses it. So a stale session's sid is one you can read
 off `GET /v1/operators` and identify by its 記名, and cannot delete: the
-delete answers `401` for everyone except the driver that is gone. The row
-also survives a server restart, because boot restores every persisted
-session with no age filter. The model's answer is the 24h expiry from last
-access (**O1**), which is not implemented yet — so on a long-lived server
-these rows accumulate, one per crashed driver. They cost you a line on the
-list, not a seat.
+delete answers `401` for everyone except the driver that is gone.
+
+**It goes on its own after 24 hours.** A session that has not been
+*accessed* for 24h is released the next time anything reads it — by the
+list you are reading, or by the boot that would otherwise have restored
+it. (Model §4.1 states this in its state diagram,
+`最終アクセスから 24h ──▶ ╳ 削除`; it carries no predicate number, and in
+particular is **not** `O1`, which is `join は無認証`.) The release is the
+same teardown a leave performs, cascade (**O8**) included, so the row, the
+registrations and any seat it still held all go together. So the
+accumulation is bounded and you are not expected to clean up after a
+crashed driver; it drops off the list a day after its driver stopped.
+
+What counts as an access is anything that shows the driver is still
+there **and arrives before the horizon**: attaching the WebSocket,
+reading **its own** session (`GET /v1/operators/:sid`), presenting its
+Bearer on a Bearer-gated route, and being assigned a seat.
+
+The qualifier is the part to read carefully, because it inverts in the
+one case you would consult this for. Every route judges the horizon
+*before* recording the access, so a call that arrives when the session is
+already 24h idle does not renew it — it is what destroys it. The WS
+upgrade and `GET /v1/operators/:sid` answer `404` and tear the session
+down; a Bearer presented to `GET /v1/operators` (or to a handover route,
+`acquire` included) answers `401` with a hint saying to re-join. That is
+deliberate: a session that went a day without contact was due for
+deletion at some point in that window, and letting a late arrival cancel
+it would make the horizon mean "24h unless somebody eventually turns up".
+If your driver has been away that long, expect to join again and
+`POST /v1/runs/:id/acquire` your seats back (**A8** never refuses) rather
+than to find your old session waiting.
+
+Two things deliberately do not count as an access: **reading somebody
+else's** entry on `GET /v1/operators` (a recovery driver must not keep
+alive the very rows it is reading to find), and time passing while
+connected — a session with a socket attached is never expired, however
+quiet, because holding the socket open *is* contact.
+
+That last one is enforced rather than assumed, on both halves. The server
+Pings an attached socket every 30s and treats five unanswered Pings —
+with no other inbound frame either — as a disconnect, so "attached" means
+a peer that is still answering and not merely a socket nobody has closed;
+a driver whose host vanishes without closing the connection is detached
+within a couple of minutes and its session goes back under the ordinary
+horizon. The same tick advances the session's stored last-access time, so
+a connected-and-quiet session survives a server restart too: the boot
+read judges the persisted row alone and knows nothing about sockets, so
+without that write a driver attached for over a day would have had its
+row deleted at the next boot (**R6**: 再起動は担当を落とさない).
 
 ### Telling parallel sessions apart: the 記名 and the holder list
 
@@ -1274,15 +1350,16 @@ send the sid yourself. `desc` is what makes your session findable on
 `mse_operator_list` afterwards; write it for the reader who has to tell
 your session from the one running in the next worktree.
 
-#### Relationship to the delegate layer
+#### There is one axis left, and `operator_sid` addresses it
 
-`operator_sid` keeps its original meaning for the opt-in
-`spawner_hints.layers = ["operator_delegate"]` path — it is that layer's
-session backend. The two axes do not interfere: where the delegate layer
-applies it bypasses the per-agent spawners entirely (see
-`OperatorSpawnerFactory`'s exclusivity note), and where it does not, the
-pin decides the AgentSpec axis underneath. One sid, both axes, same
-session.
+`operator_sid` used to mean two things, because a Blueprint could opt into
+a second, Blueprint-global dispatch path with
+`spawner_hints.layers = ["operator_delegate"]` and the pin was that
+layer's session backend. That layer is gone, and a Blueprint still
+declaring it is refused at compile with a message saying so. What is left
+is the AgentSpec axis described throughout this guide: the pin seats your
+session in the Blueprint's Operator seat, and each dispatch resolves the
+seat's *current* holder off `Run.current`. One sid, one axis.
 
 ## Responsibility summary
 

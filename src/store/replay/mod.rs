@@ -477,7 +477,6 @@ mod tests {
         assert_eq!(back.operator.id, default_op.id);
         assert!(back.operator.senior_bridge.is_none());
         assert!(back.operator.spawn_hook.is_none());
-        assert!(back.operator.operator.is_none());
     }
 
     #[tokio::test]

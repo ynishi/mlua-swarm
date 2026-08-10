@@ -68,14 +68,22 @@ pub struct CtxMeta {
 }
 
 /// Who/what is driving a spawn: a plain automated worker, an interactive
-/// MainAI operator, or a composite of both. Gates `MainAIMiddleware` /
-/// `OperatorDelegateMiddleware` (see `OperatorInfo` doc below) and feeds
-/// the 4-tier cascade resolved by `collapse_operator_kind`.
+/// MainAI operator, or a composite of both. Gates `MainAIMiddleware` — the
+/// only layer that reads this value — and feeds the 4-tier cascade
+/// resolved by [`collapse_operator_kind`]. See "The role of `kind`" in the
+/// [`OperatorInfo`] doc below.
+///
+/// It used to gate `OperatorDelegateMiddleware` as well. That layer is
+/// gone (it resolved its destination from the launch record rather than
+/// the Run's seat), so `kind` no longer decides whether a dispatch reaches
+/// an `Operator` at all — the agent's own `kind = Operator` does.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperatorKind {
-    /// An interactive, single-Operator-driven session (spawn hooks and
-    /// full-spawn delegation are enabled).
+    /// An interactive, single-Operator-driven session: `spawn_hook`'s
+    /// `before` / `after` fire around every spawn. (Full-spawn delegation
+    /// was the other thing this value enabled; that axis no longer
+    /// exists.)
     MainAi,
     /// A plain automated worker; middleware passes through into a normal
     /// spawn (the default).
@@ -239,39 +247,54 @@ mod collapse_operator_kind_tests {
 
 /// The bundle of Operator faces the engine injects into `Ctx` at dispatch.
 ///
-/// # The three `Arc<dyn ...>` fields — the three Operator faces
+/// # The two `Arc<dyn ...>` fields — the Operator faces that intercept
 ///
 /// Conceptually the Operator is one role, but inside the engine it fans out
-/// into three interception axes that fire independently. The canonical use
-/// is one external Operator (say, a WebSocket client) that implements all
-/// three traits and answers every axis from a single session (see
-/// a WebSocket-backed operator session in the server crate).
+/// into interception axes that fire independently. The canonical use is one
+/// external Operator (say, a WebSocket client) that implements the traits
+/// and answers every axis from a single session (see a WebSocket-backed
+/// operator session in the server crate).
 ///
 /// | field | trait | firing layer | purpose |
 /// |---|---|---|---|
 /// | `senior_bridge` | [`SeniorBridge`] | `SeniorEscalationMiddleware` | When a worker returns `ok = false`, query a judgment source and upgrade the outcome to Pass. |
 /// | `spawn_hook` | [`SpawnHook`] | `MainAIMiddleware` | Pre- and post-spawn observation and approve/reject gating (`kind = MainAi` / `Composite` only). |
-/// | `operator` | [`crate::operator::Operator`] | `OperatorDelegateMiddleware` | Delegate the entire spawn to an external Operator (bypass `inner.spawn` and call `execute`; `kind = MainAi` / `Composite` only). |
+///
+/// There used to be a third, `operator:
+/// Option<Arc<dyn crate::operator::Operator>>`, resolved from
+/// `LaunchEnvelope.operator_backend_id` and read by
+/// `OperatorDelegateMiddleware` to bypass the spawn entirely. Both are
+/// gone. It is worth being precise about what that does *not* mean:
+/// dispatching through an `Operator` is alive and well — it simply happens
+/// on the AgentSpec axis now, where `OperatorSpawner` holds the
+/// `Arc<dyn Operator>` for the agent's declared seat. What went is the
+/// *second*, session-global way of reaching one, which resolved its
+/// destination from the launch record instead of the Run's seat and so
+/// could not follow a handover. A dispatch's operator is no longer
+/// something the `Ctx` carries.
 ///
 /// # The role of `kind`
 ///
 /// Middleware uses `OperatorKind` (`Automate` / `MainAi` / `Composite`) as a
-/// gating signal: `MainAi` / `Composite` enable `spawn_hook` and `operator`;
-/// `Automate` lets middleware pass through into a normal spawn.
-/// `senior_bridge` is kind-agnostic and fires whenever `ok = false`.
+/// gating signal: `MainAi` / `Composite` enable `spawn_hook`; `Automate`
+/// lets middleware pass through into a normal spawn. `senior_bridge` is
+/// kind-agnostic and fires whenever `ok = false`.
 ///
 /// # Default
 ///
-/// `OperatorKind::Automate` with all three `Arc<dyn ...>` fields set to
-/// `None`. Middleware passes through; execution stays inline as usual.
+/// `OperatorKind::Automate` with both `Arc<dyn ...>` fields set to `None`.
+/// Middleware passes through; execution stays inline as usual.
 ///
 /// # Persistence boundary
 ///
 /// `OperatorInfo` is transient inside `Ctx` (`#[serde(skip)]`). The
 /// persisted `LaunchEnvelope` only holds IDs (`bridge_id` / `hook_id` /
 /// `operator_backend_id`). At dispatch time the engine resolves each `Arc`
-/// by looking those IDs up in its `senior_bridges` / `spawn_hooks` /
-/// `operators` `HashMap`s via `resolve_operator_info(session) -> OperatorInfo`.
+/// by looking those IDs up in its `senior_bridges` / `spawn_hooks`
+/// `HashMap`s via `resolve_operator_info(session) -> OperatorInfo`.
+/// `operator_backend_id` no longer resolves to anything here — it survives
+/// as the persisted session shape and as the launch-time key
+/// `Engine::list_operator_ids` validates an `operator_sid` against.
 #[derive(Clone)]
 pub struct OperatorInfo {
     /// Gating signal consumed by middleware; see the "role of `kind`"
@@ -283,8 +306,6 @@ pub struct OperatorInfo {
     pub senior_bridge: Option<Arc<dyn SeniorBridge>>,
     /// See the `spawn_hook` row in the table above.
     pub spawn_hook: Option<Arc<dyn SpawnHook>>,
-    /// See the `operator` row in the table above.
-    pub operator: Option<Arc<dyn crate::operator::Operator>>,
 }
 
 impl std::fmt::Debug for OperatorInfo {
@@ -294,7 +315,6 @@ impl std::fmt::Debug for OperatorInfo {
             .field("id", &self.id)
             .field("senior_bridge", &self.senior_bridge.is_some())
             .field("spawn_hook", &self.spawn_hook.is_some())
-            .field("operator", &self.operator.is_some())
             .finish()
     }
 }
@@ -306,7 +326,6 @@ impl Default for OperatorInfo {
             id: "default-automate".into(),
             senior_bridge: None,
             spawn_hook: None,
-            operator: None,
         }
     }
 }

@@ -29,13 +29,18 @@
 //!   joined_at_secs            INTEGER NOT NULL,
 //!   join_desc                 TEXT,           -- 記名 confirmed part (D1), NULL when unwritten
 //!   observed_json             TEXT,           -- 記名 observed part (D2), JSON array
-//!   observed_total            INTEGER NOT NULL DEFAULT 0
+//!   observed_total            INTEGER NOT NULL DEFAULT 0,
+//!   last_access_secs          INTEGER NOT NULL DEFAULT 0  -- O1's expiry clock
 //! );
 //! ```
 //!
-//! The last three columns arrived with the 記名 (model §4.2) and are added
-//! to an older file by [`migrate_add_column_if_missing`], the same way the
-//! `runs` table grows a column.
+//! The 記名 columns (model §4.2) and `last_access_secs` (the 24h horizon) all
+//! arrived after the table did, and are added to an older file the same
+//! way the `runs` table grows a column — by
+//! [`migrate_add_column_if_missing`], except for `last_access_secs`, whose
+//! back-fill matters enough to have its own migration
+//! ([`migrate_add_last_access_column`]): a plain `DEFAULT 0` would make
+//! the first read after an upgrade expire every carried-over session.
 //!
 //! A column also *left*: `roles_json` held the role aliases a session
 //! claimed at join, back when a join claimed any. Role declaration moved
@@ -61,7 +66,8 @@ CREATE TABLE IF NOT EXISTS operator_sessions (\
   joined_at_secs            INTEGER NOT NULL, \
   join_desc                 TEXT, \
   observed_json             TEXT, \
-  observed_total            INTEGER NOT NULL DEFAULT 0\
+  observed_total            INTEGER NOT NULL DEFAULT 0, \
+  last_access_secs          INTEGER NOT NULL DEFAULT 0\
 );\
 ";
 
@@ -126,6 +132,52 @@ fn migrate_drop_column_if_present(
     Ok(())
 }
 
+/// Add `last_access_secs` (the 24h expiry clock) to a file that predates
+/// it, and stamp the existing rows with the moment of the upgrade.
+///
+/// [`migrate_add_column_if_missing`] alone would leave every pre-existing
+/// row at the column default, `0` — the epoch — and the first `list()`
+/// after the upgrade would judge each of them 56 years idle and delete the
+/// lot. That is the wrong reading of a missing value: the rows are not
+/// evidence of a session nobody has touched since 1970, they are evidence
+/// of a build that did not record touches. There is no access history to
+/// recover, so the honest substitute is the last moment we know the server
+/// was running with these sessions in it, which is now.
+///
+/// Each carried-over session therefore gets a full horizon from the
+/// upgrade, and one that really is abandoned expires a day later. The
+/// back-fill runs only in the branch that adds the column, so a subsequent
+/// open — where a `0` would mean a row genuinely written with no access —
+/// leaves the values alone.
+fn migrate_add_last_access_column(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(operator_sessions)")?;
+    let has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<String>, _>>()?
+        .iter()
+        .any(|name| name == "last_access_secs");
+    drop(stmt);
+    if has_column {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE operator_sessions ADD COLUMN last_access_secs INTEGER NOT NULL DEFAULT 0;",
+    )?;
+    let now = super::expiry_now() as i64;
+    let stamped = conn.execute(
+        "UPDATE operator_sessions SET last_access_secs = ?1",
+        params![now],
+    )?;
+    if stamped > 0 {
+        tracing::info!(
+            sessions = stamped,
+            "operator session store: added O1's last-access column; the sessions already in \
+             the file are stamped with this upgrade, so each gets a full 24h from here"
+        );
+    }
+    Ok(())
+}
+
 /// The open-time schema work, shared by the file and in-memory
 /// constructors so the two can never drift apart.
 fn init_schema(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
@@ -135,6 +187,7 @@ fn init_schema(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
     migrate_add_column_if_missing(conn, "join_desc", "TEXT")?;
     migrate_add_column_if_missing(conn, "observed_json", "TEXT")?;
     migrate_add_column_if_missing(conn, "observed_total", "INTEGER NOT NULL DEFAULT 0")?;
+    migrate_add_last_access_column(conn)?;
     // Last, and after the adds: a file from before the 記名 columns is
     // brought up to the current shape first, then loses the one column the
     // current shape does not have.
@@ -238,7 +291,7 @@ fn map_isle_err(e: IsleError) -> OperatorSessionStoreError {
 
 /// One `operator_sessions` SELECT row in column order: sid, token_digest,
 /// capability_manifest_json, joined_at_secs, join_desc, observed_json,
-/// observed_total.
+/// observed_total, last_access_secs.
 type SessionRow = (
     String,
     String,
@@ -247,10 +300,11 @@ type SessionRow = (
     Option<String>,
     Option<String>,
     i64,
+    i64,
 );
 
 const SESSION_SELECT_COLUMNS: &str = "sid, token_digest, capability_manifest_json, \
-     joined_at_secs, join_desc, observed_json, observed_total";
+     joined_at_secs, join_desc, observed_json, observed_total, last_access_secs";
 
 /// Why one `operator_sessions` row could not be turned into an
 /// [`OperatorSessionRecord`].
@@ -279,6 +333,7 @@ fn row_to_record(row: SessionRow) -> Result<OperatorSessionRecord, RowDecodeErro
         desc,
         observed_json,
         observed_total,
+        last_access_secs,
     ) = row;
     // All three decodes below fail the same way and get the same treatment:
     // no column is special-cased, because special-casing one only moves the
@@ -308,6 +363,7 @@ fn row_to_record(row: SessionRow) -> Result<OperatorSessionRecord, RowDecodeErro
         token_digest,
         capability_manifest,
         joined_at_secs: joined_at_secs as u64,
+        last_access_secs: last_access_secs.max(0) as u64,
         desc,
         observed,
         observed_total: observed_total.max(0) as u64,
@@ -336,14 +392,15 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
         let observed_json = serde_json::to_string(&record.observed)
             .map_err(|e| OperatorSessionStoreError::Other(format!("encode observed: {e}")))?;
         let observed_total = record.observed_total as i64;
+        let last_access_secs = record.last_access_secs as i64;
 
         self.isle
             .call(move |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO operator_sessions \
                      (sid, token_digest, capability_manifest_json, joined_at_secs, \
-                      join_desc, observed_json, observed_total) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                      join_desc, observed_json, observed_total, last_access_secs) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         sid,
                         token_digest,
@@ -351,7 +408,8 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
                         joined_at_secs,
                         desc,
                         observed_json,
-                        observed_total
+                        observed_total,
+                        last_access_secs
                     ],
                 )
             })
@@ -380,6 +438,59 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
         }
     }
 
+    /// Unfiltered by design (see the trait's contract) — no expiry
+    /// judgment, no delete.
+    ///
+    /// A row that will not decode is an `Err(Other)` here rather than the
+    /// `None` [`Self::list`] turns it into. The difference is what the two
+    /// calls are for: `list` is boot rehydration, whose caller's error path
+    /// takes the whole server down, so one bad row must not be allowed to
+    /// become one; this asks about a single named row, and answering
+    /// "there is no such row" about one that is sitting in the file would
+    /// be the same lie the undecodable-row `warn` exists to avoid.
+    async fn get(
+        &self,
+        sid: &SessionId,
+    ) -> Result<Option<OperatorSessionRecord>, OperatorSessionStoreError> {
+        let sid_str = sid.to_string();
+        let row = self
+            .isle
+            .call(move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SESSION_SELECT_COLUMNS} FROM operator_sessions WHERE sid = ?1"
+                ))?;
+                let mut iter = stmt.query_map(params![sid_str], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                })?;
+                iter.next().transpose()
+            })
+            .await
+            .map_err(map_isle_err)?;
+        row.map(|row| {
+            row_to_record(row).map_err(
+                |RowDecodeError {
+                     raw_sid,
+                     column,
+                     detail,
+                 }| {
+                    OperatorSessionStoreError::Other(format!(
+                        "operator session row {raw_sid} will not decode ({column}): {detail}"
+                    ))
+                },
+            )
+        })
+        .transpose()
+    }
+
     async fn list(&self) -> Result<Vec<OperatorSessionRecord>, OperatorSessionStoreError> {
         let rows = self
             .isle
@@ -399,6 +510,7 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
                     ))
                 })?;
                 let mut out = Vec::new();
@@ -413,7 +525,7 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
         // contract. The returned `Err` above is a backend failure; a row
         // that will not decode is reported and dropped here instead of
         // being promoted into one.
-        Ok(rows
+        let decoded: Vec<OperatorSessionRecord> = rows
             .into_iter()
             .filter_map(|row| match row_to_record(row) {
                 Ok(record) => Some(record),
@@ -433,7 +545,27 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
                     None
                 }
             })
-            .collect())
+            .collect();
+        // O1's expiry, applied at the one point this table is read (see the
+        // trait contract). The deletes come after the read rather than as a
+        // `DELETE … WHERE` predicate because the horizon is measured
+        // against `last_access_secs()`, which folds the join time in for
+        // rows written before that column existed — a fold SQL would have
+        // to duplicate.
+        let (live, expired) = super::partition_expired(decoded, super::expiry_now(), self.name());
+        for sid in expired {
+            // A delete that fails leaves the row for the next boot to judge
+            // again; it is already excluded from this answer, so the
+            // session stays unrestorable either way.
+            if let Err(error) = self.delete(&sid).await {
+                tracing::warn!(
+                    %sid, %error,
+                    "operator session store: an expired row could not be deleted; it is \
+                     withheld from this restore and will be re-judged at the next boot"
+                );
+            }
+        }
+        Ok(live)
     }
 }
 
@@ -445,12 +577,19 @@ impl OperatorSessionStore for SqliteOperatorSessionStore {
 mod tests {
     use super::*;
 
+    /// A live record joined at `joined_at_secs`.
+    ///
+    /// The join time stays a small literal — several tests below order by
+    /// it — while the access clock is set to now, because `list()` deletes
+    /// what the 24h horizon has expired and a record last accessed at second 100 of
+    /// 1970 is expired by any real clock.
     fn mk(sid: &str, joined_at_secs: u64) -> OperatorSessionRecord {
         OperatorSessionRecord {
             sid: SessionId::parse(sid).unwrap(),
             token_digest: OperatorSessionRecord::digest_of(&format!("bearer-{sid}")),
             capability_manifest: None,
             joined_at_secs,
+            last_access_secs: super::super::expiry_now(),
             desc: None,
             observed: Vec::new(),
             observed_total: 0,

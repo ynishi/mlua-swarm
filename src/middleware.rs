@@ -67,7 +67,7 @@ use crate::core::state::{DispatchOutcome, Event, TaskSpec};
 use crate::types::{CapToken, StepId};
 use crate::worker::adapter::{SpawnError, SpawnerAdapter};
 use crate::worker::output::{ContentRef, OutputEvent};
-use crate::worker::{wrap_join, MiddlewareWorker, Worker, WorkerJoinHandler};
+use crate::worker::{wrap_join, Worker};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
@@ -165,7 +165,7 @@ impl SpawnerStack {
 //
 // - **hint layer**: wrapped **only when the Blueprint declares the key** in
 //   `spawner_hints.layers`. Examples: MainAIMiddleware /
-//   SeniorEscalationMiddleware / OperatorDelegateMiddleware. The Blueprint
+//   SeniorEscalationMiddleware. The Blueprint
 //   only declares a capability key (e.g. `"main_ai"`) without knowing the
 //   implementation; the engine-side LayerRegistry resolves key → factory,
 //   keeping the pure Flow layer separate from implementation details.
@@ -470,210 +470,59 @@ impl SpawnerAdapter for SeniorWrapped {
     }
 }
 
-// ─── OperatorDelegateMiddleware (delegates the whole spawn to an external Operator when one is attached) ──
-
-/// When `ctx.operator.operator.is_some()` (the session has an Operator
-/// backend), **bypass** `inner.spawn`, call `operator.execute(ctx, prompt)`,
-/// and box the result up as a `WorkerHandle`. In other words: the path that
-/// hands "this spawn" to whatever external Operator backend the engine has
-/// registered.
-///
-/// # Independent of `OperatorKind` (Operator is a generic abstraction)
-///
-/// An earlier implementation gated on `kind == MainAi | Composite`, which
-/// tied the `Operator` abstraction to an "AI driver" assumption — a design
-/// weakness. The `Operator` trait is a generic **external processing backend**
-/// (LLM, human, external resource, side-effectful operation — anything), and
-/// is orthogonal to the kind axis.
-///
-/// The current implementation decides solely on `operator.is_some()`:
-/// - Automate session + operator backend registered → delegate
-///   (pure external-execution delegation).
-/// - MainAi session + operator backend registered → delegate.
-/// - Any kind + `operator` `None` → pass through (normal `inner.spawn`).
-///
-/// `kind` still matters as a firing condition for `SpawnHook`s over in
-/// `MainAIMiddleware`, but this middleware ignores it.
-///
-/// # Split of responsibilities with `OperatorSpawner`
-///
-/// The two axes exist for different reasons:
-///
-/// - **This middleware — the Blueprint-global (session) axis.** Delegate every
-///   agent to the same Operator backend. The `operator_backend_id` is set
-///   at session-attach time; `ctx.agent` is ignored and every spawn in that
-///   session is routed through the operator (e.g. a MainAI-wide driver, or a
-///   human-wide console). The Blueprint doesn't have to talk about `kind` —
-///   it just declares the capability hint `"operator_delegate"` (keeping the
-///   Blueprint clean).
-///
-/// - **`OperatorSpawner` — the AgentSpec axis.** Each `AgentDef` bakes its
-///   own Operator backend. `kind = Operator` `AgentDef`s pick a backend via
-///   `spec.operator_ref`; the compiler bakes an `Arc<dyn Operator>` into
-///   `routes[agent_name]`. Agents loaded via the `agent.md` loader come in
-///   through this path (their default is `kind = Operator`).
-///
-/// # Exclusivity
-///
-/// When both are effective — this middleware's hint is declared, the session
-/// has an operator backend, **and** the Blueprint has a `kind = Operator`
-/// `AgentDef` — this middleware sits at the outer end of the stack and
-/// **completely bypasses** `inner.spawn`. The `OperatorSpawner` is never
-/// reached, so a double fire cannot occur by construction; the AgentSpec
-/// axis is inert. Consistent use means picking one axis per use case.
-pub struct OperatorDelegateMiddleware;
-
-impl OperatorDelegateMiddleware {
-    /// Stateless constructor.
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for OperatorDelegateMiddleware {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SpawnerLayer for OperatorDelegateMiddleware {
-    fn wrap(&self, inner: Arc<dyn SpawnerAdapter>) -> Arc<dyn SpawnerAdapter> {
-        Arc::new(OperatorDelegateWrapped { inner })
-    }
-}
-
-struct OperatorDelegateWrapped {
-    inner: Arc<dyn SpawnerAdapter>,
-}
-
-#[async_trait]
-impl SpawnerAdapter for OperatorDelegateWrapped {
-    async fn spawn(
-        &self,
-        engine: &Engine,
-        ctx: &Ctx,
-        task_id: StepId,
-        attempt: u32,
-        token: CapToken,
-    ) -> Result<Box<dyn Worker>, SpawnError> {
-        // Kind-independent: we decide purely on whether an operator backend is
-        // registered on the session. `kind` matters for SpawnHook-style layers
-        // (MainAIMiddleware); this middleware does not consult it.
-        let Some(operator) = ctx.operator.operator.clone() else {
-            return self.inner.spawn(engine, ctx, task_id, attempt, token).await;
-        };
-
-        // Delegate: same shape as OperatorSpawner — fetch_prompt + operator.execute + Final emit.
-        let prompt = engine
-            .fetch_prompt(&token, &task_id)
-            .await
-            .map_err(|e| SpawnError::Internal(format!("fetch_prompt: {e}")))?;
-
-        // Resolve the Blueprint-baked worker binding injected into
-        // `ctx.meta.runtime` by `WorkerBindingMiddleware` (launch-time layer,
-        // built from `AgentDef.profile.worker_binding`). Absent key = agent
-        // declared no binding → hand `None` and let binding-requiring
-        // backends fail loud (`requires_worker_binding`). A present-but-
-        // malformed value is a wiring bug, not a degrade case — fail here.
-        let worker: Option<crate::operator::WorkerBinding> = match ctx
-            .meta
-            .runtime
-            .get(crate::middleware::worker_binding::WORKER_BINDING_KEY)
-        {
-            Some(v) => Some(serde_json::from_value(v.clone()).map_err(|e| {
-                SpawnError::Internal(format!(
-                    "ctx.meta.runtime['{}'] for agent '{}' is malformed: {e}",
-                    crate::middleware::worker_binding::WORKER_BINDING_KEY,
-                    ctx.agent
-                ))
-            })?),
-            None => None,
-        };
-
-        let engine_clone = engine.clone();
-        let token_clone = token.clone();
-        let token_for_op = token.clone();
-        let task_id_clone = task_id.clone();
-        let ctx_clone = ctx.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_inner = cancel.clone();
-        let worker_id = crate::types::WorkerId::new();
-        // issue #11: WorkerId was minted but never observable anywhere;
-        // surface it in the trace log, tied to the step it serves.
-        tracing::debug!(worker_id = %worker_id, step_id = %task_id, "worker spawned (delegate axis)");
-
-        tokio::spawn(async move {
-            let result: Result<
-                crate::worker::adapter::WorkerResult,
-                crate::worker::adapter::WorkerError,
-            > = tokio::select! {
-                // OperatorDelegateMiddleware = session-global Operator delegation.
-                // Baking per-AgentDef profile.system_prompt is OperatorSpawner's
-                // job; this path has no per-agent spawner, so system stays None.
-                // The worker binding, however, IS resolved on this axis now:
-                // `WorkerBindingMiddleware` (launch-time layer) injects the
-                // Blueprint-baked binding into ctx.meta.runtime and we forward
-                // it here — the delegate axis is a first-class variant-dispatch
-                // path, not a binding-less fallback (issue 45db42a7).
-                // We hand the capability token (Role::Worker, TTL from
-                // `EngineCfg::worker_token_ttl_secs` — default 1800s —
-                // minted by `Engine::dispatch_attempt_with`) to the
-                // operator as `worker_token` — thin-spawn operators (e.g. a
-                // WebSocket-backed operator session) forward it to the SubAgent
-                // via encode(), while Operator impls that call the LLM directly
-                // may ignore it.
-                r = operator.execute(&ctx_clone, None, prompt, worker, token_for_op) => r,
-                _ = cancel_inner.cancelled() => Err(crate::worker::adapter::WorkerError::Cancelled),
-            };
-            let result = result.map(|wr| wr.ensure_worker_kind("operator"));
-            if let Ok(wr) = &result {
-                // Stats sidecar (operator axis): the WS ack may carry the
-                // Operator's proxy report of the SubAgent's usage — forward
-                // it to the engine so the dispatcher's outcome fold lands it
-                // on the terminal StepEntry (same funnel as the InProc /
-                // subprocess fold sites). Even without an ack-attached
-                // stats blob, `ensure_worker_kind` above guarantees a
-                // `worker_kind: "operator"` label always rides.
-                if let Some(stats) = wr.stats.clone() {
-                    engine_clone
-                        .record_worker_stats(&task_id_clone, attempt, stats)
-                        .await;
-                }
-                // If the SubAgent has already pushed a Final through
-                // /v1/worker/result or /v1/worker/submit POST, skip a second
-                // emit here — the POST value is the canonical one (protocol
-                // design intent). Operator impls that never POST (e.g. tests
-                // and inline Operators) still get the fallback emit.
-                let tail = engine_clone.output_tail(&task_id_clone, attempt).await;
-                let has_final = tail
-                    .iter()
-                    .any(|ev| matches!(ev, crate::worker::output::OutputEvent::Final { .. }));
-                if !has_final {
-                    let ev = crate::worker::output::OutputEvent::Final {
-                        content: crate::worker::output::ContentRef::Inline {
-                            value: wr.value.clone(),
-                        },
-                        ok: wr.ok,
-                    };
-                    let _ = engine_clone
-                        .submit_output(&token_clone, &task_id_clone, attempt, ev)
-                        .await;
-                }
-            }
-            let signal: Result<(), crate::worker::adapter::WorkerError> = result.map(|_| ());
-            let _ = tx.send(signal);
-        });
-
-        Ok(Box::new(MiddlewareWorker {
-            handler: WorkerJoinHandler {
-                worker_id,
-                cancel,
-                completion: rx,
-            },
-        }))
-    }
-}
+// ─── (removed) OperatorDelegateMiddleware — the Blueprint-global Operator delegate axis ──
+//
+// `OperatorDelegateMiddleware` used to live here. A Blueprint opted in with
+// `spawner_hints.layers = ["operator_delegate"]`, and when the launching
+// session carried an Operator backend the layer bypassed `inner.spawn`
+// entirely and called `Operator::execute` itself. It is gone, and the hint
+// key is now a hard `CompileError::RemovedSpawnerHint`
+// (`src/blueprint/compiler.rs`) rather than a silently-skipped unknown key,
+// because a Blueprint that declares a layer nothing installs would otherwise
+// change behaviour without saying so — `service::linker::link` skips
+// unregistered hint keys by design, for Blueprint portability across
+// deployments.
+//
+// # Why it went, rather than being fixed in place
+//
+// Two defects, both structural to where the axis read its destination from:
+//
+// 1. **It could not follow a handover (model §4.3 A10 — "the destination is
+//    never baked").** The delegate axis resolved its `Arc<dyn Operator>` from
+//    `LaunchEnvelope.operator_backend_id`, a *launch-time* value, through
+//    `Engine::resolve_operator_info`. It re-read that value on every dispatch
+//    but never consulted `Run.current`, so re-assigning a Run's seat left
+//    delegate-axis spawns arriving at whoever the launch first named. The
+//    sibling AgentSpec axis stopped baking its destination in `ca2ad45`
+//    (`AssigneeRouter` reads the seat's current holder per dispatch); this
+//    axis never made that move, and issue `545411ab` tracked the gap.
+//
+// 2. **It could not carry a persona.** `OperatorSpawner` (the AgentSpec axis,
+//    `src/operator.rs`) renders `AgentDef.profile.system_prompt`, bakes it via
+//    `Engine::bake_worker_system_prompt` so a SubAgent can fetch it from
+//    `/v1/worker/prompt`, and passes it to `Operator::execute`. This axis had
+//    no per-agent spawner, so it passed a literal `None` for `system` and
+//    never baked — an `agent.md` persona was unreachable by *both* routes on
+//    a delegate-layer Blueprint.
+//
+// Fixing (1) in place was considered and rejected: it means handing
+// `Engine::resolve_operator_info` a way to reach the Run's seat, i.e. giving
+// this crate's dispatch path a `RunStore` dependency it does not have and
+// should not grow. Fixing (2) means giving the axis a per-agent spawner —
+// at which point it *is* `OperatorSpawner`, and the second path buys nothing.
+//
+// # Why nothing is left behind for it
+//
+// The reason authors declared the hint was to make an `operator_sid` pin
+// effective; without the declaration the pin was inert and routing fell back
+// to the shared role-alias registry. Neither half of that is true any more:
+// `operator_sid` drives the AgentSpec axis directly (it becomes the holder of
+// the Run's seat — see `TaskLaunchRequest::operator_sid` in
+// `mlua-swarm-server`), and the role-alias registry (`roles_to_sid`) went in
+// `5307adc` along with the by-role leave route, so there is no fallback left
+// to steer away from. The replacement is not a different hint; it is
+// declaring `operators[]` and pointing agents at a seat with
+// `spec.operator_ref`.
 
 // ─── LongHoldMiddleware (warns on the EventLog if completion time exceeds default_hold) ─
 
@@ -1045,200 +894,6 @@ impl SpawnerAdapter for AfterRunAuditWrapped {
             }
             Ok(())
         }))
-    }
-}
-
-// Boundary regression spec for the delegate-axis worker-binding handoff
-// (issue 45db42a7): OperatorDelegateMiddleware must forward the binding
-// injected into ctx.meta.runtime by WorkerBindingMiddleware — both the
-// hit path (Some(worker) reaches Operator::execute) and the absent path
-// (None reaches it), plus fail-loud on a malformed value.
-#[cfg(test)]
-mod operator_delegate_worker_binding_tests {
-    use super::*;
-    use crate::core::config::EngineCfg;
-    use crate::core::state::TaskSpec;
-    use crate::operator::WorkerBinding;
-    use crate::types::Role;
-    use crate::worker::adapter::{WorkerError, WorkerResult};
-    use std::sync::Mutex;
-
-    /// Operator stub recording the `worker` argument it was executed with.
-    struct RecordingOperator {
-        seen: Arc<Mutex<Option<Option<WorkerBinding>>>>,
-    }
-
-    #[async_trait]
-    impl crate::operator::Operator for RecordingOperator {
-        async fn execute(
-            &self,
-            _ctx: &Ctx,
-            _system: Option<String>,
-            _prompt: Value,
-            worker: Option<WorkerBinding>,
-            _worker_token: CapToken,
-        ) -> Result<WorkerResult, WorkerError> {
-            *self.seen.lock().unwrap() = Some(worker);
-            Ok(WorkerResult {
-                value: Value::Null,
-                ok: true,
-                stats: None,
-            })
-        }
-    }
-
-    /// Inner spawner that must never be reached when an operator is attached.
-    struct MustNotSpawn;
-
-    #[async_trait]
-    impl SpawnerAdapter for MustNotSpawn {
-        async fn spawn(
-            &self,
-            _engine: &Engine,
-            _ctx: &Ctx,
-            _task_id: StepId,
-            _attempt: u32,
-            _token: CapToken,
-        ) -> Result<Box<dyn Worker>, SpawnError> {
-            panic!("delegate axis must bypass inner.spawn when an operator is attached");
-        }
-    }
-
-    async fn seeded_engine() -> (Engine, CapToken, StepId) {
-        let engine = Engine::new(EngineCfg::default());
-        let op_token = engine
-            .attach("ut-op", Role::Operator, Duration::from_secs(30))
-            .await
-            .expect("attach");
-        let task_id = engine
-            .start_task(
-                &op_token,
-                TaskSpec {
-                    agent: "planner".to_string(),
-                    initial_directive: "do the thing".into(),
-                    step_ctx: None,
-                    check_policy: None,
-                },
-            )
-            .await
-            .expect("start_task");
-        // Mint + register a worker token the same way
-        // `dispatch_attempt_with` does — the spawner path runs with a
-        // `Role::Worker` token (FetchPrompt is worker-verb-gated).
-        let worker_token = engine.signer().session(
-            format!("worker-of-{task_id}"),
-            Role::Worker,
-            vec!["*".into()],
-            Duration::from_secs(600),
-        );
-        let fp = worker_token.fingerprint();
-        let record = crate::core::state::CapTokenRecord::from_worker_token(
-            worker_token.clone(),
-            task_id.clone(),
-        );
-        engine
-            .with_state("test.mint_worker", move |s| {
-                s.tokens.insert(fp, record);
-            })
-            .await
-            .expect("mint worker token");
-        (engine, worker_token, task_id)
-    }
-
-    fn delegate_stack() -> Arc<dyn SpawnerAdapter> {
-        OperatorDelegateMiddleware::new().wrap(Arc::new(MustNotSpawn))
-    }
-
-    async fn recorded_worker(
-        seen: &Arc<Mutex<Option<Option<WorkerBinding>>>>,
-    ) -> Option<WorkerBinding> {
-        for _ in 0..100 {
-            if let Some(w) = seen.lock().unwrap().clone() {
-                return w;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("operator.execute was never called within 1s");
-    }
-
-    #[tokio::test]
-    async fn forwards_ctx_injected_binding_to_operator_execute() {
-        let (engine, token, task_id) = seeded_engine().await;
-        let seen = Arc::new(Mutex::new(None));
-        let op = Arc::new(RecordingOperator { seen: seen.clone() });
-
-        let mut ctx = Ctx::new(task_id.clone(), 1, "planner");
-        ctx.operator.operator = Some(op);
-        ctx.meta.runtime.insert(
-            crate::middleware::worker_binding::WORKER_BINDING_KEY.to_string(),
-            serde_json::to_value(WorkerBinding {
-                variant: "code-worker".to_string(),
-                tools: vec!["Edit".to_string()],
-                request_digest: None,
-                requested_model: None,
-            })
-            .unwrap(),
-        );
-
-        let _worker = delegate_stack()
-            .spawn(&engine, &ctx, task_id, 1, token)
-            .await
-            .expect("delegate spawn ok");
-
-        let got = recorded_worker(&seen).await.expect("binding forwarded");
-        assert_eq!(got.variant, "code-worker");
-        assert_eq!(got.tools, vec!["Edit".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn absent_binding_stays_none_no_silent_default() {
-        let (engine, token, task_id) = seeded_engine().await;
-        let seen = Arc::new(Mutex::new(None));
-        let op = Arc::new(RecordingOperator { seen: seen.clone() });
-
-        let mut ctx = Ctx::new(task_id.clone(), 1, "planner");
-        ctx.operator.operator = Some(op);
-
-        let _worker = delegate_stack()
-            .spawn(&engine, &ctx, task_id, 1, token)
-            .await
-            .expect("delegate spawn ok");
-
-        assert!(
-            recorded_worker(&seen).await.is_none(),
-            "no binding declared must reach the operator as None (fail-loud stays downstream)"
-        );
-    }
-
-    #[tokio::test]
-    async fn malformed_binding_fails_loud_before_execute() {
-        let (engine, token, task_id) = seeded_engine().await;
-        let seen = Arc::new(Mutex::new(None));
-        let op = Arc::new(RecordingOperator { seen: seen.clone() });
-
-        let mut ctx = Ctx::new(task_id.clone(), 1, "planner");
-        ctx.operator.operator = Some(op);
-        ctx.meta.runtime.insert(
-            crate::middleware::worker_binding::WORKER_BINDING_KEY.to_string(),
-            serde_json::json!({ "not_a_binding": true }),
-        );
-
-        let err = match delegate_stack()
-            .spawn(&engine, &ctx, task_id, 1, token)
-            .await
-        {
-            Ok(_) => panic!("malformed binding must fail the spawn"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("worker_binding") && msg.contains("malformed"),
-            "error must name the malformed key: {msg}"
-        );
-        assert!(
-            seen.lock().unwrap().is_none(),
-            "operator.execute must not run on malformed binding"
-        );
     }
 }
 

@@ -1089,13 +1089,13 @@ pub struct RunKickResponse {
 /// body with both fields absent, preserves the pre-#19 rekick behavior
 /// byte-for-byte (`must_not_simplify #3`).
 ///
-/// Issue #35 ST3 ports the GH #33 sync-hang guards from `run_flow_form` to
-/// this handler, both checked before any Task/Run store write: Guard 1
-/// (503) fails fast when the resolved Blueprint declares the
-/// `operator_delegate` spawner-hint layer and no operator is attached;
-/// Guard 2 (504) wraps the dispatch await in `RunKickRequest.timeout_secs`
-/// (falling back to the server-wide `sync_timeout_secs`), marking the
-/// Run/Task `Failed` rather than leaving them `Running` forever on expiry.
+/// Issue #35 ST3 ported the GH #33 sync-hang guards from `run_flow_form`
+/// to this handler. Guard 2 (504) is what remains: it wraps the dispatch
+/// await in `RunKickRequest.timeout_secs` (falling back to the
+/// server-wide `sync_timeout_secs`), marking the Run/Task `Failed` rather
+/// than leaving them `Running` forever on expiry. Guard 1 — a
+/// Blueprint-derived readiness precheck — was withdrawn from this route;
+/// the paragraph where it used to stand says why.
 pub async fn task_rekick(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1199,34 +1199,80 @@ pub async fn task_rekick(
         (_, None) => state.sync_timeout_secs,
     };
 
-    // GH #33 Guard 1 (issue #35 — adapted signal): the
-    // per-request `operator_sid` above already fail-fasts an *unknown*
-    // sid, but a rekick with no `operator_sid` still has no per-request
-    // "operator backend referenced" signal of its own (unlike
-    // `run_flow_form`, whose `op_req.operator_backend_id` is sourced from
-    // `TaskLaunchRequest.operator`). The adapted signal is the Blueprint's
-    // own `spawner_hints.layers`: when the resolved Blueprint declares the
-    // `operator_delegate` layer and zero operators are attached at all,
-    // fail fast rather than dispatching into a session nothing can serve.
-    // Same ordering invariant `run_flow_form` observes: this check runs
-    // before any Task/Run row is touched (no side effects on the 503
-    // path).
-    if resolved_bp
-        .spawner_hints
-        .layers
-        .iter()
-        .any(|l| l == "operator_delegate")
-    {
-        let attached = state.engine.list_operator_ids().await;
-        if attached.is_empty() {
-            return Err(ApiError::unavailable(format!(
-                "no operator attached to serve this rekick (task {task_id}'s \
-                 Blueprint declares the operator_delegate layer): attach an \
-                 operator via POST /v1/operators + WS, or use the poll-style \
-                 flow (GET /v1/worker/prompt + POST /v1/worker/submit)"
-            )));
-        }
-    }
+    // GH #33 Guard 1 stood here, and is deliberately gone.
+    //
+    // What it did: refuse the rekick `503` when the resolved Blueprint
+    // declared a `kind = Operator` agent while `Engine::list_operator_ids`
+    // was empty. GH #33 (`6c923f6`) introduced Guard 1 on the launch route
+    // under a stated condition — "launches not cheaply identifiable as
+    // operator-delegate are never rejected here" — and issue #35 ST3
+    // (`8060a9e`) ported it here against `spawner_hints.layers`, the
+    // Blueprint-global opt-in the delegate axis was driven by. Removing
+    // that axis (`ca2ad45`) left the ported guard testing a condition
+    // nothing reaching this handler could satisfy, and re-pointing it at
+    // `AgentDef.kind` bought the fast failure back at the price of the
+    // condition GH #33 set: the agent kind is not a cheap positive
+    // identification of "an Operator has to serve this rekick", in either
+    // direction.
+    //
+    // Over-fire, against wiring the guard could not see:
+    // `Engine::list_operator_ids` reports the engine's own operator
+    // registry, which is not the map a dispatch through a `kind = Operator`
+    // agent resolves its seat from. That map is the compiler's — either an
+    // installed `OperatorSlotResolver` (what `mse serve` wires) or
+    // `OperatorSpawnerFactory`'s own `id -> Arc<dyn Operator>` table, "the
+    // direct binding used by hosts with no Run store to resolve holders
+    // against: `mse bp doctor`'s lint stubs, in-process embeddings, tests"
+    // (that factory's struct doc). An in-process embedding registers its
+    // backends on the factory and has no reason to call
+    // `Engine::register_operator` as well — and every rekick of an
+    // Operator-declaring Blueprint on such a host was refused permanently,
+    // naming a remedy ("attach an operator via POST /v1/operators + WS")
+    // that does not apply to its wiring.
+    //
+    // Over-fire, against reachability: the condition read *declared*
+    // agents, not *reachable* steps. A Blueprint with an Operator agent on
+    // a conditional lane — the shape `B.pipeline` + `skip_on` produces, and
+    // what `mse bp new`'s scaffolds emit — was refused even when this
+    // kick's path only touches `RustFn` steps. That is the same objection
+    // the guard itself raised against keying off `Blueprint.operators[]`
+    // ("a Blueprint may declare a seat that no agent in this flow
+    // dispatches through"), one step weaker.
+    //
+    // Under-fire: any non-empty engine registry satisfied it, including an
+    // entry unrelated to the seat this dispatch resolves. The check could
+    // pass with the seat vacant and fail with the seat served — the two
+    // halves were never commensurable.
+    //
+    // What covers the hazard instead, each closer to the fact than a
+    // precheck can get:
+    //   1. `mse serve` wiring — a dispatch to a seat with no holder fails
+    //      immediately rather than slowly: `AssigneeRouter::execute`
+    //      returns `vacant_failure(.., NEVER_SEATED)` the moment
+    //      `record.current` has no entry for the slot
+    //      (`operator_ws/router.rs`). "Nothing is attached" is answered
+    //      where the seat is actually read.
+    //   2. Factory-map wiring — a seat with no backend fails the *compile*
+    //      (`OperatorSpawnerFactory::resolve_operator` ->
+    //      `CompileError::InvalidSpec`), upstream of any await.
+    //   3. Guard 2 below bounds whatever is left, which is the case Guard 1
+    //      never covered: an operator that is attached and does not answer.
+    // The failure Guard 1 bought was faster than (1) and (2) only in the
+    // sense that it did not have to be right first.
+    //
+    // Rejected — scoping the condition rather than dropping it (resolve the
+    // seat here, then ask whether it has a holder or a backend): this
+    // handler holds a resolved `Blueprint`, not a `CompiledBlueprint`, and
+    // a seat's holder is per-Run state this kick's Run does not have yet
+    // (the pin below is what seats it). Asking here means duplicating
+    // `AssigneeRouter`'s lookup against a Run that does not exist, or
+    // compiling twice to throw one away — trading a real refusal for a
+    // speculative one.
+    //
+    // Untouched: `run_flow_form`'s own Guard 1 (`lib.rs`). It reads the
+    // *request* — a launch that names an operator — which is the cheap
+    // positive identification GH #33 asked for, and it says nothing about
+    // Blueprints.
 
     let merged_init_ctx = merge_init_ctx_3layer(
         resolved_bp.default_init_ctx.as_ref(),
@@ -3133,8 +3179,20 @@ mod tests {
     /// tests can call handler functions directly (this crate's established
     /// unit-test convention; see e.g. `operator_ws::login`'s tests).
     fn test_state() -> AppState {
+        test_state_with_registry(crate::default_registry())
+    }
+
+    /// [`test_state`] against a caller-supplied `SpawnerRegistry` — the
+    /// seam the AgentSpec-axis Operator fixtures need.
+    ///
+    /// `crate::default_registry()` registers an `OperatorSpawnerFactory`
+    /// with no backends and hands no handle back, so a test that wants a
+    /// `kind = Operator` agent to resolve to something has to build the
+    /// factory itself and register it in. See
+    /// [`test_state_serving_seat`].
+    fn test_state_with_registry(registry: mlua_swarm::SpawnerRegistry) -> AppState {
         let engine = Engine::new_with_layers(EngineCfg::default(), crate::default_layer_registry());
-        let compiler = mlua_swarm::Compiler::new(crate::default_registry());
+        let compiler = mlua_swarm::Compiler::new(registry);
         let launch = Arc::new(mlua_swarm::TaskLaunchService::new(engine.clone(), compiler));
         AppState {
             engine,
@@ -3291,20 +3349,94 @@ mod tests {
     // GH #33 — sync-hang guards (readiness precheck / timeout ceiling)
     // ──────────────────────────────────────────────────────────────────
 
-    /// Same 1-step identity flow as [`identity_blueprint`], but opts into
-    /// the Blueprint-global Operator delegate axis
-    /// (`spawner_hints.layers = ["operator_delegate"]`) so a registered
-    /// `Operator` backend can be exercised end-to-end through the real
-    /// `tasks_start` dispatch path (`OperatorDelegateMiddleware` bypasses
-    /// `inner.spawn` and calls `operator.execute` instead — see
-    /// `mlua_swarm::middleware::OperatorDelegateMiddleware` doc).
-    fn identity_blueprint_with_operator_delegate() -> Blueprint {
+    /// The agent name the Operator-axis fixtures dispatch through.
+    const OP_AGENT: &str = "op-agent";
+
+    /// A 1-step flow whose only step dispatches a `kind = Operator` agent
+    /// bound to the Blueprint-declared seat `seat` — the shape that
+    /// reaches an `Operator` backend now that the Blueprint-global
+    /// delegate axis is gone (`ca2ad45`).
+    ///
+    /// Both halves are load-bearing and the compiler checks each: the
+    /// agent's `spec.operator_ref` must name an entry of
+    /// `Blueprint.operators[]` (`CompileError::OperatorRefNotDeclared`),
+    /// and the seat must resolve to a backend — through the host's
+    /// [`OperatorSlotResolver`] when one is installed, else through the
+    /// `OperatorSpawnerFactory`'s own map (see
+    /// [`test_state_serving_seat`], which is the second case).
+    fn operator_agent_blueprint(seat: &str) -> Blueprint {
         Blueprint {
-            spawner_hints: mlua_swarm::SpawnerHints {
-                layers: vec!["operator_delegate".to_string()],
-            },
+            flow: serde_json::from_value(serde_json::json!({
+                "kind": "step",
+                "ref": OP_AGENT,
+                "in": {"op": "lit", "value": "hello"},
+                "out": {"op": "path", "at": "$.out"},
+            }))
+            .expect("flow parse"),
+            agents: vec![AgentDef {
+                name: OP_AGENT.into(),
+                kind: AgentKind::Operator,
+                spec: serde_json::json!({"operator_ref": seat}),
+                profile: None,
+                meta: None,
+                runner: None,
+                runner_ref: None,
+                verdict: None,
+                lints: None,
+            }],
+            operators: vec![operator_def(seat)],
             ..identity_blueprint()
         }
+    }
+
+    /// A launch of [`operator_agent_blueprint`] that names no Operator
+    /// session of its own — so `run_flow_form`'s Guard 1 (which reads the
+    /// request, not the Blueprint) stays silent and the launch reaches
+    /// dispatch. `timeout_secs` is this launch's Guard 2 ceiling.
+    fn operator_agent_launch_req(
+        seat: &str,
+        goal: &str,
+        timeout_secs: Option<u64>,
+    ) -> crate::TaskLaunchRequest {
+        crate::TaskLaunchRequest {
+            blueprint: BlueprintRef::Inline {
+                value: Box::new(operator_agent_blueprint(seat)),
+            },
+            timeout_secs,
+            ..post_tasks_req(goal)
+        }
+    }
+
+    /// [`test_state`] whose compiler can resolve the Operator seat `seat`
+    /// to `op`.
+    ///
+    /// This is the no-resolver half of `OperatorSpawnerFactory`'s two
+    /// answering paths (see its struct doc): with no
+    /// [`OperatorSlotResolver`] installed, `spec.operator_ref` is answered
+    /// out of the factory's own `id → Arc<dyn Operator>` map, and what
+    /// lands in `routes[<agent>]` is that backend directly. `mse serve`
+    /// installs a resolver instead and resolves the seat's holder off
+    /// `Run.current` per dispatch; a handler-level test has no live
+    /// session to hold a seat, so it takes the direct binding — which is
+    /// exactly what the factory doc names tests as a user of.
+    ///
+    /// `register::<OperatorSpawnerFactory>` overwrites the empty factory
+    /// `crate::default_registry()` put under the same `AgentKind` key
+    /// (`SpawnerRegistry::register` is a `HashMap::insert` on
+    /// `F::KIND`), so the rest of the default registry is preserved.
+    ///
+    /// Note what this does *not* do: attach an operator. The engine's own
+    /// registry (`Engine::register_operator`, what
+    /// `Engine::list_operator_ids` reports and both Guard 1s read) is a
+    /// separate map — in production `register_operator_session` writes the
+    /// one session Arc into both. A caller that needs the launch to look
+    /// *attached* registers there too.
+    fn test_state_serving_seat(seat: &str, op: Arc<dyn mlua_swarm::Operator>) -> AppState {
+        let factory = Arc::new(mlua_swarm::OperatorSpawnerFactory::new());
+        factory.register_operator(seat, op);
+        let mut registry = crate::default_registry();
+        registry.register::<mlua_swarm::OperatorSpawnerFactory>(factory);
+        test_state_with_registry(registry)
     }
 
     /// `Operator` stub whose `execute` never resolves — the GH #33 Guard 2
@@ -3326,45 +3458,67 @@ mod tests {
         }
     }
 
-    /// A launch request that references an operator backend by id (via
-    /// `operator.operator_backend_id`, the coarse Guard 1 signal) against
-    /// [`identity_blueprint_with_operator_delegate`].
-    fn operator_launch_req(
-        backend_id: &str,
-        timeout_secs: Option<u64>,
-    ) -> crate::TaskLaunchRequest {
-        crate::TaskLaunchRequest {
-            blueprint: BlueprintRef::Inline {
-                value: Box::new(identity_blueprint_with_operator_delegate()),
-            },
-            init_ctx: serde_json::json!({"in": "hello"}),
-            project_root: None,
-            work_dir: None,
-            task_metadata: None,
-            ttl_secs: None,
-            operator: Some(crate::OperatorReq {
-                operator_backend_id: Some(backend_id.to_string()),
-                ..Default::default()
-            }),
-            operator_sid: None,
-            operator_desc: None,
-            operator_slot: None,
-            timeout_secs,
-            goal: Some("operator delegate test goal".to_string()),
-            detach: false,
-            check_policy: None,
+    /// `Operator` stub that answers every dispatch at once — the fixture
+    /// for the case that has to *succeed*: an Operator-declaring Blueprint
+    /// whose seat is served by the compiler's factory while the engine's
+    /// own operator registry is empty (see
+    /// [`rekick_zero_attached_operators_completes_on_factory_wiring`]).
+    ///
+    /// `StallingOperator` cannot stand in for it: a rekick that reaches a
+    /// stalled backend and one that is refused before dispatch are both
+    /// non-`2xx`, so only a backend that answers can tell "the rekick got
+    /// through" apart from "the rekick was rejected".
+    struct EchoOperator;
+
+    #[async_trait::async_trait]
+    impl mlua_swarm::Operator for EchoOperator {
+        async fn execute(
+            &self,
+            _ctx: &mlua_swarm::Ctx,
+            _system: Option<String>,
+            prompt: Value,
+            _worker: Option<mlua_swarm::WorkerBinding>,
+            _worker_token: mlua_swarm::CapToken,
+        ) -> Result<mlua_swarm::WorkerResult, mlua_swarm::WorkerError> {
+            Ok(mlua_swarm::WorkerResult {
+                value: serde_json::json!({ "out": prompt }),
+                ok: true,
+                stats: None,
+            })
         }
     }
 
-    /// Guard 1: an operator-requiring launch with zero attached operators
-    /// must fail immediately with a structured `503`, not hang waiting on
-    /// a session nothing can serve.
+    /// Guard 1: a launch that names an operator backend
+    /// (`operator.operator_backend_id`, the coarse signal `run_flow_form`
+    /// reads off the request) while zero operators are attached must fail
+    /// immediately with a structured `503`, not dispatch into a session
+    /// nothing can serve.
+    ///
+    /// The Blueprint here is the real Operator-axis one and the seat it
+    /// declares *does* resolve, so nothing but Guard 1 can produce the
+    /// `503` — a compile that never happens cannot be what fails this
+    /// launch. That mattered: until the delegate axis was removed
+    /// (`ca2ad45`) this fixture launched a Blueprint carrying
+    /// `spawner_hints.layers = ["operator_delegate"]`, which today does
+    /// not compile at all, so a Guard 1 moved to *after* the compile would
+    /// have left the test green on a `400` it never asserted against.
+    ///
+    /// `timeout_secs: Some(1)` is a shape assertion rather than a
+    /// tolerance: with Guard 2's ceiling one second away, a regression
+    /// that lets this launch reach dispatch surfaces as a `504` a second
+    /// later instead of hanging on the 300s server default.
     #[tokio::test]
     async fn sync_launch_zero_operators_fails_fast() {
-        let state = test_state();
+        let state = test_state_serving_seat(SLOT_A, Arc::new(StallingOperator));
         // No `state.engine.register_operator(...)` call — zero operators
-        // attached, matching `list_operator_ids()` being empty.
-        let req = operator_launch_req("nonexistent-op", None);
+        // attached, matching `list_operator_ids()` being empty. (The seat
+        // above is served by the *compiler's* factory, which is a
+        // different map — see `test_state_serving_seat`.)
+        let mut req = operator_agent_launch_req(SLOT_A, "zero-operator launch goal", Some(1));
+        req.operator = Some(crate::OperatorReq {
+            operator_backend_id: Some("nonexistent-op".to_string()),
+            ..Default::default()
+        });
 
         let started = std::time::Instant::now();
         let result = crate::tasks_start(State(state), Json(req)).await;
@@ -3372,7 +3526,7 @@ mod tests {
 
         let err = match result {
             Err(e) => e,
-            Ok(_) => panic!("zero attached operators must fail the operator-delegate launch"),
+            Ok(_) => panic!("zero attached operators must fail an operator-naming launch"),
         };
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
@@ -3386,17 +3540,25 @@ mod tests {
         );
     }
 
-    /// Guard 2: a launch that resolves to a registered-but-stalled
-    /// operator session must return a structured `504` within the
-    /// requested `timeout_secs` ceiling, not hang the request forever.
+    /// Guard 2: a launch that dispatches to a registered-but-stalled
+    /// operator must return a structured `504` within the requested
+    /// `timeout_secs` ceiling, not hang the request forever.
+    ///
+    /// The route to a stalling operator is the AgentSpec axis: the flow's
+    /// only step names a `kind = Operator` agent, whose declared seat the
+    /// compiler resolves to [`StallingOperator`], so
+    /// `OperatorSpawner::spawn` awaits an `execute` that never returns.
+    /// This is the same fixture with the same assertions as before the
+    /// Blueprint-global delegate axis was removed (`ca2ad45`) — only the
+    /// way the dispatch arrives at the stalling backend changed.
+    ///
+    /// The launch names no session of its own, on purpose: Guard 1 reads
+    /// the request, so leaving it unnamed keeps this test's `504` about
+    /// Guard 2 alone.
     #[tokio::test]
     async fn sync_launch_stalled_times_out() {
-        let state = test_state();
-        state
-            .engine
-            .register_operator("stall-op", Arc::new(StallingOperator))
-            .await;
-        let req = operator_launch_req("stall-op", Some(1));
+        let state = test_state_serving_seat(SLOT_A, Arc::new(StallingOperator));
+        let req = operator_agent_launch_req(SLOT_A, "stalled launch goal", Some(1));
 
         let started = std::time::Instant::now();
         // Outer safety-net timeout: if guard 2 itself regressed into an
@@ -4169,93 +4331,99 @@ mod tests {
     // GH #33 → task_rekick — sync-hang guards (issue #35 ST3 parity)
     // ──────────────────────────────────────────────────────────────────
 
-    /// A launch request for [`identity_blueprint_with_operator_delegate`]
-    /// that does **not** reference an operator backend (`operator: None`)
-    /// — used to create a rekick-able Task without tripping
-    /// `run_flow_form`'s own Guard 1 at initial-launch time (the launch
-    /// itself dispatches through the plain baseline path since
-    /// `ctx.operator.operator` stays unset either way; the BP's
-    /// `operator_delegate` layer only matters to `task_rekick`'s Guard 1,
-    /// which reads `resolved_bp.spawner_hints.layers` directly rather than
-    /// a per-request field).
-    fn delegate_launch_req(goal: &str) -> crate::TaskLaunchRequest {
-        crate::TaskLaunchRequest {
-            blueprint: BlueprintRef::Inline {
-                value: Box::new(identity_blueprint_with_operator_delegate()),
-            },
-            init_ctx: serde_json::json!({"in": "hello"}),
-            project_root: None,
-            work_dir: None,
-            task_metadata: None,
-            ttl_secs: None,
-            operator: None,
-            operator_sid: None,
-            operator_desc: None,
-            operator_slot: None,
-            timeout_secs: None,
-            goal: Some(goal.to_string()),
-            detach: false,
-            check_policy: None,
+    /// Mints a rekick-able Task from [`operator_agent_blueprint`] and
+    /// returns its id.
+    ///
+    /// The launch is detached because the Blueprint it stores is the point
+    /// of these tests: its one step dispatches a `kind = Operator` agent
+    /// bound to a [`StallingOperator`], so a *synchronous* launch would
+    /// sit on the server's 300s default ceiling before the rekick under
+    /// test ever ran. `detach: true` answers `202` as soon as the Run row
+    /// exists and leaves the stalled dispatch running in the background,
+    /// which is all these tests need from it — every assertion below is
+    /// about the rekick.
+    async fn task_with_operator_agent_blueprint(state: &AppState, goal: &str) -> TaskId {
+        let mut req = operator_agent_launch_req(SLOT_A, goal, None);
+        req.detach = true;
+        let reply = crate::tasks_start(State(state.clone()), Json(req))
+            .await
+            .expect("tasks_start (detached: mints the Task without awaiting the stalled step)");
+        assert_eq!(reply.1, StatusCode::ACCEPTED);
+        reply.0.task_id
+    }
+
+    /// Withdrawn Guard 1: a Task whose Blueprint declares a
+    /// `kind = Operator` agent must be rekickable on a host that serves
+    /// the seat through the compiler's `OperatorSpawnerFactory` and has
+    /// nothing registered on the *engine's* operator registry — the
+    /// in-process-embedding wiring that factory's struct doc names as
+    /// supported.
+    ///
+    /// This is the shape Guard 1 refused. It gated on
+    /// `Engine::list_operator_ids().is_empty()` while the dispatch
+    /// resolved its seat from the factory's own map (see
+    /// [`test_state_serving_seat`] for why those are two maps), so every
+    /// rekick on this wiring answered `503` with a remedy — attach over
+    /// `POST /v1/operators` + WS — that this host has no route for. The
+    /// handler paragraph where the guard stood carries the full argument.
+    ///
+    /// The assertion is a completed rekick rather than "not a `503`",
+    /// because the weaker form passes on a rekick that got through and
+    /// then failed for some other reason. [`EchoOperator`] answers, so the
+    /// `201` here means the dispatch reached the seat and came back with a
+    /// Run this handler could finalize.
+    #[tokio::test]
+    async fn rekick_zero_attached_operators_completes_on_factory_wiring() {
+        let state = test_state_serving_seat(SLOT_A, Arc::new(EchoOperator));
+        let task_id = task_with_operator_agent_blueprint(&state, "factory-wired rekick goal").await;
+        // No `state.engine.register_operator(...)` call — zero operators
+        // attached, matching `list_operator_ids()` being empty. The seat is
+        // served by the compiler's factory, which is the whole point.
+        assert!(
+            state.engine.list_operator_ids().await.is_empty(),
+            "fixture invariant: the engine's own operator registry stays empty"
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            task_rekick(State(state), Path(task_id.to_string()), None),
+        )
+        .await
+        .expect("task_rekick must resolve: EchoOperator answers immediately");
+
+        match result {
+            Ok((status, _)) => assert_eq!(status, StatusCode::CREATED),
+            Err(e) => panic!(
+                "a rekick whose Operator seat is served by the compiler's factory must \
+                 dispatch and complete, even with the engine's operator registry empty \
+                 (status {}): {}",
+                e.status, e.message
+            ),
         }
     }
 
-    /// Guard 1 (adapted signal): a Task whose stored Blueprint declares
-    /// the `operator_delegate` layer, rekicked with zero attached
-    /// operators, must fail immediately with a structured `503` — not
-    /// dispatch and not hang waiting on a session nothing can serve.
-    #[tokio::test]
-    async fn rekick_zero_operators_with_operator_delegate_blueprint_fails_fast() {
-        let state = test_state();
-        let posted = crate::tasks_start(
-            State(state.clone()),
-            Json(delegate_launch_req("operator delegate rekick goal")),
-        )
-        .await
-        .expect("tasks_start (no operator referenced, dispatches through baseline)")
-        .0;
-        // No `state.engine.register_operator(...)` call — zero operators
-        // attached, matching `list_operator_ids()` being empty.
-
-        let started = std::time::Instant::now();
-        let result = task_rekick(State(state), Path(posted.task_id.to_string()), None).await;
-        let elapsed = started.elapsed();
-
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!(
-                "rekicking a Task whose Blueprint declares operator_delegate with zero \
-                 attached operators must fail, not dispatch"
-            ),
-        };
-        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            err.message.contains("no operator attached"),
-            "error message must mention the missing operator: {}",
-            err.message
-        );
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "guard 1 must fail fast (no dispatch, no timeout wait): took {elapsed:?}"
-        );
-    }
-
-    /// Guard 2: a rekick with a `timeout_secs` ceiling shorter than the
-    /// dispatch takes must return a structured `504` within the outer
-    /// safety-net timeout, not hang the request forever.
+    /// Guard 2: a rekick whose dispatch reaches a stalled operator must
+    /// return a structured `504` within the requested `timeout_secs`
+    /// ceiling, not hang the request forever.
+    ///
+    /// The route to the stalled operator is the AgentSpec axis — the
+    /// stored Blueprint's one step names a `kind = Operator` agent whose
+    /// seat the compiler resolves to [`StallingOperator`] — so the
+    /// dispatch this rekick awaits genuinely never returns, and the `504`
+    /// is Guard 2 firing rather than a fast path completing.
+    ///
+    /// One map is involved and one only: the compiler's factory, which is
+    /// what a `kind = Operator` agent's seat resolves through. This test
+    /// used to also `Engine::register_operator("stall-op", ..)`, purely so
+    /// the withdrawn Guard 1 — which read the engine's separate registry —
+    /// would let the rekick reach the ceiling under test. With the guard
+    /// gone that registration measured nothing, and its absence is now
+    /// part of the assertion: the `504` here is produced by a dispatch
+    /// that never consulted the engine's operator registry at all.
     #[tokio::test]
     async fn rekick_stalled_operator_times_out() {
-        let state = test_state();
-        state
-            .engine
-            .register_operator("stall-op", Arc::new(StallingOperator))
-            .await;
-        let posted = crate::tasks_start(
-            State(state.clone()),
-            Json(delegate_launch_req("stalled rekick goal")),
-        )
-        .await
-        .expect("tasks_start")
-        .0;
+        let state = test_state_serving_seat(SLOT_A, Arc::new(StallingOperator));
+        let task_id = task_with_operator_agent_blueprint(&state, "stalled rekick goal").await;
 
         let started = std::time::Instant::now();
         // Outer safety-net timeout: if guard 2 itself regressed into an
@@ -4265,7 +4433,7 @@ mod tests {
             Duration::from_secs(5),
             task_rekick(
                 State(state),
-                Path(posted.task_id.to_string()),
+                Path(task_id.to_string()),
                 Some(Json(RunKickRequest {
                     init_ctx_override: None,
                     task_input_override: None,
@@ -4281,38 +4449,22 @@ mod tests {
         .expect("task_rekick must resolve well within 5s when guard 2's ceiling is 1s");
         let elapsed = started.elapsed();
 
-        match &result {
-            Err(e) => {
-                assert_eq!(e.status, StatusCode::GATEWAY_TIMEOUT);
-                assert!(
-                    e.message.contains('1'),
-                    "error message must mention the configured 1s ceiling: {}",
-                    e.message
-                );
-                assert!(
-                    elapsed < Duration::from_secs(3),
-                    "guard 2 must fire close to the requested 1s ceiling: took {elapsed:?}"
-                );
-            }
+        let err = match result {
+            Err(e) => e,
             Ok(_) => {
-                // This rekick passes no `operator_sid`, so its
-                // `operator_backend_id` stays `None` and the
-                // registered-but-unattached `StallingOperator` is never
-                // actually engaged by the dispatch; the flow resolves
-                // through the plain baseline path instead. Guard 2's
-                // `tokio::time::timeout`
-                // wrap is exercised (and does not falsely fire) rather
-                // than tripped — assert the fast-success shape so a
-                // regression that makes rekick dispatch slow (or that
-                // makes Guard 2 falsely trip on a fast dispatch) is still
-                // caught by the elapsed-time assertion below.
-                assert!(
-                    elapsed < Duration::from_secs(1),
-                    "a rekick that never engages an Operator (task_rekick has no \
-                     per-request operator override) must resolve fast, not stall: took {elapsed:?}"
-                );
+                panic!("a rekick dispatching into a stalled operator must time out, not succeed")
             }
-        }
+        };
+        assert_eq!(err.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            err.message.contains('1'),
+            "error message must mention the configured 1s ceiling: {}",
+            err.message
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "guard 2 must fire close to the requested 1s ceiling: took {elapsed:?}"
+        );
     }
 
     /// Guard 2 ceiling resolution: `timeout_secs: Some(0)` is invalid —
@@ -4371,29 +4523,12 @@ mod tests {
         );
     }
 
-    /// Invariant: a plain (non-`operator_delegate`) Task rekick must
-    /// never be rejected by Guard 1 — the simplest existing passing
-    /// rekick fixture still succeeds unaffected.
-    #[tokio::test]
-    async fn rekick_non_operator_path_unaffected_by_guard_1() {
-        let state = test_state();
-        let posted = crate::tasks_start(
-            State(state.clone()),
-            Json(post_tasks_req("non-operator rekick goal")),
-        )
-        .await
-        .expect("tasks_start")
-        .0;
-
-        let result = task_rekick(State(state), Path(posted.task_id.to_string()), None).await;
-        if let Err(e) = &result {
-            panic!(
-                "a plain (non-operator_delegate) Task rekick must succeed unaffected by \
-                 guard 1: {}",
-                e.message
-            );
-        }
-    }
+    // `rekick_non_operator_path_unaffected_by_guard_1` lived here: it
+    // asserted that a Blueprint with no `kind = Operator` agent was never
+    // caught by Guard 1. With the guard withdrawn there is no longer a
+    // guard for it to be unaffected by, and the assertion underneath it —
+    // a plain rekick succeeds with nothing attached — is what
+    // `rekick_adds_a_second_run_to_the_same_task` already covers.
 
     // ──────────────────────────────────────────────────────────────────
     // B-1: rekick operator_sid pin (parity with POST /v1/tasks)
@@ -4458,15 +4593,15 @@ mod tests {
     /// A rekick pinning a *registered* `operator_sid` dispatches
     /// successfully and persists the sid verbatim onto the new
     /// `RunRecord.operator_sid`. The Task's stored Blueprint is the plain
-    /// baseline (no `operator_delegate` layer), so the registered Operator
-    /// is never actually engaged — the kick resolves through the baseline
-    /// path and the assertion is purely on the persisted correlation
-    /// field.
+    /// baseline (its only agent is `kind = RustFn`), so the registered
+    /// Operator is never actually engaged — the kick resolves through the
+    /// baseline path and the assertion is purely on the persisted
+    /// correlation field.
     #[tokio::test]
     async fn rekick_with_registered_operator_sid_persists_it_on_the_run() {
         let state = test_state();
-        // Register an Operator whose sid the rekick can pin. It is never
-        // engaged (plain Blueprint does not delegate), so a `StallingOperator`
+        // Register an Operator whose sid the rekick can pin. No agent in
+        // this Blueprint dispatches through one, so a `StallingOperator`
         // is a fine stand-in for "a live, registered session".
         state
             .engine

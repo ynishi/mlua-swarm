@@ -363,9 +363,17 @@ pub struct LaunchEnvelope {
     #[serde(default)]
     pub hook_id: Option<String>,
     /// ID of the `Arc<dyn Operator>` registered on the `OperatorRegistry`.
-    /// Used by `OperatorDelegateMiddleware` when `kind = MainAi` /
-    /// `Composite` and `operator_id` is `Some`: it delegates the entire
-    /// spawn to `operator.execute`.
+    ///
+    /// **Nothing resolves this at dispatch any more.** It was
+    /// `OperatorDelegateMiddleware`'s input — the middleware looked the id
+    /// up per spawn and delegated the whole spawn to `operator.execute` —
+    /// and that layer was removed precisely because reading a launch-time
+    /// id meant the delegate axis could not follow a seat handover. What
+    /// the field still does is (a) travel in the persisted session blob,
+    /// whose shape old records are deserialized against, and (b) name the
+    /// key `Engine::list_operator_ids` validates a launch's `operator_sid`
+    /// against. A dispatch reaches its Operator through the agent's
+    /// declared seat and the Run's current holder, not through here.
     ///
     /// Its one source is the launch's `operator_sid`
     /// (`TaskLaunchInput::operator_sid`), which is where the three former

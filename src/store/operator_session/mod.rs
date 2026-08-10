@@ -86,6 +86,45 @@ pub const TASK_METADATA_MAX_BYTES: usize = 4096;
 /// long is already past what most filesystems will hand out.
 pub const OBSERVED_TEXT_MAX_BYTES: usize = 1024;
 
+/// How long a session may go unaccessed before it expires — the second
+/// exit from `Registered` in model §4.1's state diagram
+/// (`Registered ── 最終アクセスから 24h ──▶ ╳ 削除`), in seconds.
+///
+/// # The rule has no predicate number
+///
+/// It is cited that way throughout this file and the server's, and not as
+/// **O1**, which is a different rule: §4.1's `O1` is `join は無認証`, and
+/// §6's index confirms the `O1-O8` band is the eight numbered Operator
+/// predicates. The 24h horizon appears only in the diagram above them and
+/// was never given a number. Citing a number the model does not carry
+/// makes every one of these doc comments unfollowable in exactly the way
+/// a citation exists to prevent — the reader looks `O1` up and finds a
+/// statement about authentication.
+///
+/// # There is no sweeper behind this
+///
+/// The horizon is a rule about what may be *observed*, and that is how it
+/// is enforced: every path that reads a session — the boot restore, the
+/// 記名 list, a single-session read — drops the expired ones it finds and
+/// deletes their rows. A session past the horizon is therefore never
+/// returned to anybody, which is the whole of what the state diagram
+/// promises; what it is *not* is a background scan.
+///
+/// That distinction is deliberate. The periodic stale-`Run` sweeper was
+/// removed in `31fefc1` for generating false positives against Runs
+/// nobody was dispatching to, and a session reaper would run against the
+/// same kind of quiet state, on a timer, with the same failure available
+/// to it. Expiring at the read instead means the judgment is only ever
+/// made about a session someone is currently asking about, by the code
+/// that is about to answer for it — the same shape **A7** uses for seats
+/// (examined at reference time) and **O8** for the cascade (at delete
+/// time, "no timer").
+///
+/// The cost of having no sweeper is that an expired row survives until
+/// something reads it. Since the only thing an expired row can do is be
+/// read, that costs nothing but disk.
+pub const OPERATOR_SESSION_MAX_IDLE_SECS: u64 = 24 * 60 * 60;
+
 pub mod inmemory;
 pub mod sqlite;
 pub use inmemory::InMemoryOperatorSessionStore;
@@ -125,6 +164,35 @@ pub struct OperatorSessionRecord {
     pub capability_manifest: Option<AgentProviderManifest>,
     /// Unix epoch seconds when `POST /v1/operators` minted this session.
     pub joined_at_secs: u64,
+    /// Unix epoch seconds when this session was last **accessed** — model
+    /// §4.1's `最終アクセス`, the clock the 24h expiry
+    /// ([`OPERATOR_SESSION_MAX_IDLE_SECS`]) runs from.
+    ///
+    /// # Access, not activity
+    ///
+    /// [`Self::last_activity_secs`] answers "when was this session last
+    /// *assigned* something", which is what **D5** sorts the 記名 list by.
+    /// This answers "when did the driver behind this session last show
+    /// itself", which is a wider set of events: attaching a WebSocket,
+    /// reading its own session, being assigned a seat. A driver can be very
+    /// much alive and hold no seat for a day, so expiring on activity would
+    /// reap live sessions.
+    ///
+    /// # Why this one is stored and its sibling is derived
+    ///
+    /// `last_activity_secs` is a maximum over the observed ring, so it
+    /// cannot go stale — every value it reads from is already persisted.
+    /// An access leaves no such trace: nothing about a WS connect or a
+    /// `GET /v1/operators/:sid` is written down anywhere else, so if this
+    /// were derived there would be nothing to derive it from. It is
+    /// advanced by [`Self::touch`] and written through by the server.
+    ///
+    /// Additive with `#[serde(default)]`. A row persisted before this field
+    /// existed decodes as `0`, which would read as "accessed at the epoch"
+    /// and expire it on sight — so every reader goes through
+    /// [`Self::last_access_secs`], which folds `0` back onto the join time.
+    #[serde(default)]
+    pub last_access_secs: u64,
     /// The **confirmed part** of this session's 記名 (model §4.2, **D1**):
     /// roughly 50 characters the joining AI wrote about what it is working
     /// on, fixed at join and never rewritten afterwards.
@@ -356,6 +424,50 @@ impl OperatorSessionRecord {
             .max(self.joined_at_secs)
     }
 
+    /// When this session was last accessed, for the 24h expiry clock.
+    ///
+    /// Reads [`Self::last_access_secs`], with two foldings that make the
+    /// value safe to compare against a horizon:
+    ///
+    /// - a `0` (a row persisted before the field existed, or a session
+    ///   never touched since it was minted) reads as the **join time**, so
+    ///   a fresh session is never a day old on arrival;
+    /// - an assignment counts as an access even if nothing touched the
+    ///   field, so [`Self::last_activity_secs`] is folded in as well. A
+    ///   session being handed seats is being used, whatever else it does.
+    pub fn last_access_secs(&self) -> u64 {
+        self.last_access_secs.max(self.last_activity_secs())
+    }
+
+    /// Advance [`Self::last_access_secs`] to `now`, never backwards.
+    ///
+    /// Monotone because the clock is not: a `SystemTime` that steps back
+    /// (NTP correction, a suspended laptop) must not make a session look
+    /// older than the last time something saw it. Returns whether the value
+    /// moved, so a caller can skip a durable write that would change
+    /// nothing.
+    pub fn touch(&mut self, now: u64) -> bool {
+        if now <= self.last_access_secs {
+            return false;
+        }
+        self.last_access_secs = now;
+        true
+    }
+
+    /// The 24h horizon: has this session gone
+    /// [`OPERATOR_SESSION_MAX_IDLE_SECS`] without being accessed, as of
+    /// `now`?
+    ///
+    /// A pure predicate over the record. What it *cannot* see is whether a
+    /// socket is attached right now, which is why the server's expiry
+    /// checks pair it with a connectivity read — a driver holding an idle
+    /// WebSocket open is present, and reaping it would be the reaper
+    /// causing the outage it exists to prevent. See
+    /// `mse_server::operator_ws::login`'s expiry note.
+    pub fn is_expired_at(&self, now: u64) -> bool {
+        now.saturating_sub(self.last_access_secs()) >= OPERATOR_SESSION_MAX_IDLE_SECS
+    }
+
     /// Digest a plaintext bearer into the at-rest shape
     /// ([`Self::token_digest`]).
     ///
@@ -414,8 +526,67 @@ pub trait OperatorSessionStore: Send + Sync {
     /// Delete the row for `sid`. `NotFound` when no such row exists.
     async fn delete(&self, sid: &SessionId) -> Result<(), OperatorSessionStoreError>;
 
-    /// List the sessions this store can decode, ascending by
-    /// `joined_at_secs` (mint order, stable for deterministic rehydration).
+    /// The row stored under `sid`, **exactly as stored** — `Ok(None)` when
+    /// there is none.
+    ///
+    /// # This one does not apply the horizon, and that is the point
+    ///
+    /// [`list`](Self::list) both filters and deletes, which leaves it
+    /// unable to answer the question its own contract is written around:
+    /// *was the expired row deleted, or merely withheld?* Both produce the
+    /// same `list`. Three assertions elsewhere claimed to check the
+    /// deletion and read it through `list`, so all three would have passed
+    /// on a filter-only backend — the load-bearing half of the contract
+    /// ("Filtering without deleting would hide them from the reader while
+    /// leaving the file growing") was untestable through the trait,
+    /// because the trait exposed no unfiltered read.
+    ///
+    /// This is that read. It reports the backing store's contents and
+    /// applies no judgment of its own, so a caller can tell a deleted row
+    /// from a hidden one.
+    ///
+    /// # It is not a session-resolution path
+    ///
+    /// Nothing in the server resolves a live session through here: a
+    /// running process answers about sessions out of its in-memory map,
+    /// and the durable rows are read exactly once, at boot, by `list`.
+    /// Handing an expired row back is therefore not a way to revive one —
+    /// the row goes to a test or a diagnostic, both of which want the
+    /// truth about the file rather than the truth about who may be served.
+    async fn get(
+        &self,
+        sid: &SessionId,
+    ) -> Result<Option<OperatorSessionRecord>, OperatorSessionStoreError>;
+
+    /// List the sessions this store can decode **and that have not
+    /// expired**, ascending by `joined_at_secs` (mint order, stable for
+    /// deterministic rehydration).
+    ///
+    /// # Contract: an expired row is dropped *and deleted*
+    ///
+    /// A row whose last access is [`OPERATOR_SESSION_MAX_IDLE_SECS`] or
+    /// more in the past is model §4.1's second exit from `Registered`:
+    /// `Registered ── 最終アクセスから 24h ──▶ ╳ 削除` (unnumbered — see
+    /// [`OPERATOR_SESSION_MAX_IDLE_SECS`]). Implementations must omit it from
+    /// the returned vector and remove it from the backing store, reporting
+    /// each removal with a `tracing::info!`.
+    ///
+    /// A `list` that deletes is unusual enough to say why it is here rather
+    /// than in a reaper. The sole caller is boot-time rehydration, which is
+    /// also the only moment a persisted session is read from disk at all —
+    /// so this is where an expired row would otherwise be resurrected, once
+    /// per restart, forever (the row's own driver crashed and lost the
+    /// bearer `DELETE /v1/operators/:sid` wants, so nothing else can ever
+    /// remove it). Filtering without deleting would hide them from the
+    /// reader while leaving the file growing; deleting on a timer would
+    /// need a sweeper, which [`OPERATOR_SESSION_MAX_IDLE_SECS`]'s doc
+    /// explains this design is avoiding.
+    ///
+    /// Deleting is safe precisely because the row is expired: no live
+    /// process holds it (it was not in memory — this call is what would
+    /// have put it there), and nothing else refers to it. A `Run.current`
+    /// naming it is repaired by an `acquire` (**A8**), the same repair a
+    /// crashed driver's seat already needs.
     ///
     /// # Contract: per row, not all-or-nothing
     ///
@@ -449,6 +620,52 @@ pub trait OperatorSessionStore: Send + Sync {
     async fn list(&self) -> Result<Vec<OperatorSessionRecord>, OperatorSessionStoreError>;
 }
 
+/// The wall clock the expiry horizon is measured against.
+///
+/// A clock that cannot answer yields `0`, which makes `now.saturating_sub`
+/// zero for every record and expires nothing. That is the right way to
+/// fail: an unreadable clock is not evidence that a session is stale, and
+/// this is a deleting path.
+pub(crate) fn expiry_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Split a freshly read set of records into the ones a caller may see and
+/// the sids the 24h horizon has expired, logging one line per expiry.
+///
+/// Shared by both backends so the horizon, the predicate and the wording
+/// are decided once — a backend that drifted on any of the three would
+/// give the same server two different session lifetimes depending on how
+/// it was configured.
+pub(crate) fn partition_expired(
+    records: Vec<OperatorSessionRecord>,
+    now: u64,
+    backend: &str,
+) -> (Vec<OperatorSessionRecord>, Vec<SessionId>) {
+    let mut live = Vec::with_capacity(records.len());
+    let mut expired = Vec::new();
+    for record in records {
+        if record.is_expired_at(now) {
+            tracing::info!(
+                sid = %record.sid,
+                backend,
+                last_access_secs = record.last_access_secs(),
+                idle_secs = now.saturating_sub(record.last_access_secs()),
+                desc = record.desc.as_deref().unwrap_or("<none>"),
+                "operator session expired (24h since last access); dropping the row \
+                 instead of restoring it"
+            );
+            expired.push(record.sid);
+        } else {
+            live.push(record);
+        }
+    }
+    (live, expired)
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Shared inner state used by the InMemory backend.
 // ──────────────────────────────────────────────────────────────────────────
@@ -477,6 +694,7 @@ mod record_tests {
             token_digest: OperatorSessionRecord::digest_of("bearer"),
             capability_manifest: None,
             joined_at_secs: 100,
+            last_access_secs: 100,
             desc: None,
             observed: Vec::new(),
             observed_total: 0,

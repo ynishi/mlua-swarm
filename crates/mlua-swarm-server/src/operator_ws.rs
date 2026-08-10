@@ -41,8 +41,12 @@
 //!                                  │ dispatch_attempt → resolve_operator_info
 //!                                  │ looks up session.bridge_id / hook_id / operator_backend_id
 //!                                  ▼
-//!         Ctx.operator (= read by SeniorEscalationMiddleware / MainAIMiddleware /
-//!                           OperatorDelegateMiddleware)
+//!         Ctx.operator (= read by SeniorEscalationMiddleware / MainAIMiddleware)
+//!         ※ OperatorDelegateMiddleware was the third reader and is removed;
+//!           `spawner_hints.layers = ["operator_delegate"]` is now a compile
+//!           error (`removed-spawner-hint`). What replaced it is the AgentSpec
+//!           axis: a `kind = Operator` agent resolves its seat's current holder
+//!           off `Run.current` and delivers through `router::AssigneeRouter`.
 //!
 //! protocol.rs : ServerMsg / ClientMsg / PendingReply (= wire format + internal reply IR)
 //! ```

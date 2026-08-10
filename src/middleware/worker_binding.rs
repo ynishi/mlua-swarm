@@ -8,12 +8,51 @@
 //! inserts the serialized binding into `Ctx.meta.runtime` under the
 //! `worker_binding` key.
 //!
-//! Downstream `OperatorDelegateMiddleware` reads it back so the delegate
-//! axis (session-global Operator delegation, which has no per-agent
-//! `OperatorSpawner` to carry a compile-time-baked binding) can hand
-//! `Some(worker)` to `Operator::execute` instead of the historical
-//! hardcoded `None`. Agents with no declared binding get no entry — the
-//! WS thin-path `requires_worker_binding` fail-loud stays the safety net.
+//! Agents with no declared binding get no entry; the WS thin-path
+//! `requires_worker_binding` fail-loud stays the safety net.
+//!
+//! # What reads the key: nothing in this repository
+//!
+//! Said plainly, because a reader deciding whether to keep this layer on
+//! their stack needs it before the rationale. This layer was introduced
+//! *for* the delegate axis (`b5eb000`, "wire worker binding through the
+//! delegate axis"): `OperatorDelegateMiddleware` had no per-agent
+//! `OperatorSpawner` to carry a compile-time-baked binding, so it read the
+//! binding back out of `Ctx.meta.runtime` at spawn. That axis is gone, and
+//! the AgentSpec axis needs no such round trip — `OperatorSpawner` holds
+//! the baked `WorkerBinding` and hands it to `Operator::execute` as an
+//! argument.
+//!
+//! With that reader deleted, a repo-wide search for [`WORKER_BINDING_KEY`]
+//! and for `ctx.meta.runtime`'s `"worker_binding"` entry finds this
+//! module's own tests and nothing else. In particular
+//! `AgentContextView::from_ctx` does not read it (it reads the project /
+//! work-dir / metadata / run-id / alias keys), and `mlua-swarm-server`'s
+//! WS session takes the binding from its `execute` argument.
+//!
+//! Two things the layer still does, and they are the whole of why it stays
+//! wired:
+//!
+//! - It is a **published extension point**. This type and the key are
+//!   `pub` on a library crate, and "downstream Operator / Spawner code
+//!   reads the injected keys back via `ctx.meta.runtime.get(...)`" is this
+//!   crate's stated convention for out-of-tree implementations —
+//!   [`crate::middleware::task_input`]'s module doc names `worker_binding`
+//!   as one of those keys. Having no in-tree reader is not the same as
+//!   having no reader.
+//! - The value lands in the `Ctx` snapshot `ReplayStore` persists for each
+//!   passed step, so a stored run records the binding every spawn
+//!   declared.
+//!
+//! Neither is load-bearing, and this doc does not pretend otherwise. If
+//! the extension point is not wanted, delete the layer, its conditional
+//! wiring in `service::task_launch::TaskLaunchService::launch`, and this
+//! key — rather than leaving a claim of a live reader standing. That is a
+//! breaking change (both items are `pub`), and it also needs the prose
+//! references in [`crate::middleware::task_input`],
+//! `crate::middleware::agent_context` and `crate::core::agent_context`
+//! updated, one of which is an intra-doc link that would otherwise fail
+//! the doc build.
 //!
 //! Same shape as `ProjectNameAliasMiddleware` / `CompiledAgentTable`: a
 //! compile/launch-time table keyed by agent name, looked up via
@@ -30,8 +69,12 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Key under `ctx.meta.runtime` that downstream code (the delegate axis)
-/// reads with `get`.
+/// Key under `ctx.meta.runtime` this layer writes the serialized
+/// [`WorkerBinding`] to.
+///
+/// `pub` because reading it back *is* the extension point. The delegate
+/// axis used to be the in-tree reader; see the module doc for what is left
+/// after its removal (nothing in this repository).
 pub const WORKER_BINDING_KEY: &str = "worker_binding";
 
 /// `SpawnerLayer` that drops the per-agent binding into `ctx` just before

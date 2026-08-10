@@ -186,6 +186,18 @@ pub enum BpDoctorFamily {
     /// already-registered Blueprint (the compile stage only fires it under
     /// `metadata.strict_verdict_handling`).
     VerdictContractLint,
+    /// `spawner_hints.layers` keys that name a layer no deployment
+    /// installs any more — currently only the removed `operator_delegate`
+    /// axis. Report-only here; the compile stage refuses outright.
+    ///
+    /// This family exists because registering a Blueprint does **not**
+    /// compile it (`blueprints.rs` stores the document; `Compiler::compile`
+    /// runs at launch). Without a `bp_doctor` producer, a Blueprint
+    /// carrying a removed hint would pass its doctor run clean and then
+    /// fail at the first dispatch — the same "retroactively surfaced on an
+    /// already-registered Blueprint" gap [`Self::WorkerBindingLint`] was
+    /// added to close.
+    SpawnerHintLint,
 }
 
 /// Which producing stage emitted a [`Diagnostic`]. Serialized
@@ -601,6 +613,13 @@ pub const LINT_DECLS: &[LintDecl] = &[
          will carry file_path: null (content_url-only).",
         "mse://guides/operator-execution-model",
     ),
+    decl(
+        "removed-spawner-hint",
+        DiagLevel::Error,
+        LintCategory::Migration,
+        "spawner_hints.layers names a layer that no longer exists (operator_delegate).",
+        "mse://guides/blueprint-authoring",
+    ),
     // ─── Meta-lints (findings about the lints config itself) ─────────
     decl(
         "unknown-lint-kind",
@@ -623,6 +642,42 @@ pub const LINT_DECLS: &[LintDecl] = &[
 /// [`Diagnostic::kind`] must be declared).
 pub fn lint_decl(kind: &str) -> Option<&'static LintDecl> {
     LINT_DECLS.iter().find(|d| d.kind == kind)
+}
+
+/// The recovery attached to every `removed-spawner-hint` diagnostic,
+/// whichever stage emitted it.
+///
+/// Two stages report this kind — the compile gate (`impl
+/// From<&CompileError> for Diagnostic`, which refuses) and `bp_doctor`'s
+/// [`BpDoctorFamily::SpawnerHintLint`] (which reports on an
+/// already-registered Blueprint, since registering does not compile). An
+/// author who meets the same kind at either stage must not be told two
+/// different things, and the two producers live in different crates, so
+/// the text lives here — the same reason
+/// `mlua_swarm::removed_spawner_hint_reason` holds the key table for both.
+///
+/// Before this function the prose was hand-duplicated at the two call
+/// sites and happened to be byte-identical; nothing checked that, and the
+/// tests only asserted `patch.contains("\"operator_ref\"")`, which both
+/// halves of a drifted pair would still satisfy.
+///
+/// [`Applicability::HasPlaceholders`] rather than `MachineApplicable`:
+/// only the author knows which agents were meant to reach the Operator
+/// and what the seat should be called, and every such agent needs its own
+/// `spec.operator_ref`. The patch is a shape to fill in, not a drop-in
+/// replacement.
+pub fn removed_spawner_hint_suggestion() -> Suggestion {
+    Suggestion {
+        msg: "drop the removed layer key, declare an Operator seat, and point each \
+              operator-backed agent at it"
+            .into(),
+        patch: "\"spawner_hints\": { \"layers\": [] },\n\
+                \"operators\": [{ \"name\": \"main_ai\", \"kind\": \"main_ai\" }],\n\
+                \"agents\": [{ \"name\": \"<agent>\", \"kind\": \"operator\", \"spec\": { \
+                \"operator_ref\": \"main_ai\" } }]"
+            .into(),
+        applicability: Applicability::HasPlaceholders,
+    }
 }
 
 /// Author-declared level for one lint kind or group — the diag-side twin

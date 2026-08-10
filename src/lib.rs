@@ -33,7 +33,10 @@
 //! Worker dispatch passes through a [`SpawnerStack`] assembled from a
 //! [`LayerRegistry`]: a base layer set plus per-blueprint hints
 //! ([`CompilerHints`]) select layers such as audit, long-hold, main-AI
-//! bridging, senior escalation, and operator delegation.
+//! bridging, and senior escalation. Dispatching a step to an
+//! [`Operator`](operator::Operator) is not one of them: that is the
+//! AgentSpec axis, where the agent's declared seat resolves its current
+//! holder per dispatch (see [`OperatorSpawnerFactory`]).
 //!
 //! # Module map
 //!
@@ -119,8 +122,8 @@ pub use binding::{
     BindingProviderError, LegacyWorkerBindingPolicy, ManifestBindingProvider, UnboundAgent,
 };
 pub use blueprint::compiler::{
-    agents_with_all_verdict_values_unread, unhandled_verdict_values, AgentContractUnread,
-    CompileError, CompiledAgentTable, CompiledBlueprint, Compiler, HostBridge,
+    agents_with_all_verdict_values_unread, removed_spawner_hint_reason, unhandled_verdict_values,
+    AgentContractUnread, CompileError, CompiledAgentTable, CompiledBlueprint, Compiler, HostBridge,
     LuaInProcessSpawnerFactory, LuaScriptSource, OperatorSpawnerFactory,
     RustFnInProcessSpawnerFactory, SpawnerFactory, SpawnerFactoryKind, SpawnerRegistry,
     SubprocessProcessSpawnerFactory, UnhandledVerdictValue, WORKER_BINDING_REQUIRED_MSG_PREFIX,
@@ -152,7 +155,7 @@ pub use middleware::project_name_alias::{ProjectNameAliasMiddleware, PROJECT_NAM
 pub use middleware::resolver::{AgentResolver, FnResolver, ResolverMiddleware};
 pub use middleware::{
     AuditMiddleware, LayerFactory, LayerRegistry, LongHoldMiddleware, MainAIMiddleware,
-    OperatorDelegateMiddleware, SeniorEscalationMiddleware, SpawnerLayer, SpawnerStack,
+    SeniorEscalationMiddleware, SpawnerLayer, SpawnerStack,
 };
 /// GH #79: the unified diagnostic vocabulary crate, re-exported so
 /// downstream users of `mlua-swarm` reach the `Diagnostic` /

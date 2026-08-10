@@ -658,13 +658,25 @@ pub fn default_global_agent_kind() -> AgentKind {
 ///
 /// - `"main_ai"` → `MainAIMiddleware` (= fires SpawnHook before/after when kind is MainAi/Composite)
 /// - `"senior_escalation"` → `SeniorEscalationMiddleware` (= fires SeniorBridge.ask on worker ok=false)
-/// - `"operator_delegate"` → `OperatorDelegateMiddleware` (= delegates the entire spawn to an external Operator.execute)
+///
+/// # Removed keys
+///
+/// - `"operator_delegate"` → the Blueprint-global Operator delegate axis. **Removed.** It
+///   resolved its destination from the launch-time operator backend id rather than the Run's
+///   current seat holder (so it could not follow a handover) and had no per-agent spawner (so
+///   it could not carry an agent's `system_prompt`). Declaring it is a compile error, not a
+///   skipped key — see the `removed-spawner-hint` lint and
+///   `mse://guides/blueprint-authoring`. The replacement is the AgentSpec axis:
+///   `operators[]` + `spec.operator_ref`, with `operator_sid` naming the seat's holder per
+///   launch.
 ///
 /// # Behavior of unregistered keys
 ///
 /// If the engine-side LayerRegistry has no matching factory, the key is **silently skipped**
 /// (= lenient default). This preserves Blueprint portability (= an unsupported capability in
-/// another deployment falls back gracefully).
+/// another deployment falls back gracefully). A **removed** key is deliberately not covered by
+/// that leniency: portability is a reason to tolerate a capability this deployment does not
+/// have, not a reason to stay quiet about one no deployment has any more.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnerHints {

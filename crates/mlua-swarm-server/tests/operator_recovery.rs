@@ -503,6 +503,17 @@ impl OperatorSessionStore for FaultyDeleteStore {
         }
     }
 
+    /// Delegated, and deliberately *not* routed through the injected
+    /// failure: `get` is how a test observes what the file holds, so a
+    /// double that lied here would take away the only instrument the
+    /// delete-failure tests have.
+    async fn get(
+        &self,
+        sid: &SessionId,
+    ) -> Result<Option<OperatorSessionRecord>, OperatorSessionStoreError> {
+        self.inner.get(sid).await
+    }
+
     async fn list(&self) -> Result<Vec<OperatorSessionRecord>, OperatorSessionStoreError> {
         self.inner.list().await
     }
@@ -558,16 +569,39 @@ async fn spawn_server_with_session_store(
     )
 }
 
+/// Wall-clock seconds — what a persisted session's timestamps have to be
+/// made of now that the horizon expires a row 24h past its last access.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock at or after the epoch")
+        .as_secs()
+}
+
 /// Seed one persisted session for [`spawn_server_with_session_store`] to
 /// restore, authenticated by [`SEEDED_BEARER`].
+///
+/// `last_access_secs` is now, because boot restore drops rows the horizon
+/// has expired: a row stamped `0` would be 56 years idle and would never come
+/// back, which is the opposite of what every test below needs.
 async fn seed_persisted_session(store: &FaultyDeleteStore) -> SessionId {
+    seed_persisted_session_accessed_at(store, now_secs()).await
+}
+
+/// [`seed_persisted_session`] with the access clock placed explicitly —
+/// for the tests that need a row the horizon has already expired.
+async fn seed_persisted_session_accessed_at(
+    store: &FaultyDeleteStore,
+    last_access_secs: u64,
+) -> SessionId {
     let sid = SessionId::new();
     store
         .put(OperatorSessionRecord {
             sid: sid.clone(),
             token_digest: OperatorSessionRecord::digest_of(SEEDED_BEARER),
             capability_manifest: None,
-            joined_at_secs: 0,
+            joined_at_secs: last_access_secs,
+            last_access_secs,
             desc: None,
             observed: Vec::new(),
             observed_total: 0,
@@ -898,6 +932,76 @@ async fn minted_session_is_launch_pinnable_before_any_ws_connect() {
         info["connected"], false,
         "registering at mint must not make the session claim to be connected"
     );
+
+    server.shutdown();
+}
+
+// ─── the 24h horizon: a boot does not resurrect an expired session ──────────
+
+/// **The accumulation this closes.** A driver that crashes loses the bearer
+/// `DELETE /v1/operators/:sid` wants, so its row has no deleter left — and
+/// boot restore used to re-materialize every row with no age filter, which
+/// made the set grow by one per crash and survive every restart. On a
+/// long-lived server that eventually pushes live sessions off
+/// `GET /v1/operators`, which has a count ceiling (50 by default, 200 max).
+///
+/// Model §4.1's answer is its state diagram's second exit from
+/// `Registered` (`最終アクセスから 24h ──▶ ╳ 削除` — unnumbered; §4.1's
+/// `O1` is `join は無認証`), and
+/// the boot read is where it bites for a persisted row: nothing else ever
+/// reads one.
+#[tokio::test]
+async fn a_boot_does_not_restore_a_session_expired_by_o1() {
+    let store = Arc::new(FaultyDeleteStore::new());
+    let stale = seed_persisted_session_accessed_at(
+        &store,
+        now_secs() - mlua_swarm::store::operator_session::OPERATOR_SESSION_MAX_IDLE_SECS - 60,
+    )
+    .await;
+    let live = seed_persisted_session(&store).await;
+
+    let (server, engine) = spawn_server_with_session_store(store.clone()).await;
+    let client = reqwest::Client::new();
+
+    let registered = engine.list_operator_ids().await;
+    assert!(
+        !registered.contains(&stale.to_string()),
+        "a session 24h past its last access must not come back at boot: {registered:?}"
+    );
+    assert!(
+        registered.contains(&live.to_string()),
+        "and one inside the horizon must: {registered:?}"
+    );
+
+    // Gone from the store as well — otherwise it is only hidden, and the
+    // file still grows one row per crashed driver.
+    //
+    // Read through `get` rather than `list`: `list` filters expired rows
+    // unconditionally, so asserting their absence there passes just as
+    // well on a backend that deletes nothing. `get` reports the row as
+    // stored, which is the only way this distinguishes the two.
+    assert!(
+        store.get(&stale).await.expect("store get").is_none(),
+        "the expired row must be deleted, not merely withheld from the restore"
+    );
+    assert!(
+        store.get(&live).await.expect("store get").is_some(),
+        "and a row inside the horizon must still be in the file — otherwise the assertion \
+         above would also pass on a boot that deleted everything it read"
+    );
+
+    // ...and the reader sees exactly the live one.
+    let list: serde_json::Value = client
+        .get(format!("{}/v1/operators", server.base_url))
+        .bearer_auth(SEEDED_BEARER)
+        .send()
+        .await
+        .expect("list request")
+        .json()
+        .await
+        .expect("list json");
+    assert_eq!(list["total"], 1, "{list}");
+    assert_eq!(list["operators"][0]["sid"], live.to_string());
 
     server.shutdown();
 }

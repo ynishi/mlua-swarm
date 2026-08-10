@@ -25,7 +25,19 @@ pub struct EnhanceSetting {
     pub id: String,
     /// The Blueprint this setting resolves to, via `BlueprintStore`.
     pub blueprint_id: BlueprintId,
-    /// Operator-session lifetime (the TTL passed to `Engine::attach`).
+    /// Wall-clock ceiling in seconds on one enhance epoch — one issue
+    /// popped, dispatched, and driven to a commit decision.
+    ///
+    /// Also passed to `Engine::attach` as the operator-session TTL, where
+    /// it has no effect: `82d9da9` exempted `Role::Operator` tokens from
+    /// the expiry check. The ceiling
+    /// [`crate::application::enhance::EnhanceApplication`] wraps around the
+    /// launch is what this number actually does — see that type's
+    /// `dispatch_one` for what a fired ceiling leaves behind, and
+    /// `mse://guides/enhance-flow` ("The epoch ceiling") for the
+    /// author-facing account.
+    ///
+    /// `0` is refused at dispatch rather than read as "unbounded".
     pub ttl_secs: u64,
     /// Which `BlueprintVersion` to take (`Latest` / `Fixed` /
     /// `SemverReq`).
@@ -72,7 +84,9 @@ pub struct EnhanceSettingInput {
     /// Blueprint data inline; the server persists it via `BPStore.write_new`
     /// and converts it to a `blueprint_id` ref before storing.
     pub blueprint: Blueprint,
-    /// Operator-session lifetime (the TTL passed to `Engine::attach`).
+    /// Wall-clock ceiling in seconds on one enhance epoch. Must be greater
+    /// than 0 — see [`EnhanceSetting::ttl_secs`], the field this is stored
+    /// as.
     pub ttl_secs: u64,
     /// Which `BlueprintVersion` to take (`Latest` / `Fixed` / `SemverReq`).
     #[serde(default)]

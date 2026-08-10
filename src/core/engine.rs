@@ -51,9 +51,14 @@ struct EngineInner {
     spawn_hooks: tokio::sync::RwLock<HashMap<String, Arc<dyn SpawnHook>>>,
     /// ID registry for full-spawn Operator backends (backends that take the
     /// entire spawn via `execute`). Sibling to `senior_bridges` /
-    /// `spawn_hooks`. `OperatorDelegateMiddleware` looks these up via
-    /// `ctx` and, when `kind = MainAi` / `Composite`, bypasses
-    /// `inner.spawn` and calls `operator.execute` instead.
+    /// `spawn_hooks`, but read at a different time than either: those two
+    /// are resolved per dispatch by `resolve_operator_info`, while this map
+    /// is consulted at *launch* — [`Engine::list_operator_ids`] is what a
+    /// host validates an `operator_sid` against — and by the host's own
+    /// seat resolver when a dispatch turns a Run's current holder into a
+    /// destination. `resolve_operator_info` deliberately does not touch it
+    /// (see the note there): the layer that used to read it back through
+    /// `Ctx`, `OperatorDelegateMiddleware`, is gone.
     operators: tokio::sync::RwLock<HashMap<String, Arc<dyn crate::operator::Operator>>>,
     /// Base and hint layer factories for the `SpawnerStack`. At
     /// `service::linker::link` time, `compiled.router` is wrapped with
@@ -324,10 +329,14 @@ fn fold_final_and_parts(
 /// These ids are declared-then-resolved: one only reaches the envelope
 /// because a launch named it, so a miss is not "nothing was asked for" —
 /// it is a named capability that will not fire on this dispatch. Left
-/// silent, the delegate axis degrades into `inner.spawn`
-/// (`OperatorDelegateWrapped::spawn` reads `None` as "no operator is
-/// attached") and a declared hook or bridge simply never runs, with
-/// nothing in the log to say a shipped feature was dropped on the way.
+/// silent, a declared hook or bridge simply never runs, with nothing in
+/// the log to say a shipped feature was dropped on the way.
+///
+/// Two registries reach here, not the three this once covered: the
+/// `operators` arm went with `OperatorDelegateMiddleware`. Nothing reads a
+/// resolved operator backend at dispatch any more, so warning that one is
+/// missing would name a capability that cannot fire for anybody — the
+/// point of this warning is that a *reachable* feature was dropped.
 ///
 /// A `warn!` rather than a dispatch failure, deliberately. A session that
 /// leaves after its launch validated it is an ordinary operational event
@@ -855,6 +864,120 @@ impl Engine {
         .await?
     }
 
+    /// Reissue a `Role::Worker` capability whose delivery is running late,
+    /// against the record this engine already holds for it.
+    ///
+    /// # The failure this exists for
+    ///
+    /// A `Operator::execute` implementation builds its whole spawn frame —
+    /// capability token included — and only then tries to write it. The WS
+    /// implementation parks that write for the length of a client
+    /// disconnect with no deadline (bounding the wait is infra's call; see
+    /// `mse_server::operator_ws::session`'s module doc), while the token
+    /// inside has been counting down [`EngineCfg::worker_token_ttl_secs`]
+    /// since [`Self::dispatch_attempt_with`] minted it. Past that TTL
+    /// [`Self::verify_token`] rejects it — the expiry check is skipped only
+    /// for `Role::Operator` — so the frame arrived carrying a capability
+    /// that was already dead, and the SubAgent found out at `submit`, after
+    /// doing the entire job. Re-minting at the moment of delivery is what
+    /// makes the TTL bound *the token's time in the wild* rather than its
+    /// time waiting to leave the server.
+    ///
+    /// # This cannot widen what the bearer may do
+    ///
+    /// Nothing here is taken from the caller's intent; every field is
+    /// copied from what the engine already granted:
+    ///
+    /// - the presented token must **verify against this signer**, so a
+    ///   caller cannot hand in a token it composed itself;
+    /// - it must be `Role::Worker`, and the reissue is `Role::Worker` — the
+    ///   role is never re-chosen;
+    /// - `agent_id` and `scopes` are copied from the presented token, so
+    ///   the subject and the scope set are the ones already in force;
+    /// - the new record binds the **same `task_id`** the stored record
+    ///   binds, which is what `verify_token_for_task`'s ownership gate
+    ///   reads — a reissue can therefore never reach a different task;
+    /// - `max_uses` is the stored record's *remaining* budget, not the
+    ///   original allowance, so a reissue of a spent token is still spent.
+    ///
+    /// The only thing that moves is `expire_at`.
+    ///
+    /// # The old record is left in place
+    ///
+    /// Deliberately, on two counts. The short worker handle
+    /// (`worker_handles`, minted next to the original in
+    /// [`Self::dispatch_attempt_with`]) resolves through the original
+    /// fingerprint, and `OperatorSpawner`'s completion path
+    /// still holds the original token to push a fallback `Final` with
+    /// (`mse::operator`, the `submit_output` call after
+    /// `operator.execute` returns). Dropping the record would turn both
+    /// into `TokenNotFound`. Two records for one attempt is the cost, and
+    /// they are equivalent: same subject, same role, same scopes, same
+    /// bound task.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::BadSignature`] for a token this signer did not mint,
+    /// [`EngineError::RoleViolation`] for a non-Worker role,
+    /// [`EngineError::TokenNotFound`] when no record backs the presented
+    /// token or the record binds no task, and
+    /// [`EngineError::TokenUsesExhausted`] for a revoked record — the same
+    /// mapping [`Self::verify_token`] applies to a revoked one.
+    pub async fn remint_worker_token(&self, expiring: &CapToken) -> Result<CapToken, EngineError> {
+        if !self.inner.signer.verify_sig(expiring) {
+            return Err(EngineError::BadSignature);
+        }
+        if expiring.role != Role::Worker {
+            return Err(EngineError::RoleViolation {
+                role: expiring.role,
+                verb: Verb::DispatchAttempt,
+            });
+        }
+        let fp = expiring.fingerprint();
+        let fp_for_read = fp.clone();
+        // Read the grant before minting anything: the record is the
+        // authority, and what it does not say cannot be invented here.
+        let (task_id, uses_left) = self
+            .with_state("token.remint.read", move |s| {
+                let rec = s
+                    .tokens
+                    .get(&fp_for_read)
+                    .ok_or_else(|| EngineError::TokenNotFound(fp_for_read.clone()))?;
+                if rec.revoked {
+                    return Err(EngineError::TokenUsesExhausted);
+                }
+                let task_id = rec
+                    .task_id
+                    .clone()
+                    .ok_or_else(|| EngineError::TokenNotFound(fp_for_read.clone()))?;
+                Ok::<_, EngineError>((task_id, rec.uses_left))
+            })
+            .await??;
+
+        let fresh = self.inner.signer.mint(
+            expiring.agent_id.clone(),
+            Role::Worker,
+            expiring.scopes.clone(),
+            Duration::from_secs(self.inner.cfg.worker_token_ttl_secs),
+            uses_left,
+        );
+        let fresh_fp = fresh.fingerprint();
+        let fresh_for_store = fresh.clone();
+        let task_id_for_store = task_id.clone();
+        self.with_state("token.remint.insert", move |s| {
+            s.tokens.insert(
+                fresh_fp,
+                CapTokenRecord::from_worker_token(fresh_for_store, task_id_for_store),
+            );
+        })
+        .await?;
+        tracing::debug!(
+            task_id = %task_id,
+            "worker capability re-minted before a late delivery"
+        );
+        Ok(fresh)
+    }
+
     /// Submit a worker result via a short handle. Skips token verification
     /// and updates `output_tail` `Final` + `task.last_result` directly in
     /// a thin path. The caller is expected to have already resolved
@@ -1145,9 +1268,13 @@ impl Engine {
 
     /// Register an `Operator` (a spawn-body backend) under a name. An
     /// existing entry with the same name is overwritten.
-    /// `OperatorDelegateMiddleware` looks this up via `ctx` and, when
-    /// `kind = MainAi` / `Composite`, bypasses `inner.spawn` and calls
-    /// `operator.execute` instead.
+    ///
+    /// Two things read this map, neither of them a dispatch-time `ctx`
+    /// lookup: [`Self::list_operator_ids`], which a host uses to reject a
+    /// launch naming an unregistered `operator_sid`, and the host's seat
+    /// resolver, which turns the Run's current holder into a destination
+    /// on each dispatch. The `ctx`-mediated reader this doc used to name,
+    /// `OperatorDelegateMiddleware`, was removed.
     pub async fn register_operator(
         &self,
         id: impl Into<String>,
@@ -1317,15 +1444,16 @@ impl Engine {
         } else {
             None
         };
-        let operator = if let Some(id) = &session.operator_backend_id {
-            let resolved = self.inner.operators.read().await.get(id).cloned();
-            if resolved.is_none() {
-                warn_unresolved_backend("operators", id, agent_name);
-            }
-            resolved
-        } else {
-            None
-        };
+        // No `operators` lookup here. `session.operator_backend_id` used to
+        // be resolved into `OperatorInfo.operator` for
+        // `OperatorDelegateMiddleware`; with that layer removed nothing
+        // reads the resolved `Arc`, and resolving it anyway would mean
+        // warning (via `warn_unresolved_backend`) about a capability that
+        // cannot fire for anybody — a log line pointing at a fix that does
+        // not exist is worse than no log line. The id still matters at
+        // launch time, where `Engine::list_operator_ids` validates an
+        // `operator_sid` against the same registry; it just is not a
+        // dispatch-time indirection any more.
         let runtime_agent = session.runtime_agent_kinds.get(agent_name).copied();
         // "Runtime Global" tier: `Some(_)` is always an explicit request
         // (see the field doc on `LaunchEnvelope.operator_kind`).
@@ -1343,11 +1471,10 @@ impl Engine {
             id: session.operator_id.clone(),
             senior_bridge,
             spawn_hook,
-            operator,
         }
     }
 
-    /// Convenience attach that takes an `OperatorInfo` (three
+    /// Convenience attach that takes an `OperatorInfo` (two
     /// `Arc<dyn ...>` fields plus `kind`) **inline**.
     ///
     /// # Pipeline
@@ -1356,7 +1483,12 @@ impl Engine {
     /// under a synthetic ID (`br-<hex>` / `hk-<hex>` / `ob-<hex>`), and
     /// the session stores that synthetic ID. Subsequent `dispatch_attempt`
     /// calls rebuild the `Arc`s from those IDs via
-    /// `resolve_operator_info`, and the three middlewares fire as usual.
+    /// `resolve_operator_info`, and the middlewares that read them fire as
+    /// usual — `SeniorEscalationMiddleware` off `senior_bridge`,
+    /// `MainAIMiddleware` off `spawn_hook`. There were three; the third
+    /// was `OperatorDelegateMiddleware`, and the `ob-<hex>` id it consumed
+    /// now resolves to nothing here (see [`crate::core::ctx::OperatorInfo`],
+    /// "Persistence boundary").
     ///
     /// # ⚠ Non-persisted sessions only
     ///
@@ -1416,22 +1548,14 @@ impl Engine {
         } else {
             None
         };
-        let operator_backend_id = if let Some(operator) = operator_info.operator.clone() {
-            // `ob-` = operator-backend registry id. Renamed from `op-` in the
-            // issue #11 prefix reconciliation: `op-` used to collide with the
-            // WS operator sid shape (now unified into `S-<hex>` anyway), and a
-            // shared prefix across two unrelated registries made log filtering
-            // by prefix silently ambiguous.
-            let id = format!("ob-{}", crate::types::uid_hex(8));
-            self.inner
-                .operators
-                .write()
-                .await
-                .insert(id.clone(), operator);
-            Some(id)
-        } else {
-            None
-        };
+        // No operator-backend auto-registration (the `ob-<hex>` synthetic
+        // id) any more: it existed so an inline `OperatorInfo.operator`
+        // could be reached back through the registry at dispatch, and that
+        // field is gone with the delegate axis. A host that wants a
+        // dispatch to reach an `Arc<dyn Operator>` registers it by name
+        // (`register_operator`) and lets an agent's declared seat resolve
+        // it, which is the path a handover can move.
+        let operator_backend_id: Option<String> = None;
 
         let token = self
             .inner
@@ -3868,6 +3992,159 @@ mod verify_token_expiry_role_gate_tests {
             .await
             .expect("a live Worker token passes all four steps");
     }
+
+    // ── re-minting a capability whose delivery ran late ──────────────────
+
+    /// The reissue is what makes a delivery-time TTL possible: an expired
+    /// Worker token is rejected (asserted above), and a spawn frame parked
+    /// across a client disconnect could sit past its whole TTL before it
+    /// was written. The replacement must verify where the original no
+    /// longer does.
+    #[tokio::test]
+    async fn a_remint_replaces_an_expired_worker_token_with_a_verifying_one() {
+        let engine = Engine::new(EngineCfg::default());
+        let expired = register_worker_token(&engine, ALREADY_EXPIRED).await;
+        assert!(
+            engine
+                .verify_token(&expired, Verb::FetchPrompt)
+                .await
+                .is_err(),
+            "precondition: the original is past its expiry"
+        );
+
+        let fresh = engine
+            .remint_worker_token(&expired)
+            .await
+            .expect("a live record backs the expired token");
+
+        engine
+            .verify_token(&fresh, Verb::FetchPrompt)
+            .await
+            .expect("the reissue must verify");
+        assert!(fresh.expire_at > expired.expire_at, "only the expiry moves");
+    }
+
+    /// What the reissue may not do. Every field that decides what the
+    /// bearer can reach is copied from a grant the engine already made —
+    /// so a re-mint cannot widen the role, the subject, the scopes, or
+    /// (the one that matters most) the task the ownership gate binds it to.
+    #[tokio::test]
+    async fn a_remint_carries_the_grant_it_replaces_and_widens_nothing() {
+        let engine = Engine::new(EngineCfg::default());
+        let original = register_worker_token(&engine, Duration::from_secs(600)).await;
+        let bound_task = engine
+            .task_id_from_token(&original)
+            .await
+            .expect("the original is bound to a task");
+
+        let fresh = engine.remint_worker_token(&original).await.expect("remint");
+
+        assert_eq!(fresh.role, Role::Worker);
+        assert_eq!(fresh.agent_id, original.agent_id);
+        assert_eq!(fresh.scopes, original.scopes);
+        assert_eq!(
+            engine
+                .task_id_from_token(&fresh)
+                .await
+                .expect("the reissue is bound too"),
+            bound_task,
+            "a reissue must reach the same task and no other — this is the gate \
+             `verify_token_for_task` gets its answer from"
+        );
+        assert_ne!(
+            fresh.nonce, original.nonce,
+            "it is a new token, not the same one re-stamped"
+        );
+    }
+
+    /// The record is the authority, so the original stays usable. Two
+    /// things still hold it: the short `wh-` handle resolves through the
+    /// original fingerprint, and the operator-delegate completion path
+    /// pushes its fallback `Final` with the token it was handed.
+    #[tokio::test]
+    async fn a_remint_leaves_the_record_it_was_derived_from_in_place() {
+        let engine = Engine::new(EngineCfg::default());
+        let original = register_worker_token(&engine, Duration::from_secs(600)).await;
+
+        let _fresh = engine.remint_worker_token(&original).await.expect("remint");
+
+        engine
+            .verify_token(&original, Verb::FetchPrompt)
+            .await
+            .expect("the original must keep working: other holders still address it");
+    }
+
+    /// A token this engine never minted cannot be turned into one it did.
+    #[tokio::test]
+    async fn a_remint_refuses_a_token_this_signer_did_not_mint() {
+        let engine = Engine::new(EngineCfg::default());
+        let forged = CapToken {
+            agent_id: "worker-of-ST-forged".into(),
+            role: Role::Worker,
+            scopes: vec!["*".into()],
+            issued_at: 0,
+            expire_at: 0,
+            max_uses: None,
+            nonce: "forged".into(),
+            sig_hex: "00".into(),
+        };
+        let err = engine
+            .remint_worker_token(&forged)
+            .await
+            .expect_err("an unsigned token must not be reissued");
+        assert!(
+            matches!(err, EngineError::BadSignature),
+            "expected BadSignature, got {err:?}"
+        );
+    }
+
+    /// Only Worker capabilities are on this path. An Operator token has no
+    /// TTL problem to solve (`verify_token` exempts it) and re-minting one
+    /// would hand out a second bearer for a session.
+    #[tokio::test]
+    async fn a_remint_refuses_a_non_worker_role() {
+        let engine = Engine::new(EngineCfg::default());
+        let operator = engine
+            .attach("op-remint", Role::Operator, Duration::from_secs(600))
+            .await
+            .expect("attach");
+        let err = engine
+            .remint_worker_token(&operator)
+            .await
+            .expect_err("only Role::Worker is reissued here");
+        assert!(
+            matches!(
+                err,
+                EngineError::RoleViolation {
+                    role: Role::Operator,
+                    ..
+                }
+            ),
+            "expected RoleViolation, got {err:?}"
+        );
+    }
+
+    /// A signed Worker token with no record behind it is not a grant this
+    /// engine can attest to — there is no bound task to copy, and inventing
+    /// one is the widening this path exists to prevent.
+    #[tokio::test]
+    async fn a_remint_refuses_a_token_with_no_record() {
+        let engine = Engine::new(EngineCfg::default());
+        let unregistered = engine.signer().session(
+            "worker-of-nothing",
+            Role::Worker,
+            vec!["*".into()],
+            ALREADY_EXPIRED,
+        );
+        let err = engine
+            .remint_worker_token(&unregistered)
+            .await
+            .expect_err("no record, no reissue");
+        assert!(
+            matches!(err, EngineError::TokenNotFound(_)),
+            "expected TokenNotFound, got {err:?}"
+        );
+    }
 }
 
 // ─── UT: `OperatorKind` "Runtime Global" tier — `Option` semantics ─────────
@@ -3949,11 +4226,17 @@ mod resolve_operator_info_runtime_global_tests {
 // ─── UT: a declared backend id that resolves to nothing is logged ─────────
 //
 // `resolve_operator_info` used to answer `None` for a declared id exactly
-// as it does for an absent one, so a launch whose operator session had gone
-// lost its delegate axis (`OperatorDelegateWrapped::spawn` falls through to
-// `inner.spawn` on `None`) with nothing in the log to say a shipped feature
+// as it does for an absent one, so a launch whose bridge or hook had gone
+// lost that capability with nothing in the log to say a shipped feature
 // had been dropped. These pin the log, the unchanged `None` outcome, and
 // the silence when nothing was declared in the first place.
+//
+// They also pin the *shape* of that silence after the delegate axis was
+// removed: `operator_backend_id` is still a field on the envelope, and it
+// is deliberately NOT warned about any more, because nothing resolves it
+// at dispatch. A warning there would tell an operator that a capability
+// was dropped when in fact no capability was ever going to fire — the
+// exact false alarm that makes the other two warnings worth reading.
 #[cfg(test)]
 mod unresolved_backend_warning_tests {
     use super::*;
@@ -4037,17 +4320,22 @@ mod unresolved_backend_warning_tests {
     }
 
     #[tokio::test]
-    async fn declared_but_missing_operator_backend_is_logged() {
-        let (info, logged) = resolve_capturing_warnings(None, None, Some("S-gone".into())).await;
+    async fn a_declared_operator_backend_is_not_resolved_or_warned_about() {
+        // The delegate axis was the only reader of a resolved operator
+        // backend. With it gone, `resolve_operator_info` must not look the
+        // id up and must not warn when it misses: the warning's whole
+        // premise is "a capability you asked for will not fire on this
+        // dispatch", and no capability hangs off this id any more.
+        //
+        // Pinned rather than left implicit because the tempting change —
+        // "the other two arms warn, so this one should too" — would put a
+        // permanent, unactionable warning on every dispatch of every run
+        // launched with the legacy `operator_backend_id` spelling.
+        let (_info, logged) = resolve_capturing_warnings(None, None, Some("S-gone".into())).await;
         assert!(
-            info.operator.is_none(),
-            "resolution still answers None — this is a log, not a new outcome"
-        );
-        assert!(
-            logged.contains("operators") && logged.contains("S-gone"),
-            "an operator backend the launch declared, which no longer resolves, must name \
-             itself in the log rather than degrading the delegate axis in silence; \
-             got: {logged}"
+            logged.is_empty(),
+            "a declared operator backend id resolves to no capability now, so a miss is not a \
+             dropped feature and must not be logged as one; got: {logged}"
         );
     }
 
@@ -4075,7 +4363,7 @@ mod unresolved_backend_warning_tests {
         // id is not a dropped capability, and must not put a line in the
         // log on every dispatch of every operator-less run.
         let (info, logged) = resolve_capturing_warnings(None, None, None).await;
-        assert!(info.operator.is_none() && info.senior_bridge.is_none());
+        assert!(info.senior_bridge.is_none() && info.spawn_hook.is_none());
         assert!(
             logged.is_empty(),
             "nothing was declared, so nothing was lost; got: {logged}"

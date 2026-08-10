@@ -242,10 +242,12 @@ mod tests {
                 token_digest: OperatorSessionRecord::digest_of("token"),
                 capability_manifest: manifest,
                 joined_at_secs: 0,
+                last_access_secs: 0,
                 desc: None,
                 observed: Vec::new(),
                 observed_total: 0,
             },
+            None,
             None,
         );
         let sessions = Arc::new(Mutex::new(HashMap::from([(sid.clone(), live)])));
@@ -377,10 +379,12 @@ mod tests {
                 token_digest: OperatorSessionRecord::digest_of("token"),
                 capability_manifest: None,
                 joined_at_secs: 0,
+                last_access_secs: 0,
                 desc: None,
                 observed: Vec::new(),
                 observed_total: 0,
             },
+            None,
             None,
         );
         let pinned = LoginSession::new(
@@ -389,10 +393,12 @@ mod tests {
                 token_digest: OperatorSessionRecord::digest_of("token"),
                 capability_manifest: Some(manifest),
                 joined_at_secs: 0,
+                last_access_secs: 0,
                 desc: None,
                 observed: Vec::new(),
                 observed_total: 0,
             },
+            None,
             None,
         );
         let sessions = Arc::new(Mutex::new(HashMap::from([

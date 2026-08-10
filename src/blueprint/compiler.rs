@@ -89,6 +89,40 @@ pub enum CompileError {
         /// message.
         defined: Vec<String>,
     },
+    /// `Blueprint.spawner_hints.layers` names a layer that has been
+    /// removed from the engine — currently only `"operator_delegate"`.
+    ///
+    /// # Why this is an error and not a skipped key
+    ///
+    /// `service::linker::link` skips hint keys the deployment's
+    /// `LayerRegistry` does not answer, on purpose: it keeps a Blueprint
+    /// portable across deployments that install different layers. That
+    /// leniency is exactly wrong for a key the engine used to answer and
+    /// no longer does — the Blueprint would keep parsing, keep
+    /// registering, and quietly run a different execution shape than the
+    /// author wrote, with nothing anywhere saying a declared capability
+    /// had been dropped. Being lenient about an unknown capability and
+    /// being lenient about a *withdrawn* one are different bets, and only
+    /// the first one pays.
+    ///
+    /// Refusing at compile is also what makes the removal legible in the
+    /// one place that can name the replacement. See the
+    /// `removed-spawner-hint` lint and
+    /// `mse://guides/blueprint-authoring`.
+    #[error(
+        "spawner_hints.layers declares '{key}' but that layer has been removed: {reason}. \
+         Drop the key and route through the AgentSpec axis instead — declare the seat in \
+         `operators[]`, point the agent at it with `spec.operator_ref`, and pin its holder \
+         per launch with `operator_sid`"
+    )]
+    RemovedSpawnerHint {
+        /// The removed hint key the Blueprint still declares.
+        key: String,
+        /// Why the layer went, in one clause — folded into the message so
+        /// an author reading only the error text learns the cause, not
+        /// just the verdict.
+        reason: String,
+    },
     /// GH #21 Phase 2: an `AgentMeta.meta_ref` or a statically-visible
     /// `$step_meta.ref` (inside a `Step.in` **Lit** expr) does not match
     /// any `MetaDef.name` declared in `Blueprint.metas`.
@@ -224,6 +258,31 @@ pub enum CompileError {
 pub const WORKER_BINDING_REQUIRED_MSG_PREFIX: &str =
     "profile.worker_binding is required for this operator backend";
 
+/// The `spawner_hints.layers` keys the engine used to answer and no
+/// longer does, each with the one-clause reason it went. `None` for every
+/// other key — including keys this deployment simply does not install,
+/// which stay leniently skipped by `service::linker::link`.
+///
+/// Shared deliberately by both stages that report the
+/// `removed-spawner-hint` lint: the compile gate below (which refuses)
+/// and `bp_doctor`'s `spawner_hint_lint` family (which reports on an
+/// already-registered Blueprint, since registering does not compile).
+/// Keeping the table in one function is what stops the two stages from
+/// disagreeing about which keys are dead — the failure mode the earlier
+/// substring-matching of formatted error text kept producing.
+pub fn removed_spawner_hint_reason(key: &str) -> Option<&'static str> {
+    match key {
+        "operator_delegate" => Some(
+            "the Blueprint-global Operator delegate axis was removed because it could not \
+             follow a seat handover (it resolved its destination from the launch-time \
+             `operator_backend_id`, never from `Run.current`) and could not carry an \
+             agent's `system_prompt` (it had no per-agent spawner, so it passed `system: \
+             None` and never baked one for `/v1/worker/prompt`)",
+        ),
+        _ => None,
+    }
+}
+
 /// GH #79 Phase 2: project every [`CompileError`] variant into the
 /// unified [`Diagnostic`] shape (`mlua-swarm-diag`), preserving the
 /// variant's typed fields into `span` / `notes` / `help` directly — no
@@ -307,6 +366,33 @@ impl From<&CompileError> for mlua_swarm_diag::Diagnostic {
                     .with_note(format!("declared OperatorDef names: {defined:?}"))
                     .with_span(agent_span(agent))
             }
+            CompileError::RemovedSpawnerHint { key, .. } => base("removed-spawner-hint")
+                .with_note(
+                    "`service::linker::link` skips hint keys a deployment does not install, \
+                     so leaving this key in place would drop the capability silently rather \
+                     than report it"
+                        .to_string(),
+                )
+                .with_help(
+                    "route the spawn through the AgentSpec axis: the seat is declared once in \
+                     `operators[]`, each agent that should reach an Operator selects it with \
+                     `spec.operator_ref`, and the launch names who holds the seat for that run \
+                     via `operator_sid` (which a later handover can move without recompiling)",
+                )
+                // Shared with `bp_doctor`'s arm for the same kind rather
+                // than restated here — see
+                // `removed_spawner_hint_suggestion`'s doc for why the two
+                // stages cannot be allowed to drift, and for the
+                // `HasPlaceholders` grading.
+                .with_suggestion(mlua_swarm_diag::removed_spawner_hint_suggestion())
+                .with_docs_ref(DocsRef {
+                    uri: "mse://guides/blueprint-authoring",
+                    anchor: Some("removed-spawner-hint-layers"),
+                })
+                .with_span(DiagSpan {
+                    element: DiagElement::BlueprintRoot,
+                    json_path: Some(format!("$.spawner_hints.layers[?(@=='{key}')]")),
+                }),
             CompileError::UnresolvedMetaRef { defined, .. } => base("unresolved-meta-ref")
                 .with_note(format!("declared MetaDef names: {defined:?}")),
             CompileError::StepNamingCollision(_) => base("step-naming-collision"),
@@ -587,6 +673,31 @@ impl Compiler {
         // lint right after the loop, and carried into
         // `CompiledAgentTable.verdict_contracts`.
         let mut verdict_contracts: HashMap<String, VerdictContract> = HashMap::new();
+
+        // Withdrawn-capability check, ahead of every validation performed
+        // *here*: a Blueprint that asks for a layer the engine no longer
+        // has is not a Blueprint whose remaining errors are worth
+        // reporting, and the author wants the migration line first.
+        //
+        // "Here" is the qualifier that matters, and it is not the whole of
+        // a compile. Both public entry points do work before reaching this
+        // function — [`Compiler::compile`] resolves the binding snapshot
+        // (`resolve_bound_agents`) and [`Compiler::compile_bound`]
+        // materializes it (`materialize_bound_blueprint`) — so a Blueprint
+        // that both declares a withdrawn layer *and* fails binding
+        // resolution reports the binding error, and its author never sees
+        // the migration line. Hoisting the check into the entry points
+        // would fix that ordering, at the cost of stating it in two places
+        // where today it is stated in one; the case is rare enough that it
+        // has not been judged worth the duplication.
+        for key in &bp.spawner_hints.layers {
+            if let Some(reason) = removed_spawner_hint_reason(key) {
+                return Err(CompileError::RemovedSpawnerHint {
+                    key: key.clone(),
+                    reason: reason.to_string(),
+                });
+            }
+        }
 
         // Design-time validation (OperatorDef as a first-class value):
         // every `kind = Operator` agent's `spec.operator_ref` must point at
@@ -2457,37 +2568,32 @@ impl crate::worker::Worker for RustFnWorker {
 /// { "operator_ref": "main_ai" }     // Operator id pre-registered with the factory
 /// ```
 ///
-/// # Split of responsibilities with `OperatorDelegateMiddleware`
+/// # The only axis that reaches an Operator
 ///
-/// The two axes exist for different reasons:
+/// This factory (`OperatorSpawnerFactory` → `OperatorSpawner`) is the
+/// **AgentSpec axis**: a `kind = Operator` `AgentDef` names its seat
+/// through `spec.operator_ref`, and at `compile()` time an
+/// `Arc<dyn Operator>` for that seat is placed in `routes[agent_name]`.
+/// Because the `agent.md` loader (`agent_md_loader`) defaults `kind` to
+/// `Operator`, agents that flow in through external agent.md files land
+/// here.
 ///
-/// - **This factory (`OperatorSpawnerFactory` → `OperatorSpawner`) — the
-///   AgentSpec axis.** Bakes a separate Operator backend into each
-///   `AgentDef`. A `kind = Operator` `AgentDef` names its backend through
-///   `spec.operator_ref`; at `compile()` time the `Arc<dyn Operator>` is
-///   baked into `routes[agent_name]`. Because the `agent.md` loader
-///   (`agent_md_loader`) defaults `kind` to `Operator`, agents that flow
-///   in through external agent.md files land here.
+/// There was a second axis until recently: `OperatorDelegateMiddleware`,
+/// opted into with `spawner_hints.layers = ["operator_delegate"]`, which
+/// ignored `ctx.agent` and handed every spawn in the session to one
+/// backend named at launch. When both were effective it sat at the outer
+/// end of the stack and bypassed `inner.spawn` entirely, leaving this
+/// factory's routes entry inert — so the two axes needed an exclusivity
+/// story, and an author needed to know which one a given Blueprint was
+/// actually running on.
 ///
-/// - **`OperatorDelegateMiddleware` — the Blueprint-global (session)
-///   axis.** Delegates every agent to the same Operator backend. At
-///   session-attach time you call `engine.register_operator(id, op)`
-///   plus `attach_with_ids(.., operator_backend_id = Some(id))` to bind
-///   it session-wide, and declare
-///   `spawner_hints.layers = ["operator_delegate"]` to opt in. `ctx.agent`
-///   is ignored; the operator handles every spawn in that session (a
-///   MainAI-wide driver, a human-wide console, that sort of thing).
-///
-/// # Exclusivity (a double fire is structurally impossible)
-///
-/// When both are effective — the hint is declared, the session has an
-/// operator backend, **and** the Blueprint has a `kind = Operator`
-/// `AgentDef` — `OperatorDelegateMiddleware` sits at the outer end of
-/// the stack and **completely bypasses** `inner.spawn`. The
-/// `OperatorSpawner` is never reached, so under those conditions this
-/// factory's routes entry is inert. This is not a double fire — the
-/// session axis is overriding the agent axis. Consistent usage means
-/// picking one axis per use case.
+/// That axis was removed (it resolved its destination from the launch
+/// record rather than the Run's seat, so a handover could not move it,
+/// and it had no per-agent spawner with which to render an agent's
+/// `system_prompt`). Declaring its key is now a
+/// [`CompileError::RemovedSpawnerHint`]. One axis remains, so there is no
+/// exclusivity rule left to get wrong: if a dispatch reaches an
+/// `Operator`, it reached it through the agent's declared seat.
 ///
 /// # Who answers `spec.operator_ref` — resolver first, registry second
 ///
@@ -4567,6 +4673,7 @@ mod verdict_contract_lint_tests {
             "verdict-channel-mismatch",
             "verdict-value-not-in-contract",
             "verdict-value-unhandled",
+            "removed-spawner-hint",
         ];
         for kind in kinds {
             assert!(
@@ -4606,6 +4713,128 @@ mod verdict_contract_lint_tests {
             mlua_swarm_diag::DiagElement::Agent { name } => assert_eq!(name, "greeter"),
             other => panic!("expected Agent span, got {other:?}"),
         }
+    }
+
+    // ─── Removed spawner-hint layer (`operator_delegate`) ────────────
+    //
+    // The delegate axis is gone. `service::linker::link` skips hint keys
+    // the deployment does not install, so without an explicit refusal a
+    // Blueprint that still declares the key would compile, register, and
+    // run a different execution shape in silence. These pin the refusal,
+    // the fact that ordinary unknown keys keep their leniency, and the
+    // author-facing content of the diagnostic.
+
+    fn bp_with_hint_layers(layers: &[&str]) -> Blueprint {
+        let mut bp = minimal_bp(gate_agent(None), step("gate", "$.verdict"));
+        bp.spawner_hints = mlua_swarm_schema::SpawnerHints {
+            layers: layers.iter().map(|s| s.to_string()).collect(),
+        };
+        bp
+    }
+
+    #[test]
+    fn declaring_the_removed_operator_delegate_layer_fails_the_compile() {
+        let bp = bp_with_hint_layers(&["operator_delegate"]);
+        match Compiler::new(registry_with_echo()).compile(&bp) {
+            Err(CompileError::RemovedSpawnerHint { key, reason }) => {
+                assert_eq!(key, "operator_delegate");
+                assert!(
+                    reason.contains("Run.current") && reason.contains("system"),
+                    "the reason must name both defects the removal was for, so the error \
+                     alone explains why: {reason}"
+                );
+            }
+            Err(other) => panic!("expected RemovedSpawnerHint, got: {other}"),
+            Ok(_) => panic!(
+                "a Blueprint declaring the removed operator_delegate layer must not compile — \
+                 otherwise the layer silently stops applying"
+            ),
+        }
+    }
+
+    /// The leniency that still applies: a key this deployment does not
+    /// install is skipped, not refused. Removing a layer must not turn
+    /// `spawner_hints.layers` into a closed set, or every Blueprint
+    /// written against a deployment with extra layers stops compiling
+    /// here.
+    #[test]
+    fn an_unknown_but_not_removed_layer_key_still_compiles() {
+        let bp = bp_with_hint_layers(&["main_ai", "some_deployment_specific_layer"]);
+        Compiler::new(registry_with_echo())
+            .compile(&bp)
+            .expect("unknown (as opposed to removed) hint keys stay leniently skipped");
+    }
+
+    #[test]
+    fn a_blueprint_declaring_no_layers_compiles() {
+        let bp = bp_with_hint_layers(&[]);
+        Compiler::new(registry_with_echo())
+            .compile(&bp)
+            .expect("the all-clear case must produce no finding at all");
+    }
+
+    #[test]
+    fn removed_spawner_hint_projects_a_migration_diagnostic_naming_the_replacement() {
+        let err = CompileError::RemovedSpawnerHint {
+            key: "operator_delegate".into(),
+            reason: "it could not follow a handover".into(),
+        };
+        let d = mlua_swarm_diag::Diagnostic::from(&err);
+
+        assert_eq!(d.kind, "removed-spawner-hint");
+        assert_eq!(d.level, mlua_swarm_diag::DiagLevel::Error);
+        assert!(matches!(d.stage, mlua_swarm_diag::DiagStage::CompileLint));
+
+        // The kind resolves in the registry, and is filed as a migration
+        // (a deprecated surface with a replacement) rather than a plain
+        // correctness bug.
+        let decl = mlua_swarm_diag::lint_decl("removed-spawner-hint")
+            .expect("the kind must be declared in LINT_DECLS");
+        assert_eq!(decl.category, mlua_swarm_diag::LintCategory::Migration);
+
+        // What the author is actually told: where to go instead.
+        let help = d.help.as_ref().expect("help must name the replacement");
+        assert!(
+            help.contains("operators[]")
+                && help.contains("spec.operator_ref")
+                && help.contains("operator_sid"),
+            "the help line must name all three parts of the AgentSpec axis an author has to \
+             write, not just say the old one is gone: {help}"
+        );
+
+        // Whole-value equality against the shared constructor, not
+        // `patch.contains("operator_ref")`: the substring form passes on
+        // any two texts that both mention the field, which is exactly what
+        // a drifted copy of this prose would do. `bp_doctor`'s arm calls
+        // the same constructor, so this also pins the two stages together
+        // — the failure mode named in
+        // `removed_spawner_hint_suggestion`'s doc.
+        let suggestion = d.suggestion.expect("a concrete patch must be attached");
+        assert_eq!(
+            suggestion,
+            mlua_swarm_diag::removed_spawner_hint_suggestion()
+        );
+        assert!(
+            suggestion.patch.contains("\"operator_ref\""),
+            "whatever else the shared patch says, it has to show the field an author \
+             must add: {}",
+            suggestion.patch
+        );
+        assert_eq!(
+            suggestion.applicability,
+            // Not MachineApplicable: the author has to pick which agents
+            // get an `operator_ref` and what the seat is called.
+            mlua_swarm_diag::Applicability::HasPlaceholders
+        );
+
+        assert_eq!(
+            d.docs_ref.expect("docs_ref must be set").uri,
+            "mse://guides/blueprint-authoring"
+        );
+        assert!(matches!(
+            d.span.expect("span must be set").element,
+            mlua_swarm_diag::DiagElement::BlueprintRoot
+        ));
     }
 
     #[test]

@@ -783,6 +783,20 @@ struct BpDoctorReq {
     /// `disable_tool_lint` for the one behavioral difference.
     #[serde(default)]
     disable_verdict_contract_lint: Option<bool>,
+    /// `spawner_hint_lint` family (default enabled): when true, skip the
+    /// withdrawn-layer check (`removed_spawner_hint` — a
+    /// `spawner_hints.layers` key naming a layer the engine no longer
+    /// installs) and omit the top-level `spawner_hint_lint` section
+    /// entirely. WARN is the maximum severity ever emitted here; the
+    /// compile stage refuses the same kind outright.
+    ///
+    /// Disabling this hides the one authoring-time signal that an
+    /// already-registered Blueprint cannot launch — registering does not
+    /// compile, so nothing else in the report will say so. Legacy
+    /// spelling of a call-site `allow` on `removed-spawner-hint`; see
+    /// `disable_tool_lint` for the one behavioral difference.
+    #[serde(default)]
+    disable_spawner_hint_lint: Option<bool>,
     /// GH #78: optional simulated launch payload for the
     /// `projection_root_seed_missing` check — an object whose
     /// `"project_root"` / `"work_dir"` string fields mirror the canonical
@@ -1720,6 +1734,62 @@ fn classify_verdict_contract_lint(bp: &Blueprint) -> serde_json::Value {
     serde_json::json!({ "findings": findings })
 }
 
+/// `spawner_hint_lint` family: Blueprint-scoped, report-only surface for
+/// `spawner_hints.layers` keys naming a layer the engine has withdrawn.
+///
+/// One check, `removed_spawner_hint` (WARN here; the compile stage
+/// refuses the same kind as `Error`).
+///
+/// **Why this needs a `bp_doctor` surface at all when compile already
+/// refuses.** Registering a Blueprint does not compile it —
+/// `blueprints.rs` stores the document, and `Compiler::compile` first
+/// runs at launch. So a Blueprint carrying a removed hint registers
+/// cleanly, passes a `bp_doctor` run that has no producer for it, and
+/// then dies on its first dispatch, at which point the author is reading
+/// a launch failure rather than an authoring one. That is the same gap
+/// `worker_binding_lint` was added to close ("the same fail-loud
+/// condition `Compiler::compile` enforces at dispatch, retroactively
+/// surfaced on already-registered Blueprints"), and it is worse here: the
+/// hint is inert wiring rather than a missing field, so nothing else in
+/// the doctor report hints that the Blueprint is unlaunchable.
+///
+/// The severity split is deliberate and matches the model's per-stage
+/// levels: the compile stage refuses because continuing would run a
+/// different execution shape than the author wrote, while `bp_doctor` is
+/// report-only by construction and its verdict is a label, so it reports.
+///
+/// The removed-key table itself lives in
+/// [`mlua_swarm::removed_spawner_hint_reason`], shared with the compile
+/// gate so the two stages cannot disagree about which keys are dead.
+///
+/// Pure over the resolved Blueprint (no I/O), unit-testable.
+fn classify_spawner_hint_lint(bp: &Blueprint) -> serde_json::Value {
+    let findings: Vec<serde_json::Value> = bp
+        .spawner_hints
+        .layers
+        .iter()
+        .filter_map(|key| {
+            let reason = mlua_swarm::removed_spawner_hint_reason(key)?;
+            Some(serde_json::json!({
+                "check": "removed_spawner_hint",
+                "severity": "WARN",
+                "layer": key,
+                "message": format!(
+                    "spawner_hints.layers declares '{key}', but that layer has been removed: \
+                     {reason}. This Blueprint is registered and will fail to compile on its \
+                     next dispatch. Drop the key and route through the AgentSpec axis instead \
+                     — declare the seat in `operators[]`, point each operator-backed agent at \
+                     it with `spec.operator_ref`, and name the seat's holder per launch with \
+                     `operator_sid` (a later handover then moves the destination without \
+                     recompiling anything)."
+                ),
+            }))
+        })
+        .collect();
+
+    serde_json::json!({ "findings": findings })
+}
+
 // ─── GH #79 Phase 3: classify_* → Diagnostic siblings ─────────────────────
 //
 // Each `classify_*` family gains a sibling that projects its JSON
@@ -1951,6 +2021,7 @@ fn diag_from_finding(
     let docs_uri = match family {
         mlua_swarm_diag::BpDoctorFamily::SkipOnLint => "mse://guides/skip-tier-and-skip-on",
         mlua_swarm_diag::BpDoctorFamily::VerdictContractLint => "mse://guides/blueprint-authoring",
+        mlua_swarm_diag::BpDoctorFamily::SpawnerHintLint => "mse://guides/blueprint-authoring",
         _ => "mse://guides/operator-execution-model",
     };
     let check = finding.get("check")?.as_str()?;
@@ -1970,6 +2041,7 @@ fn diag_from_finding(
         "projection_root_seed_missing" => "projection-root-seed-missing",
         "verdict_value_unhandled" => "verdict-value-unhandled",
         "verdict_contract_never_read" => "verdict-contract-never-read",
+        "removed_spawner_hint" => "removed-spawner-hint",
         // A future check without a registry kind is skipped
         // rather than emitted with an undeclared kind — the
         // old `findings` field still carries it verbatim.
@@ -2015,6 +2087,15 @@ fn diag_from_finding(
             applicability: Applicability::MaybeIncorrect,
         });
     }
+    // Same lint, same recovery as the compile stage's arm in
+    // `impl From<&CompileError> for Diagnostic`. Both call the one
+    // constructor rather than each spelling the prose out: an author who
+    // meets this kind at either stage must not be told two different
+    // things, and the two arms are in different crates, so nothing local
+    // to either would notice them drifting apart.
+    if kind == "removed-spawner-hint" {
+        d = d.with_suggestion(mlua_swarm_diag::removed_spawner_hint_suggestion());
+    }
     Some(d)
 }
 
@@ -2057,6 +2138,11 @@ const BP_DOCTOR_EMITTED_KINDS: &[&str] = &[
     "projection-root-seed-missing",
     "verdict-value-unhandled",
     "verdict-contract-never-read",
+    // Dual-stage kind, like `worker-binding-missing`: `Error` at compile
+    // (the compile refuses), `Warn` here (report-only). Listing it keeps
+    // it suppressible at *this* stage — an author who has not migrated
+    // yet can `allow` the doctor noise, and the compile still refuses.
+    "removed-spawner-hint",
 ];
 
 /// Inverse of [`diag_level_from_severity`]: the `bp_doctor` severity
@@ -4857,6 +4943,7 @@ impl MseServer {
         let disable_skip_on_lint = req.disable_skip_on_lint.unwrap_or(false);
         let disable_context_policy_lint = req.disable_context_policy_lint.unwrap_or(false);
         let disable_verdict_contract_lint = req.disable_verdict_contract_lint.unwrap_or(false);
+        let disable_spawner_hint_lint = req.disable_spawner_hint_lint.unwrap_or(false);
 
         // Clippy-style lint level control: the call-site `lints` field,
         // `agents[].lints` and `metadata.lints` resolve every finding
@@ -5096,6 +5183,26 @@ impl MseServer {
             })
             .unwrap_or_default();
 
+        // Blueprint-scoped spawner_hint_lint (see
+        // `classify_spawner_hint_lint` doc for why a compile-refused kind
+        // still needs a report-only surface: registering does not compile,
+        // so a Blueprint carrying a withdrawn layer key otherwise passes
+        // its doctor run and dies at the first dispatch instead).
+        let mut spawner_hint_lint =
+            (!disable_spawner_hint_lint).then(|| classify_spawner_hint_lint(&bp));
+        let spawner_hint_lint_severities: Vec<String> = spawner_hint_lint
+            .as_mut()
+            .map(|v| {
+                apply_findings_family_lints(
+                    mlua_swarm_diag::BpDoctorFamily::SpawnerHintLint,
+                    v,
+                    &lint_layers,
+                    &mut suppressed,
+                    &mut diagnostics,
+                )
+            })
+            .unwrap_or_default();
+
         let mut skip_on_lint = (!disable_skip_on_lint).then(|| classify_skip_on_lint(&bp));
         let skip_on_lint_severities: Vec<String> = skip_on_lint
             .as_mut()
@@ -5133,6 +5240,7 @@ impl MseServer {
                 + skip_on_lint_severities.len()
                 + context_policy_lint_severities.len()
                 + verdict_contract_lint_severities.len()
+                + spawner_hint_lint_severities.len()
                 + meta_lint_severities.len(),
         );
         all_severities.extend(severities.iter().copied());
@@ -5143,6 +5251,7 @@ impl MseServer {
         all_severities.extend(skip_on_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(context_policy_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(verdict_contract_lint_severities.iter().map(|s| s.as_str()));
+        all_severities.extend(spawner_hint_lint_severities.iter().map(|s| s.as_str()));
         all_severities.extend(meta_lint_severities.iter().copied());
         let verdict = aggregate_agent_md_verdict(&all_severities);
         let over_threshold_count = severities.iter().filter(|s| **s != "OK").count();
@@ -5184,6 +5293,12 @@ impl MseServer {
             .iter()
             .filter(|s| s.as_str() == "WARN")
             .count();
+        // spawner_hint_lint findings are WARN-only at this stage (the
+        // compile stage is where the same kind is an Error).
+        let spawner_hint_lint_warn_count = spawner_hint_lint_severities
+            .iter()
+            .filter(|s| s.as_str() == "WARN")
+            .count();
 
         let mut body = serde_json::json!({
             "bp_id": req.id,
@@ -5199,6 +5314,7 @@ impl MseServer {
             "skip_on_lint_warn_count": skip_on_lint_warn_count,
             "context_policy_lint_warn_count": context_policy_lint_warn_count,
             "verdict_contract_lint_warn_count": verdict_contract_lint_warn_count,
+            "spawner_hint_lint_warn_count": spawner_hint_lint_warn_count,
             "thresholds": {
                 "warn_bytes": thresholds.warn_bytes,
                 "warn_lines": thresholds.warn_lines,
@@ -5214,6 +5330,7 @@ impl MseServer {
                 "skip_on_lint_enabled": !disable_skip_on_lint,
                 "context_policy_lint_enabled": !disable_context_policy_lint,
                 "verdict_contract_lint_enabled": !disable_verdict_contract_lint,
+                "spawner_hint_lint_enabled": !disable_spawner_hint_lint,
             },
             "agents": per_agent,
             // GH #79 Phase 3: the unified projection — one entry per
@@ -5259,6 +5376,13 @@ impl MseServer {
         if let Some(verdict_contract_lint) = verdict_contract_lint {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("verdict_contract_lint".to_string(), verdict_contract_lint);
+            }
+        }
+        // Attach `spawner_hint_lint` when the family is enabled, same
+        // conditional-presence convention.
+        if let Some(spawner_hint_lint) = spawner_hint_lint {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("spawner_hint_lint".to_string(), spawner_hint_lint);
             }
         }
         json_result(&body)
@@ -6567,6 +6691,67 @@ mod tests {
     fn file_absolute_path_rejected() {
         let e = read_blueprint_from_file("/etc/passwd").unwrap_err();
         assert!(e.contains("absolute"), "err: {e}");
+    }
+
+    /// `mse://guides/lint-diagnostic-model`'s "Legacy `disable_*_lint`
+    /// flags" table must list every such flag `BpDoctorReq` actually
+    /// accepts, and its prose count must match the table.
+    ///
+    /// Bound to the schema rather than to a hand-kept list, because the
+    /// drift this catches is exactly the hand-kept kind: adding
+    /// `disable_spawner_hint_lint` to `BpDoctorReq` left both the count
+    /// ("seven") and the table one row short, and nothing said so. Step 2
+    /// of that guide's own add-a-lint recipe is to update the guide; this
+    /// is the assertion that makes skipping it fail.
+    #[test]
+    fn lint_guide_legacy_flag_table_matches_bp_doctor_req() {
+        use schemars::schema_for;
+
+        const GUIDE: &str = include_str!("./mcp/resources/guides/lint-diagnostic-model.md");
+
+        let schema = schema_for!(BpDoctorReq);
+        let schema_json = serde_json::to_value(&schema).expect("schema to json");
+        let mut declared: Vec<String> = schema_json
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("BpDoctorReq properties")
+            .keys()
+            .filter(|k| k.starts_with("disable_") && k.ends_with("_lint"))
+            .cloned()
+            .collect();
+        declared.sort();
+
+        // The table rows: every `| \`disable_x_lint\` | ... |` line in the
+        // guide. The section has the only such rows in the file.
+        let mut documented: Vec<String> = GUIDE
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `disable_"))
+            .filter_map(|rest| rest.split('`').next())
+            .map(|name| format!("disable_{name}"))
+            .filter(|name| name.ends_with("_lint"))
+            .collect();
+        documented.sort();
+
+        assert_eq!(
+            documented, declared,
+            "the guide's legacy-flag table and BpDoctorReq's `disable_*_lint` fields \
+             have drifted apart"
+        );
+
+        // …and the sentence introducing the table counts the same rows.
+        let count_word = match declared.len() {
+            6 => "six",
+            7 => "seven",
+            8 => "eight",
+            9 => "nine",
+            n => panic!("extend the numeral table for {n} flags"),
+        };
+        assert!(
+            GUIDE.contains(&format!("The {count_word} `bp_doctor` request flags")),
+            "the guide must introduce the table as \"The {count_word} `bp_doctor` request \
+             flags\" ({} rows)",
+            declared.len()
+        );
     }
 
     /// Annotation regression guard: every `swarm_run.blueprint` variant must
@@ -9652,6 +9837,135 @@ mod context_policy_lint_tests {
     }
 }
 
+// ─── bp_doctor spawner_hint_lint family ──────────────────────────────────
+//
+// Regression axis: registering a Blueprint does not compile it, so a
+// Blueprint still declaring the removed `operator_delegate` layer
+// registers clean and only dies at its first dispatch. This family is the
+// authoring-time surface for that state; the compile stage refuses the
+// same lint kind as an Error.
+#[cfg(test)]
+mod spawner_hint_lint_tests {
+    use super::*;
+
+    /// A minimal Blueprint carrying the given `spawner_hints.layers`,
+    /// built through serde so the fixture cannot drift from the wire
+    /// format authors actually write.
+    fn bp_with_layers(layers: &[&str]) -> Blueprint {
+        serde_json::from_value(serde_json::json!({
+            "id": "spawner-hint-lint-fixture",
+            "flow": {"kind": "seq", "children": []},
+            "agents": [],
+            "spawner_hints": {"layers": layers},
+        }))
+        .expect("fixture blueprint must deserialize")
+    }
+
+    fn findings(verdict: &serde_json::Value) -> &Vec<serde_json::Value> {
+        verdict
+            .get("findings")
+            .and_then(|f| f.as_array())
+            .expect("the family always reports a findings array")
+    }
+
+    #[test]
+    fn flags_the_removed_operator_delegate_layer() {
+        let verdict = classify_spawner_hint_lint(&bp_with_layers(&["operator_delegate"]));
+        let found = findings(&verdict);
+        assert_eq!(found.len(), 1, "one declared removed layer, one finding");
+        assert_eq!(found[0]["check"], "removed_spawner_hint");
+        assert_eq!(found[0]["severity"], "WARN");
+        assert_eq!(found[0]["layer"], "operator_delegate");
+
+        let message = found[0]["message"].as_str().expect("message is a string");
+        assert!(
+            message.contains("will fail to compile on its next dispatch"),
+            "the reader has to learn this Blueprint is already unlaunchable, not merely \
+             untidy: {message}"
+        );
+        assert!(
+            message.contains("operators[]")
+                && message.contains("spec.operator_ref")
+                && message.contains("operator_sid"),
+            "the message must name the AgentSpec-axis replacement: {message}"
+        );
+    }
+
+    /// The all-clear case: a live layer key, and no layers at all, both
+    /// report an empty findings array (not an absent field).
+    #[test]
+    fn is_silent_for_live_and_absent_layer_keys() {
+        for layers in [&["main_ai", "senior_escalation"][..], &[][..]] {
+            let verdict = classify_spawner_hint_lint(&bp_with_layers(layers));
+            assert!(
+                findings(&verdict).is_empty(),
+                "no removed layer declared, so nothing to report (layers: {layers:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn projects_a_warn_diagnostic_of_the_declared_migration_kind() {
+        let verdict = classify_spawner_hint_lint(&bp_with_layers(&["operator_delegate"]));
+        let diags = diag_from_findings(mlua_swarm_diag::BpDoctorFamily::SpawnerHintLint, &verdict);
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+
+        assert_eq!(d.kind, "removed-spawner-hint");
+        // The stage asymmetry the model allows and this lint uses: Error
+        // at compile (the compile refuses), Warn here (report-only).
+        assert_eq!(d.level, mlua_swarm_diag::DiagLevel::Warn);
+        assert!(matches!(
+            d.stage,
+            mlua_swarm_diag::DiagStage::BpDoctor {
+                family: mlua_swarm_diag::BpDoctorFamily::SpawnerHintLint
+            }
+        ));
+
+        let decl = mlua_swarm_diag::lint_decl("removed-spawner-hint")
+            .expect("the kind must resolve in LINT_DECLS");
+        assert_eq!(decl.category, mlua_swarm_diag::LintCategory::Migration);
+
+        // "The same patch the compile arm does" asserted as whole-value
+        // equality against the one constructor both arms call, not as
+        // `patch.contains("operator_ref")` — the substring form is
+        // satisfied by any two texts that mention the field, so it would
+        // stay green through exactly the drift it is meant to catch. The
+        // compile-stage sibling of this assertion is in
+        // `blueprint::compiler`'s
+        // `removed_spawner_hint_projects_a_migration_diagnostic_naming_the_replacement`.
+        let suggestion = d
+            .suggestion
+            .as_ref()
+            .expect("the doctor finding carries the same patch the compile arm does");
+        assert_eq!(
+            suggestion,
+            &mlua_swarm_diag::removed_spawner_hint_suggestion()
+        );
+        assert!(
+            suggestion.patch.contains("\"operator_ref\""),
+            "the shared patch has to show the field an author must add: {}",
+            suggestion.patch
+        );
+        assert_eq!(
+            suggestion.applicability,
+            mlua_swarm_diag::Applicability::HasPlaceholders
+        );
+        assert_eq!(
+            d.docs_ref.as_ref().expect("docs_ref must be set").uri,
+            "mse://guides/blueprint-authoring"
+        );
+    }
+
+    /// The stage contract: a kind this stage can emit has to be listed,
+    /// or an author's `allow` on it raises `non-suppressible-lint`
+    /// instead of suppressing.
+    #[test]
+    fn the_kind_is_declared_as_bp_doctor_emitted() {
+        assert!(BP_DOCTOR_EMITTED_KINDS.contains(&"removed-spawner-hint"));
+    }
+}
+
 // ─── bp_doctor verdict_contract_lint family ──────────────────────────────
 //
 // Regression axis: a Blueprint that declares verdict contracts and then
@@ -10122,6 +10436,7 @@ mod bp_doctor_lint_control_tests {
                 disable_skip_on_lint: Some(true),
                 disable_context_policy_lint: Some(true),
                 disable_verdict_contract_lint: Some(true),
+                disable_spawner_hint_lint: Some(true),
                 simulated_launch: None,
             }))
             .await

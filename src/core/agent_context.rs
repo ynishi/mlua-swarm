@@ -43,7 +43,7 @@
 //!    (b) ctx.meta.runtime[AGENT_CONTEXT_KEY] = json(view)          ← Spawner axis source
 //!         │ inner.spawn(new_ctx)
 //!         ▼
-//!  base stack (OperatorDelegate → WS session.rs | in-proc AgentBlock runtime.rs)
+//!  base stack (OperatorSpawner → WS session.rs | in-proc AgentBlock runtime.rs)
 //! ```
 //!
 //! (a) is read back by `Engine::fetch_worker_payload{,_trusted}` (keyed by

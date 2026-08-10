@@ -95,8 +95,17 @@ pub enum ServerMsg {
         result: Value,
     },
     /// `Operator.execute` request (= delegates the whole spawn to an external
-    /// Operator, via `OperatorDelegateMiddleware`). The client replies with the
-    /// `WorkerResult`-equivalent (= value + ok) in `spawn_ack`.
+    /// Operator). The client replies with the `WorkerResult`-equivalent
+    /// (= value + ok) in `spawn_ack`.
+    ///
+    /// The sender is the AgentSpec axis: a `kind = Operator` agent resolves
+    /// its seat's *current* holder off `Run.current` and delivers through
+    /// [`AssigneeRouter`](super::router::AssigneeRouter). It used to say
+    /// `OperatorDelegateMiddleware` here — the Blueprint-global delegate
+    /// layer, which addressed the launch-time backend id instead of the
+    /// seat's holder and so could not follow a handover. That layer is gone
+    /// and declaring it is a compile error (`removed-spawner-hint`); this
+    /// frame is unchanged on the wire.
     ///
     /// **Thin control channel** (the Spawn thin-control axis): the server sends only
     /// the `capability_token`. `system_prompt` / `prompt` are NOT carried in the

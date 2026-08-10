@@ -321,9 +321,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // guarded against bind-state races that dispatch_attempt_with's
     // per-request spawner already prevents — no global-state race remains).
     // The Engine is built with a LayerRegistry so that
-    // `Blueprint.spawner_hints` values ("main_ai" / "senior_escalation" /
-    // "operator_delegate") get wrapped into the SpawnerStack inside
-    // TaskLaunchService.
+    // `Blueprint.spawner_hints` values ("main_ai" / "senior_escalation")
+    // get wrapped into the SpawnerStack inside TaskLaunchService.
     let engine = Engine::new_with_layers(
         engine_cfg_from(&cfg),
         mlua_swarm_server::default_layer_registry_with(mlua_swarm_server::LayerOptions {

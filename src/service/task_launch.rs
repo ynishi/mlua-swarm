@@ -55,7 +55,8 @@ use thiserror::Error;
 ///
 /// Deliberately **not** filtered by `AgentDef.kind == AgentKind::Operator`:
 /// the `OperatorKind` cascade is a middleware-level cross-cutting concern
-/// (spawn_hook / senior_bridge / operator-delegate gating via `Ctx.operator`),
+/// (spawn_hook / senior_bridge gating via `Ctx.operator` — the
+/// operator-delegate third has been withdrawn),
 /// orthogonal to the Worker IMPL axis that `AgentKind` expresses (see the
 /// crate root doc, "Operator is delivered as a cross-cutting overlay through
 /// `Ctx` plus middleware"). A `RustFn` / `Lua` / `Subprocess` agent can
@@ -71,9 +72,9 @@ use thiserror::Error;
 /// Build the `agent name → WorkerBinding` map from
 /// `Blueprint.agents[].profile.worker_binding` — the launch-time sibling of
 /// the compile-time resolution in `OperatorSpawnerFactory::build`. Consumed
-/// by `WorkerBindingMiddleware` so the delegate axis
-/// (`OperatorDelegateMiddleware`) can resolve the binding via `ctx.agent`
-/// like every other agent-keyed table (`CompiledAgentTable.routes` idiom).
+/// by `WorkerBindingMiddleware`, which publishes the binding on `ctx` keyed
+/// by `ctx.agent` like every other agent-keyed table
+/// (`CompiledAgentTable.routes` idiom).
 /// Agents without a declared binding are simply absent (no silent default).
 #[cfg(test)]
 pub(crate) fn derive_worker_bindings(blueprint: &Blueprint) -> HashMap<String, WorkerBinding> {
@@ -665,11 +666,14 @@ pub struct TaskLaunchInput {
     /// This used to be two fields, `operator_backend_id` and
     /// `operator_pin`, and every caller set them from the same value:
     ///
-    /// - **Delegate axis.** Stored on `LaunchEnvelope.operator_backend_id`
-    ///   and resolved by `OperatorDelegateMiddleware`, which — for
-    ///   `kind = MainAi` / `Composite`, and only when the Blueprint opts
-    ///   into the `operator_delegate` layer — bypasses `inner.spawn` and
-    ///   calls `operator.execute`.
+    /// - **Delegate axis.** *Gone.* The value was stored on
+    ///   `LaunchEnvelope.operator_backend_id` and resolved by
+    ///   `OperatorDelegateMiddleware`, which bypassed `inner.spawn` when
+    ///   the Blueprint opted into the `operator_delegate` layer. That
+    ///   layer was removed (it read a launch-time destination and so could
+    ///   not follow a seat handover, and it carried no `system_prompt`);
+    ///   the envelope field outlives it only as the persisted session
+    ///   shape and the launch-time "is this a live session" guard key.
     /// - **AgentSpec axis.** The binding provider attests this launch's
     ///   manifests through that session
     ///   ([`crate::binding::AgentBindingProvider::pinned_to_session`]), and
@@ -690,11 +694,10 @@ pub struct TaskLaunchInput {
     /// destination the per-dispatch lookup replaced.
     ///
     /// `None` (the default via [`Self::automate`]) names no operator: the
-    /// delegate layer finds no backend and falls through to `inner.spawn`,
-    /// and the binding provider has nothing to attest through (it reports
-    /// `Unbound`). A value that is not a live session id behaves the same
-    /// way on the second axis while still resolving on the first, which is
-    /// how an embedder-registered backend keeps working.
+    /// binding provider has nothing to attest through (it reports
+    /// `Unbound`). A value that is not a live session id reaches the same
+    /// outcome — with the delegate axis gone, a backend id that names no
+    /// live session no longer has a second path it can still resolve on.
     pub operator_sid: Option<String>,
     /// "Runtime Agent-level" tier (highest priority) of the `OperatorKind`
     /// cascade — per-agent override, keyed by `AgentDef.name`. Empty by
@@ -975,8 +978,11 @@ impl TaskLaunchService {
             spawner
         };
         // Layer the Blueprint-baked worker bindings (same ctx.meta.runtime
-        // inject shape as the alias layer above) so the delegate axis can
-        // resolve per-agent variants — see `derive_worker_bindings`.
+        // inject shape as the alias layer above) — see
+        // `derive_worker_bindings`. This used to be how the delegate axis
+        // resolved per-agent variants; that axis is gone and nothing in
+        // this repository reads the key it writes. What keeps the layer
+        // wired is set out in `WorkerBindingMiddleware`'s module doc.
         let worker_bindings = worker_bindings_from_bound_agents(&bound_agents);
         let spawner = if worker_bindings.is_empty() {
             spawner
@@ -1033,24 +1039,15 @@ impl TaskLaunchService {
             .default_operator_kind
             .map(OperatorKind::from);
 
-        // The delegate axis's half of `operator_sid`: the envelope stores it
-        // as the `Engine.operators` key `resolve_operator_info` looks up at
-        // every dispatch.
-        //
-        // # Why this still reads a launch-time value rather than `Run.current`
-        //
-        // The AgentSpec axis moved off the launch record and onto the Run's
-        // seat, which is what makes a handover work: a dispatch re-reads
-        // `Run.current` and lands wherever the seat points *now*. The
-        // delegate axis did not move with it, so a delegate-layer Blueprint
-        // keeps dispatching to whoever the launch named even after the seat
-        // has been handed over. That gap is real and is tracked separately
-        // (issue `545411ab`); it is not closed here, because closing it
-        // means giving `Engine::resolve_operator_info` a way to reach the
-        // Run's seat — a `RunStore` dependency this crate's dispatch path
-        // does not have and should not grow as a side effect of folding an
-        // input field. Folding the field changes where the value comes from
-        // (one input instead of three), not when it is read.
+        // The envelope still records the launch's operator id. Nothing
+        // dispatches through it any more: the delegate axis that used to
+        // read it back out via `Engine::resolve_operator_info` was removed
+        // precisely because it read this launch-time value instead of
+        // `Run.current`, and so could not follow a seat handover (the gap
+        // tracked as issue `545411ab`). What the field still carries is the
+        // persisted session shape and the launch-time guard key — the
+        // AgentSpec axis reaches its destination through the Run's seat,
+        // not through here.
         let token = self
             .engine
             .attach_with_ids(

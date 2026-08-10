@@ -86,7 +86,7 @@ impl WorkerResult {
     /// stats sidecar, operator ack), that value wins; otherwise the
     /// fold site's `kind` becomes the value. Called at every worker
     /// fold site (`InProcSpawner` spawn task, subprocess spawn task,
-    /// `OperatorDelegateMiddleware`).
+    /// `OperatorSpawner`).
     pub fn ensure_worker_kind(mut self, kind: &str) -> Self {
         let stats = self
             .stats

@@ -78,10 +78,10 @@ so the response body is the ref form, not what you sent:
 // POST /v1/enhance-settings  ->  201
 {
   "id": "default",
-  "ttl_secs": 600,                    // stamped on the run's operator session
-                                      // token; it no longer gates verification
-                                      // (Operator tokens are expiry-exempt), so
-                                      // the run's real bound is the driver ceiling
+  "ttl_secs": 600,                    // how long the drain waits for one flow
+                                      // before giving up on it — read "The epoch
+                                      // ceiling" below before you rely on it.
+                                      // Must be greater than 0.
   "blueprint": { /* full Blueprint document — schema: mse://api/blueprint-schema */ },
   "verifier_axes": ["des", "canonical", "noop", "agent-ref"]  // optional; this is the default
 }
@@ -106,6 +106,93 @@ the committer — applied or verifier-rejected — also appends exactly one entr
 to `GET /v1/enhance/log` (and `/v1/enhance/log/:issue_id`), carrying the
 per-axis verdicts. A run that never got that far (an infra fault, e.g. a
 missing setting) only shows up as the issue's `rejected` reason.
+
+## The epoch ceiling
+
+One tick is one epoch — one issue, popped, dispatched, and driven to a
+commit decision. `ttl_secs` bounds **how long the drain waits** for that
+flow to come back, and nothing else. It does not bound the epoch (the store
+calls on either side of the flow sit outside it), and it does not stop the
+work (a worker already running keeps running). Read both as the definition,
+not as caveats; the rest of this section is what follows from them.
+
+The knob exists to let the Swarm give up on an Operator that has stopped
+answering. That wait is the thing it bounds, and it bounds it exactly.
+
+The drain is single-threaded, so a `patch-spawner` whose model call hangs
+stalls not just its own issue but every issue queued behind it. `ttl_secs`
+is what gets the drain moving again in that case. It is not a bound on
+anything else: the store calls on either side of the flow (reading the
+setting, resolving the orbit and target Blueprints, writing the new
+version, appending the log, updating issue status) sit outside it and are
+bounded by nothing. A `BlueprintStore` blocked on git index-lock
+contention still wedges the drain.
+
+`ttl_secs` is also stamped on the epoch's operator session token, where it
+does nothing: Operator tokens are exempt from the expiry check. Bounding
+the drain's wait is the field's only effect. Set it to the number of
+seconds you are willing to wait for a whole flow — spawner call, patch
+apply, every verifier lane, committer — not to the length of the model
+call alone. `0` is refused at write time (`POST` / `PUT
+/v1/enhance-settings` answers `400`); it is a typo, not a way to say
+"unbounded".
+
+When `ttl_secs` elapses, the drain stops waiting and:
+
+- **Nothing is committed.** The epoch's only write to the `BlueprintStore`
+  happens after the flow completes, so a fired ceiling always precedes it.
+  The target Blueprint's head is byte-identical to what it was when the
+  issue was popped — there is no half-written version, and no `prev_hash`
+  drift for a later epoch to trip over.
+- **The issue is terminal `rejected`**, with a reason naming the ceiling it
+  blew through and the setting field to raise.
+- **Nothing is appended to `/v1/enhance/log`.** The log records epochs that
+  reached the committer, and carries their per-axis verdicts; a timed-out
+  epoch has none. Same treatment as every other infra fault.
+- **The worker is not stopped.** See below before you re-post.
+
+### The worker keeps running (known limitation)
+
+Giving up on the wait does not reach the work. A worker running in one of
+the in-process lanes lives in its own task, not inside the future the drain
+dropped, and nothing in the server signals it to stop:
+
+| spawner | what a fired ceiling does to it |
+|---|---|
+| in-process (Lua / Rust fn) | nothing — it runs to its own end and submits into an epoch nobody reads |
+| `agent-block` | nothing — the SDK run, its Lua VM and the MCP servers it drives all continue |
+| subprocess | nothing — the child process keeps running |
+
+This is not a bug in the ceiling. `ttl_secs` bounds a wait on an Operator,
+and none of the lanes above is a wait: they are computations running in
+this process. Bounding *them* would mean a different mechanism (a timeout
+inside the agent, or a subprocess wrapper that enforces one).
+
+**Do not re-post on reflex.** The issue going terminal does not mean the
+work stopped, and a re-post while the previous worker is alive puts two
+uncoordinated writers under the same `project_root`. Recovery order:
+
+1. **Check the previous worker has exited.** If the agent writes to a
+   working tree, check that tree too — see below.
+2. **Raise `ttl_secs`** if the epoch legitimately needs longer. A ceiling
+   that trips routinely is cutting real work loose each time.
+3. **Re-post.** There is no run record or replay log on this path, so
+   nothing is resumable — a re-post is a fresh epoch, and because nothing
+   was committed it starts from exactly the same `prev_hash`.
+
+### What a fired ceiling does not undo
+
+The ceiling ends a wait. It does not roll anything back:
+
+- **Whatever the worker wrote is still there**, and it is still being
+  written to while the worker runs. The next epoch reads that state as if
+  it were yours.
+- **The worker's result still arrives.** It submits against an epoch nobody
+  reads. Harmless on this path (no files are materialized for an `automate`
+  launch), but it is not evidence that the epoch continued.
+- **The operator session attached for the epoch is not detached** — shared
+  with the success path, which does not detach either, so it is not
+  specific to a fired ceiling.
 
 ## The spawner's output contract
 
@@ -205,3 +292,5 @@ vendor-specific templates; the examples here use neutral binaries only.
 | every issue goes straight to `rejected` with `dispatch failed: ...` | one of the two prerequisites is missing: the flow is not enabled, or there is no setting under id `default`. |
 | `fn_id '<id>' not registered in factory` at compile time | the server was started without `--enable-enhance-flow`. |
 | `spawner override: orbit blueprint declares no agent named "patch-spawner"` | the setting carries a `spawner`, but the orbit Blueprint has no agent under that name. |
+| `enhance epoch exceeded the <N>s ceiling ...` | the drain stopped waiting after `ttl_secs`. Nothing was committed, but **only the wait ended** — a worker already running keeps running, so re-posting now would put a second writer under the same `project_root`. Check it has exited (and what it left there), raise `ttl_secs` if the epoch needs longer, then re-post. See "The epoch ceiling". |
+| `enhance setting "default" declares ttl_secs: 0 ...` | `ttl_secs` must be greater than 0; zero is not a way to say "unbounded". |

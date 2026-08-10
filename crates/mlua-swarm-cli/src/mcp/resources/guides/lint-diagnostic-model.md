@@ -212,7 +212,7 @@ a rejected request or a failed register:
 
 ### Legacy `disable_*_lint` flags
 
-The seven `bp_doctor` request flags keep their exact current semantics
+The eight `bp_doctor` request flags keep their exact current semantics
 (the family's field is omitted from the response entirely). They are
 call-site `allow` on a fixed kind set:
 
@@ -225,6 +225,7 @@ call-site `allow` on a fixed kind set:
 | `disable_skip_on_lint` | `skip-on-missing-for-skip-like-verdict-value`, `skip-on-declared-but-no-matching-verdict-value`, `skip-on-pattern-conflicts-with-halt-on` |
 | `disable_context_policy_lint` | `context-policy-strips-projection-roots`, `projection-root-seed-missing` |
 | `disable_verdict_contract_lint` | `verdict-value-unhandled`, `verdict-contract-never-read` |
+| `disable_spawner_hint_lint` | `removed-spawner-hint` |
 
 New authoring uses `lints`: it is per-kind rather than per-family, it
 survives in the artifact, and an allowed finding stays visible in
