@@ -866,15 +866,27 @@ off `GET /v1/operators` and identify by its 記名, and cannot delete: the
 delete answers `401` for everyone except the driver that is gone.
 
 **It goes on its own after 24 hours.** A session that has not been
-*accessed* for 24h is released the next time anything reads it — by the
-list you are reading, or by the boot that would otherwise have restored
-it. (Model §4.1 states this in its state diagram,
+*accessed* for 24h is released two ways: the next time anything reads it —
+the list you are reading, or the boot that would otherwise have restored
+it — and, failing that, by the server's own sweep, which runs every 300s
+by default (`operator_session_sweep_secs`) and needs no reader at all.
+(Model §4.1 states the horizon in its state diagram,
 `最終アクセスから 24h ──▶ ╳ 削除`; it carries no predicate number, and in
 particular is **not** `O1`, which is `join は無認証`.) The release is the
 same teardown a leave performs, cascade (**O8**) included, so the row, the
 registrations and any seat it still held all go together. So the
 accumulation is bounded and you are not expected to clean up after a
 crashed driver; it drops off the list a day after its driver stopped.
+
+The sweep is why that last sentence holds on a quiet server. Expiring only
+at the reads would leave a crashed driver's session **registered** until
+somebody happened to list — and a dispatch aimed at its sid resolves
+through those registrations and parks, which is not a read and judges
+nothing. The sweep applies the same predicate through the same teardown;
+what it adds is arriving on its own. It reports itself on
+`GET /v1/status` (`periodic_jobs[]`: period, last run, what it released),
+and `operator_session_sweep_secs: 0` turns the schedule off without
+changing the horizon — the reads still expire what they touch.
 
 What counts as an access is anything that shows the driver is still
 there **and arrives before the horizon**: attaching the WebSocket,

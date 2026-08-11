@@ -47,9 +47,14 @@ type WsSource = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 /// it returns.
 ///
 /// A count rather than a deadline on purpose — the ② session behind the sid
-/// has no TTL and no sweeper, so however long the outage lasts, a handshake
-/// that finally succeeds is still valid. This client never retires a sid;
-/// only `DELETE /v1/operators/:sid` does.
+/// outlives any outage this client can sit through, so a handshake that
+/// finally succeeds is still valid. The one thing that does retire it is
+/// model §4.1's 24h horizon, applied at every read and by the server's
+/// `operator-session-expiry` sweep; an outage long enough to reach that is
+/// one where re-joining is the answer, and the reconnect answers `404`
+/// rather than silently reviving a session the server has released. This
+/// client never retires a sid on its own; only
+/// `DELETE /v1/operators/:sid` and that horizon do.
 const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 
 /// Timeout for the ② `GET /v1/healthz` probe that gates a reconnect.

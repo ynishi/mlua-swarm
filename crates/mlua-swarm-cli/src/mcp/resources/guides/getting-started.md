@@ -85,7 +85,8 @@ Routes served: `/v1/tasks`, `/v1/tasks/:id/runs` (re-kick — fresh
 `RunId`), `/v1/runs/:id/resume` (state-driven resume — same `RunId`),
 `/v1/status` (occupancy: `{running_runs, attached_operators}`, used by
 the `mlua_swarm_server_restart`/`_shutdown` MCP tools' busy-refusal
-guard), `/v1/operators` (WS login flow), `/v1/blueprints`, `/v1/issues`,
+guard, plus `periodic_jobs[]` — the server's scheduled work and when it
+last ran), `/v1/operators` (WS login flow), `/v1/blueprints`, `/v1/issues`,
 `/v1/enhance-settings`, `/v1/worker/*`.
 
 ### `mse mcp`

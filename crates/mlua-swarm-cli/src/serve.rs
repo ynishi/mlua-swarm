@@ -200,6 +200,16 @@ pub struct Args {
     /// config file's `sync_timeout_secs`; built-in default is 3600s (60 min).
     #[arg(long)]
     sync_timeout_secs: Option<u64>,
+    /// How often (seconds) the `operator-session-expiry` job sweeps Operator
+    /// login sessions past model §4.1's 24h horizon. This is the sweep's
+    /// period, **not** the horizon: turning it down does not expire sessions
+    /// sooner, it only shortens how long a release waits (and every read of a
+    /// session applies the horizon regardless). Overrides the config file's
+    /// `operator_session_sweep_secs`; built-in default is 300s. `0` leaves
+    /// the job registered but unscheduled, which `GET /v1/status` reports as
+    /// `enabled: false`.
+    #[arg(long)]
+    operator_session_sweep_secs: Option<u64>,
     /// R4 lock-hold guard threshold (milliseconds) for the engine: how
     /// long a single `Engine::with_state` closure may hold the state
     /// lock before the engine reports a suspected long operation inside
@@ -301,6 +311,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         default_agent_kind: args.default_agent_kind.clone(),
         token_secret: args.token_secret.clone(),
         sync_timeout_secs: args.sync_timeout_secs,
+        operator_session_sweep_secs: args.operator_session_sweep_secs,
         engine_max_hold_ms: args.engine_max_hold_ms,
         worker_token_ttl_secs: args.worker_token_ttl_secs,
         check_policy: args
@@ -598,21 +609,37 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let shutdown_run_store = run_store.clone();
 
     // Router assembly (fixed combined mode): merges task, the Operator wiring, and every enhance route.
-    let mut app = mlua_swarm_server::build_router_full_with_operator_session_persistence(
-        engine.clone(),
-        make_registry(),
-        Some(store.clone()),
-        Some(ws_operator),
-        output_store,
-        base_url,
-        Some(task_store),
-        Some(run_store),
-        Some(replay_store),
-        Some(run_trace_store),
-        Some(operator_session_persistence),
-        cfg.sync_timeout_secs,
-        cfg.legacy_worker_binding_policy,
-    );
+    // The second element owns the process's periodic jobs — it is held for
+    // the whole of `serve` and shut down beside the enhance loop below,
+    // because dropping it stops them.
+    let (mut app, periodic_jobs) =
+        mlua_swarm_server::build_router_full_with_operator_session_persistence(
+            engine.clone(),
+            make_registry(),
+            Some(store.clone()),
+            Some(ws_operator),
+            output_store,
+            base_url,
+            Some(task_store),
+            Some(run_store),
+            Some(replay_store),
+            Some(run_trace_store),
+            Some(operator_session_persistence),
+            cfg.sync_timeout_secs,
+            cfg.legacy_worker_binding_policy,
+            cfg.operator_session_sweep_secs,
+        );
+    for job in periodic_jobs.snapshot() {
+        eprintln!(
+            "mse serve: periodic job {} {}",
+            job.name,
+            if job.enabled {
+                format!("every {}s", job.period_secs)
+            } else {
+                "disabled (period 0; expiry still applies at every read)".to_string()
+            }
+        );
+    }
 
     let compiler = Compiler::new(make_registry());
     let launch_enhance = Arc::new(
@@ -695,6 +722,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .await
         .expect("serve");
     enhance_loop.abort();
+    // Same reason the enhance loop is aborted here: the drain has finished,
+    // so a sweep starting now would be walking state on its way out. (Drop
+    // would do it too — this is the explicit half of that contract.)
+    periodic_jobs.shutdown();
     // B-4: mark any Run still `Running` after the drain `Interrupted`, so a
     // restart does not leave it stranded `Running` forever. Runs BEFORE the
     // isle drivers are drained below — it writes through the SQLite stores.

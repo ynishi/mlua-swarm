@@ -803,7 +803,7 @@ pub(crate) async fn finalize_run(
 /// a literal yields `&'static str`, a formatted `panic!` yields `String`;
 /// anything else (a `panic_any` with a custom type) has no textual form, so
 /// it is reported by shape rather than dropped silently.
-fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -3211,6 +3211,7 @@ mod tests {
             run_trace_store: Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
+            periodic_reports: Default::default(),
         }
     }
 

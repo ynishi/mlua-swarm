@@ -84,6 +84,11 @@ pub mod handover;
 pub mod issues;
 /// WebSocket Operator Callback IF (`/v1/operators*`).
 pub mod operator_ws;
+/// The server's scheduled-work facility: every periodic job in the process
+/// is registered here, runs under one audited runner, and reports itself on
+/// `GET /v1/status`. See the module doc for what may be registered — a job
+/// may only apply a predicate some non-timer path already applies.
+pub mod periodic;
 /// `GET /v1/tasks/:id/runs/:run/steps*` (the metadata + content debug
 /// plane over a Run's step OUTPUT — `McpQueryAdapter`, a server-side
 /// `mlua_swarm::core::projection::ProjectionAdapter` impl reading through
@@ -274,6 +279,17 @@ pub struct AppState {
     /// A per-request `TaskLaunchRequest.timeout_secs` override, when
     /// present, takes priority over this value.
     pub sync_timeout_secs: u64,
+    /// Live state of the process's periodic jobs (see [`periodic`]), served
+    /// on `GET /v1/status`.
+    ///
+    /// The reports are held here rather than on the handle that owns the
+    /// jobs because the two have different lifetimes on purpose: the handle
+    /// belongs to whoever must be able to *stop* the jobs (the binary), and
+    /// this `Arc` belongs to whoever must be able to *see* them (every
+    /// request). A caller that wires no jobs gets an empty registry, which
+    /// reports as an empty list rather than as an absent field — "no jobs
+    /// are registered" is an answer.
+    pub periodic_reports: Arc<periodic::JobReports>,
 }
 
 /// Minimal entry point: builds a router with [`default_registry`] and no
@@ -491,7 +507,17 @@ pub fn build_router_full_with_legacy_worker_binding_policy(
         None,
         sync_timeout_secs,
         legacy_worker_binding_policy,
+        // Unscheduled, and the handle is dropped right here. These
+        // convenience builders return a bare `Router`, so there is nowhere
+        // to put the value that owns running jobs — and a job whose owner
+        // was dropped is a job that stops, which is worth saying out loud
+        // rather than leaving as a surprise. `GET /v1/status` reports the
+        // job as `enabled: false` on a router built this way. A caller that
+        // wants the sweep running calls the terminal builder, which hands
+        // the handle back.
+        0,
     )
+    .0
 }
 
 /// Operator login-session persistence bundle for the terminal router
@@ -571,9 +597,30 @@ impl OperatorSessionPersistence {
 
 /// Terminal router builder — [`build_router_full_with_legacy_worker_binding_policy`]
 /// plus Operator login-session persistence (see
-/// [`OperatorSessionPersistence`]). `None` preserves the process-volatile
-/// default (`InMemoryOperatorSessionStore`, empty seed) every pre-existing
-/// caller gets.
+/// [`OperatorSessionPersistence`]) and the process's periodic jobs (see
+/// [`periodic`]). `None` preserves the process-volatile default
+/// (`InMemoryOperatorSessionStore`, empty seed) every pre-existing caller
+/// gets.
+///
+/// # The handle is not optional to hold
+///
+/// The second element of the return is what owns the running jobs: **drop it
+/// and every job stops**, which is deliberate — a job that could outlive its
+/// server would keep sweeping state the process no longer serves. A caller
+/// that wants the jobs for the life of the process binds it and calls
+/// [`periodic::PeriodicJobsHandle::shutdown`] alongside its other background
+/// tasks at drain time; a test that only wants the router can drop it and
+/// drive the jobs by hand with
+/// [`run_now`](periodic::PeriodicJobsHandle::run_now).
+///
+/// `operator_session_sweep_secs` is the period of the one job registered
+/// here, `operator-session-expiry` (see
+/// [`operator_ws::login::sweep_expired_operator_sessions`]); `0` registers it
+/// unscheduled.
+///
+/// With a non-zero period this must be called from inside a Tokio runtime,
+/// since that is where the job's task is spawned. The `build_router_full*`
+/// wrappers pass `0` and are unaffected.
 #[allow(clippy::too_many_arguments)]
 pub fn build_router_full_with_operator_session_persistence(
     engine: Engine,
@@ -589,7 +636,8 @@ pub fn build_router_full_with_operator_session_persistence(
     operator_session_persistence: Option<OperatorSessionPersistence>,
     sync_timeout_secs: u64,
     legacy_worker_binding_policy: mlua_swarm::LegacyWorkerBindingPolicy,
-) -> Router {
+    operator_session_sweep_secs: u64,
+) -> (Router, periodic::PeriodicJobsHandle) {
     let (operator_session_store, restored_sessions): (
         Arc<dyn OperatorSessionStore>,
         Vec<Arc<crate::operator_ws::login::LoginSession>>,
@@ -678,6 +726,11 @@ pub fn build_router_full_with_operator_session_persistence(
             Arc::new(crate::operator_ws::SeatLedger::new()),
         ),
     };
+    // Built before the state so the state can carry the read side of the
+    // reports (`AppState.periodic_reports`), and started after it so the
+    // jobs can capture the state they operate on. Only the `Arc<JobReports>`
+    // crosses between the two, which is why neither has to exist first.
+    let mut periodic_jobs = periodic::PeriodicJobs::new();
     let state = AppState {
         engine,
         sessions: Arc::new(Mutex::new(SessionStore::default())),
@@ -693,8 +746,27 @@ pub fn build_router_full_with_operator_session_persistence(
         run_trace_store,
         base_url,
         sync_timeout_secs,
+        periodic_reports: periodic_jobs.reports(),
     };
-    Router::new()
+    // Model §4.1's `最終アクセスから 24h ──▶ ╳ 削除` on a schedule. The
+    // horizon itself, the predicate and the teardown all belong to the read
+    // path (`operator_ws::login::reap_if_expired`); this job supplies only
+    // the arrival, which is what the reads cannot supply for a session
+    // nobody reads. See `periodic`'s module doc for why that split is the
+    // condition of being registered here at all.
+    periodic_jobs.register(periodic::PeriodicJob::new(
+        "operator-session-expiry",
+        Duration::from_secs(operator_session_sweep_secs),
+        {
+            let state = state.clone();
+            move || {
+                let state = state.clone();
+                async move { Ok(operator_ws::login::sweep_expired_operator_sessions(&state).await) }
+            }
+        },
+    ));
+    let periodic_handle = periodic_jobs.start();
+    let router = Router::new()
         .route("/v1/healthz", get(healthz))
         .route("/v1/status", get(status_get))
         // session = collection (POST = attach, DELETE = detach, sid via Authorization)
@@ -815,7 +887,8 @@ pub fn build_router_full_with_operator_session_persistence(
             "/v1/data/:key",
             get(data::data_get).post(data::data_emit_named),
         )
-        .with_state(state)
+        .with_state(state);
+    (router, periodic_handle)
 }
 
 /// Default registry = Subprocess + RustFn (baseline `identity` worker pre-baked) + Lua + AgentBlock + empty Operator factory.
@@ -921,6 +994,18 @@ pub struct StatusResponse {
     /// Count of attached Operator ids (`engine.list_operator_ids()`,
     /// same idiom as `run_flow_form`'s Guard 1).
     pub attached_operators: usize,
+    /// One entry per registered periodic job (see [`periodic`]), ordered by
+    /// name: its period, whether it is scheduled, lifetime counters, and
+    /// when it last ran with what outcome.
+    ///
+    /// This is the only outside view of the server's scheduled work, and it
+    /// is on `status` rather than `doctor` because it is observation, not
+    /// startup configuration: the question it answers is "did the sweep run,
+    /// and what did it find", which changes every period. A job that has
+    /// never run appears with `runs: 0`, and one turned off appears with
+    /// `enabled: false` — an absent name means nothing registered it, which
+    /// is a different fault from a job that is not firing.
+    pub periodic_jobs: Vec<periodic::JobReport>,
 }
 
 /// `GET /v1/status`. Infallible summary for the ST4 occupancy guard —
@@ -942,6 +1027,7 @@ async fn status_get(State(state): State<AppState>) -> Json<StatusResponse> {
     Json(StatusResponse {
         running_runs,
         attached_operators,
+        periodic_jobs: state.periodic_reports.snapshot(),
     })
 }
 
@@ -2545,6 +2631,7 @@ mod tests {
             run_trace_store: Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
+            periodic_reports: Default::default(),
         }
     }
 

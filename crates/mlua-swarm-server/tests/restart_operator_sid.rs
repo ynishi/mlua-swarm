@@ -119,21 +119,26 @@ async fn spawn_server(bundle: &StoreBundle) -> ServerHandle {
     )
     .await
     .expect("operator session restore");
-    let router = mlua_swarm_server::build_router_full_with_operator_session_persistence(
-        engine,
-        mlua_swarm_server::default_registry(),
-        None,
-        None,
-        None,
-        None,
-        Some(bundle.task_store.clone()),
-        Some(bundle.run_store.clone()),
-        Some(bundle.replay_store.clone()),
-        None,
-        Some(persistence),
-        300,
-        mlua_swarm::LegacyWorkerBindingPolicy::Allow,
-    );
+    // Sweep period 0: this fixture is about a restart keeping a sid
+    // resolvable, and an unscheduled job spawns no task, so the handle
+    // dropping at the end of this function costs nothing.
+    let (router, _periodic_jobs) =
+        mlua_swarm_server::build_router_full_with_operator_session_persistence(
+            engine,
+            mlua_swarm_server::default_registry(),
+            None,
+            None,
+            None,
+            None,
+            Some(bundle.task_store.clone()),
+            Some(bundle.run_store.clone()),
+            Some(bundle.replay_store.clone()),
+            None,
+            Some(persistence),
+            300,
+            mlua_swarm::LegacyWorkerBindingPolicy::Allow,
+            0,
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");

@@ -290,6 +290,22 @@ it becomes an unknown key on upgrade, so drop it from
 |---|---|---|---|
 | `engine_max_hold_ms` | `--engine-max-hold-ms` | `50` | Engine lock-hold guard threshold in milliseconds: how long a single state-lock operation may run before the engine reports a suspected long operation inside the lock. Raise it on a loaded host where the warning fires on healthy runs. |
 | `worker_token_ttl_secs` | `--worker-token-ttl-secs` | `1800` | TTL in seconds for the worker capability tokens handed to SubAgents. A Step whose SubAgent runs longer than this fails authentication mid-flight, so raise it alongside the run TTL when running long Steps. The token leaves the process and cannot be revoked, so this TTL is the only bound on the capability — keep it as short as the workload allows. `0` is refused at startup (it would mint already-expired tokens). |
+| `operator_session_sweep_secs` | `--operator-session-sweep-secs` | `300` | How often the `operator-session-expiry` job sweeps Operator sessions past the 24h horizon (`mse://guides/operator-execution-model`, "It goes on its own after 24 hours"). This is the sweep's **period, not the horizon** — turning it down does not expire sessions sooner, it only shortens how long a release waits, and every read of a session applies the horizon regardless. `0` leaves the job registered but unscheduled, which is the read-time-only behaviour. |
+
+## Periodic jobs
+
+`GET /v1/status` carries a `periodic_jobs` array — one entry per scheduled
+job in the running server, with its period, whether it is scheduled, how
+many times it has run, and the outcome and duration of its last run. A job
+that has never run appears with `runs: 0`, and one turned off appears with
+`enabled: false`; a name missing from the array means nothing registered
+it, which is a different fault from a job that is not firing.
+
+There is one job today, `operator-session-expiry`. A job is only allowed on
+this runner if it applies a rule some non-timer path already applies — the
+schedule changes *when* something is noticed, never *what counts* — so a
+new entry appearing here should always be traceable to a rule stated
+elsewhere.
 
 ## See also
 

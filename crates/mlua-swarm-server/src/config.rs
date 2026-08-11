@@ -208,6 +208,24 @@ pub struct FileConfig {
     /// default (1800s / 30 min) in place. `Some(0)` is refused by [`resolve`]
     /// — it would mint tokens that are already expired.
     pub worker_token_ttl_secs: Option<u64>,
+    /// How often (seconds) the `operator-session-expiry` periodic job runs —
+    /// the sweep that applies model §4.1's 24h Operator-session horizon to
+    /// sessions nobody is reading (see
+    /// `mlua_swarm_server::periodic` and
+    /// `mlua_swarm::store::operator_session::OPERATOR_SESSION_MAX_IDLE_SECS`).
+    ///
+    /// This is a **period, not a threshold**: the horizon is fixed by the
+    /// model at 24h and is not configurable here, so the only thing this
+    /// value can change is how late a release is (up to one period) and how
+    /// often a near-empty scan runs. That is why it is safe to leave alone —
+    /// and why turning it down does not make sessions expire sooner.
+    ///
+    /// `None` = the built-in default (300s, see
+    /// [`default_operator_session_sweep_secs`]). `0` registers the job
+    /// unscheduled: expiry then happens only where a read reaches it, which
+    /// is the behaviour before the job existed. `GET /v1/status` reports it
+    /// as `enabled: false` in that case.
+    pub operator_session_sweep_secs: Option<u64>,
     /// Server-wide [`mlua_swarm::core::config::CheckPolicy`] — governs how
     /// submit-time projection sinks
     /// (`Engine::materialize_final_submission` /
@@ -277,6 +295,9 @@ pub struct CliOverrides {
     pub token_secret: Option<String>,
     /// `--sync-timeout-secs` value (mirrors [`FileConfig::sync_timeout_secs`]).
     pub sync_timeout_secs: Option<u64>,
+    /// `--operator-session-sweep-secs` value (mirrors
+    /// [`FileConfig::operator_session_sweep_secs`]).
+    pub operator_session_sweep_secs: Option<u64>,
     /// `--engine-max-hold-ms` value (mirrors
     /// [`FileConfig::engine_max_hold_ms`]).
     pub engine_max_hold_ms: Option<u64>,
@@ -359,6 +380,13 @@ pub struct ResolvedConfig {
     /// `None` = the engine's built-in default (1800s) stands. See
     /// [`FileConfig::worker_token_ttl_secs`].
     pub worker_token_ttl_secs: Option<u64>,
+    /// Period (seconds) of the `operator-session-expiry` periodic job.
+    /// Always set — defaults to 300s (see
+    /// [`default_operator_session_sweep_secs`]) when neither CLI nor config
+    /// file provides one; `0` leaves the job registered but unscheduled.
+    /// See [`FileConfig::operator_session_sweep_secs`] for why this is a
+    /// period and not the horizon itself.
+    pub operator_session_sweep_secs: u64,
     /// Opt-in endpoint injection into worker-facing data (WS Spawn
     /// directive `base_url` line / `StepPointer.content_url` absolute
     /// prefix). Always set — defaults to `false` (never injected) when
@@ -401,6 +429,7 @@ impl Default for ResolvedConfig {
             sync_timeout_secs: default_sync_timeout_secs(),
             engine_max_hold_ms: None,
             worker_token_ttl_secs: None,
+            operator_session_sweep_secs: default_operator_session_sweep_secs(),
             inject_endpoint_for_worker: false,
             long_hold_warn_ms: None,
             check_policy: CheckPolicy::default(),
@@ -418,6 +447,19 @@ impl Default for ResolvedConfig {
 /// GH #39.
 pub fn default_sync_timeout_secs() -> u64 {
     3600
+}
+
+/// Built-in default period for the `operator-session-expiry` job, seconds.
+///
+/// 300s against a 24h horizon: three orders of magnitude below the thing it
+/// enforces, so the lateness it adds (at most one period) is not a
+/// meaningful extension of "24 hours", and small enough that a session
+/// released while the server is quiet is released in minutes rather than
+/// whenever somebody next lists. The work per run is a walk of the live
+/// session map — a handful of entries on a busy server — so the cost of the
+/// scan does not argue for a longer one.
+pub fn default_operator_session_sweep_secs() -> u64 {
+    300
 }
 
 fn default_bind() -> SocketAddr {
@@ -458,6 +500,15 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
         .sync_timeout_secs
         .or(file.sync_timeout_secs)
         .unwrap_or_else(default_sync_timeout_secs);
+
+    // Zero is meaningful here rather than refused (unlike the worker TTL
+    // above): it is the "no schedule" switch, and it degrades to the
+    // read-time-only expiry that was the behaviour before the job existed —
+    // not to an outage.
+    let operator_session_sweep_secs = cli
+        .operator_session_sweep_secs
+        .or(file.operator_session_sweep_secs)
+        .unwrap_or_else(default_operator_session_sweep_secs);
 
     // A zero worker-token TTL mints tokens that are already expired
     // (`is_expired` is `now >= expire_at`), so every `/v1/worker/*` verb
@@ -552,6 +603,7 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
         sync_timeout_secs,
         engine_max_hold_ms: cli.engine_max_hold_ms.or(file.engine_max_hold_ms),
         worker_token_ttl_secs,
+        operator_session_sweep_secs,
         check_policy: cli
             .check_policy
             .or(file.check_policy)
@@ -936,6 +988,50 @@ mod tests {
             resolved.sync_timeout_secs, 45,
             "cli sync_timeout_secs must win over file"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // `operator_session_sweep_secs` resolution cascade (periodic job period)
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_operator_session_sweep_secs_default_when_cli_and_file_absent() {
+        let resolved = resolve(CliOverrides::default(), FileConfig::default()).expect("resolve");
+        assert_eq!(resolved.operator_session_sweep_secs, 300);
+        assert_eq!(
+            resolved.operator_session_sweep_secs,
+            default_operator_session_sweep_secs()
+        );
+    }
+
+    #[test]
+    fn resolve_operator_session_sweep_secs_cli_wins_over_file() {
+        let cli = CliOverrides {
+            operator_session_sweep_secs: Some(30),
+            ..Default::default()
+        };
+        let file = FileConfig {
+            operator_session_sweep_secs: Some(600),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).expect("resolve");
+        assert_eq!(
+            resolved.operator_session_sweep_secs, 30,
+            "cli operator_session_sweep_secs must win over file"
+        );
+    }
+
+    /// Zero is the documented "no schedule" switch, not an invalid value —
+    /// unlike `worker_token_ttl_secs`, which `resolve` refuses at zero. A
+    /// server configured this way still expires sessions at every read.
+    #[test]
+    fn resolve_operator_session_sweep_secs_accepts_zero_as_the_off_switch() {
+        let file = FileConfig {
+            operator_session_sweep_secs: Some(0),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file).expect("zero must resolve, not fail");
+        assert_eq!(resolved.operator_session_sweep_secs, 0);
     }
 
     // ──────────────────────────────────────────────────────────────────

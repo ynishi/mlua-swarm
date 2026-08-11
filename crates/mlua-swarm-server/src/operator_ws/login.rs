@@ -440,23 +440,37 @@ const TOUCH_PERSIST_INTERVAL_SECS: u64 = 60;
 /// [`OPERATOR_SESSION_MAX_IDLE_SECS`](mlua_swarm::store::operator_session::OPERATOR_SESSION_MAX_IDLE_SECS)
 /// unaccessed, and report whether it did.
 ///
-/// # Why the expiry lives at the reads instead of on a timer
+/// # Where this is called from
 ///
 /// §4.1's state diagram ends `Registered` two ways, `leave` and
-/// `最終アクセスから 24h`. The first has a route; the second had nothing
-/// implementing it, and could not be given the obvious implementation: a
-/// periodic scan is the shape `31fefc1` removed for the stale-`Run`
-/// sweeper, which produced false positives against Runs nobody was
-/// dispatching to. A session reaper would run against the same kind of
-/// quiet state on the same kind of timer.
+/// `最終アクセスから 24h`. The first has a route; the second is this
+/// function, and it is reached two ways.
 ///
-/// So the rule is enforced where it is *read* — here, and in the store's
-/// boot-time `list`. That is the same shape the two sibling judgments
-/// already use: **A7** decides a seat's liveness at reference time, and
-/// **O8**'s cascade fires at delete time and "nowhere else". The observable
-/// promise is identical to a sweeper's — an expired session is never
-/// returned to anybody — and it is made by the code that is about to
-/// answer for the session rather than by a job that woke up on its own.
+/// **At every read of a session** — the WS upgrade, `GET /v1/operators/:sid`,
+/// the 記名 list, the Bearer gate, and the store's boot-time `list`. Judging
+/// at the read is what makes the promise absolute for anyone *asking*: an
+/// expired session is never returned to anybody, decided by the code that is
+/// about to answer for it. It is the same shape the two sibling judgments
+/// use — **A7** decides a seat's liveness at reference time, **O8**'s cascade
+/// fires at delete time and "nowhere else".
+///
+/// **And on a schedule**, through
+/// [`sweep_expired_operator_sessions`] on the `operator-session-expiry`
+/// periodic job ([`crate::periodic`]). The reads alone leave the deletion
+/// waiting on an unrelated caller, and the deletion is not only a hiding: it
+/// unregisters the session from the engine and the adapter registry and
+/// cascades **O8** over every seat it still held. Those effects have a
+/// reader that is not a read — a dispatch routed to a dead sid resolves
+/// through the registries and *parks*, and parking is not a path that
+/// expires anything. So without the sweep, "it goes on its own after 24
+/// hours" is true only on a server somebody happens to be listing.
+///
+/// The job is legitimate under [`crate::periodic`]'s registration rule
+/// precisely because of the paragraph above it: the predicate
+/// ([`LoginSession::is_expired`]) and the effect
+/// ([`teardown_operator_session`]) are the read path's, unchanged. The timer
+/// supplies no judgment of its own, which is the whole difference from the
+/// stale-`Run` sweeper `31fefc1` removed for inventing one.
 ///
 /// # It is the same teardown a leave performs
 ///
@@ -492,6 +506,50 @@ async fn reap_if_expired(state: &AppState, sid: &SessionId, live: &Arc<LoginSess
             false
         }
     }
+}
+
+/// One pass of the `operator-session-expiry` periodic job: apply the horizon
+/// to every live session and report how many it released.
+///
+/// This is [`reap_if_expired`] over `AppState.operator_sessions`, and
+/// deliberately nothing more — the timer's entire contribution is arriving
+/// without a caller. See [`reap_if_expired`]'s "Where this is called from"
+/// for why the reads are not enough on their own, and [`crate::periodic`]
+/// for the rule that lets this be scheduled at all.
+///
+/// # The map is the whole population
+///
+/// Sweeping the in-memory map rather than the store covers every persisted
+/// row too, because the two are kept in step in both directions: a mint
+/// writes the row and inserts the map entry
+/// (see [`operators_create`]'s ordering note), and boot rehydrates one live
+/// session per surviving row ([`crate::OperatorSessionPersistence::restore`],
+/// which already drops the expired ones rather than restoring them). A row
+/// with no map entry is therefore not a thing this sweep would miss; it is a
+/// thing that does not exist.
+///
+/// # It never fails as a whole
+///
+/// A teardown that fails is logged by [`reap_if_expired`] and leaves that
+/// session intact for the next pass, exactly as it does on a read — one
+/// session's failure is not the run's failure, so this returns `Ok` with the
+/// count it did release. The snapshot is taken under the lock and released
+/// before any teardown runs, because [`teardown_operator_session`] takes the
+/// same lock to remove its entry.
+pub(crate) async fn sweep_expired_operator_sessions(state: &AppState) -> u64 {
+    let live: Vec<(SessionId, Arc<LoginSession>)> = {
+        let map = state.operator_sessions.lock().await;
+        map.iter()
+            .map(|(sid, s)| (sid.clone(), s.clone()))
+            .collect()
+    };
+    let mut released = 0;
+    for (sid, session) in live {
+        if reap_if_expired(state, &sid, &session).await {
+            released += 1;
+        }
+    }
+    released
 }
 
 // ─── POST /v1/operators (mint) ──────────────────────────────────────────────
@@ -1517,6 +1575,13 @@ const CASCADE_STATUSES: [RunStatus; 4] = [
 /// (**A7**) is likewise made where the seat is read. A periodic sweeper
 /// would be a second place where seats change hands, running against Runs
 /// nobody is dispatching to.
+///
+/// That the server has a periodic-job runner ([`crate::periodic`]) does not
+/// reopen this: a job there may only apply a predicate some non-timer path
+/// already applies, and "this seat's holder has gone" has no such
+/// predicate — it is a judgment made *about a dispatch*, at the moment one
+/// is made. The 24h session horizon is registered there precisely because
+/// it is the opposite case.
 async fn cascade_vacate_seats(state: &AppState, sid: &SessionId) {
     let mut released = 0usize;
     for status in CASCADE_STATUSES {
@@ -1641,10 +1706,11 @@ async fn cascade_vacate_seats(state: &AppState, sid: &SessionId) {
 /// That half is closed. §4.1's other exit from `Registered`
 /// (`最終アクセスから 24h ──▶ ╳ 削除`, unnumbered) is enforced at every
 /// read of a session — this crate's [`reap_if_expired`] and the store's
-/// boot-time `list` — so a stale row is released a day after its driver
-/// stopped, by the same teardown this route performs, cascade included.
-/// There is still no reaper; see [`reap_if_expired`] for why the rule
-/// lives at the reads instead.
+/// boot-time `list` — and, for a session no read reaches, by the
+/// `operator-session-expiry` job ([`sweep_expired_operator_sessions`]). So
+/// a stale row is released a day after its driver stopped, by the same
+/// teardown this route performs, cascade included, whether or not anybody
+/// is looking.
 ///
 /// `500` when the persisted row cannot be dropped: the session is then
 /// still live and fully intact (see [`teardown_operator_session`]), and the
@@ -2145,6 +2211,7 @@ mod tests {
                 run_trace_store: Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
                 base_url: None,
                 sync_timeout_secs: 300,
+                periodic_reports: Default::default(),
             }
         }
 
@@ -4293,7 +4360,7 @@ mod tests {
         }
     }
 
-    // ── the 24h horizon, judged where sessions are read ──────────────────
+    // ── the 24h horizon ──────────────────────────────────────────────────
 
     /// §4.1's second exit from `Registered` — `最終アクセスから 24h ──▶ ╳
     /// 削除`, which carries no predicate number (the `O1` these tests used
@@ -4301,8 +4368,12 @@ mod tests {
     /// all: `DELETE
     /// /v1/operators/:sid` wants the session's own bearer, and a crashed
     /// driver lost it, so the row it left behind could never be removed by
-    /// anybody. There is still no sweeper; the rule is applied where a
-    /// session is read.
+    /// anybody.
+    ///
+    /// The rule is applied at every read of a session, and — for a session
+    /// no read reaches — by the `operator-session-expiry` periodic job. The
+    /// last three tests here are that job's, and they are about the same
+    /// predicate and the same teardown arriving without a caller.
     mod o1_expiry {
         use super::kimei::mint;
         use super::support::{body_json, test_state};
@@ -4731,6 +4802,183 @@ mod tests {
                 "while the row inside the horizon stays — without this, a store that \
                  deleted everything it listed would pass the assertion above"
             );
+        }
+
+        // ── the same horizon, arriving on its own ────────────────────────
+
+        /// What the reads above cannot do: release a session **nobody is
+        /// reading**. Every assertion in this module so far had a caller —
+        /// a list, an info, a bearer, a boot. A server whose driver crashed
+        /// and whose operator is not looking has none of those, and the
+        /// registrations that make a dispatch park on the corpse stay up
+        /// until the teardown runs. That is what the
+        /// `operator-session-expiry` periodic job supplies, and it supplies
+        /// only that: same predicate, same teardown.
+        #[tokio::test]
+        async fn the_sweep_releases_a_session_no_read_ever_reaches() {
+            let state = test_state();
+            let (stale_sid, _stale) = seed_session_idle_for(
+                &state,
+                "crashed a week ago, and nobody has listed since",
+                OPERATOR_SESSION_MAX_IDLE_SECS * 7,
+            )
+            .await;
+
+            let released = sweep_expired_operator_sessions(&state).await;
+
+            assert_eq!(released, 1, "the sweep reports what it released");
+            assert!(
+                !state
+                    .operator_sessions
+                    .lock()
+                    .await
+                    .contains_key(&stale_sid),
+                "the session is gone from the map without anyone having read it"
+            );
+            assert!(
+                state
+                    .operator_session_store
+                    .get(&stale_sid)
+                    .await
+                    .expect("store get")
+                    .is_none(),
+                "and so is the persisted row, so a restart does not bring it back"
+            );
+            assert!(
+                !state
+                    .engine
+                    .list_operator_ids()
+                    .await
+                    .contains(&stale_sid.to_string()),
+                "and the engine registration with it — that is the part a read-time \
+                 expiry leaves standing, and what a dispatch would otherwise park on"
+            );
+        }
+
+        /// The sweep is the horizon, not a reaper with its own opinion: a
+        /// session inside the horizon and a connected-but-quiet one both
+        /// survive it, exactly as they survive a list. Without this the
+        /// test above would also pass on a job that emptied the map.
+        #[tokio::test]
+        async fn the_sweep_leaves_live_sessions_alone() {
+            let state = test_state();
+            let (recent_sid, _recent) = seed_session_idle_for(
+                &state,
+                "quiet, but not for a day",
+                OPERATOR_SESSION_MAX_IDLE_SECS - 600,
+            )
+            .await;
+            let (attached_sid, attached) = seed_session_idle_for(
+                &state,
+                "attached and quiet for a week",
+                OPERATOR_SESSION_MAX_IDLE_SECS * 7,
+            )
+            .await;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            attached.dispatch_target().replace_tx(tx).await;
+
+            let released = sweep_expired_operator_sessions(&state).await;
+
+            assert_eq!(released, 0, "neither session is past the horizon");
+            let map = state.operator_sessions.lock().await;
+            assert!(
+                map.contains_key(&recent_sid),
+                "a session inside the horizon is not the sweep's business"
+            );
+            assert!(
+                map.contains_key(&attached_sid),
+                "and an attached socket is contact, however quiet (O7 clause)"
+            );
+        }
+
+        /// One session's teardown failing is not the run's failure. The
+        /// sweep is a loop over independent items, so a store that refuses
+        /// one delete leaves that session for the next pass and releases
+        /// the rest — the same thing a read does when its teardown fails.
+        #[tokio::test]
+        async fn a_teardown_failure_does_not_stop_the_rest_of_the_sweep() {
+            let mut state = test_state();
+            let store = Arc::new(RefusingDeleteStore::default());
+            state.operator_session_store = store.clone();
+            let (refuses_sid, _a) = seed_session_idle_for(
+                &state,
+                "the one whose row will not delete",
+                OPERATOR_SESSION_MAX_IDLE_SECS * 2,
+            )
+            .await;
+            let (deletable_sid, _b) = seed_session_idle_for(
+                &state,
+                "the one behind it in the map",
+                OPERATOR_SESSION_MAX_IDLE_SECS * 2,
+            )
+            .await;
+            store.refuse(refuses_sid.clone());
+
+            let released = sweep_expired_operator_sessions(&state).await;
+
+            assert_eq!(
+                released, 1,
+                "the count reports releases, not attempts: only one teardown completed"
+            );
+            let map = state.operator_sessions.lock().await;
+            assert!(
+                map.contains_key(&refuses_sid),
+                "a session whose teardown failed stays live and is judged again next pass"
+            );
+            assert!(
+                !map.contains_key(&deletable_sid),
+                "and the failure does not abort the sweep before its neighbours"
+            );
+        }
+
+        /// In-memory store that refuses `delete` for the sids it was told
+        /// to refuse, and is otherwise honest — which is what makes the
+        /// test above about the sweep's loop rather than about a store
+        /// that fails everything.
+        #[derive(Default)]
+        struct RefusingDeleteStore {
+            inner: mlua_swarm::store::operator_session::InMemoryOperatorSessionStore,
+            refuse: std::sync::Mutex<Vec<SessionId>>,
+        }
+
+        impl RefusingDeleteStore {
+            fn refuse(&self, sid: SessionId) {
+                self.refuse.lock().expect("refuse list").push(sid);
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl mlua_swarm::store::operator_session::OperatorSessionStore for RefusingDeleteStore {
+            fn name(&self) -> &str {
+                "refusing-delete"
+            }
+
+            async fn put(
+                &self,
+                record: OperatorSessionRecord,
+            ) -> Result<(), OperatorSessionStoreError> {
+                self.inner.put(record).await
+            }
+
+            async fn delete(&self, sid: &SessionId) -> Result<(), OperatorSessionStoreError> {
+                if self.refuse.lock().expect("refuse list").contains(sid) {
+                    return Err(OperatorSessionStoreError::Other(
+                        "injected delete failure".to_string(),
+                    ));
+                }
+                self.inner.delete(sid).await
+            }
+
+            async fn get(
+                &self,
+                sid: &SessionId,
+            ) -> Result<Option<OperatorSessionRecord>, OperatorSessionStoreError> {
+                self.inner.get(sid).await
+            }
+
+            async fn list(&self) -> Result<Vec<OperatorSessionRecord>, OperatorSessionStoreError> {
+                self.inner.list().await
+            }
         }
     }
 

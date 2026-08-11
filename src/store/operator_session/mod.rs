@@ -101,28 +101,36 @@ pub const OBSERVED_TEXT_MAX_BYTES: usize = 1024;
 /// a citation exists to prevent — the reader looks `O1` up and finds a
 /// statement about authentication.
 ///
-/// # There is no sweeper behind this
+/// # Enforced at the reads, and on a schedule
 ///
-/// The horizon is a rule about what may be *observed*, and that is how it
-/// is enforced: every path that reads a session — the boot restore, the
-/// 記名 list, a single-session read — drops the expired ones it finds and
-/// deletes their rows. A session past the horizon is therefore never
-/// returned to anybody, which is the whole of what the state diagram
-/// promises; what it is *not* is a background scan.
+/// The horizon is first of all a rule about what may be *observed*, and
+/// that is where it is enforced: every path that reads a session — the
+/// boot restore, the 記名 list, a single-session read, the WS upgrade —
+/// drops the expired ones it finds and deletes their rows. A session past
+/// the horizon is therefore never returned to anybody, which is the whole
+/// of what the state diagram promises to a reader. That shape is shared
+/// with the two sibling judgments: **A7** examines a seat at reference
+/// time, **O8** cascades at delete time.
 ///
-/// That distinction is deliberate. The periodic stale-`Run` sweeper was
-/// removed in `31fefc1` for generating false positives against Runs
-/// nobody was dispatching to, and a session reaper would run against the
-/// same kind of quiet state, on a timer, with the same failure available
-/// to it. Expiring at the read instead means the judgment is only ever
-/// made about a session someone is currently asking about, by the code
-/// that is about to answer for it — the same shape **A7** uses for seats
-/// (examined at reference time) and **O8** for the cascade (at delete
-/// time, "no timer").
+/// The reads alone leave one thing out, and it is not the row on disk. A
+/// teardown also unregisters the session from the engine and the adapter
+/// registry, so until it happens a *dispatch* aimed at the dead sid still
+/// resolves and parks — and a dispatch is not a read, so nothing about it
+/// applies the horizon. "It goes on its own after 24 hours" would
+/// therefore hold only on a server somebody happens to be listing. So the
+/// server also runs the same judgment on a schedule, as the
+/// `operator-session-expiry` job on its periodic-job runner
+/// (`mlua_swarm_server::periodic`), which calls the same read-path
+/// predicate through the same teardown.
 ///
-/// The cost of having no sweeper is that an expired row survives until
-/// something reads it. Since the only thing an expired row can do is be
-/// read, that costs nothing but disk.
+/// That is not a reversal of `31fefc1`, which removed a periodic
+/// stale-`Run` sweeper. What was wrong there was the *predicate* — "a
+/// `Running` row nobody has written to for 3900s has lost its driver" was
+/// stated nowhere else and was false of every healthy run it could reach.
+/// This horizon is stated by the model, applied by four other call sites,
+/// and executed by the teardown a `DELETE` performs; the job contributes
+/// the schedule and nothing else. `periodic`'s module doc carries that
+/// rule for anything else that wants to be scheduled.
 pub const OPERATOR_SESSION_MAX_IDLE_SECS: u64 = 24 * 60 * 60;
 
 pub mod inmemory;
@@ -578,9 +586,14 @@ pub trait OperatorSessionStore: Send + Sync {
     /// per restart, forever (the row's own driver crashed and lost the
     /// bearer `DELETE /v1/operators/:sid` wants, so nothing else can ever
     /// remove it). Filtering without deleting would hide them from the
-    /// reader while leaving the file growing; deleting on a timer would
-    /// need a sweeper, which [`OPERATOR_SESSION_MAX_IDLE_SECS`]'s doc
-    /// explains this design is avoiding.
+    /// reader while leaving the file growing.
+    ///
+    /// The running server sweeps expired sessions on a schedule as well
+    /// (see [`OPERATOR_SESSION_MAX_IDLE_SECS`]), but that job walks the
+    /// live session map — which, at this moment, is the empty one this
+    /// call is about to fill. Boot is the one point where a row exists and
+    /// no session does, so this contract is the sweep's counterpart across
+    /// a restart, not a duplicate of it.
     ///
     /// Deleting is safe precisely because the row is expired: no live
     /// process holds it (it was not in memory — this call is what would

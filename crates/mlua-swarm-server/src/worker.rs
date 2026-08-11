@@ -1646,6 +1646,7 @@ mod tests {
             run_trace_store: Arc::new(mlua_swarm::store::trace::InMemoryRunTraceStore::new()),
             base_url: None,
             sync_timeout_secs: 300,
+            periodic_reports: Default::default(),
         }
     }
 

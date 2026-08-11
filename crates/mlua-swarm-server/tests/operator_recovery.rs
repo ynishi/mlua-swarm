@@ -538,21 +538,27 @@ async fn spawn_server_with_session_store(
         mlua_swarm_server::OperatorSessionPersistence::restore(store, &engine, None, None)
             .await
             .expect("operator session restore");
-    let router = mlua_swarm_server::build_router_full_with_operator_session_persistence(
-        engine.clone(),
-        mlua_swarm_server::default_registry(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(persistence),
-        300,
-        mlua_swarm::LegacyWorkerBindingPolicy::Allow,
-    );
+    // Sweep period 0: every expiry assertion in this file goes through a
+    // read (`GET /v1/operators`, the WS upgrade, the boot restore), so a
+    // background sweep would only make the timing of those assertions
+    // depend on a clock. The scheduled path has its own test file.
+    let (router, _periodic_jobs) =
+        mlua_swarm_server::build_router_full_with_operator_session_persistence(
+            engine.clone(),
+            mlua_swarm_server::default_registry(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(persistence),
+            300,
+            mlua_swarm::LegacyWorkerBindingPolicy::Allow,
+            0,
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
