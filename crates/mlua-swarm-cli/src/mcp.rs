@@ -2603,10 +2603,14 @@ struct ServerInstallReq {
     /// `String` for schema stability (see `ServerBootstrapReq::plist_path`).
     #[serde(default)]
     cargo_bin: Option<String>,
-    /// Override project root (default current working directory).
-    /// Declared as `String` for schema stability.
-    #[serde(default)]
-    project_root: Option<String>,
+    /// Override the daemon's `WorkingDirectory` (default `~/.mse`, the
+    /// service's own state directory — never the installer's CWD; a
+    /// checkout-dependent working directory makes the daemon
+    /// unstartable once the checkout moves, GH #97). Created if
+    /// missing. Declared as `String` for schema stability. The
+    /// pre-GH-#97 field name `project_root` is accepted as an alias.
+    #[serde(default, alias = "project_root")]
+    working_dir: Option<String>,
 }
 
 /// Input for `mlua_swarm_server_uninstall` — remove the LaunchAgent and
@@ -5818,6 +5822,9 @@ impl MseServer {
                 "up": server_up,
                 "launchd_state": server_status.launchd_state,
                 "launchd_pid": server_status.launchd_pid,
+                "launchd_last_exit_code": server_status.launchd_last_exit_code,
+                "plist_working_directory": server_status.plist_working_directory,
+                "plist_working_directory_exists": server_status.plist_working_directory_exists,
                 "doctor": server_info,
             },
             "version_drift": {
@@ -5857,7 +5864,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Report mse serve state: healthz + a `launchctl print gui/<uid>/com.mse.server` summary (state / pid / last exit code). Returns {bind, up, launchd_state, launchd_pid, launchd_last_exit_code}. See `mse://guides/server-management` for recovery flow."
+        description = "Report mse serve state: healthz + a `launchctl print gui/<uid>/com.mse.server` summary (state / pid / last exit code) + the installed plist's WorkingDirectory and whether it exists. Returns {bind, up, launchd_state, launchd_pid, launchd_last_exit_code, plist_working_directory, plist_working_directory_exists}. `plist_working_directory_exists: false` is the signature of a zero-log EX_CONFIG (78) crash loop — launchd cannot chdir, the daemon dies before its log sinks open; recover with `mlua_swarm_server_install` (GH #97). See `mse://guides/server-management` for recovery flow."
     )]
     async fn mlua_swarm_server_status(
         &self,
@@ -5988,15 +5995,15 @@ impl MseServer {
     /// `mse://guides/server-management` for recovery SOP.
     #[tool(
         annotations(read_only_hint = false, idempotent_hint = true),
-        description = "Render the embedded launchd plist template with `{{HOME}}` / `{{CARGO_BIN}}` / `{{PROJECT_ROOT}}` substitution and write it to `~/Library/LaunchAgents/com.mse.server.plist`, then run `launchctl bootstrap gui/<uid> <plist>` to load the job. Idempotent on repeat: an already-loaded job is bootout'd first so the new plist body takes effect. Returns `{plist_path, bootstrap: {status, plist_path}}`. See `mse://guides/server-management` for recovery SOP."
+        description = "Render the embedded launchd plist template with `{{HOME}}` / `{{CARGO_BIN}}` / `{{WORKING_DIR}}` substitution and write it to `~/Library/LaunchAgents/com.mse.server.plist`, then run `launchctl bootstrap gui/<uid> <plist>` to load the job. `WorkingDirectory` defaults to `~/.mse` (the service's own state directory, created if missing) — never the installer's CWD, so the daemon's ability to start cannot depend on a source checkout (GH #97). Idempotent on repeat: an already-loaded job is bootout'd first so the new plist body takes effect. Returns `{plist_path, bootstrap: {status, plist_path}}`. See `mse://guides/server-management` for recovery SOP."
     )]
     async fn mlua_swarm_server_install(
         &self,
         Parameters(req): Parameters<ServerInstallReq>,
     ) -> Result<CallToolResult, McpError> {
         let cargo_bin_pb = req.cargo_bin.as_deref().map(std::path::PathBuf::from);
-        let project_root_pb = req.project_root.as_deref().map(std::path::PathBuf::from);
-        match launchd::install(cargo_bin_pb.as_deref(), project_root_pb.as_deref()).await {
+        let working_dir_pb = req.working_dir.as_deref().map(std::path::PathBuf::from);
+        match launchd::install(cargo_bin_pb.as_deref(), working_dir_pb.as_deref()).await {
             Ok(outcome) => json_result(&outcome),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
@@ -7807,12 +7814,14 @@ mod tests {
     }
 
     /// Schema stability guard — `plist_path` / `cargo_bin` /
-    /// `project_root` are declared as `Option<String>` (not
+    /// `working_dir` are declared as `Option<String>` (not
     /// `Option<PathBuf>`) so schemars emits a concrete `type: "string"`
     /// in the tool inputSchema (see GH #24 any-schema drop). A future
     /// hand that flips the field type to `PathBuf` would silently drop
     /// the field on the MCP wire; this asserts the concrete type
-    /// literal stays put.
+    /// literal stays put. (`working_dir` is the GH #97 rename of
+    /// `project_root`; the old name survives only as a serde alias,
+    /// which is deliberately invisible in the schema.)
     #[test]
     fn new_lifecycle_tool_paths_resolve_to_string_type_in_schema() {
         let tools = MseServer::tool_router().list_all();
@@ -7825,7 +7834,7 @@ mod tests {
         for (tool_name, field) in [
             ("mlua_swarm_server_bootstrap", "plist_path"),
             ("mlua_swarm_server_install", "cargo_bin"),
-            ("mlua_swarm_server_install", "project_root"),
+            ("mlua_swarm_server_install", "working_dir"),
         ] {
             let schema = &by_name(tool_name).input_schema;
             let prop = schema

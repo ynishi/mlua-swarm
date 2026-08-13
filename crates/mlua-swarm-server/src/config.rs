@@ -16,49 +16,41 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-/// Default config path, `~/.mse/config.toml`. Falls back to a relative path
-/// literal when `$HOME` is unset (best-effort; dev-only edge case).
-pub fn default_config_path() -> PathBuf {
+/// The service's state directory, `~/.mse` — the single typed anchor
+/// every default path below (and the LaunchAgent's `WorkingDirectory`,
+/// see the CLI's `server::launchd` module) hangs off. Falls back to a
+/// relative `.mse` when `$HOME` is unset (best-effort; dev-only edge
+/// case).
+pub fn default_mse_home() -> PathBuf {
     match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home).join(".mse").join("config.toml"),
-        Err(_) => PathBuf::from(".mse/config.toml"),
+        Ok(home) => PathBuf::from(home).join(".mse"),
+        Err(_) => PathBuf::from(".mse"),
     }
 }
 
-/// Default `BlueprintStore` root, `~/.mse/store`. Same `$HOME` fallback
-/// rule as [`default_config_path`]. The store is always git-backed;
-/// config/CLI only override *where* the repos live, never whether they
-/// persist.
+/// Default config path, `~/.mse/config.toml` (anchored on
+/// [`default_mse_home`]).
+pub fn default_config_path() -> PathBuf {
+    default_mse_home().join("config.toml")
+}
+
+/// Default `BlueprintStore` root, `~/.mse/store` (anchored on
+/// [`default_mse_home`]). The store is always git-backed; config/CLI only
+/// override *where* the repos live, never whether they persist.
 pub fn default_store_path() -> PathBuf {
-    match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home).join(".mse").join("store"),
-        Err(_) => PathBuf::from(".mse/store"),
-    }
+    default_mse_home().join("store")
 }
 
 /// Default `TaskStore` SQLite path, `~/.mse/store/task.sqlite` (issue
-/// #35 ST1 — persist-by-default). Same `$HOME` fallback as
-/// [`default_config_path`].
+/// #35 ST1 — persist-by-default). Anchored on [`default_store_path`].
 pub fn default_task_store_path() -> PathBuf {
-    match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home)
-            .join(".mse")
-            .join("store")
-            .join("task.sqlite"),
-        Err(_) => PathBuf::from(".mse/store/task.sqlite"),
-    }
+    default_store_path().join("task.sqlite")
 }
 
 /// Default `RunStore` SQLite path, `~/.mse/store/run.sqlite`. Sibling of
 /// [`default_task_store_path`].
 pub fn default_run_store_path() -> PathBuf {
-    match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home)
-            .join(".mse")
-            .join("store")
-            .join("run.sqlite"),
-        Err(_) => PathBuf::from(".mse/store/run.sqlite"),
-    }
+    default_store_path().join("run.sqlite")
 }
 
 /// Default `OperatorSessionStore` SQLite path,
@@ -68,26 +60,14 @@ pub fn default_run_store_path() -> PathBuf {
 /// including the persisted `RunRecord.operator_sid` pins that pointed at
 /// them).
 pub fn default_operator_session_store_path() -> PathBuf {
-    match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home)
-            .join(".mse")
-            .join("store")
-            .join("operator_session.sqlite"),
-        Err(_) => PathBuf::from(".mse/store/operator_session.sqlite"),
-    }
+    default_store_path().join("operator_session.sqlite")
 }
 
 /// Default `ReplayStore` SQLite path, `~/.mse/store/replay.sqlite`. Sibling
 /// of [`default_run_store_path`] — persisted by default so a restart can
 /// consult the replay log (see `mlua_swarm::store::replay` module doc).
 pub fn default_replay_store_path() -> PathBuf {
-    match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home)
-            .join(".mse")
-            .join("store")
-            .join("replay.sqlite"),
-        Err(_) => PathBuf::from(".mse/store/replay.sqlite"),
-    }
+    default_store_path().join("replay.sqlite")
 }
 
 /// TOML config schema. All fields are optional — a missing field falls back

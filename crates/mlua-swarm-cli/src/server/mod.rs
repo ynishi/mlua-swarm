@@ -62,10 +62,14 @@ enum ServerSub {
         /// `$HOME/.cargo/bin`).
         #[clap(long)]
         cargo_bin: Option<std::path::PathBuf>,
-        /// `WorkingDirectory` for the daemon (default: `$PWD` env, else
-        /// the process's current working directory).
-        #[clap(long)]
-        project_root: Option<std::path::PathBuf>,
+        /// `WorkingDirectory` for the daemon (default: `~/.mse`, the
+        /// service's own state directory — never the installer's
+        /// `$PWD`; a checkout-dependent working directory makes the
+        /// daemon unstartable once the checkout moves, GH #97). The
+        /// directory is created if missing. `--project-root` is the
+        /// pre-GH-#97 spelling, kept as an alias.
+        #[clap(long, alias = "project-root")]
+        working_dir: Option<std::path::PathBuf>,
     },
     /// `bootout` the job + remove the installed plist file (idempotent —
     /// missing job / missing plist both tolerated).
@@ -118,9 +122,9 @@ async fn run_macos(args: Args) -> Result<()> {
     match args.sub {
         ServerSub::Install {
             cargo_bin,
-            project_root,
+            working_dir,
         } => {
-            let outcome = launchd::install(cargo_bin.as_deref(), project_root.as_deref())
+            let outcome = launchd::install(cargo_bin.as_deref(), working_dir.as_deref())
                 .await
                 .map_err(anyhow::Error::from)?;
             emit(&outcome, args.json, human_install(&outcome))
@@ -201,10 +205,20 @@ fn human_status(outcome: &launchd::StatusOutcome) -> String {
         .launchd_last_exit_code
         .map(|c| c.to_string())
         .unwrap_or_else(|| "none".to_string());
-    format!(
+    let mut line = format!(
         "bind={} up={} state={state} pid={pid} last_exit={last_exit}",
         outcome.bind, outcome.up
-    )
+    );
+    // Only surface the working directory when it is the problem — a
+    // missing WorkingDirectory is the zero-log EX_CONFIG crash loop
+    // (GH #97), and this line is its only human-visible symptom.
+    if outcome.plist_working_directory_exists == Some(false) {
+        let wd = outcome.plist_working_directory.as_deref().unwrap_or("?");
+        line.push_str(&format!(
+            " working_dir={wd} (MISSING — launchd cannot spawn the job; re-run `mse server install`)"
+        ));
+    }
+    line
 }
 
 #[cfg(target_os = "macos")]

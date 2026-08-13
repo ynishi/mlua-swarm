@@ -36,7 +36,18 @@ Render the baked plist template and install it as the
 already-loaded job is booted out and re-bootstrapped cleanly. Flags:
 `--cargo-bin <dir>` overrides the daemon's binary directory
 (default: `$CARGO_BIN` env, else `$HOME/.cargo/bin`);
-`--project-root <dir>` overrides `WorkingDirectory` (default: `$PWD`).
+`--working-dir <dir>` overrides `WorkingDirectory` (default: `~/.mse`,
+the service's own state directory; created if missing;
+`--project-root` is the pre-GH-#97 alias).
+
+The default is deliberately **not** the installer's `$PWD`: a
+`WorkingDirectory` that names a directory the service does not own
+(typically a source checkout) makes the daemon permanently
+unstartable once that directory moves — launchd fails the spawn with
+`EX_CONFIG` (78) before the log sinks open, a zero-log crash loop
+(GH #97). The daemon itself resolves everything it needs against
+`~/.mse` and absolute config paths, so it has no use for a checkout
+CWD.
 
 That `--cargo-bin` directory is also prepended to the daemon's
 `EnvironmentVariables.PATH`, which is what an in-process `agent_block`
@@ -46,7 +57,7 @@ is a child of the daemon, not of your shell) — see
 
 ```
 mse server install
-mse server install --cargo-bin ~/.cargo/bin --project-root ~/projects/mlua-swarm
+mse server install --cargo-bin ~/.cargo/bin --working-dir ~/.mse
 ```
 
 ### `uninstall`
@@ -112,10 +123,18 @@ mse server restart
 
 Report the daemon's health: reachability of `GET /v1/healthz` on
 `--bind`, plus the `launchctl print` summary
-(`launchd_state` / `launchd_pid` / `launchd_last_exit_code`). The
+(`launchd_state` / `launchd_pid` / `launchd_last_exit_code`), plus the
+installed plist's `WorkingDirectory` probe
+(`plist_working_directory` / `plist_working_directory_exists`). The
 one-line human summary is
-`bind=127.0.0.1:7777 up=<bool> state=<state> pid=<pid> last_exit=<code>`;
-the `--json` flavor carries the full structured payload.
+`bind=127.0.0.1:7777 up=<bool> state=<state> pid=<pid> last_exit=<code>`
+(with a `working_dir=... (MISSING ...)` suffix only when the probe
+fails); the `--json` flavor carries the full structured payload.
+
+`launchd_last_exit_code` understands launchctl's annotated form
+(`78: EX_CONFIG`) and reports the numeric code; `null` means launchd
+has not recorded an exit (fresh bootstrap, or the job was never
+spawned — e.g. `(never exited)`).
 
 ```
 mse server status
@@ -181,13 +200,39 @@ These SOPs cover the three states an MCP client (or human operator) is
 most likely to hit. Each SOP is closed under the MCP tool surface —
 you do not need shell access for recovery.
 
+### Missing WorkingDirectory (`plist_working_directory_exists: false`)
+
+Symptom
+: `mlua_swarm_server_status` reports `up: false`,
+  `launchd_state: "spawn scheduled"`, and
+  `plist_working_directory_exists: false` (often with
+  `launchd_last_exit_code: 78` — `EX_CONFIG`). `mse server logs` shows
+  nothing new: launchd fails the spawn **before** the daemon's log
+  sinks open, so the crash loop writes zero bytes of log.
+
+Cause
+: The plist's `WorkingDirectory` names a directory that no longer
+  exists, so launchd cannot chdir and never execs the binary. Installs
+  made before GH #97 baked the installer's `$PWD` (typically a source
+  checkout) into this key; moving or deleting that checkout produces
+  exactly this state.
+
+Recovery (MCP-only)
+: Call `mlua_swarm_server_install` — the re-rendered plist points
+  `WorkingDirectory` at `~/.mse` (created if missing), and install
+  boot-outs / re-bootstraps the job in the same call. Then
+  `mlua_swarm_server_start`.
+
 ### Throttle backoff (state=spawn scheduled, `last_exit_code=null`)
 
 Symptom
 : `mlua_swarm_server_status` reports `up: false`,
   `launchd_state: "spawn scheduled"`, and `launchd_last_exit_code:
   null`. The daemon just exited and launchd is waiting on
-  `ThrottleInterval` before respawning.
+  `ThrottleInterval` before respawning. (A non-null
+  `launchd_last_exit_code` names the crash reason as a sysexits code —
+  check it, and check `plist_working_directory_exists`, before
+  assuming a plain throttle wait.)
 
 Cause
 : The plist declares `ThrottleInterval=10`, so launchd enforces at
@@ -253,8 +298,8 @@ Recovery (MCP-only)
 : Call `mlua_swarm_server_install`. This tool is idempotent and
   handles the full install-and-bootstrap sequence in one call:
     1. Render the baked plist template with the current
-       `$CARGO_BIN` / `$PWD` (override with the `cargo_bin` /
-       `project_root` request fields).
+       `$CARGO_BIN` and a `~/.mse` working directory (override with
+       the `cargo_bin` / `working_dir` request fields).
     2. Write it to `~/Library/LaunchAgents/com.mse.server.plist`.
     3. Bootstrap the LaunchAgent.
     4. Return `InstallOutcome` with the resolved `plist_path` and

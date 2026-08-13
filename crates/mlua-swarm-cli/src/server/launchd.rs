@@ -51,7 +51,7 @@ const SHUTDOWN_POLL_TOTAL: Duration = Duration::from_secs(10);
 /// relative so this string is resolved from
 /// `crates/mlua-swarm-cli/src/server/plist.template` — the single source
 /// of truth since the legacy shell-side copy was retired (GH #69). The
-/// three placeholders `{{HOME}}` / `{{CARGO_BIN}}` / `{{PROJECT_ROOT}}`
+/// three placeholders `{{HOME}}` / `{{CARGO_BIN}}` / `{{WORKING_DIR}}`
 /// are expanded by [`render`].
 pub const TEMPLATE: &str = include_str!("./plist.template");
 
@@ -273,20 +273,19 @@ async fn poll_healthz_until_up(bind: &str, total: Duration, step: Duration) -> b
 
 /// Render the compile-time-baked plist template with the given absolute
 /// paths substituted for `{{HOME}}` / `{{CARGO_BIN}}` /
-/// `{{PROJECT_ROOT}}`. Byte-identical to the sed pipeline in the legacy
-/// shell installer's `render()` function. Rejects non-UTF-8 paths with
+/// `{{WORKING_DIR}}`. Rejects non-UTF-8 paths with
 /// `ServerError::Render`; also rejects any surviving `{{...}}` placeholder
 /// as a defense against future template extensions silently leaking
 /// through.
-pub fn render(home: &Path, cargo_bin: &Path, project_root: &Path) -> Result<String, ServerError> {
-    render_impl(TEMPLATE, home, cargo_bin, project_root)
+pub fn render(home: &Path, cargo_bin: &Path, working_dir: &Path) -> Result<String, ServerError> {
+    render_impl(TEMPLATE, home, cargo_bin, working_dir)
 }
 
 fn render_impl(
     template: &str,
     home: &Path,
     cargo_bin: &Path,
-    project_root: &Path,
+    working_dir: &Path,
 ) -> Result<String, ServerError> {
     let home_s = home
         .to_str()
@@ -294,13 +293,13 @@ fn render_impl(
     let cargo_bin_s = cargo_bin
         .to_str()
         .ok_or_else(|| ServerError::Render("non-utf8 cargo_bin".into()))?;
-    let project_root_s = project_root
+    let working_dir_s = working_dir
         .to_str()
-        .ok_or_else(|| ServerError::Render("non-utf8 project_root".into()))?;
+        .ok_or_else(|| ServerError::Render("non-utf8 working_dir".into()))?;
     let out = template
         .replace("{{HOME}}", home_s)
         .replace("{{CARGO_BIN}}", cargo_bin_s)
-        .replace("{{PROJECT_ROOT}}", project_root_s);
+        .replace("{{WORKING_DIR}}", working_dir_s);
     if let Some(start) = out.find("{{") {
         let end_off = out[start..]
             .find("}}")
@@ -442,9 +441,18 @@ pub async fn restart(bind: &str) -> Result<StartOutcome, ServerError> {
     }
 }
 
-/// healthz + a `launchctl print` summary (state / pid / last exit code).
-/// Never raw-dumps the `launchctl print` output. Infallible — any
-/// launchctl failure is folded into `launchd_state: None`.
+/// healthz, a `launchctl print` summary (state / pid / last exit code),
+/// and the installed plist's `WorkingDirectory` probe (the path plus
+/// whether it currently exists). Never raw-dumps the `launchctl print`
+/// output. Infallible — any launchctl failure is folded into
+/// `launchd_state: None`, and a missing / unreadable plist folds into
+/// `plist_working_directory: None`.
+///
+/// The working-directory probe exists because a `WorkingDirectory` that
+/// names a vanished directory makes launchd fail the spawn *before* the
+/// log sinks open — `EX_CONFIG` (78) crash loop with zero bytes of log
+/// (GH #97). This field pair is the surviving diagnostic surface for
+/// that state.
 pub async fn status(bind: &str) -> StatusOutcome {
     let up = healthz_ok(bind).await;
     let target = domain_target();
@@ -455,12 +463,24 @@ pub async fn status(bind: &str) -> StatusOutcome {
         }
         _ => (None, None, None),
     };
+    let plist_working_directory = match installed_plist_path() {
+        Ok(path) => match tokio::fs::read_to_string(&path).await {
+            Ok(body) => parse_plist_working_directory(&body),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    let plist_working_directory_exists = plist_working_directory
+        .as_ref()
+        .map(|p| Path::new(p).is_dir());
     StatusOutcome {
         bind: bind.into(),
         up,
         launchd_state: state,
         launchd_pid: pid,
         launchd_last_exit_code: last_exit_code,
+        plist_working_directory,
+        plist_working_directory_exists,
     }
 }
 
@@ -514,11 +534,17 @@ pub async fn bootstrap() -> Result<BootstrapOutcome, ServerError> {
 /// synced with the on-disk plist).
 ///
 /// `cargo_bin` defaults to `$CARGO_BIN` if set, else `$HOME/.cargo/bin`.
-/// `project_root` defaults to `$PWD` if set, else the process's current
-/// working directory.
+/// `working_dir` defaults to the service's own state directory `~/.mse`
+/// ([`mlua_swarm_server::config::default_mse_home`]) — never the
+/// installer's `$PWD`. A daemon whose `WorkingDirectory` names a
+/// directory that later disappears is unstartable (launchd records
+/// `EX_CONFIG` (78) before the log sinks open — a zero-log crash loop,
+/// GH #97), so the working directory must be one the service owns. The
+/// resolved directory is `create_dir_all`'d before the plist is written
+/// so the spawn precondition holds by construction.
 pub async fn install(
     cargo_bin: Option<&Path>,
-    project_root: Option<&Path>,
+    working_dir: Option<&Path>,
 ) -> Result<InstallOutcome, ServerError> {
     let home = home_path()?;
     let cargo_bin_pb = cargo_bin.map(|p| p.to_path_buf()).unwrap_or_else(|| {
@@ -526,12 +552,13 @@ pub async fn install(
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".cargo/bin"))
     });
-    let project_root_pb = project_root.map(|p| p.to_path_buf()).unwrap_or_else(|| {
-        std::env::var_os("PWD")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-    });
-    let rendered = render(&home, &cargo_bin_pb, &project_root_pb)?;
+    let working_dir_pb = working_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(mlua_swarm_server::config::default_mse_home);
+    tokio::fs::create_dir_all(&working_dir_pb)
+        .await
+        .map_err(ServerError::Io)?;
+    let rendered = render(&home, &cargo_bin_pb, &working_dir_pb)?;
     let plist_path = installed_plist_path()?;
     let launch_agents_dir = plist_path.parent().ok_or_else(|| {
         ServerError::Render("installed plist path has no parent directory".into())
@@ -630,10 +657,31 @@ fn parse_launchctl_print(text: &str) -> (Option<String>, Option<i64>, Option<i64
         } else if let Some(v) = line.strip_prefix("pid = ") {
             pid = v.trim().parse::<i64>().ok();
         } else if let Some(v) = line.strip_prefix("last exit code = ") {
-            last_exit_code = v.trim().parse::<i64>().ok();
+            // Non-zero codes carry a sysexits annotation after the number
+            // (`78: EX_CONFIG`); a job launchd never spawned reports
+            // `(never exited)`. Parse the leading segment only — the
+            // annotated form is exactly the one a caller diagnosing a
+            // crash loop needs, so it must not fold to `None` (GH #97).
+            last_exit_code = v
+                .split(':')
+                .next()
+                .and_then(|n| n.trim().parse::<i64>().ok());
         }
     }
     (state, pid, last_exit_code)
+}
+
+/// Extract `WorkingDirectory` from an installed plist body. Scans for the
+/// `<key>WorkingDirectory</key>` element and returns the following
+/// `<string>` payload. Byte-level scan, not an XML parse — the input is
+/// always this module's own [`render`] output, whose shape is fixed by
+/// the baked template.
+fn parse_plist_working_directory(plist: &str) -> Option<String> {
+    let key_end = plist.find("<key>WorkingDirectory</key>")? + "<key>WorkingDirectory</key>".len();
+    let rest = &plist[key_end..];
+    let open = rest.find("<string>")? + "<string>".len();
+    let close = rest[open..].find("</string>")? + open;
+    Some(rest[open..close].to_string())
 }
 
 /// Outcome of a successful [`start`] / [`restart`] operation.
@@ -680,6 +728,16 @@ pub struct StatusOutcome {
     /// `last exit code = ...` from `launchctl print` (`None` if launchd
     /// hasn't recorded one yet).
     pub launchd_last_exit_code: Option<i64>,
+    /// `WorkingDirectory` read from the installed plist (`None` if the
+    /// plist is missing or unreadable).
+    pub plist_working_directory: Option<String>,
+    /// Whether [`Self::plist_working_directory`] currently exists as a
+    /// directory (`None` when the plist itself could not be read).
+    /// `Some(false)` is the signature of the GH #97 zero-log crash loop:
+    /// launchd cannot chdir, so the daemon dies with `EX_CONFIG` (78)
+    /// before its log sinks open. Recovery: re-run install
+    /// (`mse server install` / `mlua_swarm_server_install`).
+    pub plist_working_directory_exists: Option<bool>,
 }
 
 /// Outcome of a successful [`bootstrap`] operation.
@@ -777,12 +835,50 @@ com.mse.server = {
         assert_eq!(code, Some(0));
     }
 
+    /// Non-zero exit codes carry a sysexits annotation (`78: EX_CONFIG`).
+    /// The pre-GH-#97 parser fed the whole segment to `parse::<i64>()`,
+    /// so exactly the failing case reported `null` — the annotated form
+    /// must survive as the numeric code.
+    #[test]
+    fn parse_launchctl_print_reads_annotated_exit_code() {
+        let sample = "\
+com.mse.server = {
+\tstate = spawn scheduled
+\tlast exit code = 78: EX_CONFIG
+}";
+        let (state, pid, code) = parse_launchctl_print(sample);
+        assert_eq!(state.as_deref(), Some("spawn scheduled"));
+        assert_eq!(pid, None);
+        assert_eq!(code, Some(78));
+    }
+
+    #[test]
+    fn parse_launchctl_print_never_exited_is_none() {
+        let (_, _, code) = parse_launchctl_print("last exit code = (never exited)");
+        assert_eq!(code, None);
+    }
+
     #[test]
     fn parse_launchctl_print_missing_fields_are_none() {
         let (state, pid, code) = parse_launchctl_print("not a plist dump\njust noise");
         assert_eq!(state, None);
         assert_eq!(pid, None);
         assert_eq!(code, None);
+    }
+
+    #[test]
+    fn parse_plist_working_directory_reads_rendered_template() {
+        let rendered = render(
+            Path::new("/Users/alice"),
+            Path::new("/Users/alice/.cargo/bin"),
+            Path::new("/Users/alice/.mse"),
+        )
+        .expect("render succeeds");
+        assert_eq!(
+            parse_plist_working_directory(&rendered).as_deref(),
+            Some("/Users/alice/.mse")
+        );
+        assert_eq!(parse_plist_working_directory("<dict></dict>"), None);
     }
 
     #[test]
@@ -853,8 +949,8 @@ com.mse.server = {
     fn render_substitutes_placeholders() {
         let home = Path::new("/Users/alice");
         let cargo_bin = Path::new("/Users/alice/.cargo/bin");
-        let project_root = Path::new("/Users/alice/projects/mlua-swarm");
-        let rendered = render(home, cargo_bin, project_root).expect("render succeeds");
+        let working_dir = Path::new("/Users/alice/.mse");
+        let rendered = render(home, cargo_bin, working_dir).expect("render succeeds");
         // All three placeholders fully substituted.
         assert!(!rendered.contains("{{HOME}}"), "HOME placeholder leaked");
         assert!(
@@ -862,15 +958,15 @@ com.mse.server = {
             "CARGO_BIN placeholder leaked"
         );
         assert!(
-            !rendered.contains("{{PROJECT_ROOT}}"),
-            "PROJECT_ROOT placeholder leaked"
+            !rendered.contains("{{WORKING_DIR}}"),
+            "WORKING_DIR placeholder leaked"
         );
         // No stray `{{` = guard is silent when all placeholders are known.
         assert!(!rendered.contains("{{"), "unresolved `{{{{` in output");
         // Payload substitutions materialized in the concrete plist body.
         assert!(rendered.contains("/Users/alice/.cargo/bin/mse"));
         assert!(rendered.contains("/Users/alice/.mse/config.toml"));
-        assert!(rendered.contains("/Users/alice/projects/mlua-swarm"));
+        assert!(rendered.contains("<string>/Users/alice/.mse</string>"));
         // The daemon's own install dir is on the daemon's PATH.
         assert!(
             rendered.contains("<string>/Users/alice/.cargo/bin:/usr/local/bin:"),

@@ -10,14 +10,20 @@
   the result at ~/Library/LaunchAgents/com.mse.server.plist.
 
   Placeholders:
-    {{HOME}}          -> $HOME (e.g. /Users/alice)
-    {{CARGO_BIN}}     -> cargo install target dir (default: $HOME/.cargo/bin)
-    {{PROJECT_ROOT}}  -> this repository's absolute path (WorkingDirectory)
+    {{HOME}}         -> $HOME (e.g. /Users/alice)
+    {{CARGO_BIN}}    -> cargo install target dir (default: $HOME/.cargo/bin)
+    {{WORKING_DIR}}  -> the daemon's WorkingDirectory (default: $HOME/.mse).
+                        Must be a directory the service owns — never a
+                        source checkout. launchd refuses to spawn a job
+                        whose WorkingDirectory is missing (EX_CONFIG 78,
+                        before the log sinks open = zero-log crash loop,
+                        GH #97), so this path must outlive the install.
 
   Manual expand + install (if you don't want the CLI subcommand):
+    mkdir -p ~/.mse
     sed -e "s|{{HOME}}|$HOME|g" \
         -e "s|{{CARGO_BIN}}|$HOME/.cargo/bin|g" \
-        -e "s|{{PROJECT_ROOT}}|$(pwd)|g" \
+        -e "s|{{WORKING_DIR}}|$HOME/.mse|g" \
         crates/mlua-swarm-cli/src/server/plist.template \
       > ~/Library/LaunchAgents/com.mse.server.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mse.server.plist
@@ -62,7 +68,7 @@
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>{{PROJECT_ROOT}}</string>
+    <string>{{WORKING_DIR}}</string>
 
     <key>RunAtLoad</key>
     <true/>
