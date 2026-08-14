@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0](https://github.com/ynishi/mlua-swarm/compare/v0.25.0...v0.26.0) - 2026-08-14
+
+### Added
+
+- *(server)* [**breaking**] give the 24h session horizon a schedule, and scheduled work a home
+
+### Fixed
+
+- *(server)* [**breaking**] close the follow-ups v0.25.0's operator work left open
+- *(engine)* say when a launch-declared backend has gone missing
+- *(cli)* stop baking the install-time $PWD into the LaunchAgent (GH #97)
+- *(server)* return a Run to where it was when dispatch fails past the flip
+
 ## [0.25.0](https://github.com/ynishi/mlua-swarm/compare/v0.24.0...v0.25.0) - 2026-08-10
 
 ### Added
