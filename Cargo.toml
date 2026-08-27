@@ -11,7 +11,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
 repository = "https://github.com/ynishi/mlua-swarm"
@@ -47,8 +47,8 @@ serde_yaml = "0.9"
 minijinja = "2"
 mlua = { version = "0.11", features = ["lua54", "vendored", "serde"] }
 tempfile = "3"
-agent-block-core = "0.31.0"
-agent-block-types = "0.31.0"
+agent-block-core = "0.33.0"
+agent-block-types = "0.33.0"
 llm-extract = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
