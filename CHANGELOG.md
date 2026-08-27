@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0](https://github.com/ynishi/mlua-swarm/compare/v0.26.0...v0.27.0) - 2026-08-27
+
+### Fixed
+
+- *(deps)* [**breaking**] bump agent-block to 0.33.0 so https:// MCP endpoints connect (GH #99)
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.26.0](https://github.com/ynishi/mlua-swarm/compare/v0.25.0...v0.26.0) - 2026-08-14
 
 ### Added
