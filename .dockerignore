@@ -1,0 +1,12 @@
+# Keep the docker build context to what the multi-stage build actually
+# reads (source + manifests). Without this, a local `docker build` /
+# `fly deploy --dockerfile` uploads the full checkout — including a
+# multi-GB target/ — to the builder. CI image builds always ran from a
+# clean checkout, which is why the gap never surfaced there (GH #101).
+target
+.git
+.worktrees
+workspace
+.claude
+.mcp.json
+.ryo

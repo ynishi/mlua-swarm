@@ -57,7 +57,12 @@ futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json"] }
 uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
-tokio-tungstenite = "0.24"
+# rustls-tls-native-roots: the operator WS client maps https:// (MSE_HTTP)
+# to wss://, and connect_async needs a TLS backend compiled in or every
+# TLS-edge endpoint fails with "TLS support not compiled in" (found live
+# on the GH #101 Fly.io verification). Native roots = OS trust store,
+# aligned with the agent-block rustls-platform-verifier choice (GH #99).
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 clap = { version = "4", features = ["derive"] }
 rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
 nix = { version = "0.29", features = ["user"] }

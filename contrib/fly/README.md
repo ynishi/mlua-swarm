@@ -11,6 +11,16 @@ access token. TLS terminates at the edge; the server speaks plain HTTP
 inside, and clients reach it as `https://` (the operator WS client maps
 that to `wss://` on its own).
 
+The whole flow below is scripted — for the common path just run:
+
+```bash
+MSE_FLY_APP=<your-app-name> bash contrib/fly/deploy.sh
+```
+
+The script is idempotent (existing app / volume / secrets / IPs are
+reused) and ends with the verification ladder from §3. The sections
+below explain what it does.
+
 ## Prerequisites
 
 - `flyctl` authenticated (`fly auth login`)
@@ -46,6 +56,18 @@ fly secrets set \
 Keep the access-token value — every client needs it.
 
 ## 3. Deploy and verify
+
+Two operational notes learned on the first live deploy:
+
+- **Public IPs**: the automatic allocation on first deploy has been
+  observed to fail (`error allocating ipv6`), leaving the app deployed
+  but unreachable (empty `fly ips list`, curl `000`). Fix:
+  `fly ips allocate-v4 --shared` (+ `allocate-v6`). `deploy.sh` does
+  this pre-emptively.
+- **Building from source** (e.g. verifying unreleased changes with
+  `fly deploy --dockerfile Dockerfile` from the repo root) relies on the
+  repo's `.dockerignore` — without it the build context uploads the full
+  checkout including a multi-GB `target/`.
 
 ```bash
 fly deploy
