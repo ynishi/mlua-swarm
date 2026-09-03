@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0](https://github.com/ynishi/mlua-swarm/compare/v0.27.0...v0.28.0) - 2026-09-03
+
+### Added
+
+- *(cli)* Fly.io single-machine deployment recipe + env fallbacks (GH #101 Layer 3)
+- *(server)* L0 perimeter access-token gate + client pass-through (GH #101)
+
+### Fixed
+
+- *(cli)* wss TLS backend + Fly deploy driver + build context hygiene (GH #101)
+
 ## [0.27.0](https://github.com/ynishi/mlua-swarm/compare/v0.26.0...v0.27.0) - 2026-08-27
 
 ### Fixed
