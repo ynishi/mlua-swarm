@@ -367,12 +367,19 @@ Every client then needs `MSE_ACCESS_TOKEN` set (the mse-mcp tools,
 `X-MSE-Access-Token` header automatically). Two more knobs matter on a
 remote host:
 
-- **Pin `token_secret`** (config or `--token-secret`): unpinned, it is
-  regenerated every boot and a restart invalidates all outstanding worker
-  CapTokens. The server warns about this on non-loopback binds.
+- **Pin `token_secret`** (config, `--token-secret`, or env
+  `MSE_TOKEN_SECRET`): unpinned, it is regenerated every boot and a
+  restart invalidates all outstanding worker CapTokens. The server warns
+  about this on non-loopback binds.
 - **TLS terminates at the platform edge / reverse proxy** — the server
   speaks plain HTTP behind it. The operator WS client maps `https://` in
   `MSE_HTTP` to `wss://` on its own.
+
+Container platforms that cannot pass flags can drive everything through
+env: `MSE_BIND`, `MSE_ACCESS_TOKEN`, `MSE_TOKEN_SECRET` (each is
+overridden by its flag, and overrides the config file). A complete
+single-machine reference deployment (Fly.io: volume, secrets, TLS edge,
+autostop off) ships in the repo under `contrib/fly/`.
 
 Credential vocabulary, the route × layer matrix, and the full rationale
 live in `mse://guides/auth-token-model`.

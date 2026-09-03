@@ -1,0 +1,49 @@
+# mse serve on Fly.io — single-machine reference deployment (GH #101 Layer 3).
+#
+# Companion runbook: contrib/fly/README.md. Security model:
+# mse://guides/auth-token-model (bundled; also
+# crates/mlua-swarm-cli/src/mcp/resources/guides/auth-token-model.md).
+#
+# The two secrets are NOT set here — they come from the platform secret
+# store (`fly secrets set MSE_ACCESS_TOKEN=... MSE_TOKEN_SECRET=...`).
+# Without MSE_ACCESS_TOKEN the server refuses to start on 0.0.0.0
+# (fail-closed), so a half-configured deploy fails loudly instead of
+# listening open.
+
+app = "CHANGE-ME"          # your Fly app name
+primary_region = "nrt"     # pick yours; single machine, so one region
+
+[build]
+# Pin a released image; `latest` also exists but a pinned tag makes
+# "which build is answering" auditable (cf. /v1/doctor server_version).
+image = "ghcr.io/ynishi/mse:0.27.0"
+
+[processes]
+# Appended to the image ENTRYPOINT (`mse`). No shell involved — bind and
+# both secrets travel via env (MSE_BIND would work too; the explicit flag
+# keeps the listen address visible in `fly config show`).
+app = "serve --bind 0.0.0.0:7777"
+
+# State root: SQLite stores + git-backed Blueprint store live under
+# ~/.mse — the image runs as root, so that is /root/.mse. One volume,
+# one machine: the engine is single-node by construction (SQLite single
+# writer), do not scale this app horizontally.
+[[mounts]]
+source = "mse_data"
+destination = "/root/.mse"
+processes = ["app"]
+
+[http_service]
+internal_port = 7777
+force_https = true
+# The operator WS is a long-lived connection and Fly does not guarantee
+# active WebSockets survive autostop — keep the machine always on.
+# https://fly.io/docs/reference/fly-proxy-autostop-autostart/
+auto_stop_machines = "off"
+auto_start_machines = true
+min_machines_running = 1
+processes = ["app"]
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "512mb"

@@ -56,11 +56,16 @@ pub struct Args {
     /// (built-in defaults apply). See `mlua_swarm_server::config` module doc.
     #[arg(long)]
     config: Option<std::path::PathBuf>,
-    /// listen address. Overrides the config file's `bind`.
+    /// listen address. Overrides `MSE_BIND` and the config file's `bind`.
+    /// Container platforms that cannot pass flags set `MSE_BIND` instead
+    /// (GH #101 Layer 3 — e.g. Fly.io `[env]`).
     #[arg(long)]
     bind: Option<String>,
-    /// Token signing secret (hex). Overrides the config file's `token_secret`.
-    /// When both are omitted, uses the default current secret.
+    /// Token signing secret (hex). Overrides `MSE_TOKEN_SECRET` and the
+    /// config file's `token_secret`. When all are omitted, a fresh secret
+    /// is generated per boot (fine on a laptop; pin it on a remote host or
+    /// every restart invalidates outstanding worker CapTokens). The env
+    /// path exists for platform secret stores (GH #101 Layer 3).
     #[arg(long)]
     token_secret: Option<String>,
     /// L0 perimeter access token (GH #101). Overrides `MSE_ACCESS_TOKEN`
@@ -284,7 +289,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let file_config = mlua_swarm_server::config::load_file_config(&config_path)
         .unwrap_or_else(|e| panic!("mse serve: config load failed: {e}"));
     let cli_overrides = mlua_swarm_server::config::CliOverrides {
-        bind: args.bind.clone(),
+        bind: args
+            .bind
+            .clone()
+            .or_else(|| std::env::var("MSE_BIND").ok().filter(|v| !v.is_empty())),
         enable_enhance_flow: if args.enable_enhance_flow {
             Some(true)
         } else {
@@ -318,7 +326,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         ephemeral: if args.ephemeral { Some(true) } else { None },
         seed_blueprint_id: args.seed_blueprint_id.clone(),
         default_agent_kind: args.default_agent_kind.clone(),
-        token_secret: args.token_secret.clone(),
+        token_secret: args.token_secret.clone().or_else(|| {
+            std::env::var("MSE_TOKEN_SECRET")
+                .ok()
+                .filter(|v| !v.is_empty())
+        }),
         // Flag wins over env; the config-file key is the third layer via
         // `resolve` (CLI > file). Empty env values count as unset.
         access_token: args.access_token.clone().or_else(|| {

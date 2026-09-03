@@ -104,8 +104,9 @@ dispatch and die with the token's TTL.
 When unset it is regenerated from the OS RNG on every boot, which
 invalidates all outstanding CapTokens across a restart. That is an
 availability concern, not a confidentiality one — so a remote deployment
-should pin it (config / platform secret), and the server warns (but does
-not refuse) when binding non-loopback with an unpinned key.
+should pin it (`--token-secret`, env `MSE_TOKEN_SECRET`, or the config
+key — hex in all three), and the server warns (but does not refuse) when
+binding non-loopback with an unpinned key.
 
 ## Remote hosting posture
 
