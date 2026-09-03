@@ -1289,7 +1289,9 @@ pub(crate) async fn register(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("register: Blueprint JSON has no top-level 'id' string field"))?;
     let url = format!("http://{server}/v1/blueprints/{id}");
-    let client = reqwest::Client::new();
+    let client = crate::http::client_builder()
+        .build()
+        .expect("http client build");
     let resp = client
         .post(&url)
         .json(bp_value)

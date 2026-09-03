@@ -76,6 +76,14 @@
 //!
 //! ## Bearer authentication
 //!
+//! `Authorization: Bearer` on these routes is the **L1 identity** channel
+//! of the layered credential model (`mse://guides/auth-token-model`) — it
+//! names *which* dispatch/agent is calling. The **L0 perimeter** (the
+//! access token in `X-MSE-Access-Token`, `crate::access`) is enforced by
+//! middleware over the whole merged router before any of this runs; the
+//! short `wh-` handle below (≈2^32 values) is only safe *because* that
+//! perimeter fail-closes on non-loopback binds.
+//!
 //! The Bearer value is the string produced by `CapToken::encode()` (= URL-safe
 //! base64 of serde_json). The server decodes it with `CapToken::decode` and then,
 //! inside the engine, verifies HMAC sig + role × verb gate + TTL via

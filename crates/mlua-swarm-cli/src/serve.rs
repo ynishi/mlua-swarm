@@ -63,6 +63,15 @@ pub struct Args {
     /// When both are omitted, uses the default current secret.
     #[arg(long)]
     token_secret: Option<String>,
+    /// L0 perimeter access token (GH #101). Overrides `MSE_ACCESS_TOKEN`
+    /// and the config file's `access_token`. When set, every `/v1` request
+    /// must carry it in `X-MSE-Access-Token` (`GET /v1/healthz` exempt).
+    /// Mandatory for non-loopback binds (fail-closed startup). Note: a
+    /// flag value is visible to every local user via `ps` — prefer the
+    /// env var or the config file on shared hosts. See
+    /// `mse://guides/auth-token-model`.
+    #[arg(long)]
+    access_token: Option<String>,
     /// Seed Blueprint id for enhance mode. Overrides the config file's `seed_blueprint_id`.
     #[arg(long)]
     seed_blueprint_id: Option<String>,
@@ -310,6 +319,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         seed_blueprint_id: args.seed_blueprint_id.clone(),
         default_agent_kind: args.default_agent_kind.clone(),
         token_secret: args.token_secret.clone(),
+        // Flag wins over env; the config-file key is the third layer via
+        // `resolve` (CLI > file). Empty env values count as unset.
+        access_token: args.access_token.clone().or_else(|| {
+            std::env::var("MSE_ACCESS_TOKEN")
+                .ok()
+                .filter(|v| !v.is_empty())
+        }),
         sync_timeout_secs: args.sync_timeout_secs,
         operator_session_sweep_secs: args.operator_session_sweep_secs,
         engine_max_hold_ms: args.engine_max_hold_ms,
@@ -326,6 +342,32 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .as_ref()
         .map(|s| parse_agent_kind_cli(s).unwrap_or_else(|e| panic!("mse serve: {e}")));
     eprintln!("mse serve: config loaded from {}", config_path.display());
+
+    // L0 perimeter, boot half (GH #101): fail-closed before anything else
+    // runs — no store opened, no thread spawned, nothing written when this
+    // refuses. See `mlua_swarm_server::access` / mse://guides/auth-token-model.
+    match mlua_swarm_server::validate_bind_security(
+        &cfg.bind,
+        cfg.access_token.is_some(),
+        cfg.token_secret.is_some(),
+    ) {
+        Ok(warnings) => {
+            for w in warnings {
+                eprintln!("mse serve: warning: {w}");
+            }
+        }
+        Err(e) => anyhow::bail!("mse serve: {e}"),
+    }
+    // Normalize the token into this process's env regardless of which of
+    // the three sources (flag / env / config file) supplied it: spawned
+    // subprocess workers inherit the env, which is how they cross the L0
+    // perimeter on their /v1/worker/* calls back to this server. Done here,
+    // before the runtime spawns any task or store thread — `set_var` is not
+    // thread-safe against concurrent `getenv` (edition-2024 marks it
+    // unsafe), and workers spawned later must already see the value.
+    if let Some(token) = &cfg.access_token {
+        std::env::set_var("MSE_ACCESS_TOKEN", token);
+    }
 
     // Engine stateless-executor refactor:
     // A single Engine instance is used (the old task / enhance axis split
@@ -696,6 +738,18 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             store.clone(),
         ))
         .merge(build_doctor_router(doctor_info, store.clone()));
+
+    // L0 perimeter (GH #101). The gate wraps the FULLY MERGED router —
+    // attaching it any earlier (inside the server crate's builders) would
+    // leave the five late-merged sub-routers above outside the perimeter.
+    // The fail-closed bind check itself already ran right after config
+    // resolution (before any store/thread was started).
+    let app = mlua_swarm_server::apply_access_gate(
+        app,
+        cfg.access_token
+            .as_deref()
+            .map(mlua_swarm_server::AccessGate::new),
+    );
 
     let _ = id;
 

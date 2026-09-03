@@ -141,7 +141,7 @@ impl MseServer {
 /// callers fall back to the local run store trace.
 async fn fetch_run_via_http(bind: &str, run_id: &str) -> Option<JsonValue> {
     let url = format!("http://{bind}/v1/runs/{run_id}");
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .ok()?;
@@ -170,7 +170,7 @@ enum RunFetchError {
 /// `internal_error` instead of both becoming an empty report.
 async fn fetch_run_strict(bind: &str, run_id: &str) -> Result<JsonValue, RunFetchError> {
     let url = format!("http://{bind}/v1/runs/{run_id}");
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| RunFetchError::Transport(format!("client build: {e}")))?;
@@ -309,7 +309,7 @@ fn aggregate_run_stats(step_entries: &[JsonValue]) -> JsonValue {
 /// error contract as [`fetch_run_via_http`].
 async fn fetch_trace_tail_via_http(bind: &str, run_id: &str) -> Option<Vec<JsonValue>> {
     let url = format!("http://{bind}/v1/runs/{run_id}/trace?latest=50");
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .ok()?;
@@ -3495,7 +3495,7 @@ impl MseServer {
             .map_err(|e| McpError::invalid_params(format!("invalid task_id: {e}"), None))?;
         let base = base_url.trim_end_matches('/');
         let url = format!("{base}/v1/worker/prompt");
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
@@ -3665,7 +3665,7 @@ impl MseServer {
                     )
                 })?,
         };
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
@@ -4322,7 +4322,7 @@ impl MseServer {
             }
         }
 
-        let client = match reqwest::Client::builder()
+        let client = match crate::http::client_builder()
             .timeout(ttl + Duration::from_secs(5))
             .build()
         {
@@ -4601,7 +4601,7 @@ impl MseServer {
             }));
         }
         let url = format!("http://{bind}/v1/blueprints/{}", req.id);
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
@@ -4867,7 +4867,7 @@ impl MseServer {
             .bind
             .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         let url = format!("http://{bind}/v1/blueprints/{}/unarchive", req.id);
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
@@ -4905,7 +4905,7 @@ impl MseServer {
             req.disable_block,
         );
         let url = format!("http://{bind}/v1/blueprints/{}/head", req.id);
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
@@ -5406,7 +5406,7 @@ impl MseServer {
             "http://{bind}/v1/blueprints/{}/agents/{}/explain",
             req.bp_id, req.agent
         );
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
@@ -5498,7 +5498,7 @@ impl MseServer {
         let bind = req
             .bind
             .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
@@ -5647,7 +5647,7 @@ impl MseServer {
 
         let server_info: JsonValue = if server_up {
             let url = format!("http://{bind}/v1/doctor");
-            match reqwest::Client::builder()
+            match crate::http::client_builder()
                 .timeout(Duration::from_secs(3))
                 .build()
             {
@@ -5689,7 +5689,7 @@ impl MseServer {
         let mut audit_findings: Vec<AuditFinding> = Vec::new();
         let mut audit_fetch_notes: Vec<String> = Vec::new();
         if server_up {
-            let client = reqwest::Client::builder()
+            let client = crate::http::client_builder()
                 .timeout(Duration::from_secs(3))
                 .build();
             match client {
@@ -5738,7 +5738,7 @@ impl MseServer {
         let mut degradation_total: usize = 0;
         let mut degradation_notes: Vec<String> = Vec::new();
         if server_up {
-            let client = reqwest::Client::builder()
+            let client = crate::http::client_builder()
                 .timeout(Duration::from_secs(3))
                 .build();
             match client {
@@ -6060,7 +6060,7 @@ impl MseServer {
             .clone()
             .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
         let url = format!("http://{bind}/v1/runs/{}/cancel", req.run_id);
-        let server_ok = match reqwest::Client::builder()
+        let server_ok = match crate::http::client_builder()
             .timeout(Duration::from_secs(5))
             .build()
         {
@@ -9264,7 +9264,9 @@ mod tests {
             blueprint_ref_includes: Vec::new(),
         };
 
-        let client = reqwest::Client::new();
+        let client = crate::http::client_builder()
+            .build()
+            .expect("http client build");
         let launch_resp = client
             .post(format!("http://{bind}/v1/tasks"))
             .json(&serde_json::json!({

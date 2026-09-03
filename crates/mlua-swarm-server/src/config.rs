@@ -167,6 +167,11 @@ pub struct FileConfig {
     pub default_agent_kind: Option<String>,
     /// Shared secret used to verify/sign `CapToken` HMAC signatures.
     pub token_secret: Option<String>,
+    /// L0 perimeter access token (GH #101, see `crate::access`). When set,
+    /// every `/v1` request must carry it in the `X-MSE-Access-Token`
+    /// header (`GET /v1/healthz` exempt). Required for non-loopback binds
+    /// (fail-closed startup). `None` = perimeter gate not installed.
+    pub access_token: Option<String>,
     /// Ceiling (seconds) for the `POST /v1/tasks` synchronous launch await
     /// (GH #33 Guard 2). Overridable per-request via `TaskLaunchRequest
     /// .timeout_secs`; this is the server-wide fallback when the request
@@ -273,6 +278,10 @@ pub struct CliOverrides {
     pub default_agent_kind: Option<String>,
     /// `--token-secret` value.
     pub token_secret: Option<String>,
+    /// `--access-token` / `MSE_ACCESS_TOKEN` value (mirrors
+    /// [`FileConfig::access_token`]; the env fallback is resolved by the
+    /// caller in `serve.rs` before this struct is built).
+    pub access_token: Option<String>,
     /// `--sync-timeout-secs` value (mirrors [`FileConfig::sync_timeout_secs`]).
     pub sync_timeout_secs: Option<u64>,
     /// `--operator-session-sweep-secs` value (mirrors
@@ -346,6 +355,10 @@ pub struct ResolvedConfig {
     pub default_agent_kind: Option<String>,
     /// Shared secret used to verify/sign `CapToken` HMAC signatures.
     pub token_secret: Option<String>,
+    /// L0 perimeter access token (GH #101). `None` = gate not installed;
+    /// non-loopback binds without it are refused at startup
+    /// (`crate::access::validate_bind_security`).
+    pub access_token: Option<String>,
     /// Ceiling (seconds) for the `POST /v1/tasks` synchronous launch await
     /// (GH #33 Guard 2). Always set — defaults to 3600s / 60 min (see
     /// [`default_sync_timeout_secs`]) when neither CLI nor config file
@@ -406,6 +419,7 @@ impl Default for ResolvedConfig {
             seed_blueprint_id: "main".into(),
             default_agent_kind: None,
             token_secret: None,
+            access_token: None,
             sync_timeout_secs: default_sync_timeout_secs(),
             engine_max_hold_ms: None,
             worker_token_ttl_secs: None,
@@ -474,6 +488,17 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
     };
 
     let ephemeral = cli.ephemeral.or(file.ephemeral).unwrap_or(false);
+
+    // An empty access token would satisfy the fail-closed bind rule while
+    // installing a gate that accepts an empty header (`--access-token
+    // "$TOKEN"` with `$TOKEN` unset) — refused here so all three sources
+    // (flag / env / file) hit one choke point.
+    let access_token = cli.access_token.or(file.access_token);
+    if access_token.as_deref() == Some("") {
+        return Err(
+            "access_token must not be empty (omit the key to run without the L0 gate)".into(),
+        );
+    }
 
     // Bound ahead of the struct literal so the cascade reads in one place.
     let sync_timeout_secs = cli
@@ -580,6 +605,7 @@ pub fn resolve(cli: CliOverrides, file: FileConfig) -> Result<ResolvedConfig, St
             .unwrap_or(default.seed_blueprint_id),
         default_agent_kind: cli.default_agent_kind.or(file.default_agent_kind),
         token_secret: cli.token_secret.or(file.token_secret),
+        access_token,
         sync_timeout_secs,
         engine_max_hold_ms: cli.engine_max_hold_ms.or(file.engine_max_hold_ms),
         worker_token_ttl_secs,
@@ -610,6 +636,41 @@ mod tests {
             resolved.bind,
             "127.0.0.1:9999".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn resolve_access_token_cli_wins_over_file_and_defaults_to_none() {
+        let resolved = resolve(CliOverrides::default(), FileConfig::default()).unwrap();
+        assert_eq!(resolved.access_token, None);
+
+        let file = FileConfig {
+            access_token: Some("from-file".into()),
+            ..Default::default()
+        };
+        let resolved = resolve(CliOverrides::default(), file.clone()).unwrap();
+        assert_eq!(resolved.access_token.as_deref(), Some("from-file"));
+
+        let cli = CliOverrides {
+            access_token: Some("from-cli".into()),
+            ..Default::default()
+        };
+        let resolved = resolve(cli, file).unwrap();
+        assert_eq!(resolved.access_token.as_deref(), Some("from-cli"));
+    }
+
+    #[test]
+    fn resolve_access_token_rejects_empty_from_either_side() {
+        let cli = CliOverrides {
+            access_token: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(resolve(cli, FileConfig::default()).is_err());
+
+        let file = FileConfig {
+            access_token: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(resolve(CliOverrides::default(), file).is_err());
     }
 
     #[test]

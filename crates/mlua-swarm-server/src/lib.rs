@@ -60,6 +60,7 @@
 
 #![warn(missing_docs)]
 
+pub mod access;
 mod assignee_trace;
 pub mod binding;
 /// HTTP surface for inspecting/registering Blueprint state (`/v1/blueprints/*`).
@@ -105,6 +106,7 @@ pub mod projection;
 pub mod tasks;
 /// `/v1/worker/*` endpoints (SubAgent self-fetch path).
 pub mod worker;
+pub use access::{apply_access_gate, validate_bind_security, AccessGate, ACCESS_TOKEN_HEADER};
 pub use blueprints::{
     build_blueprints_router, build_blueprints_router_with_refs, BindingRequirementsResponse,
 };

@@ -17,6 +17,7 @@
 //! Each subcommand carries its own flag surface (see `mse <cmd> --help`).
 
 mod bp;
+mod http;
 mod mcp;
 mod serve;
 mod server;

@@ -454,7 +454,7 @@ impl OperatorClientState {
         capability_manifest: Option<mlua_swarm::AgentProviderManifest>,
         desc: Option<String>,
     ) -> Result<String, ClientError> {
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| ClientError::Http(e.to_string()))?;
@@ -873,7 +873,7 @@ impl OperatorClientState {
         };
         entry.reader_task.lock().await.abort();
 
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| ClientError::Http(e.to_string()))?;
@@ -897,7 +897,7 @@ impl OperatorClientState {
 /// The `reqwest` client every plain HTTP call on this module uses — the
 /// same 10s budget the join and leave paths already build inline.
 fn http_client() -> Result<reqwest::Client, ClientError> {
-    reqwest::Client::builder()
+    crate::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| ClientError::Http(e.to_string()))
@@ -995,6 +995,13 @@ async fn connect_ws(
         HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|e| ClientError::Ws(e.to_string()))?,
     );
+    // L0 perimeter (GH #101): the upgrade GET goes through the access-token
+    // middleware like any request, and tungstenite bypasses reqwest's
+    // default headers — so the header is attached here explicitly.
+    if let Some(access) = crate::http::access_token_header() {
+        req.headers_mut()
+            .insert(crate::http::ACCESS_TOKEN_HEADER, access);
+    }
     let (ws_stream, _) = tokio_tungstenite::connect_async(req)
         .await
         .map_err(|e| ClientError::Ws(e.to_string()))?;
@@ -1024,7 +1031,10 @@ async fn send_text(entry: &Arc<SessionEntry>, text: &str) -> Result<(), ClientEr
 /// takes a bare `host:port` bind and hardcodes the `http://` scheme, while
 /// this client works from a full `http(s)://` base URL.
 async fn server_healthz_ok(http_base: &str) -> bool {
-    let Ok(client) = reqwest::Client::builder().timeout(HEALTHZ_TIMEOUT).build() else {
+    let Ok(client) = crate::http::client_builder()
+        .timeout(HEALTHZ_TIMEOUT)
+        .build()
+    else {
         return false;
     };
     match client.get(format!("{http_base}/v1/healthz")).send().await {

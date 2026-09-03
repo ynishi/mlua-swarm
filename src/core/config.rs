@@ -50,6 +50,9 @@ pub struct EngineCfg {
     /// for tokens to stay valid across restarts, or when multiple
     /// independently-constructed engines/signers must accept each other's
     /// tokens.
+    /// In the layered credential vocabulary (`mse://guides/auth-token-model`)
+    /// this is a **key, not a token**: it never travels on the wire and
+    /// guards no route — it only lets the server verify what it minted.
     pub token_secret: Vec<u8>,
     /// Long-hold session tuning (idle keepalive, heartbeat cadence).
     pub long_hold: LongHoldConfig,

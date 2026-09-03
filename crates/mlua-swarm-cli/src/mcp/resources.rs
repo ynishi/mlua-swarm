@@ -48,6 +48,7 @@
 //! | `mse://guides/lint-diagnostic-model`         | Unified Clippy-style `Diagnostic` model + `LINT_DECLS` registry + the 4-step add-a-lint recipe (GH #79). |
 //! | `mse://guides/strict-embed-modes`            | The two `strict-embed` layers side by side: client build-time pre-embed vs server register-time raw-ref reject (GH #78 P1b). |
 //! | `mse://guides/enhance-flow`                  | Enhance flow (issue → JSON Patch → verify → commit): prerequisites, HTTP surface, the spawner's output contract, and the `EnhanceSetting.spawner` swap. |
+//! | `mse://guides/auth-token-model`              | The three credential layers (L0 access token / L1 identity / L2 capability), fail-closed remote binds, and `MSE_ACCESS_TOKEN` client pass-through (GH #101). |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
@@ -123,6 +124,7 @@ const LINT_DIAGNOSTIC_MODEL_BODY: &str =
 const STRICT_EMBED_MODES_BODY: &str = include_str!("./resources/guides/strict-embed-modes.md");
 const SUBPROCESS_BACKENDS_BODY: &str = include_str!("./resources/guides/subprocess-backends.md");
 const ENHANCE_FLOW_BODY: &str = include_str!("./resources/guides/enhance-flow.md");
+const AUTH_TOKEN_MODEL_BODY: &str = include_str!("./resources/guides/auth-token-model.md");
 
 const SAMPLE_01_PURE_CTX_EVAL_BODY: &str =
     include_str!("./resources/samples/01-pure-ctx-eval.json");
@@ -257,6 +259,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "The Blueprint self-improvement loop: the four-step enhance-default flow (patch-spawner / patch-applier / fanout verifier-router / committer), the two prerequisites (`mse serve --enable-enhance-flow`, an EnhanceSetting under id `default`), the HTTP surface (/v1/enhance-settings, /v1/issues, /v1/enhance/log), the spawner's output contract (`ops` / `bump` / `rationale`, RFC 6901 pointer rules, fenced-reply folding), and swapping the spawner's execution backend via `EnhanceSetting.spawner` without rewriting the Blueprint.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(ENHANCE_FLOW_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://guides/auth-token-model",
+        title: "mse — Auth & token model (three credential layers)",
+        description: "The layered credential vocabulary (GH #101): L0 perimeter access token (X-MSE-Access-Token, fail-closed on non-loopback binds), L1 identity (operator session token / worker CapToken / wh- handle on Authorization: Bearer), L2 capability (role × verbs + scopes + seat, server-side), and token_secret as the CapToken signing key — plus the remote-hosting posture (TLS at the edge, MSE_ACCESS_TOKEN client pass-through).",
+        mime_type: "text/markdown",
+        body: ResourceBody::Static(AUTH_TOKEN_MODEL_BODY),
     },
     ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",

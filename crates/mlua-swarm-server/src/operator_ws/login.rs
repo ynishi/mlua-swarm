@@ -4,6 +4,13 @@
 //! route family — the sole WS Operator session route. `session.rs` /
 //! `protocol.rs` are unchanged by this module.
 //!
+//! In the layered credential model (`mse://guides/auth-token-model`) the
+//! session token issued here is **L1 identity**. Join itself needs no
+//! Bearer — it *mints* one — which is exactly why the **L0 perimeter**
+//! (`crate::access`) matters on a remote bind: with an access token
+//! configured, issuance sits behind the perimeter instead of being open to
+//! any network peer.
+//!
 //! ## Login flow
 //!
 //! ```text

@@ -388,6 +388,14 @@ pub fn default_role_verb_table() -> RoleVerbGate {
 /// Capability token. `max_uses` picks between OneTime / Session /
 /// Limited.
 ///
+/// In the layered credential model (`mse://guides/auth-token-model`) this
+/// is the worker's **L1 identity + L2 capability in one object**: the
+/// server learns *which* dispatch/agent is calling from `agent_id`, and
+/// what it may do from `role` × `scopes`. Both are minted at dispatch and
+/// die with the token's TTL, which is why they share one artifact. It is
+/// **not** the L0 perimeter credential (the access token in
+/// `X-MSE-Access-Token`) — that layer says nothing about identity.
+///
 /// The `uses_left` counter is **server-side, on `EngineState`**: the
 /// token stays immutable, and the record holds the counter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

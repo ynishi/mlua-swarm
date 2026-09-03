@@ -58,7 +58,10 @@ pub const TEMPLATE: &str = include_str!("./plist.template");
 /// healthz check via reqwest. Treats HTTP 200 with body `ok` as healthy.
 pub async fn healthz_ok(bind: &str) -> bool {
     let url = format!("http://{bind}/v1/healthz");
-    let client = match reqwest::Client::builder().timeout(HEALTHZ_TIMEOUT).build() {
+    let client = match crate::http::client_builder()
+        .timeout(HEALTHZ_TIMEOUT)
+        .build()
+    {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -77,7 +80,7 @@ pub async fn healthz_ok(bind: &str) -> bool {
 /// MCP tool handlers' fail-open-on-Err policy).
 pub async fn occupancy(bind: &str) -> Result<Occupancy, ServerError> {
     let url = format!("http://{bind}/v1/status");
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(HEALTHZ_TIMEOUT)
         .build()
         .map_err(|e| occupancy_io_err(format!("client build failed: {e}")))?;

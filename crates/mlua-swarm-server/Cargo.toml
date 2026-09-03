@@ -34,12 +34,14 @@ axum.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+tower = { workspace = true, features = ["util"] }
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 rusqlite-isle.workspace = true

@@ -352,8 +352,36 @@ schedule changes *when* something is noticed, never *what counts* — so a
 new entry appearing here should always be traceable to a rule stated
 elsewhere.
 
+## Remote hosting
+
+`mse serve` is loopback-first: binding anything other than `127.0.0.1` /
+`::1` (so `--bind 0.0.0.0:7777`, an external IP, …) requires the L0
+perimeter access token, and the server **refuses to start** without one:
+
+```bash
+mse serve --bind 0.0.0.0:7777 --access-token "$TOKEN"   # or MSE_ACCESS_TOKEN / config `access_token`
+```
+
+Every client then needs `MSE_ACCESS_TOKEN` set (the mse-mcp tools,
+`mse bp push`, the operator WS client, and worker fetch/submit attach the
+`X-MSE-Access-Token` header automatically). Two more knobs matter on a
+remote host:
+
+- **Pin `token_secret`** (config or `--token-secret`): unpinned, it is
+  regenerated every boot and a restart invalidates all outstanding worker
+  CapTokens. The server warns about this on non-loopback binds.
+- **TLS terminates at the platform edge / reverse proxy** — the server
+  speaks plain HTTP behind it. The operator WS client maps `https://` in
+  `MSE_HTTP` to `wss://` on its own.
+
+Credential vocabulary, the route × layer matrix, and the full rationale
+live in `mse://guides/auth-token-model`.
+
 ## See also
 
+- `mse://guides/auth-token-model` — the three credential layers (L0
+  access token / L1 identity / L2 capability) behind the remote-hosting
+  rules above.
 - `mse://guides/getting-started` — top-level entry point (serve /
   mcp / run) and quickstart snippets.
 - `mse://guides/mcp-tool-reference` — every `mse mcp` tool grouped by
