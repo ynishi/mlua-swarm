@@ -72,23 +72,55 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7777";
 /// gets `http://`, which is what every historical caller passed and meant.
 pub struct Endpoint {
     base: String,
+    source: EndpointSource,
+}
+
+/// Which of the three layers supplied the endpoint.
+///
+/// Knowing *where* a tool connected is half the answer; the other half is
+/// **why there**, because that names the thing a reader would go change.
+/// The failure this exists for looked like a vacant operator seat three
+/// hops downstream, and the cause was that one call had an argument and
+/// another fell through to the environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointSource {
+    /// An explicit `bind` argument on the tool call.
+    Argument,
+    /// The `MSE_HTTP` environment variable.
+    Env,
+    /// Nothing said, so [`DEFAULT_BASE_URL`].
+    Default,
+}
+
+impl EndpointSource {
+    /// Human-facing name of the thing that would have to change to point
+    /// somewhere else.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Argument => "bind argument",
+            Self::Env => "MSE_HTTP",
+            Self::Default => "loopback default",
+        }
+    }
 }
 
 impl Endpoint {
     /// Resolves the endpoint from an optional `bind` argument, falling back
     /// to `MSE_HTTP` and then to [`DEFAULT_BASE_URL`].
     pub fn resolve(bind: Option<&str>) -> Self {
-        let raw = bind
+        let (raw, source) = bind
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_owned)
+            .map(|value| (value.to_owned(), EndpointSource::Argument))
             .or_else(|| {
                 std::env::var("MSE_HTTP")
                     .ok()
                     .map(|value| value.trim().to_owned())
                     .filter(|value| !value.is_empty())
+                    .map(|value| (value, EndpointSource::Env))
             })
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+            .unwrap_or_else(|| (DEFAULT_BASE_URL.to_owned(), EndpointSource::Default));
 
         // "Already names a scheme" is the question, not "is it http or
         // https" — a caller naming some other scheme owns that choice.
@@ -100,7 +132,13 @@ impl Endpoint {
 
         Self {
             base: based.trim_end_matches('/').to_owned(),
+            source,
         }
+    }
+
+    /// Which layer supplied this endpoint.
+    pub fn source(&self) -> EndpointSource {
+        self.source
     }
 
     /// Joins an absolute path (`/v1/doctor`) onto the resolved base.
@@ -340,6 +378,44 @@ mod tests {
             "https://example.com/v1/doctor",
             "a trailing slash must not produce a doubled separator"
         );
+    }
+
+    /// "Where are we connected?" was answerable; "why there?" was not, and
+    /// that is the question a split between a local run and a remote
+    /// operator session actually poses. Three possible answers, so the
+    /// value says which one it was.
+    #[test]
+    fn endpoint_reports_that_an_argument_chose_the_target() {
+        let _lock = env_lock();
+        let _env = EnvVar::set("MSE_HTTP", Some("https://from-env.example"));
+        let endpoint = Endpoint::resolve(Some("https://from-arg.example"));
+        assert_eq!(endpoint.base(), "https://from-arg.example");
+        assert_eq!(endpoint.source(), EndpointSource::Argument);
+    }
+
+    #[test]
+    fn endpoint_reports_that_the_environment_chose_the_target() {
+        let _lock = env_lock();
+        let _env = EnvVar::set("MSE_HTTP", Some("https://from-env.example"));
+        let endpoint = Endpoint::resolve(None);
+        assert_eq!(endpoint.base(), "https://from-env.example");
+        assert_eq!(endpoint.source(), EndpointSource::Env);
+    }
+
+    #[test]
+    fn endpoint_reports_that_nothing_chose_the_target() {
+        let _lock = env_lock();
+        let _env = EnvVar::set("MSE_HTTP", None);
+        let endpoint = Endpoint::resolve(None);
+        assert_eq!(endpoint.base(), DEFAULT_BASE_URL);
+        assert_eq!(endpoint.source(), EndpointSource::Default);
+    }
+
+    #[test]
+    fn endpoint_source_renders_the_thing_a_reader_would_go_change() {
+        assert_eq!(EndpointSource::Argument.as_str(), "bind argument");
+        assert_eq!(EndpointSource::Env.as_str(), "MSE_HTTP");
+        assert_eq!(EndpointSource::Default.as_str(), "loopback default");
     }
 
     #[test]

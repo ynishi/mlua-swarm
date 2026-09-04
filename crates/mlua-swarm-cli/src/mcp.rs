@@ -5660,15 +5660,14 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Doctor snapshot: mse mcp self state (own build version + in-process store = InMemory ephemeral) + server-side config (its own build version / backend / store root / ref_base / registered BP list) fetched from GET /v1/doctor + a `version_drift` section comparing the two running processes + an audit_findings section (GH #34) flagging `audit:<step>` artifacts across every run this mse mcp process is tracking + a `degradations` section (GH #32) counting per-Run structured worker-degradation entries. Answers 'what version is actually running (and did one side miss a restart after cargo install)?', 'where is the store?', 'how many BPs are registered?', 'did any after-run audit leave a finding?', and 'did any worker report a degraded fallback?' in a single call. `version_drift.drift` is tri-state: true / false / null (null = could not compare, NOT 'no drift')."
+        description = "Doctor snapshot, in five sections that answer separate questions. `mse_mcp`: this process (build version, in-process store = InMemory ephemeral, in-flight runs). `endpoint`: where this call connected and WHY — `url`, `source` (argument | env | default, i.e. which layer supplied it, so a reader knows what to change), and `probe` {url, status, ok, error} from GET /v1/healthz. `server`: what the far end says about itself — `reachable` plus its `self_report` from GET /v1/doctor (its own bind / backend / store root / ref_base / registered BP list). `supervision`: local launchd state, and ONLY when the endpoint is this machine — against a hosted endpoint it is `{applicable: false, reason}` rather than six nulls, because launchd does not supervise someone else's server. Plus `version_drift` comparing the two processes, `audit_findings` (GH #34) flagging `audit:<step>` artifacts across tracked runs, and `degradations` (GH #32) counting per-Run worker-degradation entries. `version_drift.drift` is tri-state: true / false / null (null = could not compare, NOT 'no drift'). A `probe.status` of 301/308 means the endpoint redirects — the server is reachable and the endpoint needs its scheme (https://host), not a restart."
     )]
     async fn mse_doctor(
         &self,
         Parameters(req): Parameters<DoctorReq>,
     ) -> Result<CallToolResult, McpError> {
-        let bind = req
-            .bind
-            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
+        let endpoint = crate::http::Endpoint::resolve(req.bind.as_deref());
+        let bind = endpoint.base().to_string();
         let server_status = launchd::status(&bind).await;
         let server_up = server_status.up;
 
@@ -5850,6 +5849,30 @@ impl MseServer {
             None => JsonValue::Null,
         };
 
+        // launchd supervises a daemon on *this* machine. Against a hosted
+        // endpoint the whole section is a category error, and reporting six
+        // nulls invited reading them as "the daemon is in a bad state"
+        // rather than "there is no daemon here".
+        let supervision = if is_loopback_url(&server_status.probe_url) {
+            serde_json::json!({
+                "applicable": true,
+                "launchd_state": server_status.launchd_state,
+                "launchd_pid": server_status.launchd_pid,
+                "launchd_last_exit_code": server_status.launchd_last_exit_code,
+                "plist_working_directory": server_status.plist_working_directory,
+                "plist_working_directory_exists": server_status.plist_working_directory_exists,
+            })
+        } else {
+            serde_json::json!({
+                "applicable": false,
+                "reason": format!(
+                    "{} is not this machine, so no local daemon supervises it — \
+                     launchd state, pid and plist do not apply",
+                    endpoint.base()
+                ),
+            })
+        };
+
         let body = serde_json::json!({
             "mse_mcp": {
                 "version": mcp_version,
@@ -5857,20 +5880,33 @@ impl MseServer {
                 "in_flight_run_count": run_count,
                 "note": "The mse mcp in-process store is dedicated to swarm_run(Inline). The register path uses a separate store on the HTTP server side (POST /v1/blueprints/:id).",
             },
-            "mlua_swarm_server": {
-                "bind": bind,
-                "up": server_up,
-                "probe_url": server_status.probe_url,
-                "probe_status": server_status.probe_status,
-                "probe_error": server_status.probe_error,
-                "probe_note": "up is decided by GET probe_url. A probe_status of 301/308 means that endpoint redirects — name it with a scheme (https://host) instead of a bare host:port. probe_status null with probe_error set means nothing answered.",
-                "launchd_state": server_status.launchd_state,
-                "launchd_pid": server_status.launchd_pid,
-                "launchd_last_exit_code": server_status.launchd_last_exit_code,
-                "plist_working_directory": server_status.plist_working_directory,
-                "plist_working_directory_exists": server_status.plist_working_directory_exists,
-                "doctor": server_info,
+            // Three questions that used to share one object, and whose
+            // answers contradicted each other when they did: where did we
+            // connect and why (`endpoint`), what does the thing at the
+            // other end say about itself (`server`), and is a local daemon
+            // even part of this picture (`supervision`). The old shape put
+            // our `bind` next to the server's own `bind`, under the same
+            // name, and listed six null launchd fields for a hosted server
+            // that has no launchd.
+            "endpoint": {
+                "url": endpoint.base(),
+                "source": endpoint.source(),
+                "source_note": format!(
+                    "resolved from the {} — change that to point elsewhere",
+                    endpoint.source().as_str()
+                ),
+                "probe": {
+                    "url": server_status.probe_url,
+                    "status": server_status.probe_status,
+                    "ok": server_up,
+                    "error": server_status.probe_error,
+                },
             },
+            "server": {
+                "reachable": server_up,
+                "self_report": server_info,
+            },
+            "supervision": supervision,
             "version_drift": {
                 "mse_mcp": mcp_version,
                 "mlua_swarm_server": server_version,
@@ -9333,6 +9369,102 @@ mod tests {
             json["version_drift"]["mlua_swarm_server"].is_null(),
             "body: {json}"
         );
+    }
+
+    /// The three questions the response used to answer in one object, now
+    /// answered in three.
+    ///
+    /// `endpoint` is where we connected and why; `server` is what the thing
+    /// at the other end says about itself. They previously shared a `bind`
+    /// key holding two different values — ours and the server's — which is
+    /// how a reader ends up believing a hosted server is bound to their
+    /// loopback.
+    #[tokio::test]
+    async fn mse_doctor_separates_the_endpoint_from_the_server_and_says_why() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let router = Router::new()
+            .route("/v1/healthz", get(|| async { "ok" }))
+            .route(
+                "/v1/doctor",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "server_version": env!("CARGO_PKG_VERSION"),
+                        "bind": "0.0.0.0:7777",
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let server = MseServer::new();
+        let result = server
+            .mse_doctor(Parameters(DoctorReq {
+                bind: Some(addr.to_string()),
+            }))
+            .await
+            .expect("doctor");
+        let json: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("doctor json");
+
+        assert_eq!(
+            json["endpoint"]["url"],
+            format!("http://{addr}"),
+            "body: {json}"
+        );
+        assert_eq!(json["endpoint"]["source"], "argument", "body: {json}");
+        assert_eq!(json["endpoint"]["probe"]["status"], 200, "body: {json}");
+        assert_eq!(json["endpoint"]["probe"]["ok"], true, "body: {json}");
+        assert_eq!(json["server"]["reachable"], true, "body: {json}");
+        assert_eq!(
+            json["server"]["self_report"]["bind"], "0.0.0.0:7777",
+            "the server's own bind stays the server's, not ours: {json}"
+        );
+        assert!(
+            json["mlua_swarm_server"].is_null(),
+            "the merged section is gone: {json}"
+        );
+        // Loopback stub, so a local daemon could plausibly be serving it.
+        assert_eq!(json["supervision"]["applicable"], true, "body: {json}");
+    }
+
+    /// launchd supervises daemons on this machine. Against a hosted
+    /// endpoint the section is a category error, and six nulls read as "the
+    /// daemon is unwell" rather than "there is no daemon here".
+    #[tokio::test]
+    async fn mse_doctor_marks_supervision_inapplicable_for_a_remote_endpoint() {
+        let server = MseServer::new();
+        let result = server
+            .mse_doctor(Parameters(DoctorReq {
+                // Nothing listens; only the endpoint's shape is under test.
+                bind: Some("https://example.invalid".into()),
+            }))
+            .await
+            .expect("doctor must not fail when the endpoint is unreachable");
+        let json: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("doctor json");
+
+        assert_eq!(json["supervision"]["applicable"], false, "body: {json}");
+        assert!(
+            json["supervision"]["launchd_state"].is_null()
+                && json["supervision"]["plist_working_directory"].is_null(),
+            "inapplicable means absent, not null-valued: {json}"
+        );
+        assert!(
+            json["supervision"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not this machine"),
+            "body: {json}"
+        );
+        assert_eq!(json["server"]["reachable"], false, "body: {json}");
+        assert_eq!(json["endpoint"]["source"], "argument", "body: {json}");
     }
 
     /// Both determinate arms of the tri-state, against a stub `/v1/doctor`
