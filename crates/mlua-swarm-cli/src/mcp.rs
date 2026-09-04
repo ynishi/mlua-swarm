@@ -5849,30 +5849,6 @@ impl MseServer {
             None => JsonValue::Null,
         };
 
-        // launchd supervises a daemon on *this* machine. Against a hosted
-        // endpoint the whole section is a category error, and reporting six
-        // nulls invited reading them as "the daemon is in a bad state"
-        // rather than "there is no daemon here".
-        let supervision = if is_loopback_url(&server_status.probe.url) {
-            serde_json::json!({
-                "applicable": true,
-                "launchd_state": server_status.launchd_state,
-                "launchd_pid": server_status.launchd_pid,
-                "launchd_last_exit_code": server_status.launchd_last_exit_code,
-                "plist_working_directory": server_status.plist_working_directory,
-                "plist_working_directory_exists": server_status.plist_working_directory_exists,
-            })
-        } else {
-            serde_json::json!({
-                "applicable": false,
-                "reason": format!(
-                    "{} is not this machine, so no local daemon supervises it — \
-                     launchd state, pid and plist do not apply",
-                    endpoint.base()
-                ),
-            })
-        };
-
         let body = serde_json::json!({
             "mse_mcp": {
                 "version": mcp_version,
@@ -5888,36 +5864,7 @@ impl MseServer {
             // our `bind` next to the server's own `bind`, under the same
             // name, and listed six null launchd fields for a hosted server
             // that has no launchd.
-            "endpoint": {
-                "url": endpoint.base(),
-                "source": endpoint.source(),
-                "source_note": format!(
-                    "resolved from the {} — change that to point elsewhere",
-                    endpoint.source().as_str()
-                ),
-                "probe": {
-                    "url": server_status.probe.url,
-                    "http_status": server_status.probe.status,
-                    // Two questions, because a 301 answers them
-                    // differently: the host answered, the server is not
-                    // serving. One bool could only be wrong about one of
-                    // them.
-                    "host_network": {
-                        "reachable": server_status.probe.host_reachable(),
-                        "error": server_status.probe.error,
-                    },
-                    "server_available": {
-                        // "pass" / "fail" per the IETF health-check draft
-                        // vocabulary (draft-inadarei-api-health-check).
-                        "status": server_status.probe.availability(),
-                        "note": unreachable_note_when_failing(
-                            server_up,
-                            server_status.probe.status,
-                            &server_status.probe.url,
-                        ),
-                    },
-                },
-            },
+            "endpoint": endpoint_report(&endpoint, &server_status),
             "server": {
                 // Not "reachable" — that is the host's question, answered
                 // above. This one is only whether GET /v1/doctor could be
@@ -5925,7 +5872,7 @@ impl MseServer {
                 "self_report_read": server_up,
                 "self_report": server_info,
             },
-            "supervision": supervision,
+            "supervision": supervision_report(&endpoint, &server_status),
             "version_drift": {
                 "mse_mcp": mcp_version,
                 "mlua_swarm_server": server_version,
@@ -6015,17 +5962,18 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Report mse serve state: healthz + a `launchctl print gui/<uid>/com.mse.server` summary (state / pid / last exit code) + the installed plist's WorkingDirectory and whether it exists. Returns {bind, up, launchd_state, launchd_pid, launchd_last_exit_code, plist_working_directory, plist_working_directory_exists}. `plist_working_directory_exists: false` is the signature of a zero-log EX_CONFIG (78) crash loop — launchd cannot chdir, the daemon dies before its log sinks open; recover with `mlua_swarm_server_install` (GH #97). See `mse://guides/server-management` for recovery flow."
+        description = "Report mse serve state, in the same two sections `mse_doctor` uses so the two never disagree. `endpoint`: where this call connected and why — `url`, `source` (argument | env | default), and `probe` from GET /v1/healthz, whose `host_network` {reachable, error} and `server_available` {status: pass|fail, note} answer separately because a 301 answers them differently (the host replied; it is not serving — give the endpoint its scheme). `supervision`: the `launchctl print gui/<uid>/com.mse.server` summary (state / pid / last exit code) and the installed plist's WorkingDirectory — ONLY when the endpoint is this machine; otherwise `{applicable: false, reason}`, because launchd does not supervise someone else's server. `plist_working_directory_exists: false` is the signature of a zero-log EX_CONFIG (78) crash loop — launchd cannot chdir, the daemon dies before its log sinks open; recover with `mlua_swarm_server_install` (GH #97). See `mse://guides/server-management` for recovery flow."
     )]
     async fn mlua_swarm_server_status(
         &self,
         Parameters(req): Parameters<ServerStatusReq>,
     ) -> Result<CallToolResult, McpError> {
-        let bind = req
-            .bind
-            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
-        let out = launchd::status(&bind).await;
-        json_result(&out)
+        let endpoint = crate::http::Endpoint::resolve(req.bind.as_deref());
+        let out = launchd::status(endpoint.base()).await;
+        json_result(&serde_json::json!({
+            "endpoint": endpoint_report(&endpoint, &out),
+            "supervision": supervision_report(&endpoint, &out),
+        }))
     }
 
     #[tool(
@@ -6355,6 +6303,70 @@ fn unreachable_note_when_failing(
         JsonValue::Null
     } else {
         JsonValue::String(unreachable_note(probe_status, probe_url))
+    }
+}
+
+/// "Where did we connect, and what came back" — shared by `mse_doctor` and
+/// `mlua_swarm_server_status`, which ask the same question and so should
+/// not answer it in two shapes.
+fn endpoint_report(endpoint: &crate::http::Endpoint, status: &launchd::StatusOutcome) -> JsonValue {
+    serde_json::json!({
+        "url": endpoint.base(),
+        "source": endpoint.source(),
+        "source_note": format!(
+            "resolved from the {} — change that to point elsewhere",
+            endpoint.source().as_str()
+        ),
+        "probe": {
+            "url": status.probe.url,
+            "http_status": status.probe.status,
+            // Two questions, because a 301 answers them differently: the
+            // host answered, the server is not serving. One bool could
+            // only ever be wrong about one of them.
+            "host_network": {
+                "reachable": status.probe.host_reachable(),
+                "error": status.probe.error,
+            },
+            "server_available": {
+                // "pass" / "fail" per the IETF health-check draft
+                // vocabulary (draft-inadarei-api-health-check).
+                "status": status.probe.availability(),
+                "note": unreachable_note_when_failing(
+                    status.up,
+                    status.probe.status,
+                    &status.probe.url,
+                ),
+            },
+        },
+    })
+}
+
+/// "Is a local daemon even part of this picture" — launchd supervises a
+/// daemon on *this* machine, so against a hosted endpoint the whole
+/// section is a category error. Reporting six nulls invited reading them
+/// as "the daemon is unwell" rather than "there is no daemon here".
+fn supervision_report(
+    endpoint: &crate::http::Endpoint,
+    status: &launchd::StatusOutcome,
+) -> JsonValue {
+    if is_loopback_url(&status.probe.url) {
+        serde_json::json!({
+            "applicable": true,
+            "launchd_state": status.launchd_state,
+            "launchd_pid": status.launchd_pid,
+            "launchd_last_exit_code": status.launchd_last_exit_code,
+            "plist_working_directory": status.plist_working_directory,
+            "plist_working_directory_exists": status.plist_working_directory_exists,
+        })
+    } else {
+        serde_json::json!({
+            "applicable": false,
+            "reason": format!(
+                "{} is not this machine, so no local daemon supervises it — \
+                 launchd state, pid and plist do not apply",
+                endpoint.base()
+            ),
+        })
     }
 }
 
@@ -9508,6 +9520,77 @@ mod tests {
         assert_eq!(
             json["endpoint"]["probe"]["host_network"]["reachable"], false,
             "nothing answered, so the host was not reached either: {json}"
+        );
+    }
+
+    /// `mlua_swarm_server_status` answers the same two questions
+    /// `mse_doctor` does — where did we connect, and does a local daemon
+    /// supervise it — so it reports them the same way.
+    ///
+    /// It used to serialize the raw `StatusOutcome`: a flat `up` carrying
+    /// several questions at once, and five launchd nulls printed for a
+    /// hosted endpoint launchd has never heard of. Its description also
+    /// listed a field set that no longer matched what it returned.
+    #[tokio::test]
+    async fn server_status_reports_the_endpoint_and_supervision_like_the_doctor_does() {
+        use axum::routing::get;
+        use axum::Router;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                Router::new().route("/v1/healthz", get(|| async { "ok" })),
+            )
+            .await;
+        });
+
+        let server = MseServer::new();
+        let result = server
+            .mlua_swarm_server_status(Parameters(ServerStatusReq {
+                bind: Some(addr.to_string()),
+            }))
+            .await
+            .expect("status");
+        let json: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("status json");
+
+        assert_eq!(json["endpoint"]["url"], format!("http://{addr}"));
+        assert_eq!(
+            json["endpoint"]["probe"]["server_available"]["status"], "pass",
+            "body: {json}"
+        );
+        assert_eq!(
+            json["endpoint"]["probe"]["host_network"]["reachable"], true,
+            "body: {json}"
+        );
+        assert_eq!(json["supervision"]["applicable"], true, "body: {json}");
+        assert!(
+            json["up"].is_null(),
+            "the overloaded bool is gone — `server_available.status` says it precisely: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_status_does_not_print_launchd_nulls_for_a_remote_endpoint() {
+        let server = MseServer::new();
+        let result = server
+            .mlua_swarm_server_status(Parameters(ServerStatusReq {
+                bind: Some("https://example.invalid".into()),
+            }))
+            .await
+            .expect("status");
+        let json: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("status json");
+
+        assert_eq!(json["supervision"]["applicable"], false, "body: {json}");
+        assert!(
+            json["supervision"]["launchd_state"].is_null()
+                && json["supervision"]["reason"].is_string(),
+            "inapplicable carries a reason, not five nulls: {json}"
         );
     }
 

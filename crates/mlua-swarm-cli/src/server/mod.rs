@@ -209,6 +209,21 @@ fn human_status(outcome: &launchd::StatusOutcome) -> String {
         "bind={} up={} state={state} pid={pid} last_exit={last_exit}",
         outcome.bind, outcome.up
     );
+    // `up=false` alone cannot tell "nothing is running" from "we probed
+    // the wrong scheme" — an https endpoint answers plaintext with a 301,
+    // which is not a success and not a stopped server either. Naming the
+    // URL and the status makes the difference visible here too.
+    if !outcome.up {
+        let status = outcome
+            .probe
+            .status
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "no-answer".to_string());
+        line.push_str(&format!(
+            " probe={} http_status={status}",
+            outcome.probe.url
+        ));
+    }
     // Only surface the working directory when it is the problem — a
     // missing WorkingDirectory is the zero-log EX_CONFIG crash loop
     // (GH #97), and this line is its only human-visible symptom.
