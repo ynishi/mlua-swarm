@@ -5947,7 +5947,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Escape hatch for a `/v1/**` route this MCP does not wrap yet: issues one request against the configured mse serve and returns {status, url, body}. Takes NO url and NO token — the endpoint comes from `MSE_HTTP` (else the loopback default) and the access-token header is attached by this process, so neither ever has to be typed into a tool call or copied out of a config file. `path` is allow-listed to `/v1/**`: a scheme, a host, a protocol-relative `//`, parent-directory traversal, and control characters are all rejected, so this cannot be aimed at another host. `method` defaults to GET; `body` is sent as JSON for POST/PATCH/DELETE. Redirects are not followed (a 3xx comes back as-is), which is how a wrong-scheme endpoint shows itself instead of silently succeeding."
+        description = "Escape hatch for a `/v1/**` route this MCP does not wrap yet: issues one request against the configured mse serve and returns `endpoint` {url, source} — the base it connected to and which layer supplied it — plus `request` {method, path, url}, `status`, `body`, and `truncated` (null unless the body exceeded the 64 KiB cap, in which case it carries bytes_total / bytes_returned / a note; a capped body is never presented as a whole one). Takes NO url and NO token — the endpoint comes from `MSE_HTTP` (else the loopback default) and the access-token header is attached by this process, so neither ever has to be typed into a tool call or copied out of a config file. `path` is allow-listed to `/v1/**`: a scheme, a host, a protocol-relative `//`, parent-directory traversal, and control characters are all rejected, so this cannot be aimed at another host. `method` defaults to GET; `body` is sent as JSON for POST/PATCH/DELETE. Redirects are not followed (a 3xx comes back as-is), which is how a wrong-scheme endpoint shows itself instead of silently succeeding."
     )]
     async fn mse_http(
         &self,
@@ -5956,7 +5956,8 @@ impl MseServer {
         crate::http::validate_api_path(&req.path).map_err(|e| McpError::invalid_params(e, None))?;
 
         let method = req.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
-        let url = crate::http::Endpoint::resolve(None).url(&req.path);
+        let endpoint = crate::http::Endpoint::resolve(None);
+        let url = endpoint.url(&req.path);
 
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(30))
@@ -5986,15 +5987,10 @@ impl MseServer {
             .map_err(|e| McpError::internal_error(format!("{method} {url}: {e}"), None))?;
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
-        // Hand back parsed JSON when it is JSON, and the raw text when it
-        // is not — `/v1/healthz` answers `ok`, which is not.
-        let body: JsonValue = serde_json::from_str(&text).unwrap_or(JsonValue::String(text));
 
-        json_result(&serde_json::json!({
-            "status": status,
-            "url": url,
-            "body": body,
-        }))
+        json_result(&http_report(
+            &endpoint, &method, &req.path, &url, status, text,
+        ))
     }
 
     #[tool(
@@ -6340,6 +6336,72 @@ fn unreachable_note_when_failing(
     } else {
         JsonValue::String(unreachable_note(probe_status, probe_url))
     }
+}
+
+/// How much of a response body `mse_http` hands back.
+///
+/// The tool can reach any `/v1/**` route, including ones that answer with
+/// megabytes — a run trace, a Blueprint head. Returning all of it makes a
+/// diagnostic call capable of taking the caller's context down with it,
+/// which this session did once already through a different tool.
+const HTTP_BODY_CAP_BYTES: usize = 64 * 1024;
+
+/// Builds `mse_http`'s response.
+///
+/// Pure, so the shape and the cap are testable without pointing the
+/// process's `MSE_HTTP` somewhere — which is what left the earlier version
+/// of this tool covered only by its parts.
+///
+/// `endpoint.url` is the base and `request.url` is the full URL, named
+/// apart because the sibling tools already use `endpoint.url` for the base
+/// and one word cannot mean both. Neither is withheld: the host reaches
+/// the caller through `mse_doctor` anyway, so hiding it here would cost
+/// the ability to attribute a failure and buy nothing.
+fn http_report(
+    endpoint: &crate::http::Endpoint,
+    method: &str,
+    path: &str,
+    url: &str,
+    status: u16,
+    text: String,
+) -> JsonValue {
+    let total = text.len();
+    let (body, truncated) = if total > HTTP_BODY_CAP_BYTES {
+        // Cut on a character boundary — slicing mid-character panics, a
+        // poor end for a tool whose job is surviving whatever a route
+        // answers with.
+        let mut end = HTTP_BODY_CAP_BYTES;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let kept = text[..end].to_string();
+        let returned = kept.len();
+        (
+            JsonValue::String(kept),
+            serde_json::json!({
+                "bytes_total": total,
+                "bytes_returned": returned,
+                "note": "this is not the whole body — it was cut at the size cap. \
+                         Narrow the request, or use a tool that streams.",
+            }),
+        )
+    } else {
+        // Hand back parsed JSON when it is JSON, and the raw text when it
+        // is not — `/v1/healthz` answers `ok`, which is not.
+        let parsed = serde_json::from_str(&text).unwrap_or(JsonValue::String(text));
+        (parsed, JsonValue::Null)
+    };
+
+    serde_json::json!({
+        "endpoint": {
+            "url": endpoint.base(),
+            "source": endpoint.source(),
+        },
+        "request": { "method": method, "path": path, "url": url },
+        "status": status,
+        "body": body,
+        "truncated": truncated,
+    })
 }
 
 /// "Where did we connect, and what came back" — shared by `mse_doctor` and
@@ -9598,6 +9660,113 @@ mod tests {
                 .unwrap_or_default()
                 .contains("nothing answered"),
             "the reason lives in the probe, and only there: {json}"
+        );
+    }
+
+    // ─── mse_http response shape ───────────────────────────────────────
+    //
+    // Built as a pure function so it can be tested without moving
+    // `MSE_HTTP` process-wide, which is what kept the earlier version of
+    // this tool covered only by its parts.
+
+    fn sample_endpoint() -> crate::http::Endpoint {
+        crate::http::Endpoint::resolve(Some("https://example.test"))
+    }
+
+    /// The host reaches the caller either way — `mse_doctor` hands out
+    /// `endpoint.url` for the asking — so withholding it here would cost
+    /// the ability to attribute a failure while buying no secrecy. What it
+    /// must not do is call two different things `url`: this tool meant the
+    /// full request URL while its siblings mean the base.
+    #[test]
+    fn http_report_separates_the_endpoint_from_the_request() {
+        let report = http_report(
+            &sample_endpoint(),
+            "GET",
+            "/v1/doctor",
+            "https://example.test/v1/doctor",
+            200,
+            "{\"ok\":true}".into(),
+        );
+
+        assert_eq!(report["endpoint"]["url"], "https://example.test");
+        assert_eq!(report["endpoint"]["source"], "argument");
+        assert_eq!(report["request"]["method"], "GET");
+        assert_eq!(report["request"]["path"], "/v1/doctor");
+        assert_eq!(
+            report["request"]["url"], "https://example.test/v1/doctor",
+            "the full URL stays, under a name that says which one it is"
+        );
+        assert_eq!(report["status"], 200);
+        assert_eq!(report["body"]["ok"], true, "JSON comes back parsed");
+        assert!(
+            report["truncated"].is_null(),
+            "a body under the cap is whole, and says nothing about truncation"
+        );
+    }
+
+    #[test]
+    fn http_report_keeps_a_non_json_body_as_text() {
+        let report = http_report(
+            &sample_endpoint(),
+            "GET",
+            "/v1/healthz",
+            "https://example.test/v1/healthz",
+            200,
+            "ok".into(),
+        );
+        assert_eq!(report["body"], "ok");
+    }
+
+    /// This tool can reach any `/v1/**` route, including ones that answer
+    /// with megabytes. An unbounded body is how a diagnostic call takes a
+    /// caller's context down with it — so it is capped, and the cap is
+    /// declared rather than applied quietly.
+    #[test]
+    fn http_report_caps_a_large_body_and_says_that_it_did() {
+        let huge = "x".repeat(HTTP_BODY_CAP_BYTES * 2);
+        let total = huge.len();
+        let report = http_report(
+            &sample_endpoint(),
+            "GET",
+            "/v1/runs/R-1/trace",
+            "https://example.test/v1/runs/R-1/trace",
+            200,
+            huge,
+        );
+
+        let returned = report["body"].as_str().expect("a capped body is text");
+        assert_eq!(returned.len(), HTTP_BODY_CAP_BYTES);
+        assert_eq!(report["truncated"]["bytes_total"], total);
+        assert_eq!(report["truncated"]["bytes_returned"], HTTP_BODY_CAP_BYTES);
+        assert!(
+            report["truncated"]["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not the whole body"),
+            "a truncated body must never read as a complete one: {report}"
+        );
+    }
+
+    /// Cutting bytes out of the middle of a character would panic on the
+    /// way to a `String`, which is a poor outcome for a tool whose job is
+    /// to survive whatever a route answers with.
+    #[test]
+    fn http_report_truncates_multibyte_text_without_splitting_a_character() {
+        let huge = "あ".repeat(HTTP_BODY_CAP_BYTES); // 3 bytes each
+        let report = http_report(
+            &sample_endpoint(),
+            "GET",
+            "/v1/doctor",
+            "https://example.test/v1/doctor",
+            200,
+            huge,
+        );
+        let returned = report["body"].as_str().expect("a capped body is text");
+        assert!(returned.len() <= HTTP_BODY_CAP_BYTES);
+        assert!(
+            returned.chars().all(|c| c == 'あ'),
+            "no partial character survived the cut"
         );
     }
 
