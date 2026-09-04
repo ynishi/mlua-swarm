@@ -5687,7 +5687,12 @@ impl MseServer {
                 Err(e) => serde_json::json!({"error": format!("client build: {e}")}),
             }
         } else {
-            serde_json::json!({"note": "mse serve down; start via mlua_swarm_server_start"})
+            serde_json::json!({
+                "note": unreachable_note(
+                    server_status.probe_status,
+                    &server_status.probe_url,
+                )
+            })
         };
 
         let (run_count, tracked_runs) = {
@@ -5751,7 +5756,10 @@ impl MseServer {
                 Err(e) => audit_fetch_notes.push(format!("audit scan client build failed: {e}")),
             }
         } else {
-            audit_fetch_notes.push("mse serve down; audit_findings scan skipped".to_string());
+            audit_fetch_notes.push(format!(
+                "audit_findings scan skipped: {}",
+                unreachable_note(server_status.probe_status, &server_status.probe_url)
+            ));
         }
 
         // GH #32: degradations — for each tracked run whose task_id is
@@ -5815,7 +5823,10 @@ impl MseServer {
                 }
             }
         } else {
-            degradation_notes.push("mse serve down; degradations scan skipped".to_string());
+            degradation_notes.push(format!(
+                "degradations scan skipped: {}",
+                unreachable_note(server_status.probe_status, &server_status.probe_url)
+            ));
         }
 
         // Version drift across the three independently-aged `mse`
@@ -6236,6 +6247,61 @@ impl ServerHandler for MseServer {
     }
 }
 
+/// Explains why the server could not be read, from what the health probe
+/// actually saw.
+///
+/// The previous single sentence — "mse serve down; start via
+/// `mlua_swarm_server_start`" — was emitted for every non-`ok` probe, so a
+/// server that answered `301` (reachable, wrong scheme) or `401`
+/// (reachable, token rejected) was reported as stopped, with advice that
+/// could not help. Worse, it sat next to the probe fields that said
+/// otherwise. Each branch here names what came back and what would fix it,
+/// and the local-start hint appears only where starting a local daemon is
+/// the actual remedy.
+fn unreachable_note(probe_status: Option<u16>, probe_url: &str) -> String {
+    match probe_status {
+        Some(status) if (300..400).contains(&status) => format!(
+            "server answered {status} at {probe_url} — it is reachable, not down. \
+             That status is a redirect: name the endpoint with its scheme \
+             (https://host) instead of a bare host:port. Redirects are not \
+             followed, so the access token is never re-sent to the target."
+        ),
+        Some(status @ (401 | 403)) => format!(
+            "server answered {status} at {probe_url} — it is reachable, but the \
+             access token is missing or rejected. Set MSE_ACCESS_TOKEN to the \
+             value this server was started with."
+        ),
+        Some(status) => format!(
+            "server answered {status} at {probe_url}, which is not a healthy \
+             healthz (expected 200 with body `ok`)."
+        ),
+        // Nothing answered. Offering to start a local daemon only makes
+        // sense when the endpoint is one this machine could be serving.
+        None if is_loopback_url(probe_url) => format!(
+            "nothing answered at {probe_url}; start the local server via \
+             mlua_swarm_server_start."
+        ),
+        None => format!(
+            "nothing answered at {probe_url} — the endpoint is not local, so \
+             check that it is running and reachable from here."
+        ),
+    }
+}
+
+/// Whether a URL names this machine, i.e. whether a local daemon could be
+/// the thing serving it.
+fn is_loopback_url(url: &str) -> bool {
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0.0.0.0")
+}
+
 fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -6297,6 +6363,65 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The note that goes out when the server could not be read must not
+    /// contradict the probe printed beside it.
+    ///
+    /// `up: false` used to mean one thing — "down, go start it" — and said
+    /// so even when the probe had just come back `301`, i.e. the server was
+    /// answering and only the scheme was wrong. Two lines of the same
+    /// response disagreed, and the wrong one was the one phrased as advice.
+    #[test]
+    fn unreachable_note_names_a_redirect_instead_of_claiming_the_server_is_down() {
+        let note = unreachable_note(Some(301), "http://example.com/v1/healthz");
+        assert!(
+            note.contains("301") && note.contains("scheme"),
+            "a redirect must be named and its fix stated: {note}"
+        );
+        assert!(
+            !note.contains("mlua_swarm_server_start"),
+            "a redirecting server is not a stopped server, so do not offer to start one: {note}"
+        );
+    }
+
+    #[test]
+    fn unreachable_note_names_an_auth_rejection() {
+        for status in [401, 403] {
+            let note = unreachable_note(Some(status), "https://example.com/v1/healthz");
+            assert!(
+                note.contains(&status.to_string()) && note.contains("MSE_ACCESS_TOKEN"),
+                "an auth rejection must name the token: {note}"
+            );
+            assert!(
+                !note.contains("mlua_swarm_server_start"),
+                "not a stopped server: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn unreachable_note_still_says_down_when_nothing_answered() {
+        let note = unreachable_note(None, "http://127.0.0.1:7777/v1/healthz");
+        assert!(
+            note.contains("127.0.0.1:7777") && note.contains("mlua_swarm_server_start"),
+            "no answer at loopback is the case the start hint is for: {note}"
+        );
+    }
+
+    #[test]
+    fn unreachable_note_does_not_offer_a_local_start_for_a_remote_endpoint() {
+        let note = unreachable_note(None, "https://example.com/v1/healthz");
+        assert!(
+            !note.contains("mlua_swarm_server_start"),
+            "starting a local daemon cannot fix a remote endpoint: {note}"
+        );
+    }
+
+    #[test]
+    fn unreachable_note_reports_an_unexpected_status_verbatim() {
+        let note = unreachable_note(Some(500), "https://example.com/v1/healthz");
+        assert!(note.contains("500"), "{note}");
+    }
 
     /// T10 — `mse_http` must not grow a way to name the host or the token.
     ///
@@ -9145,10 +9270,16 @@ mod tests {
         let notes = json["audit_findings"]["notes"]
             .as_array()
             .expect("notes array");
+        // The note now explains what the probe saw rather than asserting
+        // the server is down — nothing answered at loopback, which is the
+        // one case where offering a local start is useful.
         assert!(
-            notes
-                .iter()
-                .any(|n| n.as_str().unwrap_or_default().contains("mse serve down")),
+            notes.iter().any(|n| {
+                let n = n.as_str().unwrap_or_default();
+                n.contains("audit_findings scan skipped")
+                    && n.contains("nothing answered at http://127.0.0.1:1/v1/healthz")
+                    && n.contains("mlua_swarm_server_start")
+            }),
             "notes: {notes:?}"
         );
     }
