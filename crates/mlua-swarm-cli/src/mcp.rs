@@ -528,6 +528,9 @@ fn extract_audit_findings(steps_body: &JsonValue) -> Vec<AuditFinding> {
 
 #[derive(Deserialize, JsonSchema)]
 struct DoctorReq {
+    /// Where `mse serve` is: a base URL (`https://host`, scheme included)
+    /// or a bare `host:port` (which gets `http://`). Omitted falls back to
+    /// `MSE_HTTP`, then to `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
 }
@@ -653,7 +656,9 @@ fn default_true_bool() -> bool {
 struct BpArchiveReq {
     /// Blueprint id to archive (logical soft-delete via marker commit; reversible).
     id: String,
-    /// mse serve bind address (default 127.0.0.1:7777).
+    /// Where `mse serve` is: a base URL (`https://host`, scheme included)
+    /// or a bare `host:port` (which gets `http://`). Omitted falls back to
+    /// `MSE_HTTP`, then to `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
     /// Safety guard: must be `true` to actually execute. Default false = dry-run report.
@@ -668,7 +673,9 @@ struct BpSchemaReq {}
 struct BpUnarchiveReq {
     /// Blueprint id to unarchive (appends an unarchive marker commit; audit-trail preserved).
     id: String,
-    /// mse serve bind address (default 127.0.0.1:7777).
+    /// Where `mse serve` is: a base URL (`https://host`, scheme included)
+    /// or a bare `host:port` (which gets `http://`). Omitted falls back to
+    /// `MSE_HTTP`, then to `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
 }
@@ -678,7 +685,9 @@ struct BpDoctorReq {
     /// Blueprint id to inspect (agent `profile.system_prompt` bodies are what
     /// the SubAgent receives via fetch — this tool measures those directly).
     id: String,
-    /// mse serve bind address (default 127.0.0.1:7777).
+    /// Where `mse serve` is: a base URL (`https://host`, scheme included)
+    /// or a bare `host:port` (which gets `http://`). Omitted falls back to
+    /// `MSE_HTTP`, then to `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
     /// Override WARN byte threshold. Default 25 * 1024 (25 KB). Set higher
@@ -882,7 +891,9 @@ struct BpBuildReq {
     /// run (the built JSON is then included in the response).
     #[serde(default = "default_true_bool")]
     register: bool,
-    /// mse serve bind address (default 127.0.0.1:7777).
+    /// Where `mse serve` is: a base URL (`https://host`, scheme included)
+    /// or a bare `host:port` (which gets `http://`). Omitted falls back to
+    /// `MSE_HTTP`, then to `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
     /// Also write the built (pre-expansion) Blueprint JSON to this path,
@@ -913,7 +924,9 @@ struct BpExplainAgentReq {
     bp_id: String,
     /// Agent name inside the blueprint.
     agent: String,
-    /// mse serve bind address (default 127.0.0.1:7777).
+    /// Where `mse serve` is: a base URL (`https://host`, scheme included)
+    /// or a bare `host:port` (which gets `http://`). Omitted falls back to
+    /// `MSE_HTTP`, then to `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
     /// Directory holding worker wrapper `.md` files (default
@@ -928,7 +941,9 @@ struct BpExplainAgentReq {
 struct BpExplainAgentsReq {
     /// Blueprint id (registered on the HTTP server).
     bp_id: String,
-    /// mse serve bind address (default 127.0.0.1:7777).
+    /// Where `mse serve` is: a base URL (`https://host`, scheme included)
+    /// or a bare `host:port` (which gets `http://`). Omitted falls back to
+    /// `MSE_HTTP`, then to `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
     /// Directory holding worker wrapper `.md` files (default
@@ -2567,7 +2582,11 @@ fn tool_drift_json_with_wrapper_only_split(
 
 #[derive(Deserialize, JsonSchema)]
 struct ServerStartReq {
-    /// listen address to healthz-poll after `launchctl kickstart` (default "127.0.0.1:7777").
+    /// Where to healthz-poll after `launchctl kickstart`: a base URL
+    /// (`https://host`, scheme included) or a bare `host:port` (which gets
+    /// `http://`). Omitted falls back to `MSE_HTTP`, then to
+    /// `http://127.0.0.1:7777`. Starting a daemon only makes sense for a
+    /// local endpoint — a remote one has nothing here to kickstart.
     /// Server-side settings (store root / enhance flow / etc.) come from
     /// `~/.mse/config.toml`, not from this tool call — see `mlua_swarm_server_restart` doc.
     #[serde(default)]
@@ -2576,12 +2595,18 @@ struct ServerStartReq {
 
 #[derive(Deserialize, JsonSchema)]
 struct ServerStatusReq {
+    /// Where `mse serve` is: a base URL (`https://host`, scheme included)
+    /// or a bare `host:port` (which gets `http://`). Omitted falls back to
+    /// `MSE_HTTP`, then to `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct ServerShutdownReq {
+    /// Where `mse serve` is: a base URL (`https://host`, scheme included)
+    /// or a bare `host:port` (which gets `http://`). Omitted falls back to
+    /// `MSE_HTTP`, then to `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
     /// Skip the occupancy check (in-flight runs / attached operators) and
@@ -2592,6 +2617,9 @@ struct ServerShutdownReq {
 
 #[derive(Deserialize, JsonSchema)]
 struct ServerRestartReq {
+    /// Where `mse serve` is: a base URL (`https://host`, scheme included)
+    /// or a bare `host:port` (which gets `http://`). Omitted falls back to
+    /// `MSE_HTTP`, then to `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
     /// Skip the occupancy check (in-flight runs / attached operators) and
@@ -3102,7 +3130,10 @@ enum BlueprintSelector {
     Id {
         /// Registered BlueprintId (server-side store).
         id: String,
-        /// mse serve bind address (default `127.0.0.1:7777`).
+        /// Where `mse serve` is: a base URL (`https://host`, scheme
+        /// included) or a bare `host:port` (which gets `http://`).
+        /// Omitted falls back to `MSE_HTTP`, then to
+        /// `http://127.0.0.1:7777`.
         #[serde(default)]
         bind: Option<String>,
     },
@@ -3283,7 +3314,10 @@ fn read_blueprint_from_file(path: &str) -> Result<JsonValue, String> {
 #[derive(Deserialize, JsonSchema)]
 struct SwarmStatusReq {
     run_id: String,
-    /// GH #67: `mse serve` bind address the run was launched against.
+    /// GH #67: where the `mse serve` the run was launched against is — a
+    /// base URL (`https://host`, scheme included) or a bare `host:port`
+    /// (which gets `http://`). Omitted falls back to `MSE_HTTP`, then to
+    /// `http://127.0.0.1:7777`.
     /// When present (or defaulted via `launchd::DEFAULT_BIND`), the
     /// tool issues a best-effort `GET /v1/runs/:id` to fold the server's
     /// authoritative `RunRecord` (`status` / `step_entries` / `result_ref`)
@@ -3303,8 +3337,10 @@ struct SwarmRunStatsReq {
     /// `swarm_status`), and a run launched by a different driver session
     /// is reachable by id alone.
     run_id: String,
-    /// `mse serve` bind address holding the run (default
-    /// `127.0.0.1:7777`).
+    /// Where the `mse serve` holding the run is: a base URL
+    /// (`https://host`, scheme included) or a bare `host:port` (which gets
+    /// `http://`). Omitted falls back to `MSE_HTTP`, then to
+    /// `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
 }
@@ -3312,7 +3348,9 @@ struct SwarmRunStatsReq {
 #[derive(Deserialize, JsonSchema)]
 struct SwarmCancelReq {
     run_id: String,
-    /// Optional server bind (default `127.0.0.1:7777`). The tool
+    /// Where `mse serve` is: a base URL (`https://host`, scheme included)
+    /// or a bare `host:port` (which gets `http://`). Omitted falls back to
+    /// `MSE_HTTP`, then to `http://127.0.0.1:7777`. The tool
     /// proxies to `POST /v1/runs/:id/cancel` on this bind so the
     /// server-side `RunTraceStore` picks up the `core.cancel_requested`
     /// event and the Run row's status flips to `Cancelled` — the
@@ -5915,8 +5953,7 @@ impl MseServer {
         &self,
         Parameters(req): Parameters<HttpReq>,
     ) -> Result<CallToolResult, McpError> {
-        crate::http::validate_api_path(&req.path)
-            .map_err(|e| McpError::invalid_params(e, None))?;
+        crate::http::validate_api_path(&req.path).map_err(|e| McpError::invalid_params(e, None))?;
 
         let method = req.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
         let url = crate::http::Endpoint::resolve(None).url(&req.path);
@@ -6380,7 +6417,10 @@ fn is_loopback_url(url: &str) -> bool {
         .next()
         .unwrap_or_default();
     let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0.0.0.0")
+    matches!(
+        host,
+        "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0.0.0.0"
+    )
 }
 
 fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
@@ -6531,7 +6571,14 @@ mod tests {
         );
 
         for banned in [
-            "url", "base_url", "endpoint", "bind", "host", "server", "token", "access_token",
+            "url",
+            "base_url",
+            "endpoint",
+            "bind",
+            "host",
+            "server",
+            "token",
+            "access_token",
         ] {
             assert!(
                 !properties.contains_key(banned),
@@ -9554,6 +9601,91 @@ mod tests {
         );
     }
 
+    /// Every `bind` argument must say what it now accepts.
+    ///
+    /// They all read "mse serve bind address (default 127.0.0.1:7777)",
+    /// which described a `host:port` with the scheme hard-coded — the
+    /// shape that could not name an https server at all. The argument was
+    /// widened to take a whole base URL and to fall through to `MSE_HTTP`,
+    /// and a caller who reads the old sentence has no way to know either.
+    ///
+    /// Checked here rather than trusted to review, because there are seven
+    /// of them and they drifted as one.
+    #[test]
+    fn every_bind_argument_describes_the_forms_it_accepts() {
+        /// Every `bind` property anywhere in a schema, not just at the top
+        /// level: `swarm_run` carries one nested inside its Blueprint
+        /// selector, and a check that only looked at the root would have
+        /// left it stale while reporting success.
+        fn bind_properties(schema: &JsonValue, found: &mut Vec<JsonValue>) {
+            match schema {
+                JsonValue::Object(map) => {
+                    if let Some(JsonValue::Object(props)) = map.get("properties") {
+                        if let Some(bind) = props.get("bind") {
+                            found.push(bind.clone());
+                        }
+                    }
+                    for value in map.values() {
+                        bind_properties(value, found);
+                    }
+                }
+                JsonValue::Array(items) => {
+                    for value in items {
+                        bind_properties(value, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let tools = MseServer::tool_router().list_all();
+        let mut checked = 0;
+
+        for tool in &tools {
+            let schema = JsonValue::Object((*tool.input_schema).clone());
+            let mut binds = Vec::new();
+            bind_properties(&schema, &mut binds);
+
+            for bind in binds {
+                let description = bind
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default();
+                assert!(
+                    !description.is_empty(),
+                    "{}'s `bind` has no description — a caller cannot guess whether it takes a \
+                 host:port or a base URL",
+                    tool.name
+                );
+                // A `bind` the handler ignores has no forms to describe; it
+                // only has to say that it is ignored, which is the more
+                // important thing for a caller passing one.
+                if description.contains("currently ignored") {
+                    checked += 1;
+                    continue;
+                }
+                assert!(
+                    description.contains("base URL"),
+                    "{}'s `bind` must say it accepts a base URL (scheme included), or an https \
+                 endpoint stays unreachable with no hint why: {description}",
+                    tool.name
+                );
+                assert!(
+                    description.contains("MSE_HTTP"),
+                    "{}'s `bind` must name the fallback it now has, since omitting the argument \
+                 no longer means loopback: {description}",
+                    tool.name
+                );
+                checked += 1;
+            }
+        }
+
+        assert!(
+            checked >= 12,
+            "expected every bind argument to be covered, only found {checked}"
+        );
+    }
+
     /// A tool description is what a caller plans against, so a field name
     /// in one that the response does not have is a defect in the tool.
     ///
@@ -9577,9 +9709,7 @@ mod tests {
                     }
                     map.values().any(|v| has_nested_pair(v, parent, child))
                 }
-                JsonValue::Array(items) => {
-                    items.iter().any(|v| has_nested_pair(v, parent, child))
-                }
+                JsonValue::Array(items) => items.iter().any(|v| has_nested_pair(v, parent, child)),
                 _ => false,
             }
         }
@@ -9635,7 +9765,10 @@ mod tests {
         .expect("status json");
 
         let tools = MseServer::tool_router().list_all();
-        for (name, response) in [("mse_doctor", &doctor), ("mlua_swarm_server_status", &status)] {
+        for (name, response) in [
+            ("mse_doctor", &doctor),
+            ("mlua_swarm_server_status", &status),
+        ] {
             let tool = tools
                 .iter()
                 .find(|t| t.name == name)

@@ -180,9 +180,7 @@ pub fn validate_api_path(path: &str) -> Result<(), String> {
         ));
     }
     if path.starts_with("//") {
-        return Err(format!(
-            "a leading // is a host, not a path (got {path:?})"
-        ));
+        return Err(format!("a leading // is a host, not a path (got {path:?})"));
     }
     if path
         .split(['/', '?', '#'])
@@ -196,9 +194,7 @@ pub fn validate_api_path(path: &str) -> Result<(), String> {
         .chars()
         .find(|c| c.is_whitespace() || c.is_control() || *c == '\\')
     {
-        return Err(format!(
-            "path must not contain {bad:?} (got {path:?})"
-        ));
+        return Err(format!("path must not contain {bad:?} (got {path:?})"));
     }
     Ok(())
 }
@@ -357,7 +353,10 @@ mod tests {
     #[test]
     fn endpoint_accepts_an_http_base_url_without_doubling_the_scheme() {
         let endpoint = Endpoint::resolve(Some("http://example.com:7777"));
-        assert_eq!(endpoint.url("/v1/healthz"), "http://example.com:7777/v1/healthz");
+        assert_eq!(
+            endpoint.url("/v1/healthz"),
+            "http://example.com:7777/v1/healthz"
+        );
     }
 
     #[test]
@@ -591,7 +590,12 @@ mod tests {
         let router = Router::new()
             .route(
                 "/redirect",
-                get(|| async { (StatusCode::MOVED_PERMANENTLY, [(header::LOCATION, "/target")]) }),
+                get(|| async {
+                    (
+                        StatusCode::MOVED_PERMANENTLY,
+                        [(header::LOCATION, "/target")],
+                    )
+                }),
             )
             .route(
                 "/target",
