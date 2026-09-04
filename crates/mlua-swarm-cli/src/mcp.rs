@@ -3825,7 +3825,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Run a Blueprint via TaskApplication.handle. Blocking by default (returns run_id + final_ctx + bound_version on completion); pass `detach: true` for the asynchronous launch — returns `{run_id, task_id, status: \"running\"}` immediately, poll `swarm_status` for the result. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline). On the `{kind: \"id\"}` path the run is pinned to an Operator session: `operator_sid` when given, otherwise this process's sole live session (joined via mse_operator_join, and only when the run targets that session's server) — so with several drivers sharing one server, a run's Spawn frames come back to the driver that launched it instead of to whichever session currently holds the Blueprint's logical operator role."
+        description = "Run a Blueprint via TaskApplication.handle. Blocking by default (returns run_id + final_ctx + bound_version on completion; a `final_ctx` over 128 KiB has its largest keys replaced by `{__omitted_bytes}` and gains a `__truncated` block naming the dropped keys, their sizes, and how to read them in full — small keys such as a gate's verdict are always returned whole, and a trimmed ctx is never presented as a complete one); pass `detach: true` for the asynchronous launch — returns `{run_id, task_id, status: \"running\"}` immediately, poll `swarm_status` for the result. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline). On the `{kind: \"id\"}` path the run is pinned to an Operator session: `operator_sid` when given, otherwise this process's sole live session (joined via mse_operator_join, and only when the run targets that session's server) — so with several drivers sharing one server, a run's Spawn frames come back to the driver that launched it instead of to whichever session currently holds the Blueprint's logical operator role."
     )]
     async fn swarm_run(
         &self,
@@ -4258,7 +4258,7 @@ impl MseServer {
                 "run_id": run_id,
                 "task_id": task_id_typed,
                 "status": "done",
-                "final_ctx": out.final_ctx,
+                "final_ctx": prune_run_ctx(out.final_ctx, &run_id.to_string()),
                 "bound_version": out.bound_version.map(|v| format!("{:?}", v)),
                 "head": head_id,
                 "history_len": history_len,
@@ -4455,7 +4455,10 @@ impl MseServer {
                     "run_id": effective_run_id.clone(),
                     "task_id": parsed.get("task_id").cloned().unwrap_or(JsonValue::Null),
                     "status": status_str,
-                    "final_ctx": parsed.get("final_ctx").cloned().unwrap_or(JsonValue::Null),
+                    "final_ctx": prune_run_ctx(
+                        parsed.get("final_ctx").cloned().unwrap_or(JsonValue::Null),
+                        &effective_run_id,
+                    ),
                     "bound_version": parsed.get("bound_version").cloned().unwrap_or(JsonValue::Null),
                     "effective_ttl_secs": parsed.get("effective_ttl_secs").cloned().unwrap_or(JsonValue::Null),
                     "ttl_source": parsed.get("ttl_source").cloned().unwrap_or(JsonValue::Null),
@@ -6336,6 +6339,88 @@ fn unreachable_note_when_failing(
     } else {
         JsonValue::String(unreachable_note(probe_status, probe_url))
     }
+}
+
+/// Total size of a run's `final_ctx` above which `swarm_run` starts
+/// dropping its largest keys.
+const RUN_CTX_CAP_BYTES: usize = 128 * 1024;
+
+/// Per-key size above which a single `final_ctx` entry is replaced by a
+/// statement of its size rather than returned.
+const RUN_CTX_KEY_CAP_BYTES: usize = 16 * 1024;
+
+/// Trims a run's `final_ctx` to something a caller can hold, without
+/// pretending the result is complete.
+///
+/// A ctx is the run's result, so capping it the way a response body gets
+/// capped would throw away the thing that was asked for. What actually
+/// grows is one or two keys — a gate's per-file evidence, a step's full
+/// output — while the key a caller reads is a few hundred bytes. So large
+/// keys are replaced by their size and small ones are returned whole, with
+/// a `__truncated` block naming what went and how to fetch it. A run's ctx
+/// stays on the server; `swarm_status` reads it back by id.
+fn prune_run_ctx(final_ctx: JsonValue, run_id: &str) -> JsonValue {
+    let total = serde_json::to_string(&final_ctx)
+        .map(|s| s.len())
+        .unwrap_or(0);
+    if total <= RUN_CTX_CAP_BYTES {
+        return final_ctx;
+    }
+
+    // Name the field, not just the tool: a caller told to "use
+    // swarm_status" would look for `final_ctx` there and not find it —
+    // the server's record calls the same thing `result_ref`.
+    let how = format!(
+        "this is not the whole ctx — the dropped keys are on the run record: \
+         swarm_status(run_id=\"{run_id}\") returns it under `result_ref` \
+         (equivalently GET /v1/runs/{run_id} via mse_http)"
+    );
+
+    let JsonValue::Object(map) = final_ctx else {
+        // Not an object, so there are no keys to keep or drop — say the
+        // size and where the real thing is rather than hand back a
+        // half-truth.
+        return serde_json::json!({
+            "__truncated": {
+                "bytes_total": total,
+                "dropped_keys": [],
+                "reason": "the ctx is not an object, so it could not be trimmed key by key",
+                "how_to_read_it_all": how,
+            }
+        });
+    };
+
+    let mut kept = serde_json::Map::new();
+    let mut dropped_keys = Vec::new();
+    let mut sizes = serde_json::Map::new();
+
+    for (key, value) in map {
+        let size = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
+        sizes.insert(key.clone(), JsonValue::from(size));
+        if size > RUN_CTX_KEY_CAP_BYTES {
+            dropped_keys.push(JsonValue::String(key.clone()));
+            kept.insert(
+                key,
+                serde_json::json!({
+                    "__omitted_bytes": size,
+                    "note": "dropped for size; see __truncated.how_to_read_it_all",
+                }),
+            );
+        } else {
+            kept.insert(key, value);
+        }
+    }
+
+    kept.insert(
+        "__truncated".to_string(),
+        serde_json::json!({
+            "bytes_total": total,
+            "dropped_keys": dropped_keys,
+            "key_sizes": sizes,
+            "how_to_read_it_all": how,
+        }),
+    );
+    JsonValue::Object(kept)
 }
 
 /// How much of a response body `mse_http` hands back.
@@ -9661,6 +9746,85 @@ mod tests {
                 .contains("nothing answered"),
             "the reason lives in the probe, and only there: {json}"
         );
+    }
+
+    // ─── swarm_run final_ctx size ──────────────────────────────────────
+    //
+    // A run's ctx is its result, so capping it the way `mse_http` caps a
+    // body would throw away the thing the caller asked for. What actually
+    // gets large is one or two keys — a gate's per-file evidence, a step's
+    // full output — while the key a caller reads is small. So the large
+    // ones go and the small ones stay, and the response says which.
+
+    #[test]
+    fn run_ctx_under_the_cap_is_returned_whole() {
+        let ctx = serde_json::json!({"aggregate": {"out": "# verdict: PASS"}, "r": {"n": 1}});
+        let pruned = prune_run_ctx(ctx.clone(), "R-1");
+
+        assert_eq!(pruned, ctx, "nothing to drop means nothing changes");
+        assert!(pruned["__truncated"].is_null());
+    }
+
+    #[test]
+    fn run_ctx_keeps_the_small_keys_and_drops_only_the_large_ones() {
+        // Shaped like the case that produced a 1.5 MB tool result: a short
+        // verdict a caller reads, beside per-file evidence it does not.
+        let evidence: Vec<JsonValue> = (0..40_000)
+            .map(|i| serde_json::json!({"file": format!("src/f{i}.rs"), "line": i}))
+            .collect();
+        let ctx = serde_json::json!({
+            "aggregate": {"out": "# pre-commit-gates aggregate: BLOCKED"},
+            "evidence": evidence,
+        });
+        let pruned = prune_run_ctx(ctx, "R-6a2fddc9");
+
+        assert_eq!(
+            pruned["aggregate"]["out"], "# pre-commit-gates aggregate: BLOCKED",
+            "the key a caller reads survives whole: {}",
+            pruned["__truncated"]
+        );
+        assert!(
+            pruned["evidence"]["__omitted_bytes"].as_u64().unwrap_or(0) > 0,
+            "the large key is replaced by a statement of its size"
+        );
+        assert!(
+            pruned["evidence"].get("__omitted_bytes").is_some()
+                && pruned["evidence"].as_array().is_none(),
+            "and is not left looking like a short array: {}",
+            pruned["evidence"]
+        );
+
+        let truncated = &pruned["__truncated"];
+        assert!(truncated["bytes_total"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            truncated["dropped_keys"]
+                .as_array()
+                .expect("dropped_keys array")
+                .iter()
+                .any(|k| k == "evidence"),
+            "the response names what it dropped: {truncated}"
+        );
+        assert!(
+            truncated["how_to_read_it_all"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("R-6a2fddc9"),
+            "and how to get it, for this run: {truncated}"
+        );
+    }
+
+    /// A ctx that is not an object (a bare string or array) still has to
+    /// come back describable rather than panicking or silently emptying.
+    #[test]
+    fn run_ctx_that_is_not_an_object_is_still_reported_honestly() {
+        let ctx = JsonValue::String("x".repeat(RUN_CTX_CAP_BYTES * 2));
+        let pruned = prune_run_ctx(ctx, "R-2");
+
+        assert!(
+            pruned["__truncated"]["bytes_total"].as_u64().unwrap_or(0) > 0,
+            "body: {pruned}"
+        );
+        assert!(pruned["__truncated"]["how_to_read_it_all"].is_string());
     }
 
     // ─── mse_http response shape ───────────────────────────────────────
