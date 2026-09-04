@@ -3825,7 +3825,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Run a Blueprint via TaskApplication.handle. Blocking by default (returns run_id + final_ctx + bound_version on completion; a `final_ctx` over 128 KiB has its largest keys replaced by `{__omitted_bytes}` and gains a `__truncated` block naming the dropped keys, their sizes, and how to read them in full — small keys such as a gate's verdict are always returned whole, and a trimmed ctx is never presented as a complete one); pass `detach: true` for the asynchronous launch — returns `{run_id, task_id, status: \"running\"}` immediately, poll `swarm_status` for the result. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline). On the `{kind: \"id\"}` path the run is pinned to an Operator session: `operator_sid` when given, otherwise this process's sole live session (joined via mse_operator_join, and only when the run targets that session's server) — so with several drivers sharing one server, a run's Spawn frames come back to the driver that launched it instead of to whichever session currently holds the Blueprint's logical operator role."
+        description = "Run a Blueprint via TaskApplication.handle. Blocking by default (returns run_id + final_ctx + bound_version on completion; a `final_ctx` over 32 KiB has its oversized values replaced by `{__omitted_bytes}` and gains a `__truncated` block naming the dropped paths, every value's size, and how to read them in full. The trim descends: a step entry is `{out, parts}`, so a small `out` — a gate's verdict — is kept while the `parts` behind it go, and dropped paths are named in full (`aggregate.parts.evidence`). A trimmed ctx is never presented as a complete one); pass `detach: true` for the asynchronous launch — returns `{run_id, task_id, status: \"running\"}` immediately, poll `swarm_status` for the result. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline). On the `{kind: \"id\"}` path the run is pinned to an Operator session: `operator_sid` when given, otherwise this process's sole live session (joined via mse_operator_join, and only when the run targets that session's server) — so with several drivers sharing one server, a run's Spawn frames come back to the driver that launched it instead of to whichever session currently holds the Blueprint's logical operator role."
     )]
     async fn swarm_run(
         &self,
@@ -5950,7 +5950,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Escape hatch for a `/v1/**` route this MCP does not wrap yet: issues one request against the configured mse serve and returns `endpoint` {url, source} — the base it connected to and which layer supplied it — plus `request` {method, path, url}, `status`, `body`, and `truncated` (null unless the body exceeded the 64 KiB cap, in which case it carries bytes_total / bytes_returned / a note; a capped body is never presented as a whole one). Takes NO url and NO token — the endpoint comes from `MSE_HTTP` (else the loopback default) and the access-token header is attached by this process, so neither ever has to be typed into a tool call or copied out of a config file. `path` is allow-listed to `/v1/**`: a scheme, a host, a protocol-relative `//`, parent-directory traversal, and control characters are all rejected, so this cannot be aimed at another host. `method` defaults to GET; `body` is sent as JSON for POST/PATCH/DELETE. Redirects are not followed (a 3xx comes back as-is), which is how a wrong-scheme endpoint shows itself instead of silently succeeding."
+        description = "Escape hatch for a `/v1/**` route this MCP does not wrap yet: issues one request against the configured mse serve and returns `endpoint` {url, source} — the base it connected to and which layer supplied it — plus `request` {method, path, url}, `status`, `body`, and `truncated` (null unless the body exceeded the 16 KiB cap, in which case it carries bytes_total / bytes_returned / a note; a capped body is never presented as a whole one). Takes NO url and NO token — the endpoint comes from `MSE_HTTP` (else the loopback default) and the access-token header is attached by this process, so neither ever has to be typed into a tool call or copied out of a config file. `path` is allow-listed to `/v1/**`: a scheme, a host, a protocol-relative `//`, parent-directory traversal, and control characters are all rejected, so this cannot be aimed at another host. `method` defaults to GET; `body` is sent as JSON for POST/PATCH/DELETE. Redirects are not followed (a 3xx comes back as-is), which is how a wrong-scheme endpoint shows itself instead of silently succeeding."
     )]
     async fn mse_http(
         &self,
@@ -6342,8 +6342,14 @@ fn unreachable_note_when_failing(
 }
 
 /// Total size of a run's `final_ctx` above which `swarm_run` starts
-/// dropping its largest keys.
-const RUN_CTX_CAP_BYTES: usize = 128 * 1024;
+/// dropping its largest values.
+///
+/// Sized from what an MCP client actually accepts, not from a round
+/// number: the smallest tool result observed being rejected and spilled
+/// to a file was ~69 KB, so a limit above that lets a ctx through that
+/// the caller cannot then read. 32 KiB leaves the trimmed response — ctx
+/// plus the run's other fields — comfortably inside.
+const RUN_CTX_CAP_BYTES: usize = 32 * 1024;
 
 /// Per-key size above which a single `final_ctx` entry is replaced by a
 /// statement of its size rather than returned.
@@ -6376,6 +6382,50 @@ fn prune_run_ctx(final_ctx: JsonValue, run_id: &str) -> JsonValue {
          (equivalently GET /v1/runs/{run_id} via mse_http)"
     );
 
+    /// Replaces oversized values wherever they sit, keeping their smaller
+    /// siblings — a step entry is `{out, parts}`, so judging the entry as
+    /// one unit throws away the result along with the bulk behind it.
+    /// Descends first and only replaces what is still too large on its
+    /// own, so the level that actually holds the bytes is the level that
+    /// goes.
+    fn prune_into(
+        value: JsonValue,
+        prefix: &str,
+        dropped: &mut Vec<JsonValue>,
+        sizes: &mut serde_json::Map<String, JsonValue>,
+    ) -> JsonValue {
+        let size = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
+        if !prefix.is_empty() {
+            sizes.insert(prefix.to_string(), JsonValue::from(size));
+        }
+        if size <= RUN_CTX_KEY_CAP_BYTES {
+            return value;
+        }
+        match value {
+            JsonValue::Object(map) => {
+                let mut kept = serde_json::Map::new();
+                for (key, child) in map {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    kept.insert(key, prune_into(child, &path, dropped, sizes));
+                }
+                JsonValue::Object(kept)
+            }
+            // An array or a string that is too large has no smaller part
+            // to keep — it goes as a whole, named by where it sat.
+            _ => {
+                dropped.push(JsonValue::String(prefix.to_string()));
+                serde_json::json!({
+                    "__omitted_bytes": size,
+                    "note": "dropped for size; see __truncated.how_to_read_it_all",
+                })
+            }
+        }
+    }
+
     let JsonValue::Object(map) = final_ctx else {
         // Not an object, so there are no keys to keep or drop — say the
         // size and where the real thing is rather than hand back a
@@ -6395,20 +6445,8 @@ fn prune_run_ctx(final_ctx: JsonValue, run_id: &str) -> JsonValue {
     let mut sizes = serde_json::Map::new();
 
     for (key, value) in map {
-        let size = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
-        sizes.insert(key.clone(), JsonValue::from(size));
-        if size > RUN_CTX_KEY_CAP_BYTES {
-            dropped_keys.push(JsonValue::String(key.clone()));
-            kept.insert(
-                key,
-                serde_json::json!({
-                    "__omitted_bytes": size,
-                    "note": "dropped for size; see __truncated.how_to_read_it_all",
-                }),
-            );
-        } else {
-            kept.insert(key, value);
-        }
+        let pruned = prune_into(value, &key, &mut dropped_keys, &mut sizes);
+        kept.insert(key, pruned);
     }
 
     kept.insert(
@@ -6427,9 +6465,14 @@ fn prune_run_ctx(final_ctx: JsonValue, run_id: &str) -> JsonValue {
 ///
 /// The tool can reach any `/v1/**` route, including ones that answer with
 /// megabytes — a run trace, a Blueprint head. Returning all of it makes a
-/// diagnostic call capable of taking the caller's context down with it,
-/// which this session did once already through a different tool.
-const HTTP_BODY_CAP_BYTES: usize = 64 * 1024;
+/// diagnostic call capable of taking the caller's context down with it.
+///
+/// The number is measured, not chosen: at 64 KiB the cap fired correctly
+/// and the result was still rejected by the MCP client and spilled to a
+/// file (a 129 KB Blueprint head came back as a 69 KB tool result), which
+/// is the failure the cap exists to prevent. The smallest rejection
+/// observed was ~69 KB, so the cap sits a factor of four below it.
+const HTTP_BODY_CAP_BYTES: usize = 16 * 1024;
 
 /// Builds `mse_http`'s response.
 ///
@@ -9810,6 +9853,57 @@ mod tests {
                 .unwrap_or_default()
                 .contains("R-6a2fddc9"),
             "and how to get it, for this run: {truncated}"
+        );
+    }
+
+    /// The case this trim exists for, and the one its first version got
+    /// wrong.
+    ///
+    /// A step's ctx entry is `{out, parts}` — `out` is the result a caller
+    /// reads, `parts` is the bulk behind it. Measured on the run that
+    /// motivated this: `aggregate.out` is 2,377 bytes and
+    /// `aggregate.parts` is 458,506. Judging the entry as one unit drops
+    /// both, which threw away the gate verdict while keeping the
+    /// `project_root` string beside it. The size test has to reach the
+    /// level where the size actually is.
+    #[test]
+    fn run_ctx_keeps_a_small_out_and_drops_the_parts_beside_it() {
+        let ctx = serde_json::json!({
+            "aggregate": {
+                "out": "# pre-commit-gates aggregate: BLOCKED",
+                "parts": {"evidence": vec!["x".repeat(64); 20_000]},
+            },
+            "project_root": "/home/u/p",
+        });
+        let pruned = prune_run_ctx(ctx, "R-1");
+
+        assert_eq!(
+            pruned["aggregate"]["out"], "# pre-commit-gates aggregate: BLOCKED",
+            "the verdict is small and must survive: {}",
+            pruned["__truncated"]
+        );
+        // The descent goes as deep as the bytes do: `parts` is an object,
+        // so it is entered rather than dropped, and the array inside it is
+        // what actually goes. Keeping the enclosing structure is the point
+        // — a reader can see that `parts.evidence` existed.
+        assert!(
+            pruned["aggregate"]["parts"]["evidence"]["__omitted_bytes"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+            "the bulk beside it is what goes: {}",
+            pruned["aggregate"]
+        );
+        assert_eq!(pruned["project_root"], "/home/u/p");
+        assert!(
+            pruned["__truncated"]["dropped_keys"]
+                .as_array()
+                .expect("dropped_keys")
+                .iter()
+                .any(|k| k == "aggregate.parts.evidence"),
+            "dropped keys are named by their full path, so a reader knows \
+             which level went: {}",
+            pruned["__truncated"]
         );
     }
 
