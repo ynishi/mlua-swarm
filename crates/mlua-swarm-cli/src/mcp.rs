@@ -5825,6 +5825,10 @@ impl MseServer {
             "mlua_swarm_server": {
                 "bind": bind,
                 "up": server_up,
+                "probe_url": server_status.probe_url,
+                "probe_status": server_status.probe_status,
+                "probe_error": server_status.probe_error,
+                "probe_note": "up is decided by GET probe_url. A probe_status of 301/308 means that endpoint redirects — name it with a scheme (https://host) instead of a bare host:port. probe_status null with probe_error set means nothing answered.",
                 "launchd_state": server_status.launchd_state,
                 "launchd_pid": server_status.launchd_pid,
                 "launchd_last_exit_code": server_status.launchd_last_exit_code,

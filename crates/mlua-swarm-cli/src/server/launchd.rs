@@ -38,6 +38,11 @@ use crate::server::error::ServerError;
 
 /// Default `host:port` the `mse serve` daemon binds to when the caller
 /// omits `--bind`.
+///
+/// Endpoint resolution no longer goes through a `host:port` literal — see
+/// [`crate::http::DEFAULT_BASE_URL`], which carries the scheme because
+/// that is part of the answer to "where is the server".
+#[allow(dead_code)]
 pub const DEFAULT_BIND: &str = "127.0.0.1:7777";
 /// The launchd `Label` (also the plist file's basename minus the
 /// extension) for the `mse serve` LaunchAgent.
@@ -517,7 +522,8 @@ pub async fn restart(bind: &str) -> Result<StartOutcome, ServerError> {
 /// (GH #97). This field pair is the surviving diagnostic surface for
 /// that state.
 pub async fn status(bind: &str) -> StatusOutcome {
-    let up = healthz_ok(bind).await;
+    let probe = healthz_probe(bind).await;
+    let up = probe.ok;
     let target = domain_target();
     let print_out = run_launchctl(&["print", &target]).await.ok();
     let (state, pid, last_exit_code) = match &print_out {
@@ -539,6 +545,9 @@ pub async fn status(bind: &str) -> StatusOutcome {
     StatusOutcome {
         bind: bind.into(),
         up,
+        probe_url: probe.url,
+        probe_status: probe.status,
+        probe_error: probe.error,
         launchd_state: state,
         launchd_pid: pid,
         launchd_last_exit_code: last_exit_code,
@@ -783,6 +792,18 @@ pub struct StatusOutcome {
     pub bind: String,
     /// Whether `GET /v1/healthz` returned HTTP 200 with body `ok`.
     pub up: bool,
+    /// The URL [`Self::up`] was decided from, scheme included. `up: false`
+    /// on its own cannot tell "the server is down" from "we probed the
+    /// wrong scheme"; this and [`Self::probe_status`] are what separate
+    /// them.
+    pub probe_url: String,
+    /// HTTP status of the health probe, or `None` when nothing answered.
+    /// A `301` here means the endpoint redirects — name it with a scheme
+    /// (`https://host`) instead of a bare `host:port`.
+    pub probe_status: Option<u16>,
+    /// Transport-level failure text from the health probe, when there was
+    /// one (connection refused, timeout, TLS failure).
+    pub probe_error: Option<String>,
     /// `state = ...` from `launchctl print` (`None` if launchctl is
     /// unavailable or the label isn't loaded).
     pub launchd_state: Option<String>,
@@ -972,6 +993,32 @@ mod tests {
             "an https endpoint must be probed over https"
         );
         assert!(!probe.ok);
+    }
+
+    #[tokio::test]
+    async fn status_carries_the_probe_result_so_up_false_can_be_explained() {
+        use axum::http::{header, StatusCode};
+        use axum::routing::get;
+
+        let base = spawn(axum::Router::new().route(
+            "/v1/healthz",
+            get(|| async {
+                (
+                    StatusCode::MOVED_PERMANENTLY,
+                    [(header::LOCATION, "https://example.com/v1/healthz")],
+                )
+            }),
+        ))
+        .await;
+        let out = status(&base).await;
+
+        assert!(!out.up);
+        assert_eq!(
+            out.probe_status,
+            Some(301),
+            "the reason for up:false must travel with it"
+        );
+        assert_eq!(out.probe_url, format!("{base}/v1/healthz"));
     }
 
     #[tokio::test]
