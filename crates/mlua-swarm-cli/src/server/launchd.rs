@@ -29,6 +29,7 @@
 //! state-machine — a client can now recover from `bootout` without
 //! shelling out to a separate installer script.
 
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -69,7 +70,7 @@ pub const TEMPLATE: &str = include_str!("./plist.template");
 /// [`crate::http::client_builder`]), so "healthy server, wrong scheme" and
 /// "server is down" both collapsed into `false` with nothing to tell them
 /// apart.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HealthzProbe {
     /// The URL actually requested, scheme included.
     pub url: String,
@@ -81,6 +82,33 @@ pub struct HealthzProbe {
     pub ok: bool,
     /// Transport-level failure text, when there was one.
     pub error: Option<String>,
+}
+
+impl HealthzProbe {
+    /// Whether the host answered at all — any HTTP status counts.
+    ///
+    /// Separate from [`Self::availability`] because a `301` answers this
+    /// yes and that no. Collapsing the two is how a demonstrably reachable
+    /// server got reported as unreachable, next to a note saying it was
+    /// reachable.
+    pub fn host_reachable(&self) -> bool {
+        self.status.is_some()
+    }
+    /// Whether the server is serving, in the vocabulary of the IETF health
+    /// check draft: `"pass"` (healthy) or `"fail"`.
+    ///
+    /// `"warn"` is defined there as healthy-with-concerns; `/v1/healthz`
+    /// is a flat 200-with-`ok` contract with nothing to warn about, so it
+    /// is not produced.
+    ///
+    /// <https://datatracker.ietf.org/doc/html/draft-inadarei-api-health-check-06>
+    pub fn availability(&self) -> &'static str {
+        if self.ok {
+            "pass"
+        } else {
+            "fail"
+        }
+    }
 }
 
 /// `GET /v1/healthz` against `bind`, reporting what happened.
@@ -545,9 +573,7 @@ pub async fn status(bind: &str) -> StatusOutcome {
     StatusOutcome {
         bind: bind.into(),
         up,
-        probe_url: probe.url,
-        probe_status: probe.status,
-        probe_error: probe.error,
+        probe,
         launchd_state: state,
         launchd_pid: pid,
         launchd_last_exit_code: last_exit_code,
@@ -786,24 +812,18 @@ pub struct StopOutcome {
 }
 
 /// Outcome of [`status`] — infallible healthz + `launchctl print` summary.
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct StatusOutcome {
     /// The `host:port` the daemon is bound to.
     pub bind: String,
     /// Whether `GET /v1/healthz` returned HTTP 200 with body `ok`.
     pub up: bool,
-    /// The URL [`Self::up`] was decided from, scheme included. `up: false`
-    /// on its own cannot tell "the server is down" from "we probed the
-    /// wrong scheme"; this and [`Self::probe_status`] are what separate
-    /// them.
-    pub probe_url: String,
-    /// HTTP status of the health probe, or `None` when nothing answered.
-    /// A `301` here means the endpoint redirects — name it with a scheme
-    /// (`https://host`) instead of a bare `host:port`.
-    pub probe_status: Option<u16>,
-    /// Transport-level failure text from the health probe, when there was
-    /// one (connection refused, timeout, TLS failure).
-    pub probe_error: Option<String>,
+    /// What the health probe actually saw. `up` alone cannot tell "the
+    /// server is down" from "we probed the wrong scheme"; this is what
+    /// separates them, and [`HealthzProbe::host_reachable`] /
+    /// [`HealthzProbe::availability`] read it as the two distinct
+    /// questions it answers.
+    pub probe: HealthzProbe,
     /// `state = ...` from `launchctl print` (`None` if launchctl is
     /// unavailable or the label isn't loaded).
     pub launchd_state: Option<String>,
@@ -915,6 +935,54 @@ mod tests {
         format!("http://{addr}")
     }
 
+    // Two questions one bool could not hold: did the host answer at all,
+    // and is the server serving. A 301 answers "yes" to the first and "no"
+    // to the second, which is why `reachable: false` sat next to a note
+    // saying the server was reachable.
+
+    #[tokio::test]
+    async fn a_redirect_means_the_host_answered_but_the_server_is_not_serving() {
+        use axum::http::{header, StatusCode};
+        use axum::routing::get;
+
+        let base = spawn(axum::Router::new().route(
+            "/v1/healthz",
+            get(|| async {
+                (
+                    StatusCode::MOVED_PERMANENTLY,
+                    [(header::LOCATION, "https://example.com/v1/healthz")],
+                )
+            }),
+        ))
+        .await;
+        let probe = healthz_probe(&base).await;
+
+        assert!(
+            probe.host_reachable(),
+            "an HTTP status came back, so the host is reachable: {probe:?}"
+        );
+        assert_eq!(probe.availability(), "fail", "301 is not a serving server");
+    }
+
+    #[tokio::test]
+    async fn nothing_answering_means_the_host_was_not_reached() {
+        let probe = healthz_probe("127.0.0.1:1").await;
+
+        assert!(!probe.host_reachable(), "nothing answered: {probe:?}");
+        assert_eq!(probe.availability(), "fail");
+    }
+
+    #[tokio::test]
+    async fn a_healthy_server_is_reachable_and_passing() {
+        use axum::routing::get;
+
+        let base = spawn(axum::Router::new().route("/v1/healthz", get(|| async { "ok" }))).await;
+        let probe = healthz_probe(&base).await;
+
+        assert!(probe.host_reachable());
+        assert_eq!(probe.availability(), "pass");
+    }
+
     #[tokio::test]
     async fn healthz_probe_reports_ok_for_a_healthy_server() {
         use axum::routing::get;
@@ -1014,11 +1082,15 @@ mod tests {
 
         assert!(!out.up);
         assert_eq!(
-            out.probe_status,
+            out.probe.status,
             Some(301),
             "the reason for up:false must travel with it"
         );
-        assert_eq!(out.probe_url, format!("{base}/v1/healthz"));
+        assert_eq!(out.probe.url, format!("{base}/v1/healthz"));
+        assert!(
+            out.probe.host_reachable(),
+            "a 301 means the host answered: {out:?}"
+        );
     }
 
     #[tokio::test]

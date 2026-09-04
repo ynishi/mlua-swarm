@@ -5660,7 +5660,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Doctor snapshot, in five sections that answer separate questions. `mse_mcp`: this process (build version, in-process store = InMemory ephemeral, in-flight runs). `endpoint`: where this call connected and WHY — `url`, `source` (argument | env | default, i.e. which layer supplied it, so a reader knows what to change), and `probe` {url, status, ok, error} from GET /v1/healthz. `server`: what the far end says about itself — `reachable` plus its `self_report` from GET /v1/doctor (its own bind / backend / store root / ref_base / registered BP list). `supervision`: local launchd state, and ONLY when the endpoint is this machine — against a hosted endpoint it is `{applicable: false, reason}` rather than six nulls, because launchd does not supervise someone else's server. Plus `version_drift` comparing the two processes, `audit_findings` (GH #34) flagging `audit:<step>` artifacts across tracked runs, and `degradations` (GH #32) counting per-Run worker-degradation entries. `version_drift.drift` is tri-state: true / false / null (null = could not compare, NOT 'no drift'). A `probe.status` of 301/308 means the endpoint redirects — the server is reachable and the endpoint needs its scheme (https://host), not a restart."
+        description = "Doctor snapshot, in five sections that answer separate questions. `mse_mcp`: this process (build version, in-process store = InMemory ephemeral, in-flight runs). `endpoint`: where this call connected and WHY — `url`, `source` (argument | env | default, i.e. which layer supplied it, so a reader knows what to change), and `probe` from GET /v1/healthz. The probe answers two questions separately, because a 301 answers them differently: `host_network` {reachable, error} is whether the host answered at all (any HTTP status counts), and `server_available` {status: pass|fail, note} is whether it is actually serving (200 with body `ok`); `note` carries the explanation only on fail, and `http_status` is the raw code. `server`: what the far end says about itself — `self_report_read` (whether GET /v1/doctor could be read, which also needs the right scheme and a token — NOT reachability, that is `host_network`) plus its `self_report` (its own bind / backend / store root / ref_base / registered BP list). `supervision`: local launchd state, and ONLY when the endpoint is this machine — against a hosted endpoint it is `{applicable: false, reason}` rather than six nulls, because launchd does not supervise someone else's server. Plus `version_drift` comparing the two processes, `audit_findings` (GH #34) flagging `audit:<step>` artifacts across tracked runs, and `degradations` (GH #32) counting per-Run worker-degradation entries. `version_drift.drift` is tri-state: true / false / null (null = could not compare, NOT 'no drift'). A `probe.status` of 301/308 means the endpoint redirects — the server is reachable and the endpoint needs its scheme (https://host), not a restart."
     )]
     async fn mse_doctor(
         &self,
@@ -5688,8 +5688,8 @@ impl MseServer {
         } else {
             serde_json::json!({
                 "note": unreachable_note(
-                    server_status.probe_status,
-                    &server_status.probe_url,
+                    server_status.probe.status,
+                    &server_status.probe.url,
                 )
             })
         };
@@ -5757,7 +5757,7 @@ impl MseServer {
         } else {
             audit_fetch_notes.push(format!(
                 "audit_findings scan skipped: {}",
-                unreachable_note(server_status.probe_status, &server_status.probe_url)
+                unreachable_note(server_status.probe.status, &server_status.probe.url)
             ));
         }
 
@@ -5824,7 +5824,7 @@ impl MseServer {
         } else {
             degradation_notes.push(format!(
                 "degradations scan skipped: {}",
-                unreachable_note(server_status.probe_status, &server_status.probe_url)
+                unreachable_note(server_status.probe.status, &server_status.probe.url)
             ));
         }
 
@@ -5853,7 +5853,7 @@ impl MseServer {
         // endpoint the whole section is a category error, and reporting six
         // nulls invited reading them as "the daemon is in a bad state"
         // rather than "there is no daemon here".
-        let supervision = if is_loopback_url(&server_status.probe_url) {
+        let supervision = if is_loopback_url(&server_status.probe.url) {
             serde_json::json!({
                 "applicable": true,
                 "launchd_state": server_status.launchd_state,
@@ -5896,14 +5896,33 @@ impl MseServer {
                     endpoint.source().as_str()
                 ),
                 "probe": {
-                    "url": server_status.probe_url,
-                    "status": server_status.probe_status,
-                    "ok": server_up,
-                    "error": server_status.probe_error,
+                    "url": server_status.probe.url,
+                    "http_status": server_status.probe.status,
+                    // Two questions, because a 301 answers them
+                    // differently: the host answered, the server is not
+                    // serving. One bool could only be wrong about one of
+                    // them.
+                    "host_network": {
+                        "reachable": server_status.probe.host_reachable(),
+                        "error": server_status.probe.error,
+                    },
+                    "server_available": {
+                        // "pass" / "fail" per the IETF health-check draft
+                        // vocabulary (draft-inadarei-api-health-check).
+                        "status": server_status.probe.availability(),
+                        "note": unreachable_note_when_failing(
+                            server_up,
+                            server_status.probe.status,
+                            &server_status.probe.url,
+                        ),
+                    },
                 },
             },
             "server": {
-                "reachable": server_up,
+                // Not "reachable" — that is the host's question, answered
+                // above. This one is only whether GET /v1/doctor could be
+                // read, which also needs the right scheme and a token.
+                "self_report_read": server_up,
                 "self_report": server_info,
             },
             "supervision": supervision,
@@ -5911,7 +5930,7 @@ impl MseServer {
                 "mse_mcp": mcp_version,
                 "mlua_swarm_server": server_version,
                 "drift": version_drift,
-                "note": "drift=null means the comparison could not be made (server down, or its /v1/doctor predates server_version) — not 'no drift'. Each process keeps the version it was started with; restart the drifting side to pick up a newly installed binary.",
+                "note": "drift=null means the comparison could not be made — not 'no drift'. Either the server's self-report could not be read (see endpoint.probe for why: nothing answered, a redirect, a rejected token) or its /v1/doctor predates server_version. Each process keeps the version it was started with; restart the drifting side to pick up a newly installed binary.",
             },
             "audit_findings": {
                 "count": audit_findings.len(),
@@ -6321,6 +6340,21 @@ fn unreachable_note(probe_status: Option<u16>, probe_url: &str) -> String {
             "nothing answered at {probe_url} — the endpoint is not local, so \
              check that it is running and reachable from here."
         ),
+    }
+}
+
+/// [`unreachable_note`], or `null` when the probe passed — the IETF
+/// health-check draft says `output` SHOULD be omitted for a `pass` state,
+/// and a note explaining a failure that did not happen is noise.
+fn unreachable_note_when_failing(
+    ok: bool,
+    probe_status: Option<u16>,
+    probe_url: &str,
+) -> JsonValue {
+    if ok {
+        JsonValue::Null
+    } else {
+        JsonValue::String(unreachable_note(probe_status, probe_url))
     }
 }
 
@@ -9419,9 +9453,15 @@ mod tests {
             "body: {json}"
         );
         assert_eq!(json["endpoint"]["source"], "argument", "body: {json}");
-        assert_eq!(json["endpoint"]["probe"]["status"], 200, "body: {json}");
-        assert_eq!(json["endpoint"]["probe"]["ok"], true, "body: {json}");
-        assert_eq!(json["server"]["reachable"], true, "body: {json}");
+        let probe = &json["endpoint"]["probe"];
+        assert_eq!(probe["http_status"], 200, "body: {json}");
+        assert_eq!(probe["host_network"]["reachable"], true, "body: {json}");
+        assert_eq!(probe["server_available"]["status"], "pass", "body: {json}");
+        assert!(
+            probe["server_available"]["note"].is_null(),
+            "a passing check explains nothing — the health-check draft omits `output` on pass: {json}"
+        );
+        assert_eq!(json["server"]["self_report_read"], true, "body: {json}");
         assert_eq!(
             json["server"]["self_report"]["bind"], "0.0.0.0:7777",
             "the server's own bind stays the server's, not ours: {json}"
@@ -9463,8 +9503,68 @@ mod tests {
                 .contains("not this machine"),
             "body: {json}"
         );
-        assert_eq!(json["server"]["reachable"], false, "body: {json}");
+        assert_eq!(json["server"]["self_report_read"], false, "body: {json}");
         assert_eq!(json["endpoint"]["source"], "argument", "body: {json}");
+        assert_eq!(
+            json["endpoint"]["probe"]["host_network"]["reachable"], false,
+            "nothing answered, so the host was not reached either: {json}"
+        );
+    }
+
+    /// The split that `reachable` alone could not express: a redirect means
+    /// the host answered and the server is not serving. Reported as one
+    /// bool, whichever value it took contradicted the note beside it.
+    #[tokio::test]
+    async fn mse_doctor_reports_a_redirect_as_host_reached_but_server_unavailable() {
+        use axum::http::{header, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+
+        let router = Router::new().route(
+            "/v1/healthz",
+            get(|| async {
+                (
+                    StatusCode::MOVED_PERMANENTLY,
+                    [(header::LOCATION, "https://example.com/v1/healthz")],
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let server = MseServer::new();
+        let result = server
+            .mse_doctor(Parameters(DoctorReq {
+                bind: Some(addr.to_string()),
+            }))
+            .await
+            .expect("doctor");
+        let json: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("doctor json");
+
+        let probe = &json["endpoint"]["probe"];
+        assert_eq!(probe["http_status"], 301, "body: {json}");
+        assert_eq!(
+            probe["host_network"]["reachable"], true,
+            "a 301 is an answer — the host was reached: {json}"
+        );
+        assert_eq!(
+            probe["server_available"]["status"], "fail",
+            "answering 301 is not serving: {json}"
+        );
+        let note = probe["server_available"]["note"]
+            .as_str()
+            .expect("a failing check carries its output");
+        assert!(
+            note.contains("301") && note.contains("scheme"),
+            "note: {note}"
+        );
+        assert_eq!(json["server"]["self_report_read"], false, "body: {json}");
     }
 
     /// Both determinate arms of the tri-state, against a stub `/v1/doctor`
