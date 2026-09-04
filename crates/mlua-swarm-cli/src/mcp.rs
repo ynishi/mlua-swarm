@@ -5660,7 +5660,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Doctor snapshot, in five sections that answer separate questions. `mse_mcp`: this process (build version, in-process store = InMemory ephemeral, in-flight runs). `endpoint`: where this call connected and WHY — `url`, `source` (argument | env | default, i.e. which layer supplied it, so a reader knows what to change), and `probe` from GET /v1/healthz. The probe answers two questions separately, because a 301 answers them differently: `host_network` {reachable, error} is whether the host answered at all (any HTTP status counts), and `server_available` {status: pass|fail, note} is whether it is actually serving (200 with body `ok`); `note` carries the explanation only on fail, and `http_status` is the raw code. `server`: what the far end says about itself — `self_report_read` (whether GET /v1/doctor could be read, which also needs the right scheme and a token — NOT reachability, that is `host_network`) plus its `self_report` (its own bind / backend / store root / ref_base / registered BP list). `supervision`: local launchd state, and ONLY when the endpoint is this machine — against a hosted endpoint it is `{applicable: false, reason}` rather than six nulls, because launchd does not supervise someone else's server. Plus `version_drift` comparing the two processes, `audit_findings` (GH #34) flagging `audit:<step>` artifacts across tracked runs, and `degradations` (GH #32) counting per-Run worker-degradation entries. `version_drift.drift` is tri-state: true / false / null (null = could not compare, NOT 'no drift'). A `probe.status` of 301/308 means the endpoint redirects — the server is reachable and the endpoint needs its scheme (https://host), not a restart."
+        description = "Doctor snapshot, in five sections that answer separate questions. `mse_mcp`: this process (build version, in-process store = InMemory ephemeral, in-flight runs). `endpoint`: where this call connected and WHY — `url`, `source` (argument | env | default, i.e. which layer supplied it, so a reader knows what to change), and `probe` from GET /v1/healthz. The probe answers two questions separately, because a 301 answers them differently: `host_network` {reachable, error} is whether the host answered at all (any HTTP status counts), and `server_available` {status: pass|fail, note} is whether it is actually serving (200 with body `ok`); `note` carries the explanation only on fail, and `http_status` is the raw code. `server`: what the far end says about itself — `self_report_read` (whether GET /v1/doctor could be read, which also needs the right scheme and a token — NOT reachability, that is `host_network`) plus its `self_report` (its own bind / backend / store root / ref_base / registered BP list). `supervision`: local launchd state, and ONLY when the endpoint is this machine — against a hosted endpoint it is `{applicable: false, reason}` rather than six nulls, because launchd does not supervise someone else's server. Plus `version_drift` comparing the two processes, `audit_findings` (GH #34) flagging `audit:<step>` artifacts across tracked runs, and `degradations` (GH #32) counting per-Run worker-degradation entries. `version_drift.drift` is tri-state: true / false / null (null = could not compare, NOT 'no drift'). A `probe.http_status` of 301/308 means the endpoint redirects — the server is reachable and the endpoint needs its scheme (https://host), not a restart."
     )]
     async fn mse_doctor(
         &self,
@@ -5686,12 +5686,11 @@ impl MseServer {
                 Err(e) => serde_json::json!({"error": format!("client build: {e}")}),
             }
         } else {
-            serde_json::json!({
-                "note": unreachable_note(
-                    server_status.probe.status,
-                    &server_status.probe.url,
-                )
-            })
+            // Nothing was read, so there is nothing the server said. The
+            // reason belongs to the probe, which already carries it —
+            // putting our diagnosis under `self_report` would make the
+            // section answer a question it was not asked.
+            JsonValue::Null
         };
 
         let (run_count, tracked_runs) = {
@@ -9521,6 +9520,135 @@ mod tests {
             json["endpoint"]["probe"]["host_network"]["reachable"], false,
             "nothing answered, so the host was not reached either: {json}"
         );
+    }
+
+    /// `self_report` is what the far end says about itself. When it could
+    /// not be read there is nothing it said, and putting our own diagnosis
+    /// there makes the section answer a question it was not asked — the
+    /// same confusion, one field over, that this whole restructure was
+    /// about. The reason belongs in `endpoint.probe.server_available.note`,
+    /// where it already is.
+    #[tokio::test]
+    async fn mse_doctor_omits_the_self_report_when_it_could_not_be_read() {
+        let server = MseServer::new();
+        let result = server
+            .mse_doctor(Parameters(DoctorReq {
+                bind: Some("https://example.invalid".into()),
+            }))
+            .await
+            .expect("doctor");
+        let json: JsonValue =
+            serde_json::from_str(&extract_text_payload(&result)).expect("doctor json");
+
+        assert_eq!(json["server"]["self_report_read"], false, "body: {json}");
+        assert!(
+            json["server"]["self_report"].is_null(),
+            "nothing was read, so there is nothing the server said: {json}"
+        );
+        assert!(
+            json["endpoint"]["probe"]["server_available"]["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("nothing answered"),
+            "the reason lives in the probe, and only there: {json}"
+        );
+    }
+
+    /// A tool description is what a caller plans against, so a field name
+    /// in one that the response does not have is a defect in the tool.
+    ///
+    /// This is mechanically checkable and was not being checked: the
+    /// description said `probe.status` while the response carried
+    /// `probe.http_status`, introduced by the very commit that fixed the
+    /// previous description drift. Every dotted `a.b` path in a
+    /// description must resolve against a real response.
+    #[tokio::test]
+    async fn tool_descriptions_do_not_name_response_fields_that_do_not_exist() {
+        /// Does some object in `json` have key `parent` whose value is an
+        /// object carrying `child`? Subtree match, because descriptions
+        /// name paths relative to their section, not to the root.
+        fn has_nested_pair(json: &JsonValue, parent: &str, child: &str) -> bool {
+            match json {
+                JsonValue::Object(map) => {
+                    if let Some(JsonValue::Object(inner)) = map.get(parent) {
+                        if inner.contains_key(child) {
+                            return true;
+                        }
+                    }
+                    map.values().any(|v| has_nested_pair(v, parent, child))
+                }
+                JsonValue::Array(items) => {
+                    items.iter().any(|v| has_nested_pair(v, parent, child))
+                }
+                _ => false,
+            }
+        }
+
+        /// Backticked `a.b` tokens that look like response field paths.
+        /// URIs, routes and anything capitalized are not field paths.
+        fn field_paths(description: &str) -> Vec<(String, String)> {
+            description
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter(|token| {
+                    !token.contains('/')
+                        && !token.contains(' ')
+                        && !token.contains(':')
+                        && token.contains('.')
+                        && token
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c == '_' || c == '.')
+                })
+                .filter_map(|token| {
+                    let mut parts = token.split('.');
+                    match (parts.next(), parts.next(), parts.next()) {
+                        (Some(parent), Some(child), None) => {
+                            Some((parent.to_string(), child.to_string()))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        }
+
+        let server = MseServer::new();
+        // An unreachable endpoint still produces every section, which is
+        // the shape the descriptions describe.
+        let doctor: JsonValue = serde_json::from_str(&extract_text_payload(
+            &server
+                .mse_doctor(Parameters(DoctorReq {
+                    bind: Some("https://example.invalid".into()),
+                }))
+                .await
+                .expect("doctor"),
+        ))
+        .expect("doctor json");
+        let status: JsonValue = serde_json::from_str(&extract_text_payload(
+            &server
+                .mlua_swarm_server_status(Parameters(ServerStatusReq {
+                    bind: Some("https://example.invalid".into()),
+                }))
+                .await
+                .expect("status"),
+        ))
+        .expect("status json");
+
+        let tools = MseServer::tool_router().list_all();
+        for (name, response) in [("mse_doctor", &doctor), ("mlua_swarm_server_status", &status)] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} must be a registered tool"));
+            let description = tool.description.as_deref().unwrap_or_default();
+            for (parent, child) in field_paths(description) {
+                assert!(
+                    has_nested_pair(response, &parent, &child),
+                    "{name}'s description names `{parent}.{child}`, which the response does not \
+                     carry — the description is the contract, so fix whichever is wrong: {response}"
+                );
+            }
+        }
     }
 
     /// `mlua_swarm_server_status` answers the same two questions
