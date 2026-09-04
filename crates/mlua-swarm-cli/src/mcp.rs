@@ -535,6 +535,19 @@ struct DoctorReq {
     bind: Option<String>,
 }
 
+/// Request for `mse_run_ctx` — reading back a run's recorded ctx.
+#[derive(Deserialize, JsonSchema)]
+struct RunCtxReq {
+    /// The run whose ctx to read (`R-<hex>`), as returned by `swarm_run`.
+    run_id: String,
+    /// Which branch to read, as a `$.a.b` path (for example
+    /// `$.aggregate.out`). Omitted enumerates the top level with each
+    /// branch's size, so a caller can see where the bytes are before
+    /// asking for them.
+    #[serde(default)]
+    at: Option<String>,
+}
+
 /// Request for the `mse_http` escape hatch.
 ///
 /// Deliberately carries neither a URL nor a token: the endpoint is
@@ -3825,7 +3838,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Run a Blueprint via TaskApplication.handle. Blocking by default (returns run_id + final_ctx + bound_version on completion; the whole `final_ctx` is always written to a file and `ctx_file` {path, bytes} says where — this MCP runs on the caller's own machine, so nothing is trimmed away to fit a response. `final_ctx` is inlined as well when it is under 16 KiB; above that it is `null` and `ctx_file.note` says to read the file. Nothing partial is ever returned under the name `final_ctx`, and a write that failed reports `ctx_file.error` with a null path rather than naming a file that is not there); pass `detach: true` for the asynchronous launch — returns `{run_id, task_id, status: \"running\"}` immediately, poll `swarm_status` for the result. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline). On the `{kind: \"id\"}` path the run is pinned to an Operator session: `operator_sid` when given, otherwise this process's sole live session (joined via mse_operator_join, and only when the run targets that session's server) — so with several drivers sharing one server, a run's Spawn frames come back to the driver that launched it instead of to whichever session currently holds the Blueprint's logical operator role."
+        description = "Run a Blueprint via TaskApplication.handle. Blocking by default (returns run_id + final_ctx + bound_version on completion; the whole `final_ctx` is always written to a file and `ctx_file` {path, bytes} says where — this MCP runs on the caller's own machine, so nothing is trimmed away to fit a response. `final_ctx` is inlined as well when it is under 16 KiB; above that it is `null` and `ctx_file.note` says to read the file. Read it with `mse_run_ctx(run_id, at)` when you would rather not open a file yourself — it selects one branch (`$.aggregate.out`) instead of handing back the whole ctx. Nothing partial is ever returned under the name `final_ctx`, and a write that failed reports `ctx_file.error` with a null path rather than naming a file that is not there); pass `detach: true` for the asynchronous launch — returns `{run_id, task_id, status: \"running\"}` immediately, poll `swarm_status` for the result. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline). On the `{kind: \"id\"}` path the run is pinned to an Operator session: `operator_sid` when given, otherwise this process's sole live session (joined via mse_operator_join, and only when the run targets that session's server) — so with several drivers sharing one server, a run's Spawn frames come back to the driver that launched it instead of to whichever session currently holds the Blueprint's logical operator role."
     )]
     async fn swarm_run(
         &self,
@@ -5957,6 +5970,16 @@ impl MseServer {
     }
 
     #[tool(
+        description = "Read back a run's ctx — the one `swarm_run` wrote to `ctx_file.path` — without needing a filesystem read of your own. Selects a branch rather than paging bytes: `at` takes a `$.a.b` path (`$.aggregate.out`, `$.plan.parts`) and returns that branch whole, so the response is small because you asked for a branch, not because a threshold cut one. Omit `at` to enumerate the top level with each branch's size in bytes; do the same on any branch that comes back too large — `keys` is then the list to narrow into, and `truncated.note` says so. A run with no recorded ctx and a path that is not present report differently, and neither is reported as an empty result."
+    )]
+    async fn mse_run_ctx(
+        &self,
+        Parameters(req): Parameters<RunCtxReq>,
+    ) -> Result<CallToolResult, McpError> {
+        json_result(&run_ctx_read(&mse_home(), &req.run_id, req.at.as_deref()))
+    }
+
+    #[tool(
         description = "Escape hatch for a `/v1/**` route this MCP does not wrap yet: issues one request against the configured mse serve and returns `endpoint` {url, source} — the base it connected to and which layer supplied it — plus `request` {method, path, url}, `status`, `body`, and `truncated` (null unless the body exceeded the 16 KiB cap, in which case it carries bytes_total / bytes_returned / a note; a capped body is never presented as a whole one). Takes NO url and NO token — the endpoint comes from `MSE_HTTP` (else the loopback default) and the access-token header is attached by this process, so neither ever has to be typed into a tool call or copied out of a config file. `path` is allow-listed to `/v1/**`: a scheme, a host, a protocol-relative `//`, parent-directory traversal, and control characters are all rejected, so this cannot be aimed at another host. `method` defaults to GET; `body` is sent as JSON for POST/PATCH/DELETE. Redirects are not followed (a 3xx comes back as-is), which is how a wrong-scheme endpoint shows itself instead of silently succeeding."
     )]
     async fn mse_http(
@@ -6410,6 +6433,126 @@ fn run_ctx_report(root: &std::path::Path, final_ctx: JsonValue, run_id: &str) ->
     };
 
     serde_json::json!({ "final_ctx": inline, "ctx_file": ctx_file })
+}
+
+/// Reads back a run's recorded ctx, selecting a branch rather than paging
+/// bytes.
+///
+/// `swarm_run` hands out a path, which only helps a caller that can open
+/// files — a worker with a narrowed tool scope cannot. This closes that
+/// inside the same MCP.
+///
+/// Selection is by path (`$.aggregate.out`) on purpose. A byte pager would
+/// put a size threshold back in the middle of the contract, and the caller
+/// would have to track how far it had read; with a path, the response is
+/// small because the caller asked for a branch. `at` omitted enumerates
+/// the top level with each branch's size, so a caller can see which one is
+/// the large one before asking for it.
+///
+/// The one surviving cap applies to the selected branch, and says to
+/// narrow `at` — a lever the caller always has, unlike a pager's offset.
+fn run_ctx_read(root: &std::path::Path, run_id: &str, at: Option<&str>) -> JsonValue {
+    let path = root.join("runs").join(run_id).join("ctx.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return serde_json::json!({
+                "run_id": run_id,
+                "error": format!(
+                    "no ctx recorded for {run_id} at {}: {e}",
+                    path.display()
+                ),
+            })
+        }
+    };
+    let ctx: JsonValue = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            return serde_json::json!({
+                "run_id": run_id,
+                "error": format!("the ctx file for {run_id} is not JSON: {e}"),
+            })
+        }
+    };
+
+    /// Walks a `$.a.b` selector. Only named keys — an array index is not
+    /// a thing a caller has needed, and leaving it out keeps the selector
+    /// unambiguous.
+    fn select<'a>(value: &'a JsonValue, at: &str) -> Option<&'a JsonValue> {
+        let mut cur = value;
+        for segment in at.trim_start_matches("$.").split('.') {
+            if segment.is_empty() {
+                continue;
+            }
+            cur = cur.get(segment)?;
+        }
+        Some(cur)
+    }
+
+    /// Immediate children with their serialized sizes, so a caller can see
+    /// where the bytes are before asking for them.
+    fn enumerate(value: &JsonValue, prefix: &str) -> JsonValue {
+        match value {
+            JsonValue::Object(map) => {
+                let mut keys = serde_json::Map::new();
+                for (key, child) in map {
+                    let size = serde_json::to_string(child).map(|s| s.len()).unwrap_or(0);
+                    keys.insert(format!("{prefix}.{key}"), JsonValue::from(size));
+                }
+                JsonValue::Object(keys)
+            }
+            _ => JsonValue::Null,
+        }
+    }
+
+    let Some(at) = at else {
+        return serde_json::json!({
+            "run_id": run_id,
+            "at": "$",
+            "keys": enumerate(&ctx, "$"),
+            "value": JsonValue::Null,
+            "note": "pass `at` (for example \"$.aggregate.out\") to read one branch",
+        });
+    };
+
+    let Some(selected) = select(&ctx, at) else {
+        return serde_json::json!({
+            "run_id": run_id,
+            "error": format!("{at} is not present in this run's ctx"),
+            "keys": enumerate(&ctx, "$"),
+        });
+    };
+
+    let bytes = serde_json::to_string(selected)
+        .map(|s| s.len())
+        .unwrap_or(0);
+    if bytes <= RUN_CTX_INLINE_BYTES {
+        return serde_json::json!({
+            "run_id": run_id,
+            "at": at,
+            "bytes": bytes,
+            "value": selected,
+            "truncated": JsonValue::Null,
+        });
+    }
+
+    // Too large to hand back whole. Enumerate its children instead of
+    // cutting it: the caller narrows `at` and gets a complete answer,
+    // which a byte offset could never give.
+    serde_json::json!({
+        "run_id": run_id,
+        "at": at,
+        "bytes": bytes,
+        "value": JsonValue::Null,
+        "keys": enumerate(selected, at),
+        "truncated": {
+            "bytes_total": bytes,
+            "note": format!(
+                "{at} is {bytes} bytes, over the {RUN_CTX_INLINE_BYTES} cap — narrow \
+                 `at` to one of the keys listed here and the whole branch comes back"
+            ),
+        },
+    })
 }
 
 /// Where run artifacts live. `MSE_HOME` overrides it; otherwise `~/.mse`,
@@ -9863,6 +10006,129 @@ mod tests {
             report["ctx_file"]["path"].is_null(),
             "and no path is offered that does not exist: {}",
             report["ctx_file"]
+        );
+    }
+
+    // ─── run ctx reader ────────────────────────────────────────────────
+    //
+    // Handing back a path is only half an answer: a caller whose tool
+    // scope has no filesystem read cannot open it. The reader closes that
+    // inside the same MCP — and selects by path rather than paging by
+    // bytes, so the response is small because the caller asked for a
+    // branch, not because a threshold cut one. Three attempts at guessing
+    // that threshold are the reason this is not a pager.
+
+    fn write_sample_ctx(root: &std::path::Path, run_id: &str, ctx: &JsonValue) {
+        let dir = root.join("runs").join(run_id);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("ctx.json"),
+            serde_json::to_string_pretty(ctx).expect("serialize"),
+        )
+        .expect("write");
+    }
+
+    fn gate_shaped_ctx() -> JsonValue {
+        serde_json::json!({
+            "aggregate": {
+                "out": "# pre-commit-gates aggregate: BLOCKED",
+                "parts": {"evidence": vec!["x".repeat(64); 400]},
+            },
+            "project_root": "/home/u/p",
+        })
+    }
+
+    #[test]
+    fn run_ctx_read_returns_only_the_branch_that_was_asked_for() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_sample_ctx(root.path(), "R-sel", &gate_shaped_ctx());
+
+        let got = run_ctx_read(root.path(), "R-sel", Some("$.aggregate.out"));
+
+        assert_eq!(got["at"], "$.aggregate.out");
+        assert_eq!(got["value"], "# pre-commit-gates aggregate: BLOCKED");
+        assert!(got["truncated"].is_null(), "a small branch is whole: {got}");
+    }
+
+    #[test]
+    fn run_ctx_read_without_a_path_lists_the_keys_and_their_sizes() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_sample_ctx(root.path(), "R-list", &gate_shaped_ctx());
+
+        let got = run_ctx_read(root.path(), "R-list", None);
+
+        let keys = got["keys"].as_object().expect("keys map");
+        assert!(
+            keys.contains_key("$.aggregate") && keys.contains_key("$.project_root"),
+            "the top level is enumerated so a caller knows what to ask for: {got}"
+        );
+        assert!(
+            keys["$.aggregate"].as_u64().unwrap_or(0)
+                > keys["$.project_root"].as_u64().unwrap_or(0),
+            "with sizes, so the caller can tell which branch is the large one: {got}"
+        );
+        assert!(
+            got["value"].is_null(),
+            "listing does not also dump the ctx: {got}"
+        );
+    }
+
+    #[test]
+    fn run_ctx_read_descends_into_a_named_child() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_sample_ctx(root.path(), "R-deep", &gate_shaped_ctx());
+
+        let got = run_ctx_read(root.path(), "R-deep", Some("$.aggregate"));
+        let keys = got["keys"].as_object();
+        assert!(
+            got["value"]["out"].is_string() || keys.is_some(),
+            "asking for a subtree returns it (or enumerates it when large): {got}"
+        );
+    }
+
+    /// The one place a threshold survives — and it names the way out
+    /// instead of quietly cutting, because the caller can always narrow
+    /// `at` and get the whole thing.
+    #[test]
+    fn run_ctx_read_caps_a_large_branch_and_says_how_to_narrow_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let big = serde_json::json!({"blob": "y".repeat(RUN_CTX_INLINE_BYTES * 2)});
+        write_sample_ctx(root.path(), "R-big", &big);
+
+        let got = run_ctx_read(root.path(), "R-big", Some("$.blob"));
+
+        assert!(
+            got["truncated"]["bytes_total"].as_u64().unwrap_or(0) > 0,
+            "body: {got}"
+        );
+        let note = got["truncated"]["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("narrow") && note.contains("at"),
+            "the note points at the lever the caller has: {note}"
+        );
+    }
+
+    #[test]
+    fn run_ctx_read_reports_a_missing_run_and_a_missing_path_differently() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_sample_ctx(root.path(), "R-here", &gate_shaped_ctx());
+
+        let no_run = run_ctx_read(root.path(), "R-nope", None);
+        assert!(
+            no_run["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no ctx recorded"),
+            "a run with no ctx says so: {no_run}"
+        );
+
+        let no_path = run_ctx_read(root.path(), "R-here", Some("$.missing.key"));
+        assert!(
+            no_path["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("$.missing.key"),
+            "a path that is not there names itself: {no_path}"
         );
     }
 
