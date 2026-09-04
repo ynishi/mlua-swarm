@@ -3825,7 +3825,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Run a Blueprint via TaskApplication.handle. Blocking by default (returns run_id + final_ctx + bound_version on completion; a `final_ctx` over 32 KiB has its oversized values replaced by `{__omitted_bytes}` and gains a `__truncated` block naming the dropped paths, every value's size, and how to read them in full. The trim descends: a step entry is `{out, parts}`, so a small `out` — a gate's verdict — is kept while the `parts` behind it go, and dropped paths are named in full (`aggregate.parts.evidence`). A trimmed ctx is never presented as a complete one); pass `detach: true` for the asynchronous launch — returns `{run_id, task_id, status: \"running\"}` immediately, poll `swarm_status` for the result. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline). On the `{kind: \"id\"}` path the run is pinned to an Operator session: `operator_sid` when given, otherwise this process's sole live session (joined via mse_operator_join, and only when the run targets that session's server) — so with several drivers sharing one server, a run's Spawn frames come back to the driver that launched it instead of to whichever session currently holds the Blueprint's logical operator role."
+        description = "Run a Blueprint via TaskApplication.handle. Blocking by default (returns run_id + final_ctx + bound_version on completion; the whole `final_ctx` is always written to a file and `ctx_file` {path, bytes} says where — this MCP runs on the caller's own machine, so nothing is trimmed away to fit a response. `final_ctx` is inlined as well when it is under 16 KiB; above that it is `null` and `ctx_file.note` says to read the file. Nothing partial is ever returned under the name `final_ctx`, and a write that failed reports `ctx_file.error` with a null path rather than naming a file that is not there); pass `detach: true` for the asynchronous launch — returns `{run_id, task_id, status: \"running\"}` immediately, poll `swarm_status` for the result. `blueprint` accepts a BlueprintSelector `{kind: \"inline\"|\"id\"|\"file\", ...}` or, for backward compat, a bare Blueprint object (treated as inline). On the `{kind: \"id\"}` path the run is pinned to an Operator session: `operator_sid` when given, otherwise this process's sole live session (joined via mse_operator_join, and only when the run targets that session's server) — so with several drivers sharing one server, a run's Spawn frames come back to the driver that launched it instead of to whichever session currently holds the Blueprint's logical operator role."
     )]
     async fn swarm_run(
         &self,
@@ -4254,16 +4254,20 @@ impl MseServer {
         // persisted by the driver task; what is left here is purely the
         // wire body the caller sees.
         let body = match outcome {
-            Ok(out) => serde_json::json!({
+            Ok(out) => {
+                let ctx = run_ctx_report(&mse_home(), out.final_ctx, &run_id.to_string());
+                serde_json::json!({
                 "run_id": run_id,
                 "task_id": task_id_typed,
                 "status": "done",
-                "final_ctx": prune_run_ctx(out.final_ctx, &run_id.to_string()),
+                "final_ctx": ctx["final_ctx"],
+                "ctx_file": ctx["ctx_file"],
                 "bound_version": out.bound_version.map(|v| format!("{:?}", v)),
                 "head": head_id,
                 "history_len": history_len,
                 "log_tail": log_tail,
-            }),
+                })
+            }
             Err(error) => serde_json::json!({
                 "run_id": run_id,
                 "task_id": task_id_typed,
@@ -4445,6 +4449,11 @@ impl MseServer {
                 .and_then(|v| v.as_str())
                 .unwrap_or("done")
                 .to_string();
+            let ctx = run_ctx_report(
+                &mse_home(),
+                parsed.get("final_ctx").cloned().unwrap_or(JsonValue::Null),
+                &effective_run_id,
+            );
             (
                 if status_str == "running" {
                     RunStatus::Running
@@ -4455,10 +4464,8 @@ impl MseServer {
                     "run_id": effective_run_id.clone(),
                     "task_id": parsed.get("task_id").cloned().unwrap_or(JsonValue::Null),
                     "status": status_str,
-                    "final_ctx": prune_run_ctx(
-                        parsed.get("final_ctx").cloned().unwrap_or(JsonValue::Null),
-                        &effective_run_id,
-                    ),
+                    "final_ctx": ctx["final_ctx"],
+                    "ctx_file": ctx["ctx_file"],
                     "bound_version": parsed.get("bound_version").cloned().unwrap_or(JsonValue::Null),
                     "effective_ttl_secs": parsed.get("effective_ttl_secs").cloned().unwrap_or(JsonValue::Null),
                     "ttl_source": parsed.get("ttl_source").cloned().unwrap_or(JsonValue::Null),
@@ -6341,124 +6348,82 @@ fn unreachable_note_when_failing(
     }
 }
 
-/// Total size of a run's `final_ctx` above which `swarm_run` starts
-/// dropping its largest values.
+/// Size above which a run's `final_ctx` is left out of the response and
+/// only written to its file.
 ///
-/// Sized from what an MCP client actually accepts, not from a round
-/// number: the smallest tool result observed being rejected and spilled
-/// to a file was ~69 KB, so a limit above that lets a ctx through that
-/// the caller cannot then read. 32 KiB leaves the trimmed response — ctx
-/// plus the run's other fields — comfortably inside.
-const RUN_CTX_CAP_BYTES: usize = 32 * 1024;
+/// Unlike the thresholds this replaced, it is not load-bearing: the file
+/// holds the whole ctx either way, so a value that is too high costs the
+/// caller nothing but one `Read`, and one that is too low costs nothing at
+/// all. Three earlier attempts sized a *trim* by this kind of number and
+/// each lost something a caller reads — the fix was to stop deciding what
+/// to discard, not to pick a better number.
+const RUN_CTX_INLINE_BYTES: usize = 16 * 1024;
 
-/// Per-key size above which a single `final_ctx` entry is replaced by a
-/// statement of its size rather than returned.
-const RUN_CTX_KEY_CAP_BYTES: usize = 16 * 1024;
-
-/// Trims a run's `final_ctx` to something a caller can hold, without
-/// pretending the result is complete.
+/// Writes a run's `final_ctx` to a file and reports where it went.
 ///
-/// A ctx is the run's result, so capping it the way a response body gets
-/// capped would throw away the thing that was asked for. What actually
-/// grows is one or two keys — a gate's per-file evidence, a step's full
-/// output — while the key a caller reads is a few hundred bytes. So large
-/// keys are replaced by their size and small ones are returned whole, with
-/// a `__truncated` block naming what went and how to fetch it. A run's ctx
-/// stays on the server; `swarm_status` reads it back by id.
-fn prune_run_ctx(final_ctx: JsonValue, run_id: &str) -> JsonValue {
-    let total = serde_json::to_string(&final_ctx)
+/// A ctx is the run's result, so trimming it is the wrong shape of answer:
+/// per-key, per-depth and per-measured-threshold trims were each tried and
+/// each dropped something (a gate's verdict, then the response's own size
+/// bound). The MCP transport here is stdio — the tool runs on the caller's
+/// machine — so the whole ctx goes to a file the caller can open, and the
+/// response carries the path. `final_ctx` is inlined too when it is small
+/// enough to be free; when it is not, it is `null` rather than a trimmed
+/// object wearing the same name.
+///
+/// A write failure is reported, never swallowed: a response naming a file
+/// that does not exist is worse than one saying it could not write.
+fn run_ctx_report(root: &std::path::Path, final_ctx: JsonValue, run_id: &str) -> JsonValue {
+    let serialized = serde_json::to_string_pretty(&final_ctx).unwrap_or_default();
+    let bytes = serde_json::to_string(&final_ctx)
         .map(|s| s.len())
         .unwrap_or(0);
-    if total <= RUN_CTX_CAP_BYTES {
-        return final_ctx;
-    }
 
-    // Name the field, not just the tool: a caller told to "use
-    // swarm_status" would look for `final_ctx` there and not find it —
-    // the server's record calls the same thing `result_ref`.
-    let how = format!(
-        "this is not the whole ctx — the dropped keys are on the run record: \
-         swarm_status(run_id=\"{run_id}\") returns it under `result_ref` \
-         (equivalently GET /v1/runs/{run_id} via mse_http)"
-    );
+    let dir = root.join("runs").join(run_id);
+    let path = dir.join("ctx.json");
+    let write_result =
+        std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &serialized));
 
-    /// Replaces oversized values wherever they sit, keeping their smaller
-    /// siblings — a step entry is `{out, parts}`, so judging the entry as
-    /// one unit throws away the result along with the bulk behind it.
-    /// Descends first and only replaces what is still too large on its
-    /// own, so the level that actually holds the bytes is the level that
-    /// goes.
-    fn prune_into(
-        value: JsonValue,
-        prefix: &str,
-        dropped: &mut Vec<JsonValue>,
-        sizes: &mut serde_json::Map<String, JsonValue>,
-    ) -> JsonValue {
-        let size = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
-        if !prefix.is_empty() {
-            sizes.insert(prefix.to_string(), JsonValue::from(size));
-        }
-        if size <= RUN_CTX_KEY_CAP_BYTES {
-            return value;
-        }
-        match value {
-            JsonValue::Object(map) => {
-                let mut kept = serde_json::Map::new();
-                for (key, child) in map {
-                    let path = if prefix.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{prefix}.{key}")
-                    };
-                    kept.insert(key, prune_into(child, &path, dropped, sizes));
-                }
-                JsonValue::Object(kept)
-            }
-            // An array or a string that is too large has no smaller part
-            // to keep — it goes as a whole, named by where it sat.
-            _ => {
-                dropped.push(JsonValue::String(prefix.to_string()));
-                serde_json::json!({
-                    "__omitted_bytes": size,
-                    "note": "dropped for size; see __truncated.how_to_read_it_all",
-                })
-            }
-        }
-    }
-
-    let JsonValue::Object(map) = final_ctx else {
-        // Not an object, so there are no keys to keep or drop — say the
-        // size and where the real thing is rather than hand back a
-        // half-truth.
-        return serde_json::json!({
-            "__truncated": {
-                "bytes_total": total,
-                "dropped_keys": [],
-                "reason": "the ctx is not an object, so it could not be trimmed key by key",
-                "how_to_read_it_all": how,
-            }
-        });
+    let ctx_file = match write_result {
+        Ok(()) if bytes <= RUN_CTX_INLINE_BYTES => serde_json::json!({
+            "path": path.to_string_lossy(),
+            "bytes": bytes,
+        }),
+        Ok(()) => serde_json::json!({
+            "path": path.to_string_lossy(),
+            "bytes": bytes,
+            "note": format!(
+                "final_ctx was not inlined ({bytes} bytes); read the file at this path \
+                 for the whole ctx"
+            ),
+        }),
+        Err(e) => serde_json::json!({
+            "path": JsonValue::Null,
+            "bytes": bytes,
+            "error": format!("could not write the ctx to {}: {e}", path.display()),
+        }),
     };
 
-    let mut kept = serde_json::Map::new();
-    let mut dropped_keys = Vec::new();
-    let mut sizes = serde_json::Map::new();
+    let inline = if bytes <= RUN_CTX_INLINE_BYTES {
+        final_ctx
+    } else {
+        JsonValue::Null
+    };
 
-    for (key, value) in map {
-        let pruned = prune_into(value, &key, &mut dropped_keys, &mut sizes);
-        kept.insert(key, pruned);
-    }
+    serde_json::json!({ "final_ctx": inline, "ctx_file": ctx_file })
+}
 
-    kept.insert(
-        "__truncated".to_string(),
-        serde_json::json!({
-            "bytes_total": total,
-            "dropped_keys": dropped_keys,
-            "key_sizes": sizes,
-            "how_to_read_it_all": how,
-        }),
-    );
-    JsonValue::Object(kept)
+/// Where run artifacts live. `MSE_HOME` overrides it; otherwise `~/.mse`,
+/// the same root `mse serve` uses for its store.
+fn mse_home() -> std::path::PathBuf {
+    std::env::var("MSE_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".mse"))
+                .unwrap_or_else(|_| std::path::PathBuf::from(".mse"))
+        })
 }
 
 /// How much of a response body `mse_http` hands back.
@@ -9791,134 +9756,114 @@ mod tests {
         );
     }
 
-    // ─── swarm_run final_ctx size ──────────────────────────────────────
+    // ─── swarm_run final_ctx delivery ──────────────────────────────────
     //
-    // A run's ctx is its result, so capping it the way `mse_http` caps a
-    // body would throw away the thing the caller asked for. What actually
-    // gets large is one or two keys — a gate's per-file evidence, a step's
-    // full output — while the key a caller reads is small. So the large
-    // ones go and the small ones stay, and the response says which.
+    // A run's ctx is its result, so no amount of trimming is the right
+    // answer — three attempts at one (per key, then per depth, then per
+    // measured threshold) each lost something a caller reads. The MCP
+    // transport is stdio, so the tool runs on the caller's own machine:
+    // the ctx goes to a file the caller can open, and the response says
+    // where. The inline copy is a convenience for small runs, and the
+    // threshold that decides it is no longer load-bearing — everything is
+    // in the file either way, so getting it wrong costs one Read.
 
-    #[test]
-    fn run_ctx_under_the_cap_is_returned_whole() {
-        let ctx = serde_json::json!({"aggregate": {"out": "# verdict: PASS"}, "r": {"n": 1}});
-        let pruned = prune_run_ctx(ctx.clone(), "R-1");
-
-        assert_eq!(pruned, ctx, "nothing to drop means nothing changes");
-        assert!(pruned["__truncated"].is_null());
-    }
-
-    #[test]
-    fn run_ctx_keeps_the_small_keys_and_drops_only_the_large_ones() {
-        // Shaped like the case that produced a 1.5 MB tool result: a short
-        // verdict a caller reads, beside per-file evidence it does not.
-        let evidence: Vec<JsonValue> = (0..40_000)
-            .map(|i| serde_json::json!({"file": format!("src/f{i}.rs"), "line": i}))
-            .collect();
-        let ctx = serde_json::json!({
+    fn sample_ctx(size: usize) -> JsonValue {
+        serde_json::json!({
             "aggregate": {"out": "# pre-commit-gates aggregate: BLOCKED"},
-            "evidence": evidence,
-        });
-        let pruned = prune_run_ctx(ctx, "R-6a2fddc9");
+            "evidence": "x".repeat(size),
+        })
+    }
 
+    #[test]
+    fn run_ctx_is_written_beside_the_run_and_its_path_returned() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ctx = sample_ctx(64);
+        let report = run_ctx_report(root.path(), ctx.clone(), "R-abc");
+
+        let path = report["ctx_file"]["path"]
+            .as_str()
+            .expect("the response names the file");
+        assert!(
+            path.contains("R-abc"),
+            "the file sits under the run it belongs to: {path}"
+        );
+
+        let written: JsonValue = serde_json::from_str(
+            &std::fs::read_to_string(path).expect("the file the response names exists"),
+        )
+        .expect("and holds JSON");
+        assert_eq!(written, ctx, "the file holds the whole ctx, untrimmed");
         assert_eq!(
-            pruned["aggregate"]["out"], "# pre-commit-gates aggregate: BLOCKED",
-            "the key a caller reads survives whole: {}",
-            pruned["__truncated"]
-        );
-        assert!(
-            pruned["evidence"]["__omitted_bytes"].as_u64().unwrap_or(0) > 0,
-            "the large key is replaced by a statement of its size"
-        );
-        assert!(
-            pruned["evidence"].get("__omitted_bytes").is_some()
-                && pruned["evidence"].as_array().is_none(),
-            "and is not left looking like a short array: {}",
-            pruned["evidence"]
-        );
-
-        let truncated = &pruned["__truncated"];
-        assert!(truncated["bytes_total"].as_u64().unwrap_or(0) > 0);
-        assert!(
-            truncated["dropped_keys"]
-                .as_array()
-                .expect("dropped_keys array")
-                .iter()
-                .any(|k| k == "evidence"),
-            "the response names what it dropped: {truncated}"
-        );
-        assert!(
-            truncated["how_to_read_it_all"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("R-6a2fddc9"),
-            "and how to get it, for this run: {truncated}"
+            report["ctx_file"]["bytes"].as_u64().unwrap_or(0) as usize,
+            serde_json::to_string(&ctx).expect("serialize").len()
         );
     }
 
-    /// The case this trim exists for, and the one its first version got
-    /// wrong.
-    ///
-    /// A step's ctx entry is `{out, parts}` — `out` is the result a caller
-    /// reads, `parts` is the bulk behind it. Measured on the run that
-    /// motivated this: `aggregate.out` is 2,377 bytes and
-    /// `aggregate.parts` is 458,506. Judging the entry as one unit drops
-    /// both, which threw away the gate verdict while keeping the
-    /// `project_root` string beside it. The size test has to reach the
-    /// level where the size actually is.
     #[test]
-    fn run_ctx_keeps_a_small_out_and_drops_the_parts_beside_it() {
-        let ctx = serde_json::json!({
-            "aggregate": {
-                "out": "# pre-commit-gates aggregate: BLOCKED",
-                "parts": {"evidence": vec!["x".repeat(64); 20_000]},
-            },
-            "project_root": "/home/u/p",
-        });
-        let pruned = prune_run_ctx(ctx, "R-1");
+    fn a_small_run_ctx_is_inlined_as_well() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ctx = sample_ctx(64);
+        let report = run_ctx_report(root.path(), ctx.clone(), "R-small");
 
         assert_eq!(
-            pruned["aggregate"]["out"], "# pre-commit-gates aggregate: BLOCKED",
-            "the verdict is small and must survive: {}",
-            pruned["__truncated"]
-        );
-        // The descent goes as deep as the bytes do: `parts` is an object,
-        // so it is entered rather than dropped, and the array inside it is
-        // what actually goes. Keeping the enclosing structure is the point
-        // — a reader can see that `parts.evidence` existed.
-        assert!(
-            pruned["aggregate"]["parts"]["evidence"]["__omitted_bytes"]
-                .as_u64()
-                .unwrap_or(0)
-                > 0,
-            "the bulk beside it is what goes: {}",
-            pruned["aggregate"]
-        );
-        assert_eq!(pruned["project_root"], "/home/u/p");
-        assert!(
-            pruned["__truncated"]["dropped_keys"]
-                .as_array()
-                .expect("dropped_keys")
-                .iter()
-                .any(|k| k == "aggregate.parts.evidence"),
-            "dropped keys are named by their full path, so a reader knows \
-             which level went: {}",
-            pruned["__truncated"]
+            report["final_ctx"], ctx,
+            "a small ctx costs the caller nothing to inline"
         );
     }
 
-    /// A ctx that is not an object (a bare string or array) still has to
-    /// come back describable rather than panicking or silently emptying.
     #[test]
-    fn run_ctx_that_is_not_an_object_is_still_reported_honestly() {
-        let ctx = JsonValue::String("x".repeat(RUN_CTX_CAP_BYTES * 2));
-        let pruned = prune_run_ctx(ctx, "R-2");
+    fn a_large_run_ctx_is_not_inlined_and_the_response_says_where_it_is() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ctx = sample_ctx(RUN_CTX_INLINE_BYTES * 2);
+        let report = run_ctx_report(root.path(), ctx.clone(), "R-large");
 
         assert!(
-            pruned["__truncated"]["bytes_total"].as_u64().unwrap_or(0) > 0,
-            "body: {pruned}"
+            report["final_ctx"].is_null(),
+            "null, not a trimmed object dressed up as the ctx: {}",
+            report["final_ctx"]
         );
-        assert!(pruned["__truncated"]["how_to_read_it_all"].is_string());
+        let note = report["ctx_file"]["note"]
+            .as_str()
+            .expect("a ctx left out of the response explains itself");
+        assert!(
+            note.contains("not inlined") && note.contains("read the file"),
+            "note: {note}"
+        );
+
+        let path = report["ctx_file"]["path"].as_str().expect("path");
+        let written: JsonValue =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("file exists"))
+                .expect("JSON");
+        assert_eq!(
+            written, ctx,
+            "the file is whole even though the response is not"
+        );
+    }
+
+    /// A ctx that cannot be written is a fact the caller has to be told:
+    /// the alternative is a response that looks complete while the data it
+    /// points at does not exist.
+    #[test]
+    fn a_ctx_that_could_not_be_written_is_reported_not_swallowed() {
+        // A file where the run directory needs to be: the write fails, and
+        // the run still has to report its outcome.
+        let root = tempfile::tempdir().expect("tempdir");
+        let blocker = root.path().join("runs");
+        std::fs::write(&blocker, b"not a directory").expect("place the blocker");
+
+        let ctx = sample_ctx(RUN_CTX_INLINE_BYTES * 2);
+        let report = run_ctx_report(root.path(), ctx, "R-blocked");
+
+        assert!(
+            report["ctx_file"]["error"].is_string(),
+            "the failure is named: {}",
+            report["ctx_file"]
+        );
+        assert!(
+            report["ctx_file"]["path"].is_null(),
+            "and no path is offered that does not exist: {}",
+            report["ctx_file"]
+        );
     }
 
     // ─── mse_http response shape ───────────────────────────────────────
