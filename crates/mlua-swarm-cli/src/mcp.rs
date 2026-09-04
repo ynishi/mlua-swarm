@@ -532,6 +532,30 @@ struct DoctorReq {
     bind: Option<String>,
 }
 
+/// Request for the `mse_http` escape hatch.
+///
+/// Deliberately carries neither a URL nor a token: the endpoint is
+/// resolved from this process's configuration
+/// ([`crate::http::Endpoint`]), and the access-token header is attached by
+/// [`crate::http::client_builder`]. A caller that cannot name a host
+/// cannot aim this at one, and a token that never appears in an argument
+/// never gets transcribed into a transcript. Adding a `url` / `base_url` /
+/// `token` field here would undo both at once — the test
+/// `mse_http_req_exposes_no_url_or_token_field` is there to make that a
+/// deliberate act rather than an accident.
+#[derive(Deserialize, JsonSchema)]
+struct HttpReq {
+    /// HTTP method: `GET` (default), `POST`, `PATCH`, or `DELETE`.
+    #[serde(default)]
+    method: Option<String>,
+    /// Absolute API path, `/v1/…` only (see
+    /// [`crate::http::validate_api_path`]).
+    path: String,
+    /// Optional JSON request body. Ignored for `GET`.
+    #[serde(default)]
+    body: Option<JsonValue>,
+}
+
 /// Default `agent.md` size thresholds used by the `bp_doctor` tool when the
 /// caller does not override them.
 ///
@@ -5873,6 +5897,58 @@ impl MseServer {
     }
 
     #[tool(
+        description = "Escape hatch for a `/v1/**` route this MCP does not wrap yet: issues one request against the configured mse serve and returns {status, url, body}. Takes NO url and NO token — the endpoint comes from `MSE_HTTP` (else the loopback default) and the access-token header is attached by this process, so neither ever has to be typed into a tool call or copied out of a config file. `path` is allow-listed to `/v1/**`: a scheme, a host, a protocol-relative `//`, parent-directory traversal, and control characters are all rejected, so this cannot be aimed at another host. `method` defaults to GET; `body` is sent as JSON for POST/PATCH/DELETE. Redirects are not followed (a 3xx comes back as-is), which is how a wrong-scheme endpoint shows itself instead of silently succeeding."
+    )]
+    async fn mse_http(
+        &self,
+        Parameters(req): Parameters<HttpReq>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::http::validate_api_path(&req.path)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        let method = req.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+        let url = crate::http::Endpoint::resolve(None).url(&req.path);
+
+        let client = crate::http::client_builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
+
+        let request = match method.as_str() {
+            "GET" => client.get(&url),
+            "POST" => client.post(&url),
+            "PATCH" => client.patch(&url),
+            "DELETE" => client.delete(&url),
+            other => {
+                return Err(McpError::invalid_params(
+                    format!("unsupported method {other:?} (GET / POST / PATCH / DELETE)"),
+                    None,
+                ))
+            }
+        };
+        let request = match (&req.body, method.as_str()) {
+            (Some(body), m) if m != "GET" => request.json(body),
+            _ => request,
+        };
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| McpError::internal_error(format!("{method} {url}: {e}"), None))?;
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        // Hand back parsed JSON when it is JSON, and the raw text when it
+        // is not — `/v1/healthz` answers `ok`, which is not.
+        let body: JsonValue = serde_json::from_str(&text).unwrap_or(JsonValue::String(text));
+
+        json_result(&serde_json::json!({
+            "status": status,
+            "url": url,
+            "body": body,
+        }))
+    }
+
+    #[tool(
         description = "Report mse serve state: healthz + a `launchctl print gui/<uid>/com.mse.server` summary (state / pid / last exit code) + the installed plist's WorkingDirectory and whether it exists. Returns {bind, up, launchd_state, launchd_pid, launchd_last_exit_code, plist_working_directory, plist_working_directory_exists}. `plist_working_directory_exists: false` is the signature of a zero-log EX_CONFIG (78) crash loop — launchd cannot chdir, the daemon dies before its log sinks open; recover with `mlua_swarm_server_install` (GH #97). See `mse://guides/server-management` for recovery flow."
     )]
     async fn mlua_swarm_server_status(
@@ -6221,6 +6297,42 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T10 — `mse_http` must not grow a way to name the host or the token.
+    ///
+    /// The tool's safety rests on two things a caller cannot supply: the
+    /// endpoint (resolved from configuration) and the access token
+    /// (attached by the shared client). A `url` / `base_url` / `endpoint`
+    /// field would turn it into a request forwarder aimed anywhere; a
+    /// `token` field would put a credential into tool arguments, which is
+    /// where transcripts come from. Either one is a decision, not a
+    /// refactor, so it has to break this test on the way in.
+    #[test]
+    fn mse_http_req_exposes_no_url_or_token_field() {
+        let schema = serde_json::to_value(schemars::schema_for!(HttpReq))
+            .expect("HttpReq schema serializes");
+        let properties = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("HttpReq schema has properties");
+
+        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["body", "method", "path"],
+            "mse_http's argument surface changed — see this test's doc comment"
+        );
+
+        for banned in [
+            "url", "base_url", "endpoint", "bind", "host", "server", "token", "access_token",
+        ] {
+            assert!(
+                !properties.contains_key(banned),
+                "mse_http must not accept {banned:?}"
+            );
+        }
+    }
     use mlua_flow_ir::{Expr, Node as FlowNode};
     use mlua_swarm::blueprint::{
         current_schema_version, AgentDef, AgentKind, AgentMeta, AgentProfile, AuditDef, AuditMode,

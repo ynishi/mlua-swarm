@@ -118,6 +118,53 @@ impl Endpoint {
     }
 }
 
+/// The only route prefix a caller-supplied path may name.
+pub const API_PATH_PREFIX: &str = "/v1/";
+
+/// Checks a caller-supplied API path before it is joined onto an
+/// [`Endpoint`].
+///
+/// The endpoint itself comes from configuration the caller never supplies,
+/// so a path is the only thing a caller controls — which makes it the only
+/// thing that could turn a convenience escape hatch into a request
+/// forwarder aimed at an arbitrary host. Rejected: anything outside
+/// `/v1/`, anything that names a scheme or a host, parent-directory
+/// traversal, and control characters.
+pub fn validate_api_path(path: &str) -> Result<(), String> {
+    if !path.starts_with(API_PATH_PREFIX) {
+        return Err(format!(
+            "path must start with {API_PATH_PREFIX:?} (got {path:?})"
+        ));
+    }
+    if path.contains("://") {
+        return Err(format!(
+            "path must not name a scheme — the caller does not choose the host (got {path:?})"
+        ));
+    }
+    if path.starts_with("//") {
+        return Err(format!(
+            "a leading // is a host, not a path (got {path:?})"
+        ));
+    }
+    if path
+        .split(['/', '?', '#'])
+        .any(|segment| segment == ".." || segment == ".")
+    {
+        return Err(format!(
+            "path must not traverse out of {API_PATH_PREFIX:?} (got {path:?})"
+        ));
+    }
+    if let Some(bad) = path
+        .chars()
+        .find(|c| c.is_whitespace() || c.is_control() || *c == '\\')
+    {
+        return Err(format!(
+            "path must not contain {bad:?} (got {path:?})"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! This module owns two behaviors that every HTTP call in the binary
@@ -178,6 +225,76 @@ mod tests {
     impl TokenEnv {
         fn set(value: Option<&str>) -> Self {
             Self(EnvVar::set("MSE_ACCESS_TOKEN", value))
+        }
+    }
+
+    // ─── API path allow-list ───────────────────────────────────────────────
+    //
+    // The escape hatch that lets a caller reach a route no tool wraps yet
+    // must not become a general-purpose request forwarder. The endpoint is
+    // resolved from configuration the caller never supplies, so the only
+    // thing a caller controls is the path — and that is what these bound.
+
+    #[test]
+    fn api_path_accepts_v1_routes() {
+        for path in ["/v1/doctor", "/v1/healthz", "/v1/runs/R-1/trace?latest=50"] {
+            assert!(validate_api_path(path).is_ok(), "should accept {path}");
+        }
+    }
+
+    #[test]
+    fn api_path_rejects_routes_outside_v1() {
+        for path in ["/admin", "/", "/v2/doctor", "/v1", "v1/doctor"] {
+            assert!(
+                validate_api_path(path).is_err(),
+                "should reject {path} — only /v1/ routes are reachable"
+            );
+        }
+    }
+
+    #[test]
+    fn api_path_rejects_an_absolute_url() {
+        for path in [
+            "http://evil.example/v1/doctor",
+            "https://evil.example/v1/doctor",
+            "/v1/../../http://evil.example",
+        ] {
+            assert!(
+                validate_api_path(path).is_err(),
+                "should reject {path} — the caller does not choose the host"
+            );
+        }
+    }
+
+    #[test]
+    fn api_path_rejects_a_protocol_relative_path() {
+        assert!(
+            validate_api_path("//evil.example/v1/doctor").is_err(),
+            "a leading // is a host, not a path"
+        );
+    }
+
+    #[test]
+    fn api_path_rejects_parent_directory_traversal() {
+        for path in ["/v1/../admin", "/v1/runs/../../admin", "/v1/a/../../b"] {
+            assert!(
+                validate_api_path(path).is_err(),
+                "should reject {path} — traversal escapes the allow-list"
+            );
+        }
+        assert!(
+            validate_api_path("/v1/runs/R-..-1").is_ok(),
+            "a literal '..' inside a segment is not traversal"
+        );
+    }
+
+    #[test]
+    fn api_path_rejects_control_characters_and_whitespace() {
+        for path in ["/v1/doc tor", "/v1/doctor\n", "/v1/doc\ttor", "/v1/\u{0}x"] {
+            assert!(
+                validate_api_path(path).is_err(),
+                "should reject {path:?} — request smuggling surface"
+            );
         }
     }
 

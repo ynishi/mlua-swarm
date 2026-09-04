@@ -1062,10 +1062,17 @@ fn spawn_reader(mut reader: WsSource, pending: Arc<PendingQueue>) -> JoinHandle<
     })
 }
 
-/// `MSE_HTTP` env override, default `http://127.0.0.1:7777` — same literal
-/// default `mse serve` binds by default (`server_control::DEFAULT_BIND`).
+/// Where this process's Operator sessions live: `MSE_HTTP`, else the
+/// loopback default.
+///
+/// Delegates to [`crate::http::Endpoint`] rather than reading the env
+/// itself. The two used to be separate implementations that happened to
+/// agree on the default, and "happened to agree" is exactly what broke:
+/// the `bind` side could not express a scheme, so with `MSE_HTTP` naming a
+/// remote server the operator session and the runs it was supposed to
+/// drive ended up on different machines.
 fn resolve_http_base() -> String {
-    std::env::var("MSE_HTTP").unwrap_or_else(|_| "http://127.0.0.1:7777".to_string())
+    crate::http::Endpoint::resolve(None).base().to_string()
 }
 
 /// `http://` → `ws://`, `https://` → `wss://`. Falls back to prefixing `ws://`
@@ -1449,6 +1456,22 @@ mod tests {
     }
 
     // ─── http_to_ws_base ───────────────────────────────────────────────────
+
+    /// T7 — the two halves of "where is the server" must be one answer.
+    ///
+    /// The operator tools take no `bind`; the swarm / doctor / bp tools do.
+    /// While those were separate implementations, a remote `MSE_HTTP` put
+    /// the operator session on one server and every un-`bind`-ed run on
+    /// another, and the failure surfaced three hops later as a vacant
+    /// operator seat. Whoever edits one side next has to move both.
+    #[test]
+    fn operator_base_matches_the_bind_paths_resolution() {
+        assert_eq!(
+            resolve_http_base(),
+            crate::http::Endpoint::resolve(None).base(),
+            "the operator path and the bind path must resolve identically"
+        );
+    }
 
     #[test]
     fn http_to_ws_base_converts_scheme() {
