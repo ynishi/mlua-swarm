@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.1](https://github.com/ynishi/mlua-swarm/compare/v0.28.0...v0.28.1) - 2026-09-04
+
+### Added
+
+- *(cli)* read a run's ctx back through the MCP, by branch
+- *(cli)* add an mse_http escape hatch, and unify the operator base (GH #103 layer 2)
+
+### Fixed
+
+- *(cli)* write a run's ctx to a file instead of trimming it to fit
+- *(cli)* trim at the depth the bytes are, and size the caps from a measurement
+- *(cli)* trim an oversized run ctx by key instead of returning all of it
+- *(cli)* cap mse_http's body, and stop calling two things url
+- *(cli)* keep our diagnosis out of the server's self_report, and pin descriptions to the response
+- *(cli)* give server_status the doctor's endpoint and supervision shape
+- *(cli)* separate host reachability from server availability in the probe
+- *(cli)* stop reporting a reachable server as down
+- *(cli)* say which URL the health probe used (GH #103 layer 3)
+- *(cli)* resolve the server endpoint in one place (GH #103 layer 1)
+
+### Other
+
+- *(cli)* say what bind now accepts, and check that it says it
+- *(cli)* split the doctor snapshot into endpoint / server / supervision
+
 ## [0.28.0](https://github.com/ynishi/mlua-swarm/compare/v0.27.0...v0.28.0) - 2026-09-03
 
 ### Added
