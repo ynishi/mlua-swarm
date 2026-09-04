@@ -55,22 +55,82 @@ const SHUTDOWN_POLL_TOTAL: Duration = Duration::from_secs(10);
 /// are expanded by [`render`].
 pub const TEMPLATE: &str = include_str!("./plist.template");
 
-/// healthz check via reqwest. Treats HTTP 200 with body `ok` as healthy.
-pub async fn healthz_ok(bind: &str) -> bool {
-    let url = format!("http://{bind}/v1/healthz");
+/// What a health probe learned, not just what it concluded.
+///
+/// The `bool` this replaces discarded the two facts a caller needs when the
+/// answer is "no": which URL was probed, and what came back. A
+/// TLS-terminated deployment answers plaintext with a `301` to https, and
+/// the shared client does not follow redirects (deliberately — see
+/// [`crate::http::client_builder`]), so "healthy server, wrong scheme" and
+/// "server is down" both collapsed into `false` with nothing to tell them
+/// apart.
+#[derive(Debug, Clone)]
+pub struct HealthzProbe {
+    /// The URL actually requested, scheme included.
+    pub url: String,
+    /// HTTP status, when the server answered at all. `None` means the
+    /// request never got a response (connection refused, timeout, TLS
+    /// failure).
+    pub status: Option<u16>,
+    /// Whether this is a healthy `mse serve`: HTTP 200 with body `ok`.
+    pub ok: bool,
+    /// Transport-level failure text, when there was one.
+    pub error: Option<String>,
+}
+
+/// `GET /v1/healthz` against `bind`, reporting what happened.
+///
+/// `bind` may be a whole base URL (`https://host`) or a bare `host:port`;
+/// see [`crate::http::Endpoint`] for the resolution rules.
+pub async fn healthz_probe(bind: &str) -> HealthzProbe {
+    let url = crate::http::Endpoint::resolve(Some(bind)).url("/v1/healthz");
+
     let client = match crate::http::client_builder()
         .timeout(HEALTHZ_TIMEOUT)
         .build()
     {
         Ok(c) => c,
-        Err(_) => return false,
-    };
-    match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => {
-            r.text().await.map(|t| t.trim() == "ok").unwrap_or(false)
+        Err(e) => {
+            return HealthzProbe {
+                url,
+                status: None,
+                ok: false,
+                error: Some(format!("client build failed: {e}")),
+            }
         }
-        _ => false,
+    };
+
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let ok = status.is_success()
+                && response
+                    .text()
+                    .await
+                    .map(|body| body.trim() == "ok")
+                    .unwrap_or(false);
+            HealthzProbe {
+                url,
+                status: Some(status.as_u16()),
+                ok,
+                error: None,
+            }
+        }
+        Err(e) => HealthzProbe {
+            url,
+            status: None,
+            ok: false,
+            error: Some(e.to_string()),
+        },
     }
+}
+
+/// healthz check via reqwest. Treats HTTP 200 with body `ok` as healthy.
+///
+/// The yes/no form, kept for the callers that only branch on it. Reach for
+/// [`healthz_probe`] when a failure has to be explained to a human.
+pub async fn healthz_ok(bind: &str) -> bool {
+    healthz_probe(bind).await.ok
 }
 
 /// `GET /v1/status` on the running `mse serve` process — the lifecycle
@@ -79,7 +139,7 @@ pub async fn healthz_ok(bind: &str) -> bool {
 /// treat `Err` as "occupancy unknown", not "occupancy = busy" (see the
 /// MCP tool handlers' fail-open-on-Err policy).
 pub async fn occupancy(bind: &str) -> Result<Occupancy, ServerError> {
-    let url = format!("http://{bind}/v1/status");
+    let url = crate::http::Endpoint::resolve(Some(bind)).url("/v1/status");
     let client = crate::http::client_builder()
         .timeout(HEALTHZ_TIMEOUT)
         .build()
@@ -812,6 +872,117 @@ pub struct Occupancy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── healthz probe ─────────────────────────────────────────────────────
+    //
+    // `healthz_ok` answered a yes/no question and threw away everything it
+    // learned getting there. A TLS-terminated deployment 301s plaintext to
+    // https, the shared client does not follow redirects (deliberately), and
+    // the `false` that came back named neither the URL nor the status — so a
+    // healthy server read as "down" with nothing to go on. These pin the
+    // diagnosis, not just the verdict.
+
+    /// Spawns a stub on an ephemeral port and returns its base URL.
+    async fn spawn(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn healthz_probe_reports_ok_for_a_healthy_server() {
+        use axum::routing::get;
+
+        let base = spawn(axum::Router::new().route("/v1/healthz", get(|| async { "ok" }))).await;
+        let probe = healthz_probe(&base).await;
+
+        assert!(probe.ok, "probe: {probe:?}");
+        assert_eq!(probe.status, Some(200));
+        assert_eq!(probe.url, format!("{base}/v1/healthz"));
+        assert!(probe.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn healthz_probe_surfaces_a_redirect_instead_of_a_bare_false() {
+        use axum::http::{header, StatusCode};
+        use axum::routing::get;
+
+        let base = spawn(axum::Router::new().route(
+            "/v1/healthz",
+            get(|| async {
+                (
+                    StatusCode::MOVED_PERMANENTLY,
+                    [(header::LOCATION, "https://example.com/v1/healthz")],
+                )
+            }),
+        ))
+        .await;
+        let probe = healthz_probe(&base).await;
+
+        assert!(!probe.ok, "a 301 is not a healthy server");
+        assert_eq!(
+            probe.status,
+            Some(301),
+            "the status must reach the caller — this is the whole diagnosis"
+        );
+        assert_eq!(probe.url, format!("{base}/v1/healthz"));
+    }
+
+    #[tokio::test]
+    async fn healthz_probe_reports_a_body_that_is_not_ok() {
+        use axum::routing::get;
+
+        let base =
+            spawn(axum::Router::new().route("/v1/healthz", get(|| async { "not-ok" }))).await;
+        let probe = healthz_probe(&base).await;
+
+        assert!(!probe.ok);
+        assert_eq!(probe.status, Some(200), "200 with the wrong body is not up");
+    }
+
+    #[tokio::test]
+    async fn healthz_probe_reports_a_transport_error_with_no_status() {
+        // Port 1 on loopback: nothing listens, so this fails to connect
+        // rather than answering — the "server is actually down" case.
+        let probe = healthz_probe("127.0.0.1:1").await;
+
+        assert!(!probe.ok);
+        assert_eq!(probe.status, None, "no response means no status");
+        assert!(
+            probe.error.is_some(),
+            "a transport failure must say what happened"
+        );
+        assert_eq!(probe.url, "http://127.0.0.1:1/v1/healthz");
+    }
+
+    #[tokio::test]
+    async fn healthz_probe_honours_an_https_base_url() {
+        // Nothing listens here either; what is under test is that the
+        // scheme the caller named survives into the URL that was probed,
+        // instead of being overwritten with `http://`.
+        let probe = healthz_probe("https://127.0.0.1:1").await;
+
+        assert_eq!(
+            probe.url, "https://127.0.0.1:1/v1/healthz",
+            "an https endpoint must be probed over https"
+        );
+        assert!(!probe.ok);
+    }
+
+    #[tokio::test]
+    async fn healthz_ok_still_answers_the_yes_no_question() {
+        use axum::routing::get;
+
+        let base = spawn(axum::Router::new().route("/v1/healthz", get(|| async { "ok" }))).await;
+
+        assert!(healthz_ok(&base).await, "the existing callers keep working");
+        assert!(!healthz_ok("127.0.0.1:1").await);
+    }
 
     #[test]
     fn parse_launchctl_print_extracts_state_pid_exit_code() {

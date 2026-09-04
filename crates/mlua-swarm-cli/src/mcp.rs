@@ -140,7 +140,7 @@ impl MseServer {
 /// error (HTTP client build / send / non-2xx / non-JSON body / timeout) —
 /// callers fall back to the local run store trace.
 async fn fetch_run_via_http(bind: &str, run_id: &str) -> Option<JsonValue> {
-    let url = format!("http://{bind}/v1/runs/{run_id}");
+    let url = crate::http::Endpoint::resolve(Some(bind)).url(&format!("/v1/runs/{run_id}"));
     let client = crate::http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -169,7 +169,7 @@ enum RunFetchError {
 /// surfaces as `invalid_params` and an unreachable server as
 /// `internal_error` instead of both becoming an empty report.
 async fn fetch_run_strict(bind: &str, run_id: &str) -> Result<JsonValue, RunFetchError> {
-    let url = format!("http://{bind}/v1/runs/{run_id}");
+    let url = crate::http::Endpoint::resolve(Some(bind)).url(&format!("/v1/runs/{run_id}"));
     let client = crate::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -308,7 +308,8 @@ fn aggregate_run_stats(step_entries: &[JsonValue]) -> JsonValue {
 /// RunTrace tail `swarm_status` folds into `log_tail`. Same silent-`None`
 /// error contract as [`fetch_run_via_http`].
 async fn fetch_trace_tail_via_http(bind: &str, run_id: &str) -> Option<Vec<JsonValue>> {
-    let url = format!("http://{bind}/v1/runs/{run_id}/trace?latest=50");
+    let url = crate::http::Endpoint::resolve(Some(bind))
+        .url(&format!("/v1/runs/{run_id}/trace?latest=50"));
     let client = crate::http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -3159,11 +3160,7 @@ fn any_json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
 /// Pure and side-effect-free so the matching rule is unit-testable without a
 /// live session.
 fn auto_pin_targets_joined_server(http_base: &str, bind: Option<&str>) -> bool {
-    let target = format!(
-        "http://{}",
-        bind.unwrap_or(launchd::DEFAULT_BIND).trim_end_matches('/')
-    );
-    http_base.trim_end_matches('/') == target
+    crate::http::Endpoint::resolve(bind).base() == http_base.trim_end_matches('/')
 }
 
 /// A run-scoped Operator pin, together with the record of how this process
@@ -4251,8 +4248,8 @@ impl MseServer {
             );
         }
 
-        let bind = bind.unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
-        let url = format!("http://{bind}/v1/tasks");
+        let bind = bind.unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
+        let url = crate::http::Endpoint::resolve(Some(&bind)).url("/v1/tasks");
 
         let mut operator_obj = serde_json::Map::new();
         if let Some(k) = operator_kind {
@@ -4494,7 +4491,7 @@ impl MseServer {
         // Done on its own, so the poll is redundant but harmless).
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         let http_body: Option<JsonValue> = fetch_run_via_http(&bind, &req.run_id).await;
         if let Some(server_body) = http_body {
             // Server is the id authority; overwrite the fields it knows.
@@ -4554,7 +4551,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         let record = fetch_run_strict(&bind, &req.run_id)
             .await
             .map_err(|e| match e {
@@ -4591,7 +4588,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         if !req.confirm {
             return json_result(&serde_json::json!({
                 "status": "dry_run",
@@ -4600,7 +4597,8 @@ impl MseServer {
                 "note": "Pass confirm=true to archive. Reversible via bp_unarchive (marker commit; audit-trail preserved).",
             }));
         }
-        let url = format!("http://{bind}/v1/blueprints/{}", req.id);
+        let url =
+            crate::http::Endpoint::resolve(Some(&bind)).url(&format!("/v1/blueprints/{}", req.id));
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -4829,7 +4827,7 @@ impl MseServer {
         }
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         match crate::bp::register(&bp_value, Some(&bind)).await {
             Ok(outcome) => {
                 let json_bytes = serde_json::to_vec(&bp_value).map(|v| v.len()).unwrap_or(0);
@@ -4865,8 +4863,9 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
-        let url = format!("http://{bind}/v1/blueprints/{}/unarchive", req.id);
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
+        let url = crate::http::Endpoint::resolve(Some(&bind))
+            .url(&format!("/v1/blueprints/{}/unarchive", req.id));
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -4896,7 +4895,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         let thresholds = AgentMdThresholds::from_req(
             req.warn_bytes,
             req.warn_lines,
@@ -4904,7 +4903,8 @@ impl MseServer {
             req.block_lines,
             req.disable_block,
         );
-        let url = format!("http://{bind}/v1/blueprints/{}/head", req.id);
+        let url = crate::http::Endpoint::resolve(Some(&bind))
+            .url(&format!("/v1/blueprints/{}/head", req.id));
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -5005,7 +5005,8 @@ impl MseServer {
             // `bind`/`client` already constructed above.
             // `last_rendered_bytes: null` is a normal response
             // (agent never dispatched) — always 200, never a 404.
-            let render_size_url = format!("http://{bind}/v1/agents/{}/render-size", agent.name);
+            let render_size_url = crate::http::Endpoint::resolve(Some(&bind))
+                .url(&format!("/v1/agents/{}/render-size", agent.name));
             let last_rendered_bytes: Option<usize> = match client.get(&render_size_url).send().await
             {
                 Ok(resp) if resp.status().is_success() => resp
@@ -5401,11 +5402,11 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
-        let url = format!(
-            "http://{bind}/v1/blueprints/{}/agents/{}/explain",
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
+        let url = crate::http::Endpoint::resolve(Some(&bind)).url(&format!(
+            "/v1/blueprints/{}/agents/{}/explain",
             req.bp_id, req.agent
-        );
+        ));
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -5497,13 +5498,14 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
 
-        let batch_url = format!("http://{bind}/v1/blueprints/{}/agents/explain", req.bp_id);
+        let batch_url = crate::http::Endpoint::resolve(Some(&bind))
+            .url(&format!("/v1/blueprints/{}/agents/explain", req.bp_id));
         let batch_resp =
             client.get(&batch_url).send().await.map_err(|e| {
                 McpError::internal_error(format!("bp_explain_agents fetch: {e}"), None)
@@ -5522,7 +5524,8 @@ impl MseServer {
             McpError::internal_error(format!("bp_explain_agents batch decode: {e}"), None)
         })?;
 
-        let head_url = format!("http://{bind}/v1/blueprints/{}/head", req.bp_id);
+        let head_url = crate::http::Endpoint::resolve(Some(&bind))
+            .url(&format!("/v1/blueprints/{}/head", req.bp_id));
         let head_resp = client.get(&head_url).send().await.map_err(|e| {
             McpError::internal_error(format!("bp_explain_agents head fetch: {e}"), None)
         })?;
@@ -5641,12 +5644,12 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         let server_status = launchd::status(&bind).await;
         let server_up = server_status.up;
 
         let server_info: JsonValue = if server_up {
-            let url = format!("http://{bind}/v1/doctor");
+            let url = crate::http::Endpoint::resolve(Some(&bind)).url("/v1/doctor");
             match crate::http::client_builder()
                 .timeout(Duration::from_secs(3))
                 .build()
@@ -5698,7 +5701,8 @@ impl MseServer {
                         let Some(task_id) = task_id else {
                             continue;
                         };
-                        let url = format!("http://{bind}/v1/tasks/{task_id}/runs/{run_id}/steps");
+                        let url = crate::http::Endpoint::resolve(Some(&bind))
+                            .url(&format!("/v1/tasks/{task_id}/runs/{run_id}/steps"));
                         match client.get(&url).send().await {
                             Ok(resp) if resp.status().is_success() => {
                                 match resp.json::<JsonValue>().await {
@@ -5747,7 +5751,8 @@ impl MseServer {
                         let Some(task_id) = task_id else {
                             continue;
                         };
-                        let url = format!("http://{bind}/v1/runs/{run_id}");
+                        let url = crate::http::Endpoint::resolve(Some(&bind))
+                            .url(&format!("/v1/runs/{run_id}"));
                         match client.get(&url).send().await {
                             Ok(resp) if resp.status().is_success() => {
                                 match resp.json::<JsonValue>().await {
@@ -5856,7 +5861,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         match launchd::start(&bind).await {
             Ok(outcome) => json_result(&outcome),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
@@ -5872,7 +5877,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         let out = launchd::status(&bind).await;
         json_result(&out)
     }
@@ -5886,7 +5891,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         let force = req.force.unwrap_or(false);
         if !force && launchd::healthz_ok(&bind).await {
             match launchd::occupancy(&bind).await {
@@ -5925,7 +5930,7 @@ impl MseServer {
     ) -> Result<CallToolResult, McpError> {
         let bind = req
             .bind
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         let force = req.force.unwrap_or(false);
         if !force && launchd::healthz_ok(&bind).await {
             match launchd::occupancy(&bind).await {
@@ -6058,8 +6063,9 @@ impl MseServer {
         let bind = req
             .bind
             .clone()
-            .unwrap_or_else(|| launchd::DEFAULT_BIND.to_string());
-        let url = format!("http://{bind}/v1/runs/{}/cancel", req.run_id);
+            .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
+        let url = crate::http::Endpoint::resolve(Some(&bind))
+            .url(&format!("/v1/runs/{}/cancel", req.run_id));
         let server_ok = match crate::http::client_builder()
             .timeout(Duration::from_secs(5))
             .build()

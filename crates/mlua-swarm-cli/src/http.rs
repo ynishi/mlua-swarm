@@ -46,3 +46,395 @@ pub fn client_builder() -> reqwest::ClientBuilder {
         .redirect(reqwest::redirect::Policy::none())
         .default_headers(headers)
 }
+
+/// The loopback address `mse serve` binds to when nothing says otherwise.
+/// Kept as a whole base URL rather than a `host:port` literal, because the
+/// scheme is part of "where the server is" — see [`Endpoint`].
+pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7777";
+
+/// Where the server is — resolved once, in one place.
+///
+/// Every HTTP call this binary makes used to answer that question twice, in
+/// two incompatible ways: the `bind` tool arguments carried a `host:port`
+/// and each call site wrote `format!("http://{bind}/…")`, while the operator
+/// client read `MSE_HTTP` as a whole base URL. The first shape cannot name
+/// an `https` server at all — a scheme written into `bind` comes back out as
+/// `http://https://…` — so half the tools could reach a TLS-terminated
+/// deployment and half could not, and no error said so.
+///
+/// Resolution order, in full:
+///
+/// 1. the `bind` argument, when given and non-empty;
+/// 2. otherwise `MSE_HTTP`, when set and non-empty;
+/// 3. otherwise [`DEFAULT_BASE_URL`].
+///
+/// A value that already names a scheme is used as given; a bare `host:port`
+/// gets `http://`, which is what every historical caller passed and meant.
+pub struct Endpoint {
+    base: String,
+}
+
+impl Endpoint {
+    /// Resolves the endpoint from an optional `bind` argument, falling back
+    /// to `MSE_HTTP` and then to [`DEFAULT_BASE_URL`].
+    pub fn resolve(bind: Option<&str>) -> Self {
+        let raw = bind
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var("MSE_HTTP")
+                    .ok()
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+
+        // "Already names a scheme" is the question, not "is it http or
+        // https" — a caller naming some other scheme owns that choice.
+        let based = if raw.contains("://") {
+            raw
+        } else {
+            format!("http://{raw}")
+        };
+
+        Self {
+            base: based.trim_end_matches('/').to_owned(),
+        }
+    }
+
+    /// Joins an absolute path (`/v1/doctor`) onto the resolved base.
+    pub fn url(&self, path: &str) -> String {
+        debug_assert!(
+            path.starts_with('/'),
+            "Endpoint::url takes an absolute path, got {path:?}"
+        );
+        format!("{}{}", self.base, path)
+    }
+
+    /// The resolved base URL, scheme included, without a trailing slash.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! This module owns two behaviors that every HTTP call in the binary
+    //! inherits — whether the access-token header is attached, and whether a
+    //! redirect is followed — and until now neither was pinned by a test.
+    //! That is not a cosmetic gap: `Policy::none()` is what turns an
+    //! http→https `301` into a non-success status, which is how a healthy
+    //! server came to be reported as `up: false`. The policy is correct and
+    //! stays; these tests exist so that it stays *deliberately*, and so that
+    //! the header contract is not silently lost in a refactor.
+
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    /// `MSE_ACCESS_TOKEN` is process-global state, and cargo runs tests in
+    /// one process across many threads. Every test that touches the variable
+    /// takes this lock, so they serialize against each other instead of
+    /// reading a value another test is midway through setting.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Sets an environment variable for the duration of a test and restores
+    /// whatever was there before, so a developer running the suite with the
+    /// variable exported in their shell gets the same result as CI.
+    struct EnvVar {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVar {
+        fn set(name: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var(name).ok();
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    /// Shorthand for the token variable, which most of these tests move.
+    struct TokenEnv(#[allow(dead_code)] EnvVar);
+
+    impl TokenEnv {
+        fn set(value: Option<&str>) -> Self {
+            Self(EnvVar::set("MSE_ACCESS_TOKEN", value))
+        }
+    }
+
+    // ─── Endpoint resolution ───────────────────────────────────────────────
+    //
+    // The defect these pin: `bind` was modelled as `host:port` and every URL
+    // was built with `format!("http://{bind}/…")`, so there was no way to
+    // name an https server — writing a scheme into `bind` produced
+    // `http://https://…`. Meanwhile the operator client read `MSE_HTTP`, a
+    // whole base URL. One process, two types for "where the server is".
+
+    #[test]
+    fn endpoint_accepts_an_https_base_url() {
+        let endpoint = Endpoint::resolve(Some("https://example.com"));
+        assert_eq!(
+            endpoint.url("/v1/doctor"),
+            "https://example.com/v1/doctor",
+            "a base URL that already names its scheme must be used as given"
+        );
+    }
+
+    #[test]
+    fn endpoint_accepts_an_http_base_url_without_doubling_the_scheme() {
+        let endpoint = Endpoint::resolve(Some("http://example.com:7777"));
+        assert_eq!(endpoint.url("/v1/healthz"), "http://example.com:7777/v1/healthz");
+    }
+
+    #[test]
+    fn endpoint_completes_the_scheme_for_a_bare_host_port() {
+        let endpoint = Endpoint::resolve(Some("127.0.0.1:7777"));
+        assert_eq!(
+            endpoint.url("/v1/doctor"),
+            "http://127.0.0.1:7777/v1/doctor",
+            "the historical host:port shape must keep working unchanged"
+        );
+    }
+
+    #[test]
+    fn endpoint_tolerates_a_trailing_slash_on_the_base() {
+        let endpoint = Endpoint::resolve(Some("https://example.com/"));
+        assert_eq!(
+            endpoint.url("/v1/doctor"),
+            "https://example.com/v1/doctor",
+            "a trailing slash must not produce a doubled separator"
+        );
+    }
+
+    #[test]
+    fn endpoint_falls_back_to_mse_http_when_no_bind_is_given() {
+        let _lock = env_lock();
+        let _env = EnvVar::set("MSE_HTTP", Some("https://example.com"));
+        assert_eq!(
+            Endpoint::resolve(None).url("/v1/doctor"),
+            "https://example.com/v1/doctor",
+            "the bind path and the operator path must resolve to one server"
+        );
+    }
+
+    #[test]
+    fn endpoint_falls_back_to_loopback_when_neither_bind_nor_env_is_set() {
+        let _lock = env_lock();
+        let _env = EnvVar::set("MSE_HTTP", None);
+        assert_eq!(
+            Endpoint::resolve(None).url("/v1/healthz"),
+            "http://127.0.0.1:7777/v1/healthz",
+            "the historical default must survive"
+        );
+    }
+
+    #[test]
+    fn endpoint_ignores_an_empty_mse_http() {
+        let _lock = env_lock();
+        let _env = EnvVar::set("MSE_HTTP", Some(""));
+        assert_eq!(
+            Endpoint::resolve(None).url("/v1/healthz"),
+            "http://127.0.0.1:7777/v1/healthz",
+            "an empty value is 'unset', not an empty base URL"
+        );
+    }
+
+    #[test]
+    fn access_token_header_is_none_when_the_env_is_unset() {
+        let _lock = env_lock();
+        let _env = TokenEnv::set(None);
+        assert!(access_token_header().is_none());
+    }
+
+    #[test]
+    fn access_token_header_is_none_when_the_env_is_empty() {
+        let _lock = env_lock();
+        let _env = TokenEnv::set(Some(""));
+        assert!(
+            access_token_header().is_none(),
+            "an empty token is 'no perimeter', not a header with an empty value"
+        );
+    }
+
+    #[test]
+    fn access_token_header_is_marked_sensitive() {
+        let _lock = env_lock();
+        let _env = TokenEnv::set(Some("secret-value"));
+        let header = access_token_header().expect("a non-empty token yields a header");
+        assert!(
+            header.is_sensitive(),
+            "the header must be marked sensitive so reqwest/http debug output redacts it"
+        );
+    }
+
+    #[test]
+    fn access_token_header_is_none_when_the_value_is_not_header_safe() {
+        let _lock = env_lock();
+        let _env = TokenEnv::set(Some("bad\nvalue"));
+        assert!(
+            access_token_header().is_none(),
+            "a value that cannot be a header must be dropped, not panic the caller"
+        );
+    }
+
+    /// Spawns a stub that records the access-token header of whatever
+    /// request reaches `/probe`, and returns `(base_url, recorded)`.
+    async fn spawn_header_recorder() -> (String, Arc<Mutex<Option<Option<String>>>>) {
+        use axum::extract::State;
+        use axum::http::HeaderMap as AxumHeaderMap;
+        use axum::routing::get;
+        use axum::Router;
+
+        let recorded: Arc<Mutex<Option<Option<String>>>> = Arc::new(Mutex::new(None));
+        let router = Router::new()
+            .route(
+                "/probe",
+                get(
+                    |State(sink): State<Arc<Mutex<Option<Option<String>>>>>,
+                     headers: AxumHeaderMap| async move {
+                        let seen = headers
+                            .get(ACCESS_TOKEN_HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        *sink.lock().expect("sink lock") = Some(seen);
+                        "ok"
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&recorded));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (format!("http://{addr}"), recorded)
+    }
+
+    #[tokio::test]
+    async fn client_builder_attaches_the_access_token_header_to_requests() {
+        // The client bakes the header in at build time, so the env only has
+        // to be set while building — never while awaiting.
+        let client = {
+            let _lock = env_lock();
+            let _env = TokenEnv::set(Some("tok-abc"));
+            client_builder().build().expect("build client")
+        };
+
+        let (base, recorded) = spawn_header_recorder().await;
+        let response = client
+            .get(format!("{base}/probe"))
+            .send()
+            .await
+            .expect("request reaches the stub");
+        assert!(response.status().is_success());
+
+        let seen = recorded.lock().expect("sink lock").clone();
+        assert_eq!(
+            seen,
+            Some(Some("tok-abc".to_string())),
+            "every request from this client must carry the L0 header"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_builder_omits_the_header_when_the_env_is_unset() {
+        let client = {
+            let _lock = env_lock();
+            let _env = TokenEnv::set(None);
+            client_builder().build().expect("build client")
+        };
+
+        let (base, recorded) = spawn_header_recorder().await;
+        client
+            .get(format!("{base}/probe"))
+            .send()
+            .await
+            .expect("request reaches the stub");
+
+        let seen = recorded.lock().expect("sink lock").clone();
+        assert_eq!(
+            seen,
+            Some(None),
+            "no token configured must mean no header — byte-identical to a server without a perimeter"
+        );
+    }
+
+    /// The behavior that produced the `up: false` report on a healthy
+    /// server. It is deliberate — following a cross-host redirect would
+    /// re-send the access token to the redirect target — so this test pins
+    /// it rather than arguing with it. What must change is elsewhere: the
+    /// caller has to be able to say `https` in the first place, and has to
+    /// report the `301` instead of collapsing it to `false`.
+    #[tokio::test]
+    async fn client_builder_does_not_follow_redirects() {
+        use axum::http::{header, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+
+        let target_hit = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&target_hit);
+        let router = Router::new()
+            .route(
+                "/redirect",
+                get(|| async { (StatusCode::MOVED_PERMANENTLY, [(header::LOCATION, "/target")]) }),
+            )
+            .route(
+                "/target",
+                get(move || {
+                    let flag = Arc::clone(&flag);
+                    async move {
+                        flag.store(true, Ordering::SeqCst);
+                        "arrived"
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let client = client_builder().build().expect("build client");
+        let response = client
+            .get(format!("http://{addr}/redirect"))
+            .send()
+            .await
+            .expect("request reaches the stub");
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::MOVED_PERMANENTLY,
+            "the 301 must surface to the caller, not be followed away"
+        );
+        assert!(
+            !target_hit.load(Ordering::SeqCst),
+            "the redirect target must never be requested — that is what keeps the \
+             access token from reaching another host"
+        );
+    }
+}
