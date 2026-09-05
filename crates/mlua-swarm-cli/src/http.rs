@@ -71,7 +71,15 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7777";
 /// A value that already names a scheme is used as given; a bare `host:port`
 /// gets `http://`, which is what every historical caller passed and meant.
 pub struct Endpoint {
+    /// The resolved base, scheme included, trailing slash trimmed — the
+    /// text form every report and log line shows.
     base: String,
+    /// The same base as a parsed URL, or why it does not parse. Every
+    /// request URL this binary makes is derived from this value by
+    /// [`Endpoint::url`] / [`Endpoint::api`] / [`Endpoint::ws`], so a
+    /// scheme, a host with a port, a path prefix, and percent-encoding are
+    /// all the `url` crate's business and never a `format!`'s.
+    parsed: Result<reqwest::Url, String>,
     source: EndpointSource,
 }
 
@@ -130,8 +138,23 @@ impl Endpoint {
             format!("http://{raw}")
         };
 
+        let base = based.trim_end_matches('/').to_owned();
+        let parsed = reqwest::Url::parse(&base)
+            .map_err(|e| format!("{} {base:?} is not a URL: {e}", source.as_str()))
+            .and_then(|url| {
+                if url.cannot_be_a_base() || url.host_str().is_none() {
+                    Err(format!(
+                        "{} {base:?} names no host — a server endpoint is `scheme://host[:port]`",
+                        source.as_str()
+                    ))
+                } else {
+                    Ok(url)
+                }
+            });
+
         Self {
-            base: based.trim_end_matches('/').to_owned(),
+            base,
+            parsed,
             source,
         }
     }
@@ -141,13 +164,60 @@ impl Endpoint {
         self.source
     }
 
-    /// Joins an absolute path (`/v1/doctor`) onto the resolved base.
-    pub fn url(&self, path: &str) -> String {
+    /// Joins an absolute path (`/v1/doctor`, optionally with a `?query`)
+    /// onto the resolved base. The path is split into segments and appended
+    /// under the base's own path, so a base mounted under a prefix keeps
+    /// it, and each segment is percent-encoded by the `url` crate.
+    pub fn url(&self, path: &str) -> Result<reqwest::Url, String> {
         debug_assert!(
             path.starts_with('/'),
             "Endpoint::url takes an absolute path, got {path:?}"
         );
-        format!("{}{}", self.base, path)
+        let (path, query) = match path.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (path, None),
+        };
+        let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        let mut url = self.api(&segments)?;
+        url.set_query(query);
+        Ok(url)
+    }
+
+    /// The URL for one API route, given as path segments
+    /// (`["v1", "blueprints", id]`). Segments are appended under the base's
+    /// path and percent-encoded, so an id containing `/` or `?` cannot
+    /// change the route it lands on.
+    pub fn api(&self, segments: &[&str]) -> Result<reqwest::Url, String> {
+        let mut url = self.parsed.clone()?;
+        {
+            let mut path = url
+                .path_segments_mut()
+                .map_err(|()| format!("{:?} cannot carry a path", self.base))?;
+            path.pop_if_empty();
+            path.extend(segments.iter().filter(|s| !s.is_empty()));
+        }
+        url.set_query(None);
+        Ok(url)
+    }
+
+    /// [`Endpoint::api`] on the WebSocket scheme that pairs with the base's:
+    /// `http` → `ws`, `https` → `wss`. Any other scheme is refused rather
+    /// than guessed.
+    pub fn ws(&self, segments: &[&str]) -> Result<reqwest::Url, String> {
+        let mut url = self.api(segments)?;
+        let scheme = match url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            other => {
+                return Err(format!(
+                    "{:?}: no WebSocket scheme pairs with {other:?} (expected http or https)",
+                    self.base
+                ))
+            }
+        };
+        url.set_scheme(scheme)
+            .map_err(|()| format!("{:?}: could not switch to {scheme}", self.base))?;
+        Ok(url)
     }
 
     /// The resolved base URL, scheme included, without a trailing slash.
@@ -344,7 +414,7 @@ mod tests {
     fn endpoint_accepts_an_https_base_url() {
         let endpoint = Endpoint::resolve(Some("https://example.com"));
         assert_eq!(
-            endpoint.url("/v1/doctor"),
+            endpoint.url("/v1/doctor").unwrap().as_str(),
             "https://example.com/v1/doctor",
             "a base URL that already names its scheme must be used as given"
         );
@@ -354,7 +424,7 @@ mod tests {
     fn endpoint_accepts_an_http_base_url_without_doubling_the_scheme() {
         let endpoint = Endpoint::resolve(Some("http://example.com:7777"));
         assert_eq!(
-            endpoint.url("/v1/healthz"),
+            endpoint.url("/v1/healthz").unwrap().as_str(),
             "http://example.com:7777/v1/healthz"
         );
     }
@@ -363,7 +433,7 @@ mod tests {
     fn endpoint_completes_the_scheme_for_a_bare_host_port() {
         let endpoint = Endpoint::resolve(Some("127.0.0.1:7777"));
         assert_eq!(
-            endpoint.url("/v1/doctor"),
+            endpoint.url("/v1/doctor").unwrap().as_str(),
             "http://127.0.0.1:7777/v1/doctor",
             "the historical host:port shape must keep working unchanged"
         );
@@ -373,10 +443,88 @@ mod tests {
     fn endpoint_tolerates_a_trailing_slash_on_the_base() {
         let endpoint = Endpoint::resolve(Some("https://example.com/"));
         assert_eq!(
-            endpoint.url("/v1/doctor"),
+            endpoint.url("/v1/doctor").unwrap().as_str(),
             "https://example.com/v1/doctor",
             "a trailing slash must not produce a doubled separator"
         );
+    }
+
+    /// Ids are path segments, not format arguments: a `/` or `?` in one is
+    /// percent-encoded and cannot change which route the request lands on.
+    #[test]
+    fn endpoint_api_encodes_each_segment() {
+        let endpoint = Endpoint::resolve(Some("https://example.com"));
+        assert_eq!(
+            endpoint
+                .api(&["v1", "blueprints", "a/b?c"])
+                .unwrap()
+                .as_str(),
+            "https://example.com/v1/blueprints/a%2Fb%3Fc"
+        );
+    }
+
+    /// A base mounted under a path prefix keeps it — the failure a
+    /// `Url::join("/v1/…")` would have produced by resetting to the root.
+    #[test]
+    fn endpoint_keeps_a_path_prefix_on_the_base() {
+        let endpoint = Endpoint::resolve(Some("https://example.com/mse/"));
+        assert_eq!(
+            endpoint.url("/v1/doctor").unwrap().as_str(),
+            "https://example.com/mse/v1/doctor"
+        );
+        assert_eq!(
+            endpoint.api(&["v1", "runs", "R-1"]).unwrap().as_str(),
+            "https://example.com/mse/v1/runs/R-1"
+        );
+    }
+
+    /// `url` keeps a `?query` the caller wrote into the path; `api` never
+    /// carries one over from the base.
+    #[test]
+    fn endpoint_url_carries_the_callers_query() {
+        let endpoint = Endpoint::resolve(Some("http://127.0.0.1:7777"));
+        assert_eq!(
+            endpoint.url("/v1/runs/R-1/trace?latest=50").unwrap().as_str(),
+            "http://127.0.0.1:7777/v1/runs/R-1/trace?latest=50"
+        );
+    }
+
+    /// The WebSocket scheme pairs with the base's; another scheme is an
+    /// error, not a guess.
+    #[test]
+    fn endpoint_ws_pairs_the_scheme() {
+        assert_eq!(
+            Endpoint::resolve(Some("http://127.0.0.1:7777"))
+                .ws(&["v1", "operators", "S-1", "ws"])
+                .unwrap()
+                .as_str(),
+            "ws://127.0.0.1:7777/v1/operators/S-1/ws"
+        );
+        assert_eq!(
+            Endpoint::resolve(Some("https://example.com"))
+                .ws(&["v1", "operators", "S-1", "ws"])
+                .unwrap()
+                .as_str(),
+            "wss://example.com/v1/operators/S-1/ws"
+        );
+        assert!(Endpoint::resolve(Some("ftp://example.com"))
+            .ws(&["v1"])
+            .is_err());
+    }
+
+    /// An endpoint that is not a URL is reported as such at the first
+    /// request, naming the layer that supplied it — never silently
+    /// replaced by the default.
+    #[test]
+    fn endpoint_that_does_not_parse_fails_loud_and_names_its_source() {
+        let endpoint = Endpoint::resolve(Some("http://"));
+        assert_eq!(endpoint.base(), "http:");
+        let err = endpoint.url("/v1/healthz").unwrap_err();
+        assert!(err.contains("bind argument"), "{err}");
+        let err = Endpoint::resolve(Some("not a url at all"))
+            .api(&["v1"])
+            .unwrap_err();
+        assert!(err.contains("bind argument"), "{err}");
     }
 
     /// "Where are we connected?" was answerable; "why there?" was not, and
@@ -422,7 +570,7 @@ mod tests {
         let _lock = env_lock();
         let _env = EnvVar::set("MSE_HTTP", Some("https://example.com"));
         assert_eq!(
-            Endpoint::resolve(None).url("/v1/doctor"),
+            Endpoint::resolve(None).url("/v1/doctor").unwrap().as_str(),
             "https://example.com/v1/doctor",
             "the bind path and the operator path must resolve to one server"
         );
@@ -433,7 +581,7 @@ mod tests {
         let _lock = env_lock();
         let _env = EnvVar::set("MSE_HTTP", None);
         assert_eq!(
-            Endpoint::resolve(None).url("/v1/healthz"),
+            Endpoint::resolve(None).url("/v1/healthz").unwrap().as_str(),
             "http://127.0.0.1:7777/v1/healthz",
             "the historical default must survive"
         );
@@ -444,7 +592,7 @@ mod tests {
         let _lock = env_lock();
         let _env = EnvVar::set("MSE_HTTP", Some(""));
         assert_eq!(
-            Endpoint::resolve(None).url("/v1/healthz"),
+            Endpoint::resolve(None).url("/v1/healthz").unwrap().as_str(),
             "http://127.0.0.1:7777/v1/healthz",
             "an empty value is 'unset', not an empty base URL"
         );

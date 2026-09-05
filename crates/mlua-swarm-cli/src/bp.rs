@@ -81,8 +81,10 @@ struct BuildArgs {
     /// POST the built JSON to a running `mse serve` (`/v1/blueprints/:id`).
     #[arg(long)]
     register: bool,
-    /// Server bind address for `--register` (`host:port`, no scheme).
-    /// Defaults to `mse serve`'s own default bind.
+    /// Where `mse serve` is, for `--register`: a base URL (`https://host`,
+    /// scheme included) or a bare `host:port` (which gets `http://`).
+    /// Omitted falls back to `MSE_HTTP`, then to the loopback default —
+    /// the same resolution every other request in this binary uses.
     #[arg(long)]
     server: Option<String>,
     /// Additional directory to search when resolving `$agent_md` /
@@ -162,12 +164,6 @@ struct NewArgs {
     #[arg(short = 'o', long = "out")]
     out: Option<PathBuf>,
 }
-
-/// Default `mse serve` bind address. Kept as a local literal (matching
-/// `mcp::server_control::DEFAULT_BIND`'s value) rather than reaching
-/// into that bin-private module — see `server_control.rs` for the
-/// source of truth this default tracks.
-const DEFAULT_SERVER: &str = "127.0.0.1:7777";
 
 /// Entry point wired from `main.rs`'s `Cmd::Bp` arm.
 pub async fn run(args: BpArgs) -> Result<()> {
@@ -1499,17 +1495,22 @@ pub(crate) async fn register(
     bp_value: &serde_json::Value,
     server: Option<&str>,
 ) -> Result<RegisterOutcome> {
-    let server = server.unwrap_or(DEFAULT_SERVER);
     let id = bp_value
         .get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("register: Blueprint JSON has no top-level 'id' string field"))?;
-    let url = format!("http://{server}/v1/blueprints/{id}");
+    // `server` may be a whole base URL (`https://host`) or a bare
+    // `host:port`; absent, it falls through `MSE_HTTP` to the loopback
+    // default — the same resolution every other request in this binary
+    // uses. The id is one path segment, percent-encoded by the URL type.
+    let url = crate::http::Endpoint::resolve(server)
+        .api(&["v1", "blueprints", id])
+        .map_err(|e| anyhow!("register: {e}"))?;
     let client = crate::http::client_builder()
         .build()
         .expect("http client build");
     let resp = client
-        .post(&url)
+        .post(url.clone())
         .json(bp_value)
         .send()
         .await
@@ -1520,7 +1521,7 @@ pub(crate) async fn register(
         return Err(anyhow!("register: {url} returned HTTP {status}: {body}"));
     }
     Ok(RegisterOutcome {
-        url,
+        url: url.to_string(),
         http_status: status.as_u16(),
         body,
     })

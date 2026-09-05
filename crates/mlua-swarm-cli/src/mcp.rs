@@ -141,12 +141,14 @@ impl MseServer {
 /// error (HTTP client build / send / non-2xx / non-JSON body / timeout) —
 /// callers fall back to the local run store trace.
 async fn fetch_run_via_http(bind: &str, run_id: &str) -> Option<JsonValue> {
-    let url = crate::http::Endpoint::resolve(Some(bind)).url(&format!("/v1/runs/{run_id}"));
+    let url = crate::http::Endpoint::resolve(Some(bind))
+        .api(&["v1", "runs", run_id])
+        .ok()?;
     let client = crate::http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .ok()?;
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -170,13 +172,15 @@ enum RunFetchError {
 /// surfaces as `invalid_params` and an unreachable server as
 /// `internal_error` instead of both becoming an empty report.
 async fn fetch_run_strict(bind: &str, run_id: &str) -> Result<JsonValue, RunFetchError> {
-    let url = crate::http::Endpoint::resolve(Some(bind)).url(&format!("/v1/runs/{run_id}"));
+    let url = crate::http::Endpoint::resolve(Some(bind))
+        .api(&["v1", "runs", run_id])
+        .map_err(RunFetchError::Transport)?;
     let client = crate::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| RunFetchError::Transport(format!("client build: {e}")))?;
     let resp = client
-        .get(&url)
+        .get(url.clone())
         .send()
         .await
         .map_err(|e| RunFetchError::Transport(format!("GET {url}: {e}")))?;
@@ -309,13 +313,15 @@ fn aggregate_run_stats(step_entries: &[JsonValue]) -> JsonValue {
 /// RunTrace tail `swarm_status` folds into `log_tail`. Same silent-`None`
 /// error contract as [`fetch_run_via_http`].
 async fn fetch_trace_tail_via_http(bind: &str, run_id: &str) -> Option<Vec<JsonValue>> {
-    let url = crate::http::Endpoint::resolve(Some(bind))
-        .url(&format!("/v1/runs/{run_id}/trace?latest=50"));
+    let mut url = crate::http::Endpoint::resolve(Some(bind))
+        .api(&["v1", "runs", run_id, "trace"])
+        .ok()?;
+    url.query_pairs_mut().append_pair("latest", "50");
     let client = crate::http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .ok()?;
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -558,7 +564,8 @@ async fn dispatch_block_spawn(
 }
 
 /// Fetches the step's worker payload and runs the block named by the
-/// spawn's agent under `MSE_BLOCKS_DIR`.
+/// spawn's agent under the blocks dir (`MSE_BLOCKS_DIR`, else
+/// `$MSE_HOME/blocks`).
 async fn run_block_spawn(
     client: &reqwest::Client,
     base: &str,
@@ -567,9 +574,9 @@ async fn run_block_spawn(
     let dir = block_runner::blocks_dir()?;
     let script = block_runner::resolve_block_script(&dir, &spawn.agent)?;
 
-    let url = format!("{base}/v1/worker/prompt");
+    let url = worker_prompt_endpoint_url(base)?;
     let resp = client
-        .get(&url)
+        .get(url)
         .query(&[("task_id", spawn.task_id.as_str())])
         .header("Authorization", format!("Bearer {}", spawn.worker_handle))
         .send()
@@ -3233,10 +3240,8 @@ struct StatsInput {
 /// url::Url` re-export, not as a direct dependency, so its `ParseError`
 /// type is deliberately not named in this signature).
 fn worker_submit_endpoint_url(base_url: &str, name: Option<&str>) -> Result<reqwest::Url, String> {
-    let base = base_url.trim_end_matches('/');
     let path = if name.is_some() { "artifact" } else { "submit" };
-    let mut url =
-        reqwest::Url::parse(&format!("{base}/v1/worker/{path}")).map_err(|e| e.to_string())?;
+    let mut url = crate::http::Endpoint::resolve(Some(base_url)).api(&["v1", "worker", path])?;
     if let Some(name) = name {
         url.query_pairs_mut().append_pair("name", name);
     }
@@ -3252,8 +3257,7 @@ fn worker_submit_endpoint_url(base_url: &str, name: Option<&str>) -> Result<reqw
 /// key. Pure and side-effect-free, mirroring `worker_submit_endpoint_url`'s
 /// own unit-testable shape.
 fn worker_degradation_endpoint_url(base_url: &str) -> Result<reqwest::Url, String> {
-    let base = base_url.trim_end_matches('/');
-    reqwest::Url::parse(&format!("{base}/v1/worker/degradation")).map_err(|e| e.to_string())
+    crate::http::Endpoint::resolve(Some(base_url)).api(&["v1", "worker", "degradation"])
 }
 
 // convention-token-ok: mse_worker_submit is a mlua-swarm public MCP tool name.
@@ -3262,8 +3266,13 @@ fn worker_degradation_endpoint_url(base_url: &str) -> Result<reqwest::Url, Strin
 /// and error contract as [`worker_degradation_endpoint_url`] — trailing
 /// slash trimmed, no query params, pure and unit-testable.
 fn worker_stats_endpoint_url(base_url: &str) -> Result<reqwest::Url, String> {
-    let base = base_url.trim_end_matches('/');
-    reqwest::Url::parse(&format!("{base}/v1/worker/stats")).map_err(|e| e.to_string())
+    crate::http::Endpoint::resolve(Some(base_url)).api(&["v1", "worker", "stats"])
+}
+
+/// Builds the `/v1/worker/prompt` endpoint URL — the fetch side of the
+/// worker contract, shared by `mse_worker_fetch` and the block runner.
+fn worker_prompt_endpoint_url(base_url: &str) -> Result<reqwest::Url, String> {
+    crate::http::Endpoint::resolve(Some(base_url)).api(&["v1", "worker", "prompt"])
 }
 
 // ---- tool param schemas ----
@@ -3702,7 +3711,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Pop one pending server frame (ask / hook_before / hook_after / spawn) for `sid`, waiting up to `timeout_ms` (default 30000) if the queue is empty. Returns {timed_out, req_id?, type?, payload?} on delivery — `type` mirrors the server's ServerMsg discriminant, `payload` carries the remaining frame fields verbatim. Returns {timed_out: true} on timeout. Reply via mse_ack with a matching `kind`. A spawn whose `worker.variant` is `agent-block` never reaches this queue: this process runs that block itself, on this host, with no SubAgent and without waiting for anyone to poll — the WS reader diverts it the moment it arrives (so it runs during a blocking `swarm_run` too), and a background task resolves `<MSE_BLOCKS_DIR>/<agent name>/init.lua`, fetches the step's prompt through the worker endpoint, runs the script with the launch's work_dir as project root, POSTs staged parts and the body the way a SubAgent would, and acks the spawn. `blocks_dispatched` counts the spawns diverted that way since the previous call (a block that fails — missing `MSE_BLOCKS_DIR`, unknown block, script error — is submitted as a failed attempt with the reason as its body, never silently dropped). Guide: `mse://guides/agent-block-runner`."
+        description = "Pop one pending server frame (ask / hook_before / hook_after / spawn) for `sid`, waiting up to `timeout_ms` (default 30000) if the queue is empty. Returns {timed_out, req_id?, type?, payload?} on delivery — `type` mirrors the server's ServerMsg discriminant, `payload` carries the remaining frame fields verbatim. Returns {timed_out: true} on timeout. Reply via mse_ack with a matching `kind`. A spawn whose `worker.variant` is `agent-block` never reaches this queue: this process runs that block itself, on this host, with no SubAgent and without waiting for anyone to poll — the WS reader diverts it the moment it arrives (so it runs during a blocking `swarm_run` too), and a background task resolves `<blocks dir>/<agent name>/init.lua` (blocks dir = `MSE_BLOCKS_DIR`, else `$MSE_HOME/blocks`), fetches the step's prompt through the worker endpoint, runs the script with the launch's work_dir as project root, POSTs staged parts and the body the way a SubAgent would, and acks the spawn. `blocks_dispatched` counts the spawns diverted that way since the previous call (a block that fails — no blocks dir, unknown block, script error — is submitted as a failed attempt with the reason as its body, never silently dropped). Guide: `mse://guides/agent-block-runner`."
     )]
     async fn mse_pending_wait(
         &self,
@@ -3831,13 +3840,14 @@ impl MseServer {
         let task_id = StepId::parse(task_id_raw)
             .map_err(|e| McpError::invalid_params(format!("invalid task_id: {e}"), None))?;
         let base = base_url.trim_end_matches('/');
-        let url = format!("{base}/v1/worker/prompt");
+        let url = worker_prompt_endpoint_url(base)
+            .map_err(|e| McpError::invalid_params(format!("invalid base_url: {e}"), None))?;
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
         let resp = client
-            .get(&url)
+            .get(url)
             .query(&[("task_id", task_id.as_str())])
             .header("Authorization", format!("Bearer {}", req.worker_handle))
             .send()
@@ -4593,7 +4603,9 @@ impl MseServer {
         }
 
         let bind = bind.unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
-        let url = crate::http::Endpoint::resolve(Some(&bind)).url("/v1/tasks");
+        let url = crate::http::Endpoint::resolve(Some(&bind))
+            .url("/v1/tasks")
+            .map_err(|e| McpError::invalid_params(format!("invalid bind: {e}"), None))?;
 
         let mut operator_obj = serde_json::Map::new();
         if let Some(k) = operator_kind {
@@ -4682,7 +4694,7 @@ impl MseServer {
             }
         };
 
-        let resp = match client.post(&url).json(&payload).send().await {
+        let resp = match client.post(url.clone()).json(&payload).send().await {
             Ok(r) => r,
             Err(e) => {
                 let mut inner = self.state.write().await;
@@ -4947,14 +4959,15 @@ impl MseServer {
                 "note": "Pass confirm=true to archive. Reversible via bp_unarchive (marker commit; audit-trail preserved).",
             }));
         }
-        let url =
-            crate::http::Endpoint::resolve(Some(&bind)).url(&format!("/v1/blueprints/{}", req.id));
+        let url = crate::http::Endpoint::resolve(Some(&bind))
+            .api(&["v1", "blueprints", &req.id])
+            .map_err(|e| McpError::invalid_params(format!("invalid bind: {e}"), None))?;
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
         let resp = client
-            .delete(&url)
+            .delete(url)
             .send()
             .await
             .map_err(|e| McpError::internal_error(format!("archive: {e}"), None))?;
@@ -5245,13 +5258,14 @@ impl MseServer {
             .bind
             .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
         let url = crate::http::Endpoint::resolve(Some(&bind))
-            .url(&format!("/v1/blueprints/{}/unarchive", req.id));
+            .api(&["v1", "blueprints", &req.id, "unarchive"])
+            .map_err(|e| McpError::invalid_params(format!("invalid bind: {e}"), None))?;
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
         let resp = client
-            .post(&url)
+            .post(url)
             .send()
             .await
             .map_err(|e| McpError::internal_error(format!("unarchive: {e}"), None))?;
@@ -5284,13 +5298,14 @@ impl MseServer {
             req.disable_block,
         );
         let url = crate::http::Endpoint::resolve(Some(&bind))
-            .url(&format!("/v1/blueprints/{}/head", req.id));
+            .api(&["v1", "blueprints", &req.id, "head"])
+            .map_err(|e| McpError::invalid_params(format!("invalid bind: {e}"), None))?;
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
         let resp = client
-            .get(&url)
+            .get(url)
             .send()
             .await
             .map_err(|e| McpError::internal_error(format!("bp_doctor fetch: {e}"), None))?;
@@ -5386,8 +5401,9 @@ impl MseServer {
             // `last_rendered_bytes: null` is a normal response
             // (agent never dispatched) — always 200, never a 404.
             let render_size_url = crate::http::Endpoint::resolve(Some(&bind))
-                .url(&format!("/v1/agents/{}/render-size", agent.name));
-            let last_rendered_bytes: Option<usize> = match client.get(&render_size_url).send().await
+                .api(&["v1", "agents", &agent.name, "render-size"])
+                .map_err(|e| McpError::invalid_params(format!("invalid bind: {e}"), None))?;
+            let last_rendered_bytes: Option<usize> = match client.get(render_size_url).send().await
             {
                 Ok(resp) if resp.status().is_success() => resp
                     .json::<JsonValue>()
@@ -5783,16 +5799,15 @@ impl MseServer {
         let bind = req
             .bind
             .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
-        let url = crate::http::Endpoint::resolve(Some(&bind)).url(&format!(
-            "/v1/blueprints/{}/agents/{}/explain",
-            req.bp_id, req.agent
-        ));
+        let url = crate::http::Endpoint::resolve(Some(&bind))
+            .api(&["v1", "blueprints", &req.bp_id, "agents", &req.agent, "explain"])
+            .map_err(|e| McpError::invalid_params(format!("invalid bind: {e}"), None))?;
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
         let resp =
-            client.get(&url).send().await.map_err(|e| {
+            client.get(url).send().await.map_err(|e| {
                 McpError::internal_error(format!("bp_explain_agent fetch: {e}"), None)
             })?;
         let status = resp.status();
@@ -5885,9 +5900,10 @@ impl MseServer {
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
 
         let batch_url = crate::http::Endpoint::resolve(Some(&bind))
-            .url(&format!("/v1/blueprints/{}/agents/explain", req.bp_id));
+            .api(&["v1", "blueprints", &req.bp_id, "agents", "explain"])
+            .map_err(|e| McpError::invalid_params(format!("invalid bind: {e}"), None))?;
         let batch_resp =
-            client.get(&batch_url).send().await.map_err(|e| {
+            client.get(batch_url).send().await.map_err(|e| {
                 McpError::internal_error(format!("bp_explain_agents fetch: {e}"), None)
             })?;
         let batch_status = batch_resp.status();
@@ -5905,8 +5921,9 @@ impl MseServer {
         })?;
 
         let head_url = crate::http::Endpoint::resolve(Some(&bind))
-            .url(&format!("/v1/blueprints/{}/head", req.bp_id));
-        let head_resp = client.get(&head_url).send().await.map_err(|e| {
+            .api(&["v1", "blueprints", &req.bp_id, "head"])
+            .map_err(|e| McpError::invalid_params(format!("invalid bind: {e}"), None))?;
+        let head_resp = client.get(head_url).send().await.map_err(|e| {
             McpError::internal_error(format!("bp_explain_agents head fetch: {e}"), None)
         })?;
         let head_status = head_resp.status();
@@ -6028,18 +6045,23 @@ impl MseServer {
         let server_up = server_status.up;
 
         let server_info: JsonValue = if server_up {
-            let url = crate::http::Endpoint::resolve(Some(&bind)).url("/v1/doctor");
-            match crate::http::client_builder()
-                .timeout(Duration::from_secs(3))
-                .build()
-            {
-                Ok(client) => match client.get(&url).send().await {
+            match crate::http::Endpoint::resolve(Some(&bind))
+                .url("/v1/doctor")
+                .map_err(|e| format!("doctor url: {e}"))
+                .and_then(|url| {
+                    crate::http::client_builder()
+                        .timeout(Duration::from_secs(3))
+                        .build()
+                        .map(|client| (client, url))
+                        .map_err(|e| format!("client build: {e}"))
+                }) {
+                Ok((client, url)) => match client.get(url).send().await {
                     Ok(r) => r.json::<JsonValue>().await.unwrap_or_else(
                         |e| serde_json::json!({"error": format!("doctor decode: {e}")}),
                     ),
                     Err(e) => serde_json::json!({"error": format!("doctor fetch: {e}")}),
                 },
-                Err(e) => serde_json::json!({"error": format!("client build: {e}")}),
+                Err(e) => serde_json::json!({"error": e}),
             }
         } else {
             // Nothing was read, so there is nothing the server said. The
@@ -6084,9 +6106,12 @@ impl MseServer {
                         let Some(task_id) = task_id else {
                             continue;
                         };
-                        let url = crate::http::Endpoint::resolve(Some(&bind))
-                            .url(&format!("/v1/tasks/{task_id}/runs/{run_id}/steps"));
-                        match client.get(&url).send().await {
+                        let Ok(url) = crate::http::Endpoint::resolve(Some(&bind))
+                            .api(&["v1", "tasks", &task_id, "runs", &run_id, "steps"])
+                        else {
+                            continue;
+                        };
+                        match client.get(url).send().await {
                             Ok(resp) if resp.status().is_success() => {
                                 match resp.json::<JsonValue>().await {
                                     Ok(steps_body) => {
@@ -6137,9 +6162,12 @@ impl MseServer {
                         let Some(task_id) = task_id else {
                             continue;
                         };
-                        let url = crate::http::Endpoint::resolve(Some(&bind))
-                            .url(&format!("/v1/runs/{run_id}"));
-                        match client.get(&url).send().await {
+                        let Ok(url) =
+                            crate::http::Endpoint::resolve(Some(&bind)).api(&["v1", "runs", &run_id])
+                        else {
+                            continue;
+                        };
+                        match client.get(url).send().await {
                             Ok(resp) if resp.status().is_success() => {
                                 match resp.json::<JsonValue>().await {
                                     Ok(run_body) => {
@@ -6285,7 +6313,9 @@ impl MseServer {
 
         let method = req.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
         let endpoint = crate::http::Endpoint::resolve(None);
-        let url = endpoint.url(&req.path);
+        let url = endpoint
+            .url(&req.path)
+            .map_err(|e| McpError::invalid_params(e, None))?;
 
         let client = crate::http::client_builder()
             .timeout(Duration::from_secs(30))
@@ -6293,10 +6323,10 @@ impl MseServer {
             .map_err(|e| McpError::internal_error(format!("client build: {e}"), None))?;
 
         let request = match method.as_str() {
-            "GET" => client.get(&url),
-            "POST" => client.post(&url),
-            "PATCH" => client.patch(&url),
-            "DELETE" => client.delete(&url),
+            "GET" => client.get(url.clone()),
+            "POST" => client.post(url.clone()),
+            "PATCH" => client.patch(url.clone()),
+            "DELETE" => client.delete(url.clone()),
             other => {
                 return Err(McpError::invalid_params(
                     format!("unsupported method {other:?} (GET / POST / PATCH / DELETE)"),
@@ -6317,7 +6347,12 @@ impl MseServer {
         let text = response.text().await.unwrap_or_default();
 
         json_result(&http_report(
-            &endpoint, &method, &req.path, &url, status, text,
+            &endpoint,
+            &method,
+            &req.path,
+            url.as_str(),
+            status,
+            text,
         ))
     }
 
@@ -6518,19 +6553,20 @@ impl MseServer {
             .bind
             .clone()
             .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
-        let url = crate::http::Endpoint::resolve(Some(&bind))
-            .url(&format!("/v1/runs/{}/cancel", req.run_id));
-        let server_ok = match crate::http::client_builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-        {
-            Ok(client) => client
-                .post(&url)
+        let url = crate::http::Endpoint::resolve(Some(&bind)).api(&["v1", "runs", &req.run_id, "cancel"]);
+        let server_ok = match (
+            url,
+            crate::http::client_builder()
+                .timeout(Duration::from_secs(5))
+                .build(),
+        ) {
+            (Ok(url), Ok(client)) => client
+                .post(url)
                 .send()
                 .await
                 .map(|r| r.status().is_success())
                 .unwrap_or(false),
-            Err(_) => false,
+            _ => false,
         };
         if !has_local && !server_ok {
             return Err(McpError::invalid_params(
@@ -7100,15 +7136,19 @@ async fn fetch_system_ref_bytes(
 ) -> Result<Vec<u8>, String> {
     match system_ref.mode {
         mlua_swarm::types::SystemRefMode::Http => {
-            let url = if system_ref.uri.starts_with("http://")
-                || system_ref.uri.starts_with("https://")
-            {
-                system_ref.uri.clone()
+            // An absolute `uri` names its own host; a path is joined onto
+            // the base the prompt came from, by the URL type — never by
+            // string concatenation.
+            let url = if system_ref.uri.contains("://") {
+                reqwest::Url::parse(&system_ref.uri)
+                    .map_err(|e| format!("system_ref.uri {:?}: {e}", system_ref.uri))?
             } else {
-                format!("{base}{}", system_ref.uri)
+                crate::http::Endpoint::resolve(Some(base))
+                    .url(&system_ref.uri)
+                    .map_err(|e| format!("system_ref.uri {:?}: {e}", system_ref.uri))?
             };
             let resp = client
-                .get(&url)
+                .get(url.clone())
                 .send()
                 .await
                 .map_err(|e| format!("download {url}: {e}"))?;

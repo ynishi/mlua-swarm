@@ -609,7 +609,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // restored session is built with the same base URL a freshly
     // connected one gets.
     let base_url: Option<std::sync::Arc<str>> = if cfg.inject_endpoint_for_worker {
-        Some(format!("http://{}", cfg.bind).into())
+        // The listener speaks plain http on `bind`; the scheme completion
+        // and normalization are `Endpoint`'s, the same as every client-side
+        // base URL in this binary.
+        Some(
+            crate::http::Endpoint::resolve(Some(&cfg.bind.to_string()))
+                .base()
+                .into(),
+        )
     } else {
         None
     };

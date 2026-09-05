@@ -116,7 +116,21 @@ impl HealthzProbe {
 /// `bind` may be a whole base URL (`https://host`) or a bare `host:port`;
 /// see [`crate::http::Endpoint`] for the resolution rules.
 pub async fn healthz_probe(bind: &str) -> HealthzProbe {
-    let url = crate::http::Endpoint::resolve(Some(bind)).url("/v1/healthz");
+    let endpoint = crate::http::Endpoint::resolve(Some(bind));
+    let url = match endpoint.url("/v1/healthz") {
+        Ok(url) => url,
+        Err(e) => {
+            // Nothing was probed: the endpoint itself does not parse. The
+            // text form is still reported so the reader sees what was
+            // tried.
+            return HealthzProbe {
+                url: format!("{}/v1/healthz", endpoint.base()),
+                status: None,
+                ok: false,
+                error: Some(e),
+            };
+        }
+    };
 
     let client = match crate::http::client_builder()
         .timeout(HEALTHZ_TIMEOUT)
@@ -125,7 +139,7 @@ pub async fn healthz_probe(bind: &str) -> HealthzProbe {
         Ok(c) => c,
         Err(e) => {
             return HealthzProbe {
-                url,
+                url: url.to_string(),
                 status: None,
                 ok: false,
                 error: Some(format!("client build failed: {e}")),
@@ -133,7 +147,7 @@ pub async fn healthz_probe(bind: &str) -> HealthzProbe {
         }
     };
 
-    match client.get(&url).send().await {
+    match client.get(url.clone()).send().await {
         Ok(response) => {
             let status = response.status();
             let ok = status.is_success()
@@ -143,14 +157,14 @@ pub async fn healthz_probe(bind: &str) -> HealthzProbe {
                     .map(|body| body.trim() == "ok")
                     .unwrap_or(false);
             HealthzProbe {
-                url,
+                url: url.to_string(),
                 status: Some(status.as_u16()),
                 ok,
                 error: None,
             }
         }
         Err(e) => HealthzProbe {
-            url,
+            url: url.to_string(),
             status: None,
             ok: false,
             error: Some(e.to_string()),
@@ -172,13 +186,15 @@ pub async fn healthz_ok(bind: &str) -> bool {
 /// treat `Err` as "occupancy unknown", not "occupancy = busy" (see the
 /// MCP tool handlers' fail-open-on-Err policy).
 pub async fn occupancy(bind: &str) -> Result<Occupancy, ServerError> {
-    let url = crate::http::Endpoint::resolve(Some(bind)).url("/v1/status");
+    let url = crate::http::Endpoint::resolve(Some(bind))
+        .url("/v1/status")
+        .map_err(occupancy_io_err)?;
     let client = crate::http::client_builder()
         .timeout(HEALTHZ_TIMEOUT)
         .build()
         .map_err(|e| occupancy_io_err(format!("client build failed: {e}")))?;
     let resp = client
-        .get(&url)
+        .get(url)
         .send()
         .await
         .map_err(|e| occupancy_io_err(format!("request failed: {e}")))?;

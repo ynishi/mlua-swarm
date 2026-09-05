@@ -495,7 +495,7 @@ impl OperatorClientState {
             .build()
             .map_err(|e| ClientError::Http(e.to_string()))?;
         let resp = client
-            .post(format!("{}/v1/operators", self.http_base))
+            .post(self.api_url(&["v1", "operators"])?)
             .json(&serde_json::json!({
                 "capability_manifest": capability_manifest,
                 "desc": desc,
@@ -766,11 +766,12 @@ impl OperatorClientState {
         sid: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Value, ClientError> {
-        let mut url = format!("{}/v1/operators", self.http_base);
+        let mut url = self.api_url(&["v1", "operators"])?;
         if let Some(limit) = limit {
-            url.push_str(&format!("?limit={limit}"));
+            url.query_pairs_mut()
+                .append_pair("limit", &limit.to_string());
         }
-        self.get_as_operator(sid, &url).await
+        self.get_as_operator(sid, url).await
     }
 
     /// `GET /v1/runs/:id/assignees` (Bearer) — who holds each of the Run's
@@ -783,8 +784,8 @@ impl OperatorClientState {
         sid: Option<&str>,
         run_id: &RunId,
     ) -> Result<Value, ClientError> {
-        let url = format!("{}/v1/runs/{run_id}/assignees", self.http_base);
-        self.get_as_operator(sid, &url).await
+        let url = self.api_url(&["v1", "runs", run_id.as_str(), "assignees"])?;
+        self.get_as_operator(sid, url).await
     }
 
     /// `GET /v1/runs/:id/handover` (Bearer) — the four-axis snapshot,
@@ -799,8 +800,8 @@ impl OperatorClientState {
         sid: Option<&str>,
         run_id: &RunId,
     ) -> Result<Value, ClientError> {
-        let url = format!("{}/v1/runs/{run_id}/handover", self.http_base);
-        self.get_as_operator(sid, &url).await
+        let url = self.api_url(&["v1", "runs", run_id.as_str(), "handover"])?;
+        self.get_as_operator(sid, url).await
     }
 
     /// `GET /v1/runs/:id/material?step_id=<id>` (Bearer) — the material for
@@ -814,11 +815,10 @@ impl OperatorClientState {
         run_id: &RunId,
         step_id: &StepId,
     ) -> Result<Value, ClientError> {
-        let url = format!(
-            "{}/v1/runs/{run_id}/material?step_id={step_id}",
-            self.http_base
-        );
-        self.get_as_operator(sid, &url).await
+        let mut url = self.api_url(&["v1", "runs", run_id.as_str(), "material"])?;
+        url.query_pairs_mut()
+            .append_pair("step_id", step_id.as_str());
+        self.get_as_operator(sid, url).await
     }
 
     /// `POST /v1/runs/:id/acquire` — take one of the Run's Operator seats.
@@ -843,9 +843,9 @@ impl OperatorClientState {
         desc: &str,
         slot: Option<&str>,
     ) -> Result<Value, ClientError> {
-        let url = format!("{}/v1/runs/{run_id}/acquire", self.http_base);
+        let url = self.api_url(&["v1", "runs", run_id.as_str(), "acquire"])?;
         let resp = http_client()?
-            .post(&url)
+            .post(url.clone())
             .json(&serde_json::json!({
                 "op": op,
                 "desc": desc,
@@ -854,7 +854,7 @@ impl OperatorClientState {
             .send()
             .await
             .map_err(|e| ClientError::Http(e.to_string()))?;
-        json_or_http_error(resp, "POST", &url).await
+        json_or_http_error(resp, "POST", url.as_str()).await
     }
 
     /// One Bearer-gated `GET` presented as an Operator: resolve which
@@ -865,16 +865,32 @@ impl OperatorClientState {
     /// rule and the "verbatim body" contract are written once. A response
     /// this process re-shaped would be a second, quietly different account
     /// of who holds what.
-    async fn get_as_operator(&self, sid: Option<&str>, url: &str) -> Result<Value, ClientError> {
+    async fn get_as_operator(
+        &self,
+        sid: Option<&str>,
+        url: reqwest::Url,
+    ) -> Result<Value, ClientError> {
         let sid = self.bearer_sid(sid).await?;
         let entry = self.get_entry(&sid).await?;
         let resp = http_client()?
-            .get(url)
+            .get(url.clone())
             .bearer_auth(&entry.token)
             .send()
             .await
             .map_err(|e| ClientError::Http(e.to_string()))?;
-        json_or_http_error(resp, "GET", url).await
+        json_or_http_error(resp, "GET", url.as_str()).await
+    }
+
+    /// The URL of one API route on the server this process is joined to,
+    /// from path segments (`["v1", "runs", id, "acquire"]`). Every request
+    /// this client makes goes through here or [`crate::http::Endpoint`]
+    /// directly — never through string concatenation — so the scheme, a
+    /// path prefix on the base, and percent-encoding of ids are handled in
+    /// one place.
+    fn api_url(&self, segments: &[&str]) -> Result<reqwest::Url, ClientError> {
+        crate::http::Endpoint::resolve(Some(&self.http_base))
+            .api(segments)
+            .map_err(ClientError::Http)
     }
 
     /// Which session's Bearer token a **D3**-gated read presents: the one
@@ -914,7 +930,7 @@ impl OperatorClientState {
             .build()
             .map_err(|e| ClientError::Http(e.to_string()))?;
         let resp = client
-            .delete(format!("{}/v1/operators/{sid}", self.http_base))
+            .delete(self.api_url(&["v1", "operators", sid])?)
             .bearer_auth(&entry.token)
             .send()
             .await
@@ -983,8 +999,9 @@ async fn rollback_minted_session(
     sid: &str,
     token: &str,
 ) -> Result<(), String> {
+    let url = crate::http::Endpoint::resolve(Some(http_base)).api(&["v1", "operators", sid])?;
     let response = client
-        .delete(format!("{http_base}/v1/operators/{sid}"))
+        .delete(url)
         .bearer_auth(token)
         .send()
         .await
@@ -1022,8 +1039,13 @@ async fn connect_ws(
     sid: &str,
     token: &str,
 ) -> Result<(WsSink, WsSource), ClientError> {
-    let ws_url = format!("{}/v1/operators/{}/ws", http_to_ws_base(http_base), sid);
+    // `http` → `ws`, `https` → `wss`, decided by the URL type from the
+    // base's own scheme; anything else is refused rather than guessed.
+    let ws_url = crate::http::Endpoint::resolve(Some(http_base))
+        .ws(&["v1", "operators", sid, "ws"])
+        .map_err(ClientError::Ws)?;
     let mut req = ws_url
+        .as_str()
         .into_client_request()
         .map_err(|e| ClientError::Ws(e.to_string()))?;
     req.headers_mut().insert(
@@ -1073,7 +1095,10 @@ async fn server_healthz_ok(http_base: &str) -> bool {
     else {
         return false;
     };
-    match client.get(format!("{http_base}/v1/healthz")).send().await {
+    let Ok(url) = crate::http::Endpoint::resolve(Some(http_base)).url("/v1/healthz") else {
+        return false;
+    };
+    match client.get(url).send().await {
         Ok(response) if response.status().is_success() => response
             .text()
             .await
@@ -1142,20 +1167,6 @@ fn spawn_reader(
 /// drive ended up on different machines.
 fn resolve_http_base() -> String {
     crate::http::Endpoint::resolve(None).base().to_string()
-}
-
-/// `http://` → `ws://`, `https://` → `wss://`. Falls back to prefixing `ws://`
-/// for a bare host:port (defensive; `resolve_http_base` always yields a
-/// scheme-prefixed value, so this branch is only reachable via a malformed
-/// `MSE_HTTP` override).
-fn http_to_ws_base(http_base: &str) -> String {
-    if let Some(rest) = http_base.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = http_base.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        format!("ws://{http_base}")
-    }
 }
 
 #[cfg(test)]
@@ -1619,13 +1630,27 @@ mod tests {
         );
     }
 
+    /// The WebSocket URL is derived from the base by the URL type: the
+    /// scheme pairs with the base's own, the sid is one percent-encoded
+    /// segment, and a base mounted under a prefix keeps it.
     #[test]
-    fn http_to_ws_base_converts_scheme() {
+    fn ws_url_pairs_the_scheme_and_keeps_the_base_path() {
+        let ws = |base: &str| {
+            crate::http::Endpoint::resolve(Some(base))
+                .ws(&["v1", "operators", "S-1", "ws"])
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(ws("http://127.0.0.1:7777"), "ws://127.0.0.1:7777/v1/operators/S-1/ws");
+        assert_eq!(ws("https://example.com"), "wss://example.com/v1/operators/S-1/ws");
         assert_eq!(
-            http_to_ws_base("http://127.0.0.1:7777"),
-            "ws://127.0.0.1:7777"
+            ws("https://example.com/mse/"),
+            "wss://example.com/mse/v1/operators/S-1/ws"
         );
-        assert_eq!(http_to_ws_base("https://example.com"), "wss://example.com");
+        let err = crate::http::Endpoint::resolve(Some("ftp://example.com"))
+            .ws(&["v1"])
+            .unwrap_err();
+        assert!(err.contains("ftp"), "{err}");
     }
 
     // ─── ③ reconnect ─────────────────────────────────────────────────────
@@ -2128,8 +2153,11 @@ mod tests {
         let sid = state.join(None, None).await.expect("join");
         // `/v1/runs/:id/steps` is not a route this stub serves, so the
         // reqwest call gets a real 404 off the same server.
+        let url = state
+            .api_url(&["v1", "runs", "R-stub", "nope"])
+            .expect("stub base is a URL");
         let error = state
-            .get_as_operator(Some(&sid), &format!("{}/v1/runs/R-stub/nope", stub.base()))
+            .get_as_operator(Some(&sid), url)
             .await
             .unwrap_err();
         let message = error.to_string();
