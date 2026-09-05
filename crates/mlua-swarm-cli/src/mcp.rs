@@ -6497,6 +6497,10 @@ fn run_ctx_report(root: &std::path::Path, final_ctx: JsonValue, run_id: &str) ->
 /// embedded Blueprint (every agent's prompt in one document) is the case
 /// this exists for.
 ///
+/// `bytes` is the size of the file as written — the pretty-printed form —
+/// so a reader who does `ls -l` on the path sees the same number; the
+/// inline threshold is applied to that same value.
+///
 /// A write failure is reported in `blueprint_file.error` with a null path,
 /// never swallowed.
 fn bp_build_report(
@@ -6506,7 +6510,7 @@ fn bp_build_report(
     out: Option<&str>,
 ) -> JsonValue {
     let serialized = serde_json::to_string_pretty(wire).unwrap_or_default();
-    let bytes = serde_json::to_string(wire).map(|s| s.len()).unwrap_or(0);
+    let bytes = serialized.len();
 
     let path = match out {
         Some(p) => std::path::PathBuf::from(p),
@@ -6922,7 +6926,8 @@ mod tests {
         );
         assert_eq!(
             report["blueprint_file"]["bytes"].as_u64().unwrap_or(0) as usize,
-            serde_json::to_string(&wire).unwrap().len()
+            std::fs::metadata(path).expect("stat").len() as usize,
+            "bytes is the size of the file on disk: {report}"
         );
     }
 
@@ -6956,6 +6961,11 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&out).expect("file written"))
                 .expect("file is JSON");
         assert_eq!(on_disk, wire, "nothing trimmed on disk");
+        assert_eq!(
+            report["blueprint_file"]["bytes"].as_u64().unwrap_or(0),
+            std::fs::metadata(&out).expect("stat").len(),
+            "bytes is the size of the file on disk: {report}"
+        );
     }
 
     /// A write failure is reported with a null path — never a path to a
