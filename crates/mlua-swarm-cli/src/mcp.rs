@@ -909,16 +909,38 @@ struct BpBuildReq {
     /// `MSE_HTTP`, then to `http://127.0.0.1:7777`.
     #[serde(default)]
     bind: Option<String>,
-    /// Also write the built (pre-expansion) Blueprint JSON to this path,
-    /// pretty-printed — same as the CLI's `-o`.
+    /// Where to write the built Blueprint JSON, pretty-printed — same as
+    /// the CLI's `-o`. The JSON is always written to a file: here when
+    /// given, otherwise to `$MSE_HOME/bp/<bp id>.json`; the response
+    /// names the file as `blueprint_file {path, bytes}`. Pre-expansion
+    /// by default; refs embedded when `strict_embed` is set (the two
+    /// differ only in that).
     #[serde(default)]
     out: Option<String>,
-    /// Require every `$file` / `$agent_md` ref to embed at build time.
-    /// Default false: on an unresolved ref the tool proceeds with raw
-    /// wire JSON and reports the lint as `warn (…)` — the server
-    /// resolves refs itself at register time. `true` mirrors the CLI's
-    /// `--strict-embed`: an unresolved ref returns `status: "error"`
-    /// with `stage: "lint"` and no register attempt is made.
+    /// Extra directories to resolve `$file` / `$agent_md` refs against
+    /// (tier 4 of the include cascade — same as the CLI's repeatable
+    /// `--include <DIR>`). Absolute, or relative to the mse-mcp process
+    /// CWD. Tiers 1 (the script's own dir), 2 (in-bp
+    /// `blueprint_ref_includes`), 3 (`MSE_BLUEPRINT_INCLUDES`) and 6
+    /// (bundled samples) apply without this.
+    #[serde(default)]
+    include: Vec<String>,
+    /// Require every `$file` / `$agent_md` ref to embed at build time,
+    /// and emit them embedded. Default false: refs travel raw in the
+    /// wire JSON and the server resolves them at register time; an
+    /// unresolved ref only downgrades the lint to `warn (…)`. `true`
+    /// mirrors the CLI's `--strict-embed` — an unresolved ref returns
+    /// `status: "error"` with `stage: "lint"` and no register attempt,
+    /// and a resolved one is written into the file / `blueprint` / the
+    /// registered body in place of the ref. That is what lets a server
+    /// which cannot read the author's files (a hosted `mse serve`)
+    /// receive the prompts at all. Two more things follow from "the
+    /// Blueprint is self-contained": a `$agent_md` whose kind the
+    /// Blueprint does not declare (no sibling `kind`, no top-level
+    /// `default_agent_kind`) is a `stage: "lint"` error rather than a
+    /// silent pin to the schema default, and every embedded agent
+    /// carries `profile.extras.embed {source, repo, rev}` naming the
+    /// file and git revision it was built from.
     /// Independent from the server-side `mse serve
     /// --blueprint-strict-embed` switch (register-time raw-ref
     /// reject) — see `mse://guides/strict-embed-modes`.
@@ -4774,7 +4796,7 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Build a `.bp.lua` authoring-DSL script into canonical Blueprint JSON and (by default) register it with the running `mse serve` — the MCP twin of the `mse bp build --register` CLI, so a Blueprint can go from Lua script to registered without shelling out. Pipeline: run the script in an embedded Lua VM (`require(\"flow_dsl\")` / `require(\"bp_dsl\")`), best-effort compile-lint the result through the real Compiler (includes the GH #50 verdict-contract lints; reported as `lint: \"skipped: ...\"` — never silently — when `$file`/`$agent_md` refs cannot be resolved relative to the script's own directory, since the server resolves those itself against its `--blueprint-ref-base` at register time), then POST the built JSON to `/v1/blueprints/:id`. The server never runs Lua — JSON stays the canonical wire format; the DSL is an authoring frontend (GH #52). Failures return `status: \"error\"` with a `stage` field (read | build | lint | write_out | register) so an authoring loop can fix the script and re-call. GH #62 Axis B.1: on `stage: \"lint\"` failures whose Compiler message matches a known lint kind (worker-binding-missing / verdict-value-not-in-contract / halted-at-missing), the response also carries `fix_hint: {kind, reason, patch_suggestion, docs_ref}` — a Clippy-style structured recovery hint the caller can render. `fix_hint` is `null` on lint failures without a canonical fix recipe (never a wrong-but-confident hint). Pass `register=false` for a build+lint-only dry run; the dry run (and any lint error) includes the built JSON as `blueprint` for inspection, while a successful register returns `json_bytes` instead (read it back via bp-family read tools or the emitted `out` file). Every successful build also returns authoring_warnings — bp_dsl-level lint lines (e.g. the B.pipeline dead-halt check: pipeline-level halt_on with zero gate-emitting stages), additive and report-only."
+        description = "Build a `.bp.lua` authoring-DSL script into canonical Blueprint JSON and (by default) register it with the running `mse serve` — the MCP twin of the `mse bp build --register` CLI, so a Blueprint can go from Lua script to registered without shelling out. Pipeline: run the script in an embedded Lua VM (`require(\"flow_dsl\")` / `require(\"bp_dsl\")`), best-effort compile-lint the result through the real Compiler (includes the GH #50 verdict-contract lints; reported as `lint: \"skipped: ...\"` — never silently — when `$file`/`$agent_md` refs cannot be resolved relative to the script's own directory, since the server resolves those itself against its `--blueprint-ref-base` at register time), then POST the built JSON to `/v1/blueprints/:id`. The server never runs Lua — JSON stays the canonical wire format; the DSL is an authoring frontend (GH #52). Failures return `status: \"error\"` with a `stage` field (read | build | lint | write_out | register) so an authoring loop can fix the script and re-call. GH #62 Axis B.1: on `stage: \"lint\"` failures whose Compiler message matches a known lint kind (worker-binding-missing / verdict-value-not-in-contract / halted-at-missing), the response also carries `fix_hint: {kind, reason, patch_suggestion, docs_ref}` — a Clippy-style structured recovery hint the caller can render. `fix_hint` is `null` on lint failures without a canonical fix recipe (never a wrong-but-confident hint). Pass `register=false` for a build+lint-only dry run. The built JSON is always written to a file — `out` when given, else `$MSE_HOME/bp/<bp id>.json` — and every successful build (dry run or registered) names it as `blueprint_file {path, bytes}`; the dry run additionally inlines it as `blueprint` when it is under 16 KiB (above that `blueprint` is `null` and `blueprint_file.note` says to read the file — a `strict_embed` build carries every agent's prompt and is the case this is for), a lint error inlines the pre-expansion JSON as `blueprint` for inspection, and a successful register returns `json_bytes` alongside the file. Pass `include` (a list of dirs) to resolve refs the script's own dir / in-bp includes / `MSE_BLUEPRINT_INCLUDES` do not cover, same as the CLI's `--include`. Every successful build also returns authoring_warnings — bp_dsl-level lint lines (e.g. the B.pipeline dead-halt check: pipeline-level halt_on with zero gate-emitting stages), additive and report-only."
     )]
     async fn bp_build(
         &self,
@@ -4804,8 +4826,27 @@ impl MseServer {
                     }))
                 }
             };
-        let lint = match crate::bp::compile_lint(&bp_value, &script_path, &[]) {
-            Ok(crate::bp::LintReport::Ok { agents, operators }) => {
+        // Set under `strict_embed` to the linker's expanded product, which
+        // then stands in for `bp_value` at write_out / register / response.
+        // This MCP is a stdio server — it runs on the caller's own machine,
+        // so it can read the `agent.md` files a remote `mse serve` cannot.
+        let mut embedded: Option<serde_json::Value> = None;
+        let includes: Vec<std::path::PathBuf> =
+            req.include.iter().map(std::path::PathBuf::from).collect();
+        let lint = match crate::bp::compile_lint(
+            &bp_value,
+            &script_path,
+            &includes,
+            req.strict_embed,
+        ) {
+            Ok(crate::bp::LintReport::Ok {
+                agents,
+                operators,
+                expanded,
+            }) => {
+                if req.strict_embed {
+                    embedded = Some(*expanded);
+                }
                 format!("ok ({agents} agent(s), {operators} operator(s) checked)")
             }
             Ok(crate::bp::LintReport::Warn {
@@ -4881,24 +4922,33 @@ impl MseServer {
                 }));
             }
         };
+        let wire = embedded.as_ref().unwrap_or(&bp_value);
         let bp_id = bp_value
             .get("id")
             .and_then(|v| v.as_str())
             .map(String::from);
-        if let Some(out) = &req.out {
-            let pretty = serde_json::to_string_pretty(&bp_value)
-                .map_err(|e| McpError::internal_error(format!("bp_build stringify: {e}"), None))?;
-            if let Err(e) = std::fs::write(out, &pretty) {
-                return json_result(&serde_json::json!({
-                    "status": "error",
-                    "stage": "write_out",
-                    "bp_id": bp_id,
-                    "lint": lint,
-                    "authoring_warnings": authoring_warnings,
-                    "out": out,
-                    "error": e.to_string(),
-                }));
-            }
+        // The built JSON always goes to a file (`out`, or a default under
+        // `$MSE_HOME/bp/`) and the response names it; an embedded Blueprint
+        // is every agent's prompt in one document and does not belong in a
+        // tool response. Inline only when small — same contract as
+        // `swarm_run`'s `final_ctx` / `ctx_file`.
+        let file_stem = bp_id.clone().unwrap_or_else(|| {
+            script_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "blueprint".to_string())
+        });
+        let report = bp_build_report(&mse_home(), wire, &file_stem, req.out.as_deref());
+        if let Some(err) = report["blueprint_file"]["error"].as_str() {
+            return json_result(&serde_json::json!({
+                "status": "error",
+                "stage": "write_out",
+                "bp_id": bp_id,
+                "lint": lint,
+                "authoring_warnings": authoring_warnings,
+                "out": req.out,
+                "error": err,
+            }));
         }
         if !req.register {
             return json_result(&serde_json::json!({
@@ -4907,15 +4957,16 @@ impl MseServer {
                 "lint": lint,
                 "authoring_warnings": authoring_warnings,
                 "out": req.out,
-                "blueprint": bp_value,
+                "blueprint": report["blueprint"],
+                "blueprint_file": report["blueprint_file"],
             }));
         }
         let bind = req
             .bind
             .unwrap_or_else(|| crate::http::Endpoint::resolve(None).base().to_string());
-        match crate::bp::register(&bp_value, Some(&bind)).await {
+        match crate::bp::register(wire, Some(&bind)).await {
             Ok(outcome) => {
-                let json_bytes = serde_json::to_vec(&bp_value).map(|v| v.len()).unwrap_or(0);
+                let json_bytes = serde_json::to_vec(wire).map(|v| v.len()).unwrap_or(0);
                 json_result(&serde_json::json!({
                     "status": "registered",
                     "bp_id": bp_id,
@@ -4926,6 +4977,7 @@ impl MseServer {
                     "http_status": outcome.http_status,
                     "body": outcome.body,
                     "json_bytes": json_bytes,
+                    "blueprint_file": report["blueprint_file"],
                 }))
             }
             Err(e) => json_result(&serde_json::json!({
@@ -6435,6 +6487,66 @@ fn run_ctx_report(root: &std::path::Path, final_ctx: JsonValue, run_id: &str) ->
     serde_json::json!({ "final_ctx": inline, "ctx_file": ctx_file })
 }
 
+/// Writes a built Blueprint to a file and reports where it went — the
+/// `bp_build` twin of [`run_ctx_report`], under the same contract: the
+/// whole document always goes to a file the caller can open (`out` when
+/// given, else `<root>/bp/<stem>.json`), the response carries the path and
+/// size, and `blueprint` is inlined only when it is under
+/// [`RUN_CTX_INLINE_BYTES`] — above that it is `null` and the file entry
+/// carries a note, never a trimmed object under the same name. A fully
+/// embedded Blueprint (every agent's prompt in one document) is the case
+/// this exists for.
+///
+/// A write failure is reported in `blueprint_file.error` with a null path,
+/// never swallowed.
+fn bp_build_report(
+    root: &std::path::Path,
+    wire: &JsonValue,
+    stem: &str,
+    out: Option<&str>,
+) -> JsonValue {
+    let serialized = serde_json::to_string_pretty(wire).unwrap_or_default();
+    let bytes = serde_json::to_string(wire).map(|s| s.len()).unwrap_or(0);
+
+    let path = match out {
+        Some(p) => std::path::PathBuf::from(p),
+        None => root.join("bp").join(format!("{stem}.json")),
+    };
+    let write_result = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => std::fs::create_dir_all(dir),
+        _ => Ok(()),
+    }
+    .and_then(|()| std::fs::write(&path, &serialized));
+
+    let blueprint_file = match write_result {
+        Ok(()) if bytes <= RUN_CTX_INLINE_BYTES => serde_json::json!({
+            "path": path.to_string_lossy(),
+            "bytes": bytes,
+        }),
+        Ok(()) => serde_json::json!({
+            "path": path.to_string_lossy(),
+            "bytes": bytes,
+            "note": format!(
+                "blueprint was not inlined ({bytes} bytes); read the file at this path \
+                 for the whole Blueprint"
+            ),
+        }),
+        Err(e) => serde_json::json!({
+            "path": JsonValue::Null,
+            "bytes": bytes,
+            "error": format!("could not write the Blueprint to {}: {e}", path.display()),
+        }),
+    };
+
+    let inline = if bytes <= RUN_CTX_INLINE_BYTES {
+        wire.clone()
+    } else {
+        JsonValue::Null
+    };
+
+    serde_json::json!({ "blueprint": inline, "blueprint_file": blueprint_file })
+}
+
 /// Reads back a run's recorded ctx, selecting a branch rather than paging
 /// bytes.
 ///
@@ -6782,6 +6894,90 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small Blueprint is written to the default file *and* inlined; the
+    /// response names the file either way.
+    #[test]
+    fn bp_build_report_writes_default_file_and_inlines_when_small() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wire = serde_json::json!({ "id": "tiny", "agents": [] });
+        let report = bp_build_report(tmp.path(), &wire, "tiny", None);
+
+        let path = report["blueprint_file"]["path"]
+            .as_str()
+            .expect("blueprint_file.path present");
+        assert_eq!(
+            std::path::Path::new(path),
+            tmp.path().join("bp").join("tiny.json"),
+            "default location is <root>/bp/<stem>.json: {report}"
+        );
+        let on_disk: JsonValue =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("file written"))
+                .expect("file is JSON");
+        assert_eq!(on_disk, wire, "the whole Blueprint is on disk");
+        assert_eq!(report["blueprint"], wire, "small enough to inline");
+        assert!(
+            report["blueprint_file"]["note"].is_null(),
+            "no note when inlined: {report}"
+        );
+        assert_eq!(
+            report["blueprint_file"]["bytes"].as_u64().unwrap_or(0) as usize,
+            serde_json::to_string(&wire).unwrap().len()
+        );
+    }
+
+    /// Past the inline threshold the file is still whole, `blueprint` is
+    /// `null` (never a trimmed object), and the note says where to read.
+    /// `out` wins over the default location.
+    #[test]
+    fn bp_build_report_nulls_inline_past_threshold_and_honors_out() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("nested").join("big.json");
+        let prompt = "x".repeat(RUN_CTX_INLINE_BYTES + 1);
+        let wire = serde_json::json!({
+            "id": "big",
+            "agents": [ { "name": "a", "profile": { "system_prompt": prompt } } ],
+        });
+        let report = bp_build_report(tmp.path(), &wire, "big", Some(out.to_str().unwrap()));
+
+        assert_eq!(
+            report["blueprint_file"]["path"].as_str(),
+            out.to_str(),
+            "`out` is honored, parents created: {report}"
+        );
+        assert!(report["blueprint"].is_null(), "not inlined: {report}");
+        assert!(
+            report["blueprint_file"]["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("read the file")),
+            "note points at the file: {report}"
+        );
+        let on_disk: JsonValue =
+            serde_json::from_str(&std::fs::read_to_string(&out).expect("file written"))
+                .expect("file is JSON");
+        assert_eq!(on_disk, wire, "nothing trimmed on disk");
+    }
+
+    /// A write failure is reported with a null path — never a path to a
+    /// file that is not there.
+    #[test]
+    fn bp_build_report_reports_write_failure_with_null_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A file where the parent directory must go.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "not a dir").unwrap();
+        let out = blocker.join("x.json");
+        let wire = serde_json::json!({ "id": "x" });
+        let report = bp_build_report(tmp.path(), &wire, "x", Some(out.to_str().unwrap()));
+
+        assert!(report["blueprint_file"]["path"].is_null(), "{report}");
+        assert!(
+            report["blueprint_file"]["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("could not write")),
+            "{report}"
+        );
+    }
 
     /// The note that goes out when the server could not be read must not
     /// contradict the probe printed beside it.

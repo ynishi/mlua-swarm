@@ -83,6 +83,16 @@ pub struct ResolveConfig {
     /// for server-side use, where the server never ships authoring
     /// files).
     pub bundled_default: Option<PathBuf>,
+    /// Refuse a `$agent_md` ref whose `kind` is not declared by the
+    /// Blueprint itself — no sibling `"kind"` literal next to the ref.
+    /// The caller sets this when it is producing a self-contained
+    /// (fully embedded) Blueprint and the BP declares no top-level
+    /// `default_agent_kind` either: silently pinning the schema
+    /// default into the emitted JSON would bypass whatever default the
+    /// registering server was configured with, so the build refuses
+    /// instead and names the two places the kind can be declared.
+    /// Off (the default) keeps the fallback-to-`default_kind` cascade.
+    pub require_declared_kind: bool,
 }
 
 impl ResolveConfig {
@@ -124,6 +134,13 @@ impl ResolveConfig {
     /// disable the fallback (server-side default).
     pub fn with_bundled_default(mut self, p: Option<PathBuf>) -> Self {
         self.bundled_default = p;
+        self
+    }
+
+    /// Require every `$agent_md` ref to carry a sibling `"kind"` (see
+    /// [`ResolveConfig::require_declared_kind`]).
+    pub fn with_require_declared_kind(mut self, v: bool) -> Self {
+        self.require_declared_kind = v;
         self
     }
 
@@ -261,7 +278,13 @@ pub fn pre_read_default_agent_kind(val: &Value) -> AgentKind {
 /// 6-tier cascade in `cfg` (first-hit-wins). On miss, the error names
 /// every tier dir searched so authors can diagnose which include layer
 /// to add.
-fn resolve_ref_path(rel: &str, cfg: &ResolveConfig) -> Result<PathBuf, LoadError> {
+/// Resolve one `$file` / `$agent_md` ref string to the first existing
+/// file across the cascade in `cfg`, with the same path-hygiene rejects
+/// (absolute path / `..` escape) the expansion applies. Public so a
+/// caller that already ran [`expand_file_refs_with_config`] can find out
+/// *which* file a ref resolved to — the expansion replaces the ref with
+/// the file's content and keeps no record of the path.
+pub fn resolve_ref_path(rel: &str, cfg: &ResolveConfig) -> Result<PathBuf, LoadError> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return Err(LoadError::FileRef {
@@ -345,6 +368,17 @@ pub fn expand_file_refs_with_config(
             // upstream from BP `default_agent_kind` or the CLI default.
             if let Some(Value::String(rel)) = map.get("$agent_md") {
                 let full = resolve_ref_path(rel, cfg)?;
+                if cfg.require_declared_kind && map.get("kind").is_none() {
+                    return Err(LoadError::FileRef {
+                        path: full,
+                        msg: format!(
+                            "strict-embed: kind for `$agent_md` = {rel:?} is not declared in the \
+                             Blueprint; set top-level `default_agent_kind` or a sibling `kind` \
+                             next to the ref (a fully embedded Blueprint carries its kinds \
+                             itself instead of taking the registering server's default)"
+                        ),
+                    });
+                }
                 // Peek at the sibling "kind"; fall back to `default_kind`
                 // if absent.
                 let resolved_kind = map

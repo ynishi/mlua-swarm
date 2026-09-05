@@ -21,6 +21,6 @@ pub mod linker;
 
 pub use linker::{
     env_blueprint_includes, expand_file_refs, expand_file_refs_with_config,
-    load_blueprint_from_path, pre_read_default_agent_kind, pre_read_in_bp_includes, LoadError,
-    ResolveConfig,
+    load_blueprint_from_path, pre_read_default_agent_kind, pre_read_in_bp_includes,
+    resolve_ref_path, LoadError, ResolveConfig,
 };

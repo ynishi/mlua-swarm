@@ -93,16 +93,26 @@ struct BuildArgs {
     /// bundled default samples dir.
     #[arg(long = "include", action = clap::ArgAction::Append, value_name = "DIR")]
     include: Vec<PathBuf>,
-    /// Require every `$file` / `$agent_md` ref to embed at build time.
-    /// Default behavior on an unresolved ref: emit the raw wire JSON
-    /// (refs preserved) and print a WARN — the server resolves refs
-    /// itself at register time. With `--strict-embed`, an unresolved
-    /// ref hard-fails the build (non-zero exit, no JSON emitted). Name
-    /// mirrors "require refs to be embedded": not `--strict-refs`
-    /// (which would misleadingly suggest refs themselves are
-    /// disallowed). Independent from the server-side `mse serve
-    /// --blueprint-strict-embed` switch (register-time raw-ref
-    /// reject) — the two layers are compared side by side in
+    /// Require every `$file` / `$agent_md` ref to embed at build time,
+    /// and emit them embedded. Default behavior on an unresolved ref:
+    /// emit the raw wire JSON (refs preserved) and print a WARN — the
+    /// server resolves refs itself at register time. With
+    /// `--strict-embed`, an unresolved ref hard-fails the build
+    /// (non-zero exit, no JSON emitted), and a resolved one is written
+    /// into the emitted JSON (`-o` and `--register` both carry the
+    /// embedded body) rather than left as a path only this machine can
+    /// follow. Two more things follow from "the Blueprint is
+    /// self-contained": a `$agent_md` whose kind the Blueprint does not
+    /// declare (no sibling `kind`, no top-level `default_agent_kind`)
+    /// fails the build instead of being pinned to the schema default
+    /// behind the registering server's back, and every embedded agent
+    /// carries `profile.extras.embed {source, repo, rev}` naming the
+    /// file and git revision it was built from. Name mirrors "require
+    /// refs to be embedded": not
+    /// `--strict-refs` (which would misleadingly suggest refs
+    /// themselves are disallowed). Independent from the server-side
+    /// `mse serve --blueprint-strict-embed` switch (register-time
+    /// raw-ref reject) — the two layers are compared side by side in
     /// `mse://guides/strict-embed-modes`.
     #[arg(long = "strict-embed")]
     strict_embed: bool,
@@ -180,9 +190,28 @@ async fn run_build(args: BuildArgs) -> Result<()> {
         eprintln!("dsl warn: {w}");
     }
 
-    match compile_lint(&bp_value, &args.script, &args.include) {
-        Ok(LintReport::Ok { agents, operators }) => {
+    // Set by the `--strict-embed` arm below: the linker's expanded product,
+    // which then replaces `bp_value` everywhere downstream (emit, `-o`,
+    // register). Left `None` on the default path, where refs travel raw and
+    // the server resolves them against its own cascade.
+    let mut embedded: Option<serde_json::Value> = None;
+
+    match compile_lint(&bp_value, &args.script, &args.include, args.strict_embed) {
+        Ok(LintReport::Ok {
+            agents,
+            operators,
+            expanded,
+        }) => {
             eprintln!("compile lint: OK ({agents} agent(s), {operators} operator(s) checked)");
+            // The flag reads "require every ref to embed at build time", so
+            // it has to *do* the embedding, not just assert it could be
+            // done. Emitting the pre-expansion value here would hand the
+            // server a body full of `$agent_md` paths that only exist on
+            // the author's machine — the exact posture the flag is for.
+            if args.strict_embed {
+                eprintln!("compile lint: --strict-embed, emitting refs embedded");
+                embedded = Some(*expanded);
+            }
         }
         Ok(LintReport::Warn {
             agents,
@@ -232,7 +261,8 @@ async fn run_build(args: BuildArgs) -> Result<()> {
         }
     }
 
-    let out_str = serde_json::to_string_pretty(&bp_value)?;
+    let wire = embedded.as_ref().unwrap_or(&bp_value);
+    let out_str = serde_json::to_string_pretty(wire)?;
     match &args.out {
         Some(path) => {
             std::fs::write(path, &out_str)
@@ -242,7 +272,7 @@ async fn run_build(args: BuildArgs) -> Result<()> {
     }
 
     if args.register {
-        let outcome = register(&bp_value, args.server.as_deref()).await?;
+        let outcome = register(wire, args.server.as_deref()).await?;
         eprintln!(
             "register: {} -> HTTP {}: {}",
             outcome.url, outcome.http_status, outcome.body
@@ -284,8 +314,12 @@ fn run_lint(args: LintArgs) -> Result<()> {
     // is still printed, but the exit code is non-zero for CI use.
     let strict_dsl_warn = args.strict && !dsl_warnings.is_empty();
 
-    match compile_lint(&bp_value, &args.script, &args.include) {
-        Ok(LintReport::Ok { agents, operators }) => {
+    match compile_lint(&bp_value, &args.script, &args.include, false) {
+        // `bp lint` emits no JSON, so the expanded product has no consumer
+        // here — only `bp build --strict-embed` ships it.
+        Ok(LintReport::Ok {
+            agents, operators, ..
+        }) => {
             eprintln!("bp lint: OK ({agents} agent(s), {operators} operator(s) checked)");
             if strict_dsl_warn {
                 return Err(anyhow!("bp lint: --strict, exiting non-zero on WARN"));
@@ -1096,7 +1130,18 @@ fn extract_between<'a>(s: &'a str, prefix: &str, suffix: &str) -> Option<&'a str
 /// field instead of printing to stderr.
 pub(crate) enum LintReport {
     /// The full compile lint ran against the resolved Blueprint.
-    Ok { agents: usize, operators: usize },
+    ///
+    /// `expanded` is the linker's product — the same wire JSON with every
+    /// `$file` / `$agent_md` ref replaced by what it referenced. Callers
+    /// running under `--strict-embed` emit and register *this* instead of
+    /// the pre-expansion value: that is what "embed at build time" means,
+    /// and a server that cannot read the author's files (a hosted one) has
+    /// no other way to receive the prompts.
+    Ok {
+        agents: usize,
+        operators: usize,
+        expanded: Box<serde_json::Value>,
+    },
     /// The compile lint ran, but the linker only partially resolved the
     /// Blueprint (e.g. some `$file`/`$agent_md` refs were unresolvable
     /// against the include cascade so only the static DSL shape was
@@ -1142,22 +1187,24 @@ fn bundled_agents_dir() -> Option<PathBuf> {
 /// itself also picks up in-bp `blueprint_ref_includes` (tier 2),
 /// `MSE_BLUEPRINT_INCLUDES` (tier 3), and the bundled samples dir
 /// (tier 6, see [`bundled_agents_dir`]).
+///
+/// `strict_embed` is the `--strict-embed` / `strict_embed` switch of the
+/// caller. It changes two things inside the lint, both because the product
+/// is then going to be *emitted* rather than only checked: a `$agent_md`
+/// whose kind the Blueprint does not declare itself is refused (see
+/// [`ResolveConfig::require_declared_kind`]), and the expanded agents carry
+/// an `embed` provenance record (see [`embed_provenance`]).
 pub(crate) fn compile_lint(
     bp_value: &serde_json::Value,
     script_path: &Path,
     cli_includes: &[PathBuf],
+    strict_embed: bool,
 ) -> Result<LintReport> {
-    use mlua_swarm_compile::{
-        env_blueprint_includes, expand_file_refs_with_config, pre_read_in_bp_includes,
-        ResolveConfig,
-    };
-    let base = script_path.parent().unwrap_or_else(|| Path::new("."));
+    use mlua_swarm_compile::expand_file_refs_with_config;
     let default_kind = mlua_swarm::blueprint::loader::pre_read_default_agent_kind(bp_value);
-    let cfg = ResolveConfig::new(base.to_path_buf())
-        .with_in_bp_includes(pre_read_in_bp_includes(bp_value))
-        .with_env_includes(env_blueprint_includes())
-        .with_cli_includes(cli_includes.to_vec())
-        .with_bundled_default(bundled_agents_dir());
+    let cfg = resolve_config(bp_value, script_path, cli_includes).with_require_declared_kind(
+        strict_embed && bp_value.get("default_agent_kind").is_none(),
+    );
     let expanded = match expand_file_refs_with_config(bp_value.clone(), &cfg, default_kind) {
         Ok(v) => v,
         Err(e) => {
@@ -1172,7 +1219,7 @@ pub(crate) fn compile_lint(
                 "could not resolve $file/$agent_md refs relative to {} ({e}). Only the \
                  static DSL shape was validated; the server resolves these refs against \
                  its own include cascade at register time.",
-                base.display()
+                cfg.base.display()
             );
             return Ok(LintReport::Warn {
                 agents: 0,
@@ -1182,9 +1229,12 @@ pub(crate) fn compile_lint(
             });
         }
     };
-    let bp: mlua_swarm::Blueprint = serde_json::from_value(expanded).map_err(|e| {
-        anyhow!("compile lint: blueprint shape invalid after $agent_md expansion: {e}")
-    })?;
+    // Deserialize by reference: the expanded value is handed back to the
+    // caller below, so a by-value `from_value` would clone the whole
+    // Blueprint (every embedded prompt included) on every lint.
+    let bp = <mlua_swarm::Blueprint as serde::Deserialize>::deserialize(&expanded).map_err(
+        |e| anyhow!("compile lint: blueprint shape invalid after $agent_md expansion: {e}"),
+    )?;
 
     let registry = lint_registry(&bp);
     // GH #79 Phase 2: keep the typed `CompileError` in the anyhow chain
@@ -1195,10 +1245,176 @@ pub(crate) fn compile_lint(
     Compiler::new(registry)
         .compile(&bp)
         .map_err(|e| anyhow::Error::new(e).context("compile lint FAILED"))?;
+    let mut expanded = expanded;
+    if strict_embed {
+        embed_provenance(&mut expanded, bp_value, &cfg);
+    }
     Ok(LintReport::Ok {
         agents: bp.agents.len(),
         operators: bp.operators.len(),
+        expanded: Box::new(expanded),
     })
+}
+
+/// The client-side include cascade for one `.bp.lua`: tier 1 = the
+/// script's own directory, tier 2 = in-bp `blueprint_ref_includes`, tier 3
+/// = `MSE_BLUEPRINT_INCLUDES`, tier 4 = the `--include` flags, tier 6 = the
+/// bundled samples dir. (Tier 5, the server config, is server-side only.)
+fn resolve_config(
+    bp_value: &serde_json::Value,
+    script_path: &Path,
+    cli_includes: &[PathBuf],
+) -> mlua_swarm_compile::ResolveConfig {
+    use mlua_swarm_compile::{env_blueprint_includes, pre_read_in_bp_includes, ResolveConfig};
+    let base = script_path.parent().unwrap_or_else(|| Path::new("."));
+    ResolveConfig::new(base.to_path_buf())
+        .with_in_bp_includes(pre_read_in_bp_includes(bp_value))
+        .with_env_includes(env_blueprint_includes())
+        .with_cli_includes(cli_includes.to_vec())
+        .with_bundled_default(bundled_agents_dir())
+}
+
+/// Record, on every agent that came from a `$agent_md` ref, where it came
+/// from — so a registered, fully embedded Blueprint can still be traced
+/// back to the file and revision it was built from. The expansion itself
+/// keeps no such record: it replaces the ref with the file's content.
+///
+/// Written to `agents[i].profile.extras.embed` as
+/// `{ "source": <path>, "repo": <dir name>, "rev": <git HEAD> }`:
+///
+/// - `source` is the path **relative to the git work tree** the file sits
+///   in, when it sits in one; otherwise the ref string exactly as written
+///   in the Blueprint. Never an absolute path — the record travels to
+///   whatever server the Blueprint registers with, and the author's
+///   directory layout is not that server's business.
+/// - `repo` is the work tree's directory name (`agent-profiles`), the
+///   piece that makes `source` unambiguous across repos. Absent when the
+///   file is not under git.
+/// - `rev` is the work tree's `HEAD` sha, suffixed `-dirty` when the tree
+///   has uncommitted changes. Absent when the file is not under git or
+///   `git` is not on PATH — the record is best-effort about the revision,
+///   never about the source.
+///
+/// `extras` is the carry for frontmatter keys the schema does not model,
+/// so adding a key there needs no schema change and registers with a
+/// server that predates this record. The per-agent `version_hash` (blake3
+/// of the body) is set by the loader independently of this.
+///
+/// `bp_value` is the **pre-expansion** value — it still carries the refs
+/// this function resolves; `expanded` is the linker's product for the same
+/// Blueprint, so the two `agents[]` arrays line up index for index.
+pub(crate) fn embed_provenance(
+    expanded: &mut serde_json::Value,
+    bp_value: &serde_json::Value,
+    cfg: &mlua_swarm_compile::ResolveConfig,
+) {
+    let Some(raw_agents) = bp_value.get("agents").and_then(|a| a.as_array()) else {
+        return;
+    };
+    let mut repos: std::collections::HashMap<PathBuf, Option<GitRev>> =
+        std::collections::HashMap::new();
+    for (i, raw) in raw_agents.iter().enumerate() {
+        let Some(rel) = raw.get("$agent_md").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(full) = mlua_swarm_compile::resolve_ref_path(rel, cfg) else {
+            continue;
+        };
+        let mut record = serde_json::Map::new();
+        let toplevel = full.parent().and_then(git_toplevel);
+        match toplevel {
+            Some(top) => {
+                let source = full
+                    .strip_prefix(&top)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| rel.to_string());
+                record.insert("source".into(), serde_json::Value::String(source));
+                if let Some(name) = top.file_name() {
+                    record.insert(
+                        "repo".into(),
+                        serde_json::Value::String(name.to_string_lossy().into_owned()),
+                    );
+                }
+                let rev = repos
+                    .entry(top.clone())
+                    .or_insert_with(|| git_rev(&top))
+                    .clone();
+                if let Some(rev) = rev {
+                    record.insert("rev".into(), serde_json::Value::String(rev.render()));
+                }
+            }
+            None => {
+                record.insert("source".into(), serde_json::Value::String(rel.to_string()));
+            }
+        }
+        let Some(agent) = expanded
+            .get_mut("agents")
+            .and_then(|a| a.get_mut(i))
+            .and_then(|a| a.as_object_mut())
+        else {
+            continue;
+        };
+        let profile = agent
+            .entry("profile")
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        let Some(profile) = profile.as_object_mut() else {
+            continue;
+        };
+        let extras = profile.entry("extras").or_insert(serde_json::Value::Null);
+        if !extras.is_object() {
+            *extras = serde_json::Value::Object(Default::default());
+        }
+        if let Some(extras) = extras.as_object_mut() {
+            extras.insert("embed".into(), serde_json::Value::Object(record));
+        }
+    }
+}
+
+/// `HEAD` of one git work tree plus whether it has uncommitted changes.
+#[derive(Clone, Debug)]
+struct GitRev {
+    sha: String,
+    dirty: bool,
+}
+
+impl GitRev {
+    fn render(&self) -> String {
+        if self.dirty {
+            format!("{}-dirty", self.sha)
+        } else {
+            self.sha.clone()
+        }
+    }
+}
+
+/// Run `git` with `args` inside `dir` and return trimmed stdout on success;
+/// `None` when git is absent, `dir` is not in a work tree, or the command
+/// fails for any other reason. Provenance is best-effort about revisions.
+fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_toplevel(dir: &Path) -> Option<PathBuf> {
+    git_stdout(dir, &["rev-parse", "--show-toplevel"])
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+fn git_rev(toplevel: &Path) -> Option<GitRev> {
+    let sha = git_stdout(toplevel, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty())?;
+    let dirty = git_stdout(toplevel, &["status", "--porcelain"])
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    Some(GitRev { sha, dirty })
 }
 
 /// A stub `Operator` backend used only so `kind = operator` agents (the
@@ -1322,7 +1538,7 @@ mod tests {
         // `script_path` arg is only used as the parent for ref
         // resolution, so any path resolves (the loader never touches disk
         // when the Blueprint carries no refs).
-        compile_lint(&bp_value, Path::new("/tmp/nonexistent.bp.lua"), &[])
+        compile_lint(&bp_value, Path::new("/tmp/nonexistent.bp.lua"), &[], false)
     }
 
     #[test]
@@ -1341,7 +1557,9 @@ mod tests {
         // Round-trip through the real Compiler — this is the AC.
         let report = build_and_compile_lint(&rendered).expect("compile lint must succeed");
         match report {
-            LintReport::Ok { agents, operators } => {
+            LintReport::Ok {
+                agents, operators, ..
+            } => {
                 assert_eq!(agents, DEFAULT_PIPELINE_STAGES.len());
                 assert_eq!(operators, 1);
             }
@@ -1423,7 +1641,8 @@ mod tests {
             report,
             LintReport::Ok {
                 agents: 3,
-                operators: 1
+                operators: 1,
+                ..
             }
         ));
     }
@@ -1441,7 +1660,8 @@ mod tests {
             report,
             LintReport::Ok {
                 agents: 1,
-                operators: 1
+                operators: 1,
+                ..
             }
         ));
     }
@@ -1459,7 +1679,8 @@ mod tests {
             report,
             LintReport::Ok {
                 agents: 4,
-                operators: 1
+                operators: 1,
+                ..
             }
         ));
     }
@@ -1544,7 +1765,8 @@ mod tests {
             report,
             LintReport::Ok {
                 agents: 3,
-                operators: 1
+                operators: 1,
+                ..
             }
         ));
     }
@@ -1574,7 +1796,8 @@ mod tests {
             report,
             LintReport::Ok {
                 agents: 4,
-                operators: 1
+                operators: 1,
+                ..
             }
         ));
     }
@@ -1717,7 +1940,8 @@ mod tests {
             report,
             LintReport::Ok {
                 agents: 2,
-                operators: 1
+                operators: 1,
+                ..
             }
         ));
     }
@@ -1921,7 +2145,7 @@ mod tests {
         // The clause's trailing `},` closes the agent table — keep it.
         let stripped = rendered.replace(runner_clause, "},");
         let bp_value = dsl::build_bp_from_script(&stripped).expect("script must build");
-        let err = compile_lint(&bp_value, Path::new("/tmp/nonexistent.bp.lua"), &[])
+        let err = compile_lint(&bp_value, Path::new("/tmp/nonexistent.bp.lua"), &[], false)
             .err()
             .expect("compile lint must fail without a runner");
         assert!(
@@ -1961,7 +2185,8 @@ mod tests {
             report,
             LintReport::Ok {
                 agents: n,
-                operators: 1
+                operators: 1,
+                ..
             } if n == DEFAULT_PIPELINE_STAGES.len()
         ));
     }

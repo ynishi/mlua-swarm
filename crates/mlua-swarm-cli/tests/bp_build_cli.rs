@@ -428,6 +428,201 @@ return {
     );
 }
 
+/// `--strict-embed` on a ref that *does* resolve must emit it embedded.
+///
+/// The sibling test above pins the default on this same fixture: the ref
+/// survives into the JSON even though the linker resolved it during lint.
+/// The flag is the only difference between the two, which is the point —
+/// it reads "require every ref to embed at build time", so it has to do
+/// the embedding rather than only assert that it was possible. A build
+/// that checked and then emitted the path anyway left the prompts
+/// unreachable to any server that cannot open the author's files, which
+/// is every hosted one.
+#[test]
+fn bp_build_strict_embed_emits_the_resolved_ref_embedded() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let script_path = tmp.path().join("strict-embed-resolved.bp.lua");
+    let out_path = tmp.path().join("out.json");
+    fs::write(
+        &script_path,
+        r#"
+local F = require("flow_dsl")
+
+return {
+  id = "strict-embed-resolved",
+  -- A fully embedded Blueprint declares its kinds itself (see the
+  -- undeclared-kind test below for what happens without this line).
+  default_agent_kind = "operator",
+  flow = F.step({ id = "solo", agent = "researcher", input = F.lit(""), out = F.p("$.solo") }),
+  agents = {
+    {
+      -- Same bare-name tier-6 ref as the default-emit test above.
+      ["$agent_md"] = "researcher.md",
+      spec = { operator_ref = "main-ai" },
+    },
+  },
+  operators = { { name = "main-ai" } },
+  strategy = { strict_refs = true, strict_kind = true },
+}
+"#,
+    )
+    .expect("write strict-embed fixture script");
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .env_remove("MSE_BLUEPRINT_INCLUDES")
+        .args(["bp", "build", "--strict-embed"])
+        .arg(&script_path)
+        .args(["-o"])
+        .arg(&out_path)
+        .assert()
+        .success()
+        .stderr(contains("compile lint: OK"))
+        .stderr(contains("emitting refs embedded"));
+
+    let out = fs::read_to_string(&out_path).expect("out.json written");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("out.json is valid JSON");
+    let agent = value
+        .get("agents")
+        .and_then(|a| a.get(0))
+        .expect("agents[0] present");
+    assert!(
+        agent.get("$agent_md").is_none(),
+        "--strict-embed must replace the ref, not carry it alongside the expansion: {agent}"
+    );
+    assert_eq!(
+        agent.get("name").and_then(|v| v.as_str()),
+        Some("researcher"),
+        "the expansion supplies AgentDef.name from the agent.md frontmatter"
+    );
+    let prompt = agent
+        .get("profile")
+        .and_then(|p| p.get("system_prompt"))
+        .and_then(|v| v.as_str())
+        .expect("expanded agent carries profile.system_prompt");
+    assert!(
+        !prompt.trim().is_empty(),
+        "the embedded body is the agent.md body, not an empty placeholder"
+    );
+    // Sibling keys still win over the expansion (shallow merge), so the
+    // embed must not have dropped what the Blueprint declared itself.
+    assert_eq!(
+        agent
+            .get("spec")
+            .and_then(|s| s.get("operator_ref"))
+            .and_then(|v| v.as_str()),
+        Some("main-ai"),
+        "sibling keys survive the expansion"
+    );
+    // The loader's body hash rides along: it is what lets a registered
+    // Blueprint be compared against the agent.md it was built from.
+    assert!(
+        agent
+            .get("profile")
+            .and_then(|p| p.get("version_hash"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|h| !h.is_empty()),
+        "embedded agent carries the loader's profile.version_hash: {agent}"
+    );
+    // Provenance: the ref resolved through tier 6 into this repo's bundled
+    // samples dir, so the record names that file relative to the work tree
+    // (never an absolute path) and this repo by directory name.
+    let embed = agent
+        .get("profile")
+        .and_then(|p| p.get("extras"))
+        .and_then(|x| x.get("embed"))
+        .expect("embedded agent carries profile.extras.embed");
+    let source = embed
+        .get("source")
+        .and_then(|v| v.as_str())
+        .expect("embed.source present");
+    assert!(
+        source.ends_with("samples/agents/researcher.md") && !source.starts_with('/'),
+        "embed.source is the work-tree-relative path of the resolved file: {embed}"
+    );
+    assert_eq!(
+        embed.get("repo").and_then(|v| v.as_str()),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str()),
+        "embed.repo is the work tree's directory name: {embed}"
+    );
+    assert!(
+        embed
+            .get("rev")
+            .and_then(|v| v.as_str())
+            .is_some_and(|r| r.len() >= 40),
+        "embed.rev is the work tree's HEAD (optionally -dirty): {embed}"
+    );
+}
+
+/// `--strict-embed` on a `$agent_md` whose kind the Blueprint does not
+/// declare must refuse, not pin the schema default.
+///
+/// Without the flag the kind is left for the registering server to fill in
+/// from its own `--default-agent-kind`; an embedded Blueprint carries the
+/// kind literal itself, so silently writing `operator` would bypass that
+/// server setting. The error names both places the Blueprint can declare
+/// it. Same fixture as the embed test above minus `default_agent_kind`.
+#[test]
+fn bp_build_strict_embed_refuses_an_agent_md_ref_with_undeclared_kind() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let script_path = tmp.path().join("strict-embed-undeclared-kind.bp.lua");
+    let out_path = tmp.path().join("out.json");
+    fs::write(
+        &script_path,
+        r#"
+local F = require("flow_dsl")
+
+return {
+  id = "strict-embed-undeclared-kind",
+  flow = F.step({ id = "solo", agent = "researcher", input = F.lit(""), out = F.p("$.solo") }),
+  agents = {
+    {
+      ["$agent_md"] = "researcher.md",
+      spec = { operator_ref = "main-ai" },
+    },
+  },
+  operators = { { name = "main-ai" } },
+  strategy = { strict_refs = true, strict_kind = true },
+}
+"#,
+    )
+    .expect("write undeclared-kind fixture script");
+
+    // Default path: unchanged — raw emit, exit 0, the server decides the kind.
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .env_remove("MSE_BLUEPRINT_INCLUDES")
+        .args(["bp", "build"])
+        .arg(&script_path)
+        .args(["-o"])
+        .arg(&out_path)
+        .assert()
+        .success()
+        .stderr(contains("compile lint: OK"));
+    fs::remove_file(&out_path).expect("remove default-path out.json");
+
+    Command::cargo_bin("mse")
+        .expect("mse binary")
+        .env_remove("MSE_BLUEPRINT_INCLUDES")
+        .args(["bp", "build", "--strict-embed"])
+        .arg(&script_path)
+        .args(["-o"])
+        .arg(&out_path)
+        .assert()
+        .failure()
+        .stderr(contains("strict-embed: kind for `$agent_md` = \"researcher.md\" is not declared"))
+        .stderr(contains("default_agent_kind"))
+        .stderr(contains("--strict-embed"));
+    assert!(
+        !out_path.exists(),
+        "--strict-embed must not write out.json when a kind is undeclared"
+    );
+}
+
 /// GH #62 Axis A CLI error path: an unknown template must exit non-zero
 /// with the accepted list named — closed set discoverable from the
 /// error rather than requiring the author to open the guide.

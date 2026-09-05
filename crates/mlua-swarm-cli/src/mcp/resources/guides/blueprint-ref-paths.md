@@ -85,7 +85,7 @@ only; each layer chooses its own strictness.
 | layer | default | strict opt-in |
 |---|---|---|
 | `mse bp lint` | linker best-effort, verdict `WARN`, exit 0 | `--strict` — non-zero exit on any WARN/ERROR |
-| `mse bp build` | linker; on fail, emit raw wire JSON with refs preserved and print WARN | `--strict-embed` — hard-fail (non-zero exit, no JSON emitted) |
+| `mse bp build` | linker; emit the wire JSON with refs preserved either way, and print WARN on fail | `--strict-embed` — emit the linker's expansion in place of every ref; hard-fail on an unresolved one (non-zero exit, no JSON emitted) |
 | server register (`POST /v1/blueprints/:id`) | linker; on fail, HTTP 400 with a fix hint naming every include-cascade knob | server config `blueprint_strict_embed = true` — reject any request body that still carries `$file` / `$agent_md` before the linker even runs |
 | dispatch (worker prompt build) | n/a — typed `Blueprint` is resolved-only by the time the compiler sees it | n/a |
 
@@ -99,7 +99,24 @@ The flag semantic is "require refs to be **embedded** at build time,
 hard-fail if any are unresolved." Not `--strict-refs`, which would
 suggest refs themselves are disallowed — they are not. `mse bp build`
 still accepts a Blueprint with refs by default; `--strict-embed` is
-the switch that promotes the default WARN to an error.
+the switch that promotes the default WARN to an error **and** puts the
+expansion into the emitted JSON.
+
+Both halves are the flag: a build that verified the refs resolve and
+then emitted the paths anyway would leave the JSON no more portable
+than before, which is the only reason to embed. So under the flag,
+`-o`, stdout, and the `--register` body all carry the expanded
+Blueprint.
+
+Two more rules follow from the emitted JSON being self-contained, and
+apply only under the flag: a `$agent_md` whose kind neither a sibling
+`kind` nor the top-level `default_agent_kind` declares is a build error
+(the schema default is not pinned behind the registering server's
+`--default-agent-kind`), and each embedded agent carries
+`profile.extras.embed {source, repo, rev}` — work-tree-relative path,
+repo directory name, `HEAD` sha (`-dirty` when uncommitted) — next to
+the loader's `version_hash`. `mse://guides/strict-embed-modes` has the
+detail.
 
 ## Path hygiene
 
