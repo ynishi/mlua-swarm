@@ -8,6 +8,7 @@
 //! the mse serve lib (= the baseline `identity` RustFn is pre-baked, the shared SoT
 //! across the three sibling binaries).
 
+mod block_runner;
 mod operator_client;
 mod resources;
 // launchd knowledge lives in `crate::server::launchd` (relocated from
@@ -453,6 +454,204 @@ enum SyncRunReport {
 /// (`internal_error`). `SessionClosed` says the sid's WS could not be
 /// re-established *for this call* — the sid itself stays valid, and the
 /// driver is free to call again once the server is back.
+/// Adds the [`block_runner::LAUNCH_VARIANT`] capability to a join manifest
+/// that does not already declare it. Idempotent: a manifest that names the
+/// variant (with whatever model / tools) is returned untouched.
+fn with_block_capability(
+    mut manifest: mlua_swarm::AgentProviderManifest,
+) -> mlua_swarm::AgentProviderManifest {
+    let declared = manifest
+        .capabilities
+        .iter()
+        .any(|c| c.launch_variant.as_deref() == Some(block_runner::LAUNCH_VARIANT));
+    if !declared {
+        manifest
+            .capabilities
+            .push(mlua_swarm::AgentProviderCapability {
+                launch_variant: Some(block_runner::LAUNCH_VARIANT.to_string()),
+                resolved_model: None,
+                effective_tools: Vec::new(),
+                capability_snapshot_digest: None,
+            });
+    }
+    manifest
+}
+
+/// Runs one `agent-block` spawn to completion on this host and reports it
+/// back to the server the way a SubAgent would: staged parts to
+/// `/v1/worker/artifact`, the body to `/v1/worker/submit` (with `ok=false`
+/// on failure), then `spawn_ack`. Every failure mode lands as a failed
+/// attempt whose body says why — a block the server cannot see the
+/// outcome of would wedge the step until its TTL.
+async fn dispatch_block_spawn(
+    op: Arc<OperatorClientState>,
+    sid: String,
+    spawn: block_runner::BlockSpawn,
+) {
+    let base = op.http_base().trim_end_matches('/').to_string();
+    let client = match crate::http::client_builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(agent = %spawn.agent, "block runner: client build: {e}");
+            let _ = op
+                .ack(
+                    &sid,
+                    spawn.req_id.clone(),
+                    "spawn_ack",
+                    Some(serde_json::json!({})),
+                    false,
+                    Some(format!("block runner: client build: {e}")),
+                    None,
+                )
+                .await;
+            return;
+        }
+    };
+
+    let outcome = run_block_spawn(&client, &base, &spawn).await;
+
+    let (body, ok, error) = match &outcome {
+        Ok(out) => {
+            for (name, content) in &out.artifacts {
+                if let Err(e) = post_worker_body(
+                    &client,
+                    &base,
+                    &spawn.worker_handle,
+                    Some(name),
+                    block_runner::body_text(content),
+                    true,
+                )
+                .await
+                {
+                    tracing::error!(agent = %spawn.agent, part = %name, "block runner: artifact: {e}");
+                }
+            }
+            (block_runner::body_text(&out.value), out.ok, None)
+        }
+        Err(e) => {
+            tracing::error!(agent = %spawn.agent, "block runner: {e}");
+            (e.clone(), false, Some(e.clone()))
+        }
+    };
+
+    if let Err(e) = post_worker_body(&client, &base, &spawn.worker_handle, None, body, ok).await {
+        tracing::error!(agent = %spawn.agent, "block runner: submit: {e}");
+    }
+    if let Err(e) = op
+        .ack(
+            &sid,
+            spawn.req_id.clone(),
+            "spawn_ack",
+            Some(serde_json::json!({})),
+            ok,
+            error,
+            None,
+        )
+        .await
+    {
+        tracing::error!(agent = %spawn.agent, "block runner: spawn_ack: {e}");
+    }
+    tracing::info!(agent = %spawn.agent, task_id = %spawn.task_id, ok, "block runner: done");
+}
+
+/// Fetches the step's worker payload and runs the block named by the
+/// spawn's agent under `MSE_BLOCKS_DIR`.
+async fn run_block_spawn(
+    client: &reqwest::Client,
+    base: &str,
+    spawn: &block_runner::BlockSpawn,
+) -> Result<block_runner::BlockOutcome, String> {
+    let dir = block_runner::blocks_dir()?;
+    let script = block_runner::resolve_block_script(&dir, &spawn.agent)?;
+
+    let url = format!("{base}/v1/worker/prompt");
+    let resp = client
+        .get(&url)
+        .query(&[("task_id", spawn.task_id.as_str())])
+        .header("Authorization", format!("Bearer {}", spawn.worker_handle))
+        .send()
+        .await
+        .map_err(|e| format!("worker fetch: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("worker fetch: HTTP {} — {text}", status.as_u16()));
+    }
+    let payload: JsonValue =
+        serde_json::from_str(&text).map_err(|e| format!("worker fetch decode: {e}"))?;
+
+    let prompt = payload
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let system = match payload.get("system_ref") {
+        Some(sr) => {
+            let system_ref: mlua_swarm::types::SystemRef = serde_json::from_value(sr.clone())
+                .map_err(|e| format!("system_ref decode: {e}"))?;
+            let bytes = fetch_system_ref_bytes(client, base, &system_ref).await?;
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        None => payload
+            .get("system")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    };
+    let context = payload.get("context");
+    let input = block_runner::BlockInput {
+        script,
+        project_root: block_runner::project_root_from_context(context),
+        prompt,
+        system,
+        extra_globals: block_runner::context_globals(context),
+    };
+    tracing::info!(
+        agent = %spawn.agent,
+        script = %input.script.display(),
+        project_root = %input.project_root.display(),
+        "block runner: start"
+    );
+    block_runner::run_block(input).await
+}
+
+/// One worker POST: `name` = Some → `/v1/worker/artifact` (a staged part),
+/// None → `/v1/worker/submit` (the body, `?ok=false` when the attempt
+/// failed). Same wire as `mse_worker_submit`, minus the tool surface.
+async fn post_worker_body(
+    client: &reqwest::Client,
+    base: &str,
+    worker_handle: &str,
+    name: Option<&str>,
+    body: String,
+    ok: bool,
+) -> Result<(), String> {
+    let url = worker_submit_endpoint_url(base, name)?;
+    let mut request = client
+        .post(url)
+        .header("Authorization", format!("Bearer {worker_handle}"))
+        .header("Content-Type", "text/plain");
+    if name.is_none() && !ok {
+        request = request.query(&[("ok", "false")]);
+    }
+    let resp = request
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("worker post: {e}"))?;
+    let status = resp.status();
+    if status != reqwest::StatusCode::NO_CONTENT {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "worker post: HTTP {} (expected 204) — {text}",
+            status.as_u16()
+        ));
+    }
+    Ok(())
+}
+
 fn client_error_to_mcp(e: ClientError) -> McpError {
     match e {
         ClientError::UnknownSid(_)
@@ -3406,9 +3605,16 @@ impl MseServer {
         &self,
         Parameters(req): Parameters<OperatorJoinReq>,
     ) -> Result<CallToolResult, McpError> {
+        // This process runs `agent-block` spawns itself (see
+        // `block_runner`), so a manifest it submits covers that variant
+        // whether or not the caller thought to list it — a strict-binding
+        // server would otherwise refuse the block steps this very process
+        // is the executor for.
+        let manifest = req.capability_manifest.map(with_block_capability);
+        self.ensure_block_drain().await;
         let sid = self
             .op_client
-            .join(req.capability_manifest, Some(req.desc))
+            .join(manifest, Some(req.desc))
             .await
             .map_err(client_error_to_mcp)?;
         json_result(&serde_json::json!({ "sid": sid }))
@@ -3496,27 +3702,64 @@ impl MseServer {
     }
 
     #[tool(
-        description = "Pop one pending server frame (ask / hook_before / hook_after / spawn) for `sid`, waiting up to `timeout_ms` (default 30000) if the queue is empty. Returns {timed_out, req_id?, type?, payload?} on delivery — `type` mirrors the server's ServerMsg discriminant, `payload` carries the remaining frame fields verbatim. Returns {timed_out: true} on timeout. Reply via mse_ack with a matching `kind`."
+        description = "Pop one pending server frame (ask / hook_before / hook_after / spawn) for `sid`, waiting up to `timeout_ms` (default 30000) if the queue is empty. Returns {timed_out, req_id?, type?, payload?} on delivery — `type` mirrors the server's ServerMsg discriminant, `payload` carries the remaining frame fields verbatim. Returns {timed_out: true} on timeout. Reply via mse_ack with a matching `kind`. A spawn whose `worker.variant` is `agent-block` never reaches this queue: this process runs that block itself, on this host, with no SubAgent and without waiting for anyone to poll — the WS reader diverts it the moment it arrives (so it runs during a blocking `swarm_run` too), and a background task resolves `<MSE_BLOCKS_DIR>/<agent name>/init.lua`, fetches the step's prompt through the worker endpoint, runs the script with the launch's work_dir as project root, POSTs staged parts and the body the way a SubAgent would, and acks the spawn. `blocks_dispatched` counts the spawns diverted that way since the previous call (a block that fails — missing `MSE_BLOCKS_DIR`, unknown block, script error — is submitted as a failed attempt with the reason as its body, never silently dropped). Guide: `mse://guides/agent-block-runner`."
     )]
     async fn mse_pending_wait(
         &self,
         Parameters(req): Parameters<OperatorPendingWaitReq>,
     ) -> Result<CallToolResult, McpError> {
+        self.ensure_block_drain().await;
         let timeout_ms = req.timeout_ms.unwrap_or(30_000);
         let frame = self
             .op_client
             .pending_wait(&req.sid, timeout_ms)
             .await
             .map_err(client_error_to_mcp)?;
+        // Block spawns never reach this queue — the WS reader diverts them
+        // to the drain (see `ensure_block_drain`). The count is the one
+        // trace of them a driver gets to see here.
+        let blocks_dispatched = self.op_client.blocks_intercepted_since_last();
         match frame {
             Some(f) => json_result(&serde_json::json!({
                 "timed_out": false,
                 "req_id": f.req_id,
                 "type": f.kind,
                 "payload": f.payload,
+                "blocks_dispatched": blocks_dispatched,
             })),
-            None => json_result(&serde_json::json!({ "timed_out": true })),
+            None => json_result(&serde_json::json!({
+                "timed_out": true,
+                "blocks_dispatched": blocks_dispatched,
+            })),
         }
+    }
+
+    /// Starts, once per process, the task that runs the block spawns the
+    /// WS readers divert (see `OperatorClientState::take_block_rx`). Called
+    /// from every tool that can lead to a spawn frame arriving, so the
+    /// drain exists before the first session does; a second call is a
+    /// no-op.
+    async fn ensure_block_drain(&self) {
+        let Some(mut rx) = self.op_client.take_block_rx().await else {
+            return;
+        };
+        let op = self.op_client.clone();
+        tokio::spawn(async move {
+            while let Some((sid, frame)) = rx.recv().await {
+                let Some(spawn) =
+                    block_runner::parse_block_spawn(frame.kind, &frame.req_id, &frame.payload)
+                else {
+                    continue;
+                };
+                // Each block on its own task: a slow lane must not hold
+                // back the next spawn, and a fanout of lanes runs them
+                // side by side the way the server would.
+                let op = op.clone();
+                tokio::spawn(async move {
+                    dispatch_block_spawn(op, sid, spawn).await;
+                });
+            }
+        });
     }
 
     #[tool(
@@ -6898,6 +7141,48 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A join manifest gains the `agent-block` capability once, and only
+    /// when it does not already declare it.
+    #[test]
+    fn with_block_capability_adds_the_variant_once() {
+        let bare = mlua_swarm::AgentProviderManifest {
+            provider_id: "claude-code".into(),
+            provider_revision: None,
+            capabilities: vec![mlua_swarm::AgentProviderCapability {
+                launch_variant: Some("claude".into()),
+                resolved_model: Some("sonnet".into()),
+                effective_tools: vec!["Read".into()],
+                capability_snapshot_digest: None,
+            }],
+        };
+        let added = with_block_capability(bare.clone());
+        assert_eq!(added.capabilities.len(), 2, "{added:?}");
+        assert_eq!(
+            added.capabilities[1].launch_variant.as_deref(),
+            Some(block_runner::LAUNCH_VARIANT)
+        );
+        assert_eq!(added.capabilities[0], bare.capabilities[0], "existing entry untouched");
+
+        let again = with_block_capability(added.clone());
+        assert_eq!(again, added, "idempotent: already declared, nothing appended");
+
+        let declared_by_caller = mlua_swarm::AgentProviderManifest {
+            provider_id: "x".into(),
+            provider_revision: None,
+            capabilities: vec![mlua_swarm::AgentProviderCapability {
+                launch_variant: Some(block_runner::LAUNCH_VARIANT.into()),
+                resolved_model: None,
+                effective_tools: vec!["custom".into()],
+                capability_snapshot_digest: None,
+            }],
+        };
+        assert_eq!(
+            with_block_capability(declared_by_caller.clone()),
+            declared_by_caller,
+            "a caller's own declaration (with its tools) is kept as is"
+        );
+    }
 
     /// A small Blueprint is written to the default file *and* inlined; the
     /// response names the file either way.

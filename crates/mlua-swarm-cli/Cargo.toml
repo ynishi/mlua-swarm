@@ -34,6 +34,11 @@ mlua-swarm-compile.workspace = true
 rusqlite-isle.workspace = true
 mlua-flow-ir.workspace = true
 mlua.workspace = true
+# The caller-side block runner (`mcp/block_runner.rs`) makes the same
+# agent-block-core call the server-side in-process runtime makes — the
+# crate is already in the binary through `mlua-swarm`; this only names it.
+agent-block-core.workspace = true
+agent-block-types.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true

@@ -1865,6 +1865,8 @@ dependencies = [
 name = "mlua-swarm-cli"
 version = "0.28.1"
 dependencies = [
+ "agent-block-core",
+ "agent-block-types",
  "anyhow",
  "assert_cmd",
  "async-trait",

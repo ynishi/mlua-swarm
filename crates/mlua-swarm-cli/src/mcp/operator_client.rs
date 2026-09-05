@@ -21,6 +21,7 @@
 //! `ClientMsgMirror` below, which match `protocol.rs` field-for-field).
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +31,7 @@ use mlua_swarm::{RunId, StepId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -386,23 +387,58 @@ pub struct OperatorClientState {
     /// lifetime — a handful of short strings per dispatch, so no eviction
     /// is needed at realistic session sizes.
     worker_routes: Mutex<HashMap<String, WorkerRoute>>,
+    /// Where the reader tasks send the spawn frames this process runs
+    /// itself (`worker.variant == "agent-block"`, see
+    /// [`super::block_runner`]) instead of queuing them for
+    /// `mse_pending_wait`. Tapped at the reader so a block runs whether or
+    /// not the MainAI is polling — a blocking `swarm_run` cannot poll, and
+    /// a Blueprint made only of blocks would otherwise never advance.
+    block_tx: mpsc::UnboundedSender<(String, PendingFrame)>,
+    /// The receiving end, handed out once to whoever drains it (see
+    /// [`Self::take_block_rx`]).
+    block_rx: Mutex<Option<mpsc::UnboundedReceiver<(String, PendingFrame)>>>,
+    /// Spawns diverted to `block_tx` since the last
+    /// [`Self::blocks_intercepted_since_last`] — surfaced on
+    /// `mse_pending_wait` so a driver can see that frames were taken.
+    /// Shared with the reader tasks, which outlive any borrow of `self`.
+    blocks_intercepted: Arc<AtomicUsize>,
 }
 
 impl OperatorClientState {
     pub fn new() -> Self {
-        Self {
-            sessions: Mutex::new(HashMap::new()),
-            http_base: resolve_http_base(),
-            worker_routes: Mutex::new(HashMap::new()),
-        }
+        Self::with_http_base(resolve_http_base())
     }
 
-    #[cfg(test)]
     fn with_http_base(http_base: impl Into<String>) -> Self {
+        let (block_tx, block_rx) = mpsc::unbounded_channel();
         Self {
             sessions: Mutex::new(HashMap::new()),
             http_base: http_base.into(),
             worker_routes: Mutex::new(HashMap::new()),
+            block_tx,
+            block_rx: Mutex::new(Some(block_rx)),
+            blocks_intercepted: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The receiving end of the block-spawn tap, once. `None` after the
+    /// first call — there is one drain per process.
+    pub async fn take_block_rx(&self) -> Option<mpsc::UnboundedReceiver<(String, PendingFrame)>> {
+        self.block_rx.lock().await.take()
+    }
+
+    /// Number of spawn frames diverted to the block tap since the previous
+    /// call; resets the counter.
+    pub fn blocks_intercepted_since_last(&self) -> usize {
+        self.blocks_intercepted.swap(0, Ordering::Relaxed)
+    }
+
+    /// The reader-side tap for one session.
+    fn block_tap(&self, sid: &str) -> BlockTap {
+        BlockTap {
+            sid: sid.to_string(),
+            tx: self.block_tx.clone(),
+            intercepted: self.blocks_intercepted.clone(),
         }
     }
 
@@ -504,7 +540,7 @@ impl OperatorClientState {
         };
 
         let pending = Arc::new(PendingQueue::new());
-        let reader_task = spawn_reader(reader, pending.clone());
+        let reader_task = spawn_reader(reader, pending.clone(), self.block_tap(&sid));
 
         let entry = Arc::new(SessionEntry {
             token,
@@ -601,7 +637,7 @@ impl OperatorClientState {
                     *entry.writer.lock().await = writer;
                     let replaced = std::mem::replace(
                         &mut *entry.reader_task.lock().await,
-                        spawn_reader(reader, entry.pending.clone()),
+                        spawn_reader(reader, entry.pending.clone(), self.block_tap(sid)),
                     );
                     // The old reader has normally finished already; abort
                     // covers the failed-send path, where it may still be
@@ -1047,7 +1083,40 @@ async fn server_healthz_ok(http_base: &str) -> bool {
     }
 }
 
-fn spawn_reader(mut reader: WsSource, pending: Arc<PendingQueue>) -> JoinHandle<()> {
+/// The reader-side end of the block-spawn tap: which session the frames
+/// belong to, where to send them, and the counter to bump.
+struct BlockTap {
+    sid: String,
+    tx: mpsc::UnboundedSender<(String, PendingFrame)>,
+    intercepted: Arc<AtomicUsize>,
+}
+
+/// Routes one parsed frame: a spawn this process runs itself (an
+/// `agent-block` worker variant) goes to the tap, everything else to the
+/// session's pending queue for `mse_pending_wait`. Split out of the reader
+/// so the decision is unit-testable without a socket.
+async fn route_frame(frame: PendingFrame, pending: &PendingQueue, tap: &BlockTap) {
+    let is_block =
+        super::block_runner::parse_block_spawn(frame.kind, &frame.req_id, &frame.payload)
+            .is_some();
+    if is_block {
+        tap.intercepted.fetch_add(1, Ordering::Relaxed);
+        // A closed tap means nothing drains blocks in this process; the
+        // frame still has to reach *someone*, so fall back to the queue
+        // rather than drop it on the floor.
+        if let Err(mpsc::error::SendError((_, frame))) = tap.tx.send((tap.sid.clone(), frame)) {
+            pending.push(frame).await;
+        }
+        return;
+    }
+    pending.push(frame).await;
+}
+
+fn spawn_reader(
+    mut reader: WsSource,
+    pending: Arc<PendingQueue>,
+    tap: BlockTap,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(item) = reader.next().await {
             let txt = match item {
@@ -1056,7 +1125,7 @@ fn spawn_reader(mut reader: WsSource, pending: Arc<PendingQueue>) -> JoinHandle<
                 _ => continue,
             };
             if let Some(frame) = parse_server_frame(&txt) {
-                pending.push(frame).await;
+                route_frame(frame, &pending, &tap).await;
             }
         }
     })
@@ -1092,6 +1161,83 @@ fn http_to_ws_base(http_base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spawn_frame(variant: &str, req_id: &str) -> PendingFrame {
+        let text = serde_json::json!({
+            "type": "spawn",
+            "req_id": req_id,
+            "task_id": "ST-1",
+            "agent": "checkout-prep",
+            "attempt": 1,
+            "capability_token": "cap",
+            "worker_handle": "wh-deadbeef",
+            "worker": { "variant": variant, "tools": [] },
+            "directive": "..."
+        })
+        .to_string();
+        parse_server_frame(&text).expect("spawn frame parses")
+    }
+
+    /// An `agent-block` spawn goes to the tap and is counted; any other
+    /// frame goes to the queue untouched. With the tap closed, the block
+    /// spawn falls back to the queue instead of vanishing.
+    #[tokio::test]
+    async fn route_frame_taps_block_spawns_and_queues_the_rest() {
+        let pending = PendingQueue::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let tap = BlockTap {
+            sid: "sid-1".into(),
+            tx,
+            intercepted: Arc::new(AtomicUsize::new(0)),
+        };
+
+        route_frame(
+            spawn_frame(super::super::block_runner::LAUNCH_VARIANT, "r-block"),
+            &pending,
+            &tap,
+        )
+        .await;
+        route_frame(spawn_frame("claude", "r-claude"), &pending, &tap).await;
+
+        let (sid, tapped) = rx.try_recv().expect("block spawn reached the tap");
+        assert_eq!(sid, "sid-1");
+        assert_eq!(tapped.req_id, "r-block");
+        assert_eq!(tap.intercepted.load(Ordering::Relaxed), 1);
+        let queued = pending
+            .wait(Duration::from_millis(10))
+            .await
+            .expect("claude spawn queued");
+        assert_eq!(queued.req_id, "r-claude");
+        assert!(
+            pending.wait(Duration::from_millis(10)).await.is_none(),
+            "the block spawn was not also queued"
+        );
+
+        drop(rx);
+        route_frame(
+            spawn_frame(super::super::block_runner::LAUNCH_VARIANT, "r-orphan"),
+            &pending,
+            &tap,
+        )
+        .await;
+        let fallback = pending
+            .wait(Duration::from_millis(10))
+            .await
+            .expect("with no drain, the block spawn is queued rather than dropped");
+        assert_eq!(fallback.req_id, "r-orphan");
+    }
+
+    /// The receiver is handed out exactly once, and the counter resets on
+    /// read.
+    #[tokio::test]
+    async fn block_rx_is_taken_once_and_the_counter_resets() {
+        let state = OperatorClientState::with_http_base("http://127.0.0.1:1");
+        assert!(state.take_block_rx().await.is_some());
+        assert!(state.take_block_rx().await.is_none());
+        state.blocks_intercepted.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(state.blocks_intercepted_since_last(), 3);
+        assert_eq!(state.blocks_intercepted_since_last(), 0);
+    }
 
     // ─── parse_server_frame ──────────────────────────────────────────────
 
