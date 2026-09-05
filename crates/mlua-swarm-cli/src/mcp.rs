@@ -572,7 +572,6 @@ async fn run_block_spawn(
     spawn: &block_runner::BlockSpawn,
 ) -> Result<block_runner::BlockOutcome, String> {
     let dir = block_runner::blocks_dir()?;
-    let script = block_runner::resolve_block_script(&dir, &spawn.agent)?;
 
     let url = worker_prompt_endpoint_url(base)?;
     let resp = client
@@ -608,6 +607,11 @@ async fn run_block_spawn(
             .map(str::to_string),
     };
     let context = payload.get("context");
+    // The block is named by the agent's declared ctx (`meta.ctx.block`) when
+    // present, else by the agent itself — decided after the fetch because the
+    // ctx travels on the worker payload, not the Spawn frame.
+    let block = block_runner::block_name(context, &spawn.agent);
+    let script = block_runner::resolve_block_script(&dir, block)?;
     let input = block_runner::BlockInput {
         script,
         project_root: block_runner::project_root_from_context(context),
