@@ -29,19 +29,22 @@
 //! ```
 //!
 //! The server dispatches it like any Operator step — a `Spawn` frame with
-//! `worker.variant = "agent-block"` — and this process, on popping that
-//! frame in `mse_pending_wait`, does not hand it to the MainAI. It resolves
-//! the block by **agent name** under [`BLOCKS_DIR_ENV`]
-//! (`<dir>/<agent>/init.lua`), fetches the step's prompt / system through
-//! the ordinary worker endpoint, runs the script with the caller's
-//! `work_dir` as the project root, POSTs the result the way a SubAgent
-//! would (`/v1/worker/artifact` for staged parts, `/v1/worker/submit` for
-//! the body), and acks the spawn. The MainAI never sees a turn for it.
+//! `worker.variant = "agent-block"` — and this process's WS reader diverts
+//! that frame as it arrives (`operator_client::route_frame`), so it never
+//! reaches the queue `mse_pending_wait` pops from and runs whether or not
+//! the MainAI is polling. A background task resolves the block by **agent
+//! name** under the blocks dir ([`blocks_dir`]: [`BLOCKS_DIR_ENV`], else
+//! `$MSE_HOME/blocks`) as `<dir>/<agent>/init.lua`, fetches the step's
+//! prompt / system through the ordinary worker endpoint, runs the script
+//! with the caller's `work_dir` as the project root, POSTs the result the
+//! way a SubAgent would (`/v1/worker/artifact` for staged parts,
+//! `/v1/worker/submit` for the body), and acks the spawn. The MainAI never
+//! sees a turn for it.
 //!
 //! Naming the block after the agent keeps the Blueprint free of any path:
-//! where the blocks live is this host's business (`MSE_BLOCKS_DIR`), not
-//! the Blueprint's. A Blueprint registered with an old server still
-//! dispatches — the variant is an ordinary string to it.
+//! where the blocks live is this host's business, not the Blueprint's. A
+//! Blueprint registered with an old server still dispatches — the variant
+//! is an ordinary string to it.
 //!
 //! ## Script contract
 //!
@@ -71,8 +74,8 @@ use tokio::sync::oneshot;
 pub const LAUNCH_VARIANT: &str = "agent-block";
 
 /// Environment variable naming the directory that holds one `<name>/init.lua`
-/// per block. Read per spawn, so a value set after the MCP started still
-/// counts.
+/// per block. Read per spawn. Wins over the `$MSE_HOME/blocks` default
+/// (see [`blocks_dir`]).
 pub const BLOCKS_DIR_ENV: &str = "MSE_BLOCKS_DIR";
 
 /// The one `bus.emit` kind that stages a named part instead of finishing
@@ -122,16 +125,35 @@ pub fn parse_block_spawn(kind: &str, req_id: &str, payload: &Value) -> Option<Bl
     })
 }
 
-/// The blocks directory this host resolves block names under.
+/// The directory under `$MSE_HOME` that stands in for [`BLOCKS_DIR_ENV`]
+/// when it is not set — a sibling of `bp/` and `runs/`, so a symlink to
+/// wherever the blocks live is enough and no process environment has to
+/// change.
+pub const DEFAULT_BLOCKS_SUBDIR: &str = "blocks";
+
+/// The blocks directory this host resolves block names under:
+/// [`BLOCKS_DIR_ENV`] when set, else `<mse_home>/blocks` when that exists.
 pub fn blocks_dir() -> Result<PathBuf, String> {
-    match std::env::var_os(BLOCKS_DIR_ENV) {
-        Some(v) if !v.is_empty() => Ok(PathBuf::from(v)),
-        _ => Err(format!(
-            "{BLOCKS_DIR_ENV} is not set: this process was asked to run block agent \
-             steps but does not know where the blocks are — set it to the directory \
-             holding one <name>/init.lua per block"
-        )),
+    blocks_dir_from(std::env::var_os(BLOCKS_DIR_ENV), &super::mse_home())
+}
+
+/// [`blocks_dir`] with its two inputs explicit.
+pub fn blocks_dir_from(env: Option<std::ffi::OsString>, mse_home: &Path) -> Result<PathBuf, String> {
+    if let Some(v) = env.filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(v));
     }
+    let default = mse_home.join(DEFAULT_BLOCKS_SUBDIR);
+    if default.is_dir() {
+        return Ok(default);
+    }
+    Err(format!(
+        "no blocks directory: {BLOCKS_DIR_ENV} is not set and {} does not exist — this \
+         process was asked to run a block agent step but does not know where the blocks \
+         are. Set {BLOCKS_DIR_ENV} to the directory holding one <name>/init.lua per block, \
+         or make {} that directory (a symlink is fine)",
+        default.display(),
+        default.display()
+    ))
 }
 
 /// `<dir>/<block>/init.lua`, refusing a name that could step outside `dir`.
@@ -355,6 +377,28 @@ mod tests {
         let mut no_handle = p.clone();
         no_handle.as_object_mut().unwrap().remove("worker_handle");
         assert!(parse_block_spawn("spawn", "r1", &no_handle).is_none());
+    }
+
+    #[test]
+    fn blocks_dir_prefers_env_then_the_mse_home_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let err = blocks_dir_from(None, home).unwrap_err();
+        assert!(err.contains(BLOCKS_DIR_ENV) && err.contains("blocks"), "{err}");
+        assert!(
+            blocks_dir_from(Some(std::ffi::OsString::new()), home).is_err(),
+            "an empty env value counts as unset"
+        );
+        std::fs::create_dir_all(home.join(DEFAULT_BLOCKS_SUBDIR)).unwrap();
+        assert_eq!(
+            blocks_dir_from(None, home).unwrap(),
+            home.join(DEFAULT_BLOCKS_SUBDIR)
+        );
+        assert_eq!(
+            blocks_dir_from(Some("/elsewhere".into()), home).unwrap(),
+            PathBuf::from("/elsewhere"),
+            "env wins over the default even when the default exists"
+        );
     }
 
     #[test]

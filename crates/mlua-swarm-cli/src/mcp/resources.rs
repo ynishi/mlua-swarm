@@ -49,7 +49,7 @@
 //! | `mse://guides/strict-embed-modes`            | The two `strict-embed` layers side by side: client build-time pre-embed vs server register-time raw-ref reject (GH #78 P1b). |
 //! | `mse://guides/enhance-flow`                  | Enhance flow (issue → JSON Patch → verify → commit): prerequisites, HTTP surface, the spawner's output contract, and the `EnhanceSetting.spawner` swap. |
 //! | `mse://guides/auth-token-model`              | The three credential layers (L0 access token / L1 identity / L2 capability), fail-closed remote binds, and `MSE_ACCESS_TOKEN` client pass-through (GH #101). |
-//! | `mse://guides/agent-block-runner`            | Blocks on the caller's host: `ws_operator` + `variant = "agent-block"`, resolved under `MSE_BLOCKS_DIR` by agent name and run by `mse mcp` inside `mse_pending_wait` — no SubAgent, no server-side script path. |
+//! | `mse://guides/agent-block-runner`            | Blocks on the caller's host: `ws_operator` + `variant = "agent-block"`, resolved by agent name under `MSE_BLOCKS_DIR` / `~/.mse/blocks` and run by `mse mcp` off its WS reader — no SubAgent, no polling, no server-side script path. |
 //! | `mse://blueprints/samples/01-pure-ctx-eval`  | Zero-spawn ctx-only Blueprint sample.               |
 //! | `mse://blueprints/samples/02-verdict-loop`   | Verdict retry-loop Blueprint sample.                |
 //! | `mse://blueprints/samples/03-fn-override`    | Verdict fn-override Blueprint sample.               |
@@ -272,7 +272,7 @@ pub const RESOURCES: &[ResourceEntry] = &[
     ResourceEntry {
         uri: "mse://guides/agent-block-runner",
         title: "mse — Running blocks on the caller's host (`agent-block` launch variant)",
-        description: "How a deterministic Lua block step runs against a hosted `mse serve` without a SubAgent: bind the agent to `ws_operator` + `variant = \"agent-block\"`, name it after its block, and `mse mcp` runs `$MSE_BLOCKS_DIR/<name>/init.lua` itself when `mse_pending_wait` pops the spawn — worker fetch, run with the launch's work_dir, artifact / submit POSTs, spawn_ack — with no turn for the MainAI. Script contract (same globals and `bus.emit` rules as the in-process runtime), the join-manifest capability, and when to pick in-process vs caller-side.",
+        description: "How a deterministic Lua block step runs against a hosted `mse serve` without a SubAgent: bind the agent to `ws_operator` + `variant = \"agent-block\"`, name it after its block, and `mse mcp` runs `<blocks dir>/<name>/init.lua` itself (blocks dir = `MSE_BLOCKS_DIR`, else `~/.mse/blocks`) the moment its WS reader sees the spawn — worker fetch, run with the launch's work_dir, artifact / submit POSTs, spawn_ack — with no turn for the MainAI and no polling required. Script contract (same globals and `bus.emit` rules as the in-process runtime), the join-manifest capability, and when to pick in-process vs caller-side.",
         mime_type: "text/markdown",
         body: ResourceBody::Static(AGENT_BLOCK_RUNNER_BODY),
     },

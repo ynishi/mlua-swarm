@@ -70,9 +70,19 @@ The only thing a block step needs from the driver is a joined session
 for the run to be pinned to (`mse_operator_join`, then `swarm_run` on the
 Blueprint id): the spawn is delivered over that session's socket.
 
-`MSE_BLOCKS_DIR` is read per spawn, from the MCP process's environment.
-Set it where the MCP is configured (the `env` block of the server entry
-in `mcp.json`, or the shell that launches it).
+Where the blocks are is resolved per spawn: `MSE_BLOCKS_DIR` from the
+MCP process's environment when set, else `$MSE_HOME/blocks`
+(`~/.mse/blocks` by default — a sibling of `bp/` and `runs/`). The
+default means a symlink is enough:
+
+```sh
+ln -s /path/to/your/blocks ~/.mse/blocks
+```
+
+and nothing about how the MCP is launched has to change. Set the
+variable instead when the blocks live somewhere per-project (the `env`
+block of the server entry in `mcp.json`, or the shell that launches the
+MCP); it wins over the default.
 
 ## Script contract
 
