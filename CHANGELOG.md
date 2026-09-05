@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0](https://github.com/ynishi/mlua-swarm/compare/v0.28.1...v0.29.0) - 2026-09-05
+
+### Added
+
+- *(cli)* make `--strict-embed` emit the embedded Blueprint, with declared kinds and provenance
+- *(cli)* resolve blocks under `$MSE_HOME/blocks` when `MSE_BLOCKS_DIR` is unset
+- *(cli)* run `agent-block` steps on the caller's host from mse mcp
+
+### Fixed
+
+- *(cli)* build every request URL through `Endpoint`, never by string
+- *(cli)* report `blueprint_file.bytes` as the size written to disk
+
+### Other
+
+- *(cli)* isolate agent-block SQLite state in the block runner tests
+
 ## [0.28.1](https://github.com/ynishi/mlua-swarm/compare/v0.28.0...v0.28.1) - 2026-09-04
 
 ### Added
