@@ -347,6 +347,23 @@ pub fn body_text(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    /// agent-block-core opens its KV / SQL / TS SQLite stores under
+    /// `$HOME/.agent-block/` by default, and a `cargo test --workspace`
+    /// runs several test binaries at once — the shared files then contend
+    /// (`journal_mode=WAL: database is locked`, seen on the macOS CI lane).
+    /// `:memory:` gives each process its own store; nothing here needs
+    /// state to outlive a run. Same isolation as
+    /// `tests/agent_block_script_e2e.rs`, set once per process before the
+    /// first runtime reads the env.
+    fn isolate_agent_block_state() {
+        static ISOLATED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ISOLATED.get_or_init(|| {
+            std::env::set_var("AGENT_BLOCK_KV_PATH", ":memory:");
+            std::env::set_var("AGENT_BLOCK_SQL_PATH", ":memory:");
+            std::env::set_var("AGENT_BLOCK_TS_PATH", ":memory:");
+        });
+    }
+
     fn spawn_payload(variant: &str) -> Value {
         serde_json::json!({
             "task_id": "T-1",
@@ -448,6 +465,7 @@ mod tests {
     /// collected, the terminal emit's `response` is the body.
     #[tokio::test]
     async fn run_block_runs_a_script_with_the_worker_globals() {
+        isolate_agent_block_state();
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("init.lua");
         std::fs::write(
@@ -491,6 +509,7 @@ bus.emit("worker_result", {
 
     #[tokio::test]
     async fn run_block_reports_a_script_that_never_emits() {
+        isolate_agent_block_state();
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("init.lua");
         std::fs::write(&script, "local x = 1\n").unwrap();
