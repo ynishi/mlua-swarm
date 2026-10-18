@@ -75,8 +75,8 @@ fn single_stage_default_wiring_and_gate_shape() {
     assert_eq!(
         gate["then"],
         serde_json::json!({
-            "kind": "assign",
-            "at": {"op": "path", "at": "$.halted_at"},
+            "kind": "let",
+            "at": "$.halted_at",
             "value": {"op": "lit", "value": "scout"},
         })
     );
@@ -84,8 +84,8 @@ fn single_stage_default_wiring_and_gate_shape() {
     assert_eq!(
         gate["else"],
         serde_json::json!({
-            "kind": "assign",
-            "at": {"op": "path", "at": "$.done"},
+            "kind": "let",
+            "at": "$.done",
             "value": {"op": "lit", "value": true},
         })
     );
@@ -222,11 +222,8 @@ fn default_no_stage_opt_in_emits_no_gate() {
     );
     assert_eq!(children[0]["kind"], serde_json::json!("step"));
     // No branch anywhere along the chain — final_else is the `done` assign.
-    assert_eq!(children[1]["kind"], serde_json::json!("assign"));
-    assert_eq!(
-        children[1]["at"],
-        serde_json::json!({"op": "path", "at": "$.done"})
-    );
+    assert_eq!(children[1]["kind"], serde_json::json!("let"));
+    assert_eq!(children[1]["at"], serde_json::json!("$.done"));
 }
 
 /// Explicit `gate = true` on a stage opts it in even when the pipeline
@@ -667,8 +664,8 @@ fn halted_at_defaults_when_unset() {
     assert_eq!(
         gate["then"],
         serde_json::json!({
-            "kind": "assign",
-            "at": {"op": "path", "at": "$.halted_at"},
+            "kind": "let",
+            "at": "$.halted_at",
             "value": {"op": "lit", "value": "scout"},
         }),
         "default halted_at must be `$.halted_at` (matches the bundled sample convention)",

@@ -174,10 +174,38 @@ pub async fn run(args: BpArgs) -> Result<()> {
     }
 }
 
+/// [`dsl::build_bp_from_script_with_warnings`] plus the authoring findings
+/// the CLI raises on the built document itself — currently one
+/// `flow-node-renamed` per legacy `assign` flow node
+/// ([`legacy_flow_warnings`]). Shared by `mse bp build`, `mse bp lint` and
+/// the `bp_build` MCP tool so the three report the same thing.
+pub(crate) fn build_bp_with_warnings(script: &str) -> Result<(serde_json::Value, Vec<String>)> {
+    let (bp_value, mut warnings) = dsl::build_bp_from_script_with_warnings(script)?;
+    warnings.extend(legacy_flow_warnings(&bp_value));
+    Ok((bp_value, warnings))
+}
+
+/// One warning line per legacy `assign` flow node in `bp_value`, prefixed
+/// with the lint kind (`[flow-node-renamed] ...`). The node still builds:
+/// it is read as `let` wherever the Blueprint is parsed.
+pub(crate) fn legacy_flow_warnings(bp_value: &serde_json::Value) -> Vec<String> {
+    bp_value
+        .get("flow")
+        .map(mlua_swarm_schema::legacy_flow::legacy_assign_paths)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| {
+            let d =
+                mlua_swarm_diag::flow_node_renamed(mlua_swarm_diag::DiagStage::CompileLint, path);
+            format!("[{}] {}", d.kind, d.message)
+        })
+        .collect()
+}
+
 async fn run_build(args: BuildArgs) -> Result<()> {
     let script = std::fs::read_to_string(&args.script)
         .with_context(|| format!("reading {}", args.script.display()))?;
-    let (bp_value, dsl_warnings) = dsl::build_bp_from_script_with_warnings(&script)
+    let (bp_value, dsl_warnings) = build_bp_with_warnings(&script)
         .with_context(|| format!("building Blueprint from {}", args.script.display()))?;
 
     // Authoring-time (bp_dsl-level) warnings — report-only, printed before
@@ -298,7 +326,7 @@ async fn run_build(args: BuildArgs) -> Result<()> {
 fn run_lint(args: LintArgs) -> Result<()> {
     let script = std::fs::read_to_string(&args.script)
         .with_context(|| format!("reading {}", args.script.display()))?;
-    let (bp_value, dsl_warnings) = dsl::build_bp_from_script_with_warnings(&script)
+    let (bp_value, dsl_warnings) = build_bp_with_warnings(&script)
         .with_context(|| format!("building Blueprint from {}", args.script.display()))?;
 
     // Authoring-time (bp_dsl-level) warnings — report-only, printed before
@@ -1530,6 +1558,35 @@ pub(crate) async fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── flow-node-renamed: legacy `assign` nodes in a built document ───
+
+    #[test]
+    fn legacy_assign_node_in_a_script_is_reported_with_its_path() {
+        // A raw table, not `F.assign` — the DSL builder already emits `let`.
+        let (_, warnings) = build_bp_with_warnings(
+            r#"return { id = "t", flow = { kind = "seq", children = {
+                 { kind = "assign", at = { op = "path", at = "$.x" },
+                   value = { op = "lit", value = 1 } } } } }"#,
+        )
+        .expect("script must build");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let w = &warnings[0];
+        assert!(w.starts_with("[flow-node-renamed] "), "{w}");
+        assert!(w.contains("$.flow.children[0]"), "{w}");
+        assert!(mlua_swarm_diag::lint_decl("flow-node-renamed").is_some());
+    }
+
+    #[test]
+    fn dsl_assign_builder_reports_nothing() {
+        let (value, warnings) = build_bp_with_warnings(
+            r#"local F = require("flow_dsl")
+               return { id = "t", flow = F.assign{ at = F.p("$.x"), value = F.lit(1) } }"#,
+        )
+        .expect("script must build");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(value["flow"]["kind"], "let");
+    }
 
     // ─── GH #62 Axis A: template rendering + round-trip through Compiler ───
 

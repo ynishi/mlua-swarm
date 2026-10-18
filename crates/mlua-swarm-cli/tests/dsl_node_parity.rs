@@ -138,8 +138,8 @@ fn branch_node_emits_the_documented_field_names() {
         serde_json::json!({
             "kind": "branch",
             "cond": {"op": "lit", "value": true},
-            "then": {"kind": "assign", "at": {"op": "path", "at": "$.x"}, "value": {"op": "lit", "value": 1}},
-            "else": {"kind": "assign", "at": {"op": "path", "at": "$.x"}, "value": {"op": "lit", "value": 2}},
+            "then": {"kind": "let", "at": "$.x", "value": {"op": "lit", "value": 1}},
+            "else": {"kind": "let", "at": "$.x", "value": {"op": "lit", "value": 2}},
         })
     );
 }

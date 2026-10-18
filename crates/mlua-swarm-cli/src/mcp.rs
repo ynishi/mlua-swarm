@@ -572,7 +572,6 @@ async fn run_block_spawn(
     spawn: &block_runner::BlockSpawn,
 ) -> Result<block_runner::BlockOutcome, String> {
     let dir = block_runner::blocks_dir()?;
-    let script = block_runner::resolve_block_script(&dir, &spawn.agent)?;
 
     let url = worker_prompt_endpoint_url(base)?;
     let resp = client
@@ -608,6 +607,11 @@ async fn run_block_spawn(
             .map(str::to_string),
     };
     let context = payload.get("context");
+    // The block is named by the agent's declared ctx (`meta.ctx.block`) when
+    // present, else by the agent itself — decided after the fetch because the
+    // ctx travels on the worker payload, not the Spawn frame.
+    let block = block_runner::block_name(context, &spawn.agent);
+    let script = block_runner::resolve_block_script(&dir, block)?;
     let input = block_runner::BlockInput {
         script,
         project_root: block_runner::project_root_from_context(context),
@@ -1664,7 +1668,7 @@ fn classify_skip_on_lint(bp: &Blueprint) -> serde_json::Value {
                 walk_node(body, out);
                 walk_node(catch, out);
             }
-            FlowNode::Step { .. } | FlowNode::Assign { .. } => {}
+            FlowNode::Step { .. } | FlowNode::Let { .. } => {}
         }
     }
 
@@ -5070,18 +5074,17 @@ impl MseServer {
                 }))
             }
         };
-        let (bp_value, authoring_warnings) =
-            match mlua_swarm_cli::dsl::build_bp_from_script_with_warnings(&script) {
-                Ok(v) => v,
-                Err(e) => {
-                    return json_result(&serde_json::json!({
-                        "status": "error",
-                        "stage": "build",
-                        "script_path": req.script_path,
-                        "error": format!("{e:#}"),
-                    }))
-                }
-            };
+        let (bp_value, authoring_warnings) = match crate::bp::build_bp_with_warnings(&script) {
+            Ok(v) => v,
+            Err(e) => {
+                return json_result(&serde_json::json!({
+                    "status": "error",
+                    "stage": "build",
+                    "script_path": req.script_path,
+                    "error": format!("{e:#}"),
+                }))
+            }
+        };
         // Set under `strict_embed` to the linker's expanded product, which
         // then stands in for `bp_value` at write_out / register / response.
         // This MCP is a stdio server — it runs on the caller's own machine,

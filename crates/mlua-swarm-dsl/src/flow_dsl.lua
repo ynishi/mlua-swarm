@@ -260,12 +260,18 @@ function M.fanout(t)
   }
 end
 
---- `F.assign{at=, value=}` — an `assign` Node (pure ctx transform, no
---- agent dispatch).
+--- `F.assign{at=, value=}` — a `let` Node (pure ctx transform, no
+--- agent dispatch). The wire kind is `let` with `at` as a bare path
+--- string (mlua-flow-ir 0.3.0 renamed `assign` to `let`); `at` accepts
+--- `F.p(...)` or a path string.
 function M.assign(t)
+  local at = M.unwrap(t.at)
+  if type(at) == "table" and at.op == "path" then
+    at = at.at
+  end
   return {
-    kind = "assign",
-    at = M.unwrap(t.at),
+    kind = "let",
+    at = at,
     value = M.unwrap(t.value),
   }
 end

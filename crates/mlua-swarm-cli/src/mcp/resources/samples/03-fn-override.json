@@ -44,11 +44,8 @@
               }
             },
             {
-              "kind": "assign",
-              "at": {
-                "op": "path",
-                "at": "$.verdict_final"
-              },
+              "kind": "let",
+              "at": "$.verdict_final",
               "value": {
                 "op": "path",
                 "at": "$.approval"
@@ -57,11 +54,8 @@
           ]
         },
         "else": {
-          "kind": "assign",
-          "at": {
-            "op": "path",
-            "at": "$.verdict_final"
-          },
+          "kind": "let",
+          "at": "$.verdict_final",
           "value": {
             "op": "path",
             "at": "$.verdict"
@@ -110,11 +104,8 @@
           }
         },
         "else": {
-          "kind": "assign",
-          "at": {
-            "op": "path",
-            "at": "$.escalated"
-          },
+          "kind": "let",
+          "at": "$.escalated",
           "value": {
             "op": "lit",
             "value": "ESCALATED"

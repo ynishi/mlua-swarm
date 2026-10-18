@@ -42,7 +42,11 @@
 //! sees a turn for it.
 //!
 //! Naming the block after the agent keeps the Blueprint free of any path:
-//! where the blocks live is this host's business, not the Blueprint's. A
+//! where the blocks live is this host's business, not the Blueprint's. An
+//! agent named for its role rather than its block (`gate-danger`), or two
+//! agents sharing one block, declare the directory instead —
+//! `meta = { ctx = { block = "<dir>" } }` — which reaches this process as
+//! `context.extra.block` on the worker payload ([`block_name`]). A
 //! Blueprint registered with an old server still dispatches — the variant
 //! is an ordinary string to it.
 //!
@@ -223,6 +227,21 @@ pub fn context_globals(context: Option<&Value>) -> HashMap<String, Value> {
         }
     }
     globals
+}
+
+/// Which block a spawn runs: the agent's declared context `block` entry
+/// when the Blueprint set one (`meta = { ctx = { block = "<dir>" } }`,
+/// delivered as `context.extra.block` on the worker payload), else the
+/// agent's own name. The override is for an agent whose name is its role
+/// (`gate-danger`) rather than its block directory, and for two agents
+/// that run the same block.
+pub fn block_name<'a>(context: Option<&'a Value>, agent: &'a str) -> &'a str {
+    context
+        .and_then(|c| c.get("extra"))
+        .and_then(|e| e.get("block"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(agent)
 }
 
 /// The project root a block runs in: the launch's `work_dir`, else its
@@ -416,6 +435,17 @@ mod tests {
             PathBuf::from("/elsewhere"),
             "env wins over the default even when the default exists"
         );
+    }
+
+    #[test]
+    fn block_name_prefers_the_declared_ctx_entry_over_the_agent_name() {
+        let ctx = serde_json::json!({ "extra": { "block": "secret-pre-commit-danger-scan" } });
+        assert_eq!(block_name(Some(&ctx), "gate-danger"), "secret-pre-commit-danger-scan");
+        let empty = serde_json::json!({ "extra": { "block": "" } });
+        assert_eq!(block_name(Some(&empty), "gate-danger"), "gate-danger");
+        let other = serde_json::json!({ "extra": { "k": "v" } });
+        assert_eq!(block_name(Some(&other), "gate-danger"), "gate-danger");
+        assert_eq!(block_name(None, "gate-danger"), "gate-danger");
     }
 
     #[test]

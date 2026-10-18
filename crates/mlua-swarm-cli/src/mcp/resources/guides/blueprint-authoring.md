@@ -112,9 +112,30 @@ Every node is tagged with a `kind` discriminator:
 | `loop`    | `counter`, `cond`, `body`, `max`                      | Writes `0` to `counter`, then repeats `body` while `cond` is truthy and `counter < max`, incrementing `counter` after each iteration. |
 | `fanout`  | `items`, `bind`, `body`, `join`, `out`                | Evaluate `items` to an array; run `body` once per element (bound to `bind` in a branch-local ctx); aggregate into `out` per `join` mode: `all` (every branch runs, array of final ctx), `any` (first success wins), `race` (first to settle wins), `all_settled` (never raises, per-item `{status, value|reason}` record). |
 | `try`     | `body`, `catch`, `err_at?`                            | Run `body`; on error, roll back ctx writes, optionally write the error message to `err_at`, then run `catch`. |
-| `assign`  | `at`, `value`                                         | Pure ctx transform: evaluate `value` against the ctx snapshot and write it to `at`. No agent dispatch. |
+| `let`     | `at`, `value`                                         | Pure ctx transform: evaluate `value` against the ctx snapshot and write it to `at`. No agent dispatch. `at` is a bare path string (`"$.x"`), not a `path` expr. |
 
-`out` / `at` / `counter` must always be `path` exprs (write targets).
+`out` / `counter` must always be `path` exprs (write targets); `let`'s `at`
+is the one write target written as a bare path string.
+
+### Legacy `assign` nodes {#legacy-assign-nodes}
+
+`let` was called `assign` before mlua-flow-ir 0.3.0, and its `at` was a
+`path` expr object:
+
+```jsonc
+// legacy                                                    // current
+{"kind": "assign", "at": {"op": "path", "at": "$.x"}, ...}   {"kind": "let", "at": "$.x", ...}
+```
+
+A Blueprint that still says `assign` keeps working: the node is read as
+`let` wherever the Blueprint is parsed (registration, launch, resume of a
+run launched before the rename). Every stage that sees the document as
+written reports each such node as `flow-node-renamed` (WARN, category
+`migration`) with its JSONPath — `mse bp lint` / `mse bp build` / the
+`bp_build` tool print it, and `POST /v1/blueprints/:id` returns it in
+`diagnostics[]`. To clear it, rewrite the node to the current shape:
+rename `kind` to `let` and replace the `at` object with its path string.
+The Lua DSL's `F.assign{...}` already emits the current shape.
 
 ### Fanout lanes, `$.results`, and the aggregate gate
 

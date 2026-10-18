@@ -4,22 +4,16 @@
     "kind": "seq",
     "children": [
       {
-        "kind": "assign",
-        "at": {
-          "op": "path",
-          "at": "$.x"
-        },
+        "kind": "let",
+        "at": "$.x",
         "value": {
           "op": "lit",
           "value": 10
         }
       },
       {
-        "kind": "assign",
-        "at": {
-          "op": "path",
-          "at": "$.y"
-        },
+        "kind": "let",
+        "at": "$.y",
         "value": {
           "op": "lit",
           "value": 20
@@ -55,22 +49,16 @@
           ]
         },
         "then": {
-          "kind": "assign",
-          "at": {
-            "op": "path",
-            "at": "$.verdict"
-          },
+          "kind": "let",
+          "at": "$.verdict",
           "value": {
             "op": "lit",
             "value": "PASS"
           }
         },
         "else": {
-          "kind": "assign",
-          "at": {
-            "op": "path",
-            "at": "$.verdict"
-          },
+          "kind": "let",
+          "at": "$.verdict",
           "value": {
             "op": "lit",
             "value": "FAIL"
@@ -85,6 +73,6 @@
     "strict_kind": true
   },
   "metadata": {
-    "description": "Zero-spawn pure ctx evaluation using Assign + And + Gt + Lt + Lit primitives. No worker dispatch required."
+    "description": "Zero-spawn pure ctx evaluation using Let + And + Gt + Lt + Lit primitives. No worker dispatch required."
   }
 }

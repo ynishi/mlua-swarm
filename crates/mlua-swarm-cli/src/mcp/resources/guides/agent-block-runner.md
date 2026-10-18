@@ -33,10 +33,26 @@ platform-neutral Operator runner. No `script_path`, no path of any kind:
 ```
 
 The block is addressed **by the agent's name**: the MCP resolves
-`$MSE_BLOCKS_DIR/<name>/init.lua` on its own host. Where the blocks live
+`<blocks dir>/<name>/init.lua` on its own host. Where the blocks live
 is that host's business, not the Blueprint's — which is also why the
 Blueprint no longer carries an absolute path that is only true on the
 author's machine.
+
+When the agent's name is its role rather than its block directory, or
+two agents run the same block, declare the directory on the agent's
+context instead — it reaches the MCP as `context.extra.block` on the
+worker payload and wins over the name:
+
+```lua
+{
+  name = "gate-danger",
+  kind = "operator",
+  runner = { backend = "ws_operator", variant = "agent-block" },
+  spec = { operator_ref = "main-ai" },
+  meta = { ctx = { block = "secret-pre-commit-danger-scan" } },
+  profile = { system_prompt = "" },
+}
+```
 
 To the server this is an ordinary Operator step: it dispatches a `Spawn`
 frame with `worker.variant = "agent-block"` and waits for the worker

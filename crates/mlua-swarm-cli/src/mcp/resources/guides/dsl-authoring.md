@@ -59,7 +59,7 @@ comparison Expr — there is no `E1 < E2` shorthand.
 ## Node builders
 
 `flow_dsl` exposes exactly **7** Node builders, one per `flow.ir` Node
-kind (`step` / `seq` / `branch` / `loop` / `fanout` / `assign` / `try`).
+kind (`step` / `seq` / `branch` / `loop` / `fanout` / `let` / `try`).
 Each returns a plain Lua table (no metatable) shaped like a `flow.ir` `Node`.
 GH #82 closed the previous 6-only gap by adding `F.fanout`; the full
 `flow.ir` Node grammar is now reachable through the DSL without
@@ -72,7 +72,7 @@ resorting to `F.raw()`.
 | `branch` | `F.branch{cond=, on_true=, on_false=}`                 | `cond` -> wire `cond`; `on_true` -> wire `then`; `on_false` -> wire `else` (`then`/`else` are Lua reserved words). |
 | `loop_`  | `F.loop_{counter=, cond=, max=, body=}`                | `counter` -> wire `counter`; `cond` -> wire `cond`; `max` -> wire `max`; `body` -> wire `body` (`loop` is a Lua reserved word, hence the trailing underscore). |
 | `fanout` | `F.fanout{items=, bind=, body=, join=, out=}`          | `items` -> wire `items`; `bind` -> wire `bind`; `body` -> wire `body`; `join` -> wire `join` (`"all"` / `"any"` / `"race"` / `"all_settled"` — see `mse://guides/blueprint-authoring` § Flow node kinds); `out` -> wire `out`. Parallel branch dispatch + aggregate — the shape `bp_dsl` previously required `F.raw()` for (GH #82). `body` runs once per item, so it holds one step per lane: a bare `F.step` for the homogeneous shape, or a `branch` cascade on the bound item to pick a different agent per lane. Live sample: `mse://blueprints/samples/10-fanout`; scaffold: `mse bp new fanout`. |
-| `assign` | `F.assign{at=, value=}`                                | `at` -> wire `at`; `value` -> wire `value`. Pure ctx transform, no agent dispatch.                   |
+| `let`    | `F.assign{at=, value=}`                                | `at` -> wire `at` as a bare path string (`F.p("$.x")` or `"$.x"`); `value` -> wire `value`. Pure ctx transform, no agent dispatch. The builder keeps its pre-rename name; the node it emits is `let` (see `mse://guides/blueprint-authoring` § Legacy `assign` nodes). |
 | `try_`   | `F.try_{body=, catch=, err_at=}`                       | `body` -> wire `body`; `catch` -> wire `catch`; `err_at` -> wire `err_at` (optional — omitted entirely from the emitted table when not given, matching the wire schema's default). `try` is a Lua reserved word, hence the trailing underscore. |
 
 ## `bp_dsl` pipeline conventions
@@ -179,11 +179,11 @@ When a gate emits, its shape:
 
 - `cond`: `eq(path(<out>.parts["verdict"]), lit(halt_on_value))` —
   `or`-combined across every value when there's more than one.
-- `then` (halt): `assign{at=halted_at, value=lit(stage_id)}` only —
+- `then` (halt): `let{at=halted_at, value=lit(stage_id)}` only —
   every remaining stage is skipped.
 - `else`: the rest of the pipeline (following stage's step + its own
   gate, and so on). The innermost `else` (after the last stage's gate)
-  is `assign{at=done, value=lit(true)}` when `done` was given, or an
+  is `let{at=done, value=lit(true)}` when `done` was given, or an
   empty `seq{}` otherwise.
 
 Because the gate always addresses `<out>.parts["verdict"]`, a stage whose

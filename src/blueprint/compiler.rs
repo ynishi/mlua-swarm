@@ -933,7 +933,7 @@ fn collect_refs(node: &FlowNode, out: &mut Vec<String>) {
             collect_refs(body, out);
             collect_refs(catch, out);
         }
-        FlowNode::Assign { .. } => {} // The Assign node carries no ref.
+        FlowNode::Let { .. } => {} // The Let node carries no ref.
     }
 }
 
@@ -968,7 +968,7 @@ fn collect_step_meta_refs(node: &FlowNode, out: &mut Vec<(String, String)>) {
             collect_step_meta_refs(body, out);
             collect_step_meta_refs(catch, out);
         }
-        FlowNode::Assign { .. } => {} // The Assign node carries no `in`.
+        FlowNode::Let { .. } => {} // The Let node carries no `in`.
     }
 }
 
@@ -1222,7 +1222,7 @@ fn collect_step_outputs_and_agents(
             collect_step_outputs_and_agents(body, out, step_agents);
             collect_step_outputs_and_agents(catch, out, step_agents);
         }
-        FlowNode::Assign { .. } => {} // The Assign node produces no agent output.
+        FlowNode::Let { .. } => {} // The Let node produces no agent output.
     }
 }
 
@@ -1313,7 +1313,7 @@ fn collect_verdict_conds(
                 errors,
             );
         }
-        FlowNode::Step { .. } | FlowNode::Assign { .. } => {}
+        FlowNode::Step { .. } | FlowNode::Let { .. } => {}
     }
 }
 
