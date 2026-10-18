@@ -29,10 +29,10 @@ inherits = "release"
 lto = "thin"
 
 [workspace.dependencies]
-mlua-flow-ir = "0.2.0"
-mlua-isle = { version = "0.5.0", features = ["pool", "tokio"] }
-rusqlite-isle = { version = "0.2", features = ["tokio"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+mlua-flow-ir = "0.4.0"
+mlua-isle = { version = "0.10.0", features = ["pool", "tokio"] }
+rusqlite-isle = { version = "0.6", features = ["tokio"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 semver = { version = "1", features = ["serde"] }
 schemars = "1"
 hmac = "0.12"
@@ -43,14 +43,14 @@ base64 = "0.22"
 hex = "0.4"
 getrandom = "0.3"
 blake3 = "1"
-git2 = { version = "0.19", default-features = false }
+git2 = { version = "0.18", default-features = false }
 async-trait = "0.1"
 serde_yaml = "0.9"
 minijinja = "2"
-mlua = { version = "0.11", features = ["lua54", "vendored", "serde"] }
+mlua = { version = "0.12", features = ["lua54", "vendored", "serde"] }
 tempfile = "3"
-agent-block-core = "0.33.0"
-agent-block-types = "0.33.0"
+agent-block-core = "0.42.0"
+agent-block-types = "0.42.0"
 llm-extract = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"

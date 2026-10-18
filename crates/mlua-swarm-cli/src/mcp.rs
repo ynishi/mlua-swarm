@@ -1668,7 +1668,7 @@ fn classify_skip_on_lint(bp: &Blueprint) -> serde_json::Value {
                 walk_node(body, out);
                 walk_node(catch, out);
             }
-            FlowNode::Step { .. } | FlowNode::Assign { .. } => {}
+            FlowNode::Step { .. } | FlowNode::Let { .. } => {}
         }
     }
 
@@ -5074,18 +5074,17 @@ impl MseServer {
                 }))
             }
         };
-        let (bp_value, authoring_warnings) =
-            match mlua_swarm_cli::dsl::build_bp_from_script_with_warnings(&script) {
-                Ok(v) => v,
-                Err(e) => {
-                    return json_result(&serde_json::json!({
-                        "status": "error",
-                        "stage": "build",
-                        "script_path": req.script_path,
-                        "error": format!("{e:#}"),
-                    }))
-                }
-            };
+        let (bp_value, authoring_warnings) = match crate::bp::build_bp_with_warnings(&script) {
+            Ok(v) => v,
+            Err(e) => {
+                return json_result(&serde_json::json!({
+                    "status": "error",
+                    "stage": "build",
+                    "script_path": req.script_path,
+                    "error": format!("{e:#}"),
+                }))
+            }
+        };
         // Set under `strict_embed` to the linker's expanded product, which
         // then stands in for `bp_value` at write_out / register / response.
         // This MCP is a stdio server — it runs on the caller's own machine,

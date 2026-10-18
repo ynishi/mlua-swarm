@@ -28,7 +28,7 @@ use crate::worker::adapter::{SpawnError, SpawnerAdapter, WorkerError};
 use crate::worker::{wrap_join, Worker};
 use async_trait::async_trait;
 use mlua::LuaSerdeExt;
-use mlua_isle::{AsyncIslePool, IsleError, PoolConfig, PoolStrategy};
+use mlua_isle::{AsyncIslePool, IsleError, LuaErrorKind, LuaFailure, PoolConfig, PoolStrategy};
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 
@@ -123,6 +123,12 @@ fn ctx_to_serializable(ctx: &Ctx) -> Value {
     })
 }
 
+/// A JSON (de)serialization failure on the hook's ctx / result, reported as
+/// a Lua-side conversion failure so it surfaces the same way a Lua error does.
+fn json_failure(e: serde_json::Error) -> IsleError {
+    IsleError::Lua(LuaFailure::new(LuaErrorKind::Conversion, e.to_string()))
+}
+
 /// Helper that returns a closure running the "before hook" inside AsyncIsle.exec.
 /// Return value is fixed to the literal string "ok" — success / failure is
 /// expressed through IsleError.
@@ -131,16 +137,10 @@ fn make_before_exec(
     ctx_json: String,
 ) -> impl FnOnce(&mlua::Lua) -> Result<String, IsleError> + Send + 'static {
     move |lua| {
-        let ctx_val: Value =
-            serde_json::from_str(&ctx_json).map_err(|e| IsleError::Lua(e.to_string()))?;
-        let ctx_lua: mlua::Value = lua
-            .to_value(&ctx_val)
-            .map_err(|e| IsleError::Lua(e.to_string()))?;
-        let f: mlua::Function = lua
-            .load(&src)
-            .eval()
-            .map_err(|e| IsleError::Lua(e.to_string()))?;
-        let _: mlua::Value = f.call(ctx_lua).map_err(|e| IsleError::Lua(e.to_string()))?;
+        let ctx_val: Value = serde_json::from_str(&ctx_json).map_err(json_failure)?;
+        let ctx_lua: mlua::Value = lua.to_value(&ctx_val)?;
+        let f: mlua::Function = lua.load(&src).eval()?;
+        let _: mlua::Value = f.call(ctx_lua)?;
         Ok("ok".to_string())
     }
 }
@@ -153,27 +153,14 @@ fn make_after_exec(
     result_json: String,
 ) -> impl FnOnce(&mlua::Lua) -> Result<String, IsleError> + Send + 'static {
     move |lua| {
-        let ctx_val: Value =
-            serde_json::from_str(&ctx_json).map_err(|e| IsleError::Lua(e.to_string()))?;
-        let result_val: Value =
-            serde_json::from_str(&result_json).map_err(|e| IsleError::Lua(e.to_string()))?;
-        let ctx_lua: mlua::Value = lua
-            .to_value(&ctx_val)
-            .map_err(|e| IsleError::Lua(e.to_string()))?;
-        let result_lua: mlua::Value = lua
-            .to_value(&result_val)
-            .map_err(|e| IsleError::Lua(e.to_string()))?;
-        let f: mlua::Function = lua
-            .load(&src)
-            .eval()
-            .map_err(|e| IsleError::Lua(e.to_string()))?;
-        let returned: mlua::Value = f
-            .call((ctx_lua, result_lua))
-            .map_err(|e| IsleError::Lua(e.to_string()))?;
-        let new_result: Value = lua
-            .from_value(returned)
-            .map_err(|e| IsleError::Lua(e.to_string()))?;
-        serde_json::to_string(&new_result).map_err(|e| IsleError::Lua(e.to_string()))
+        let ctx_val: Value = serde_json::from_str(&ctx_json).map_err(json_failure)?;
+        let result_val: Value = serde_json::from_str(&result_json).map_err(json_failure)?;
+        let ctx_lua: mlua::Value = lua.to_value(&ctx_val)?;
+        let result_lua: mlua::Value = lua.to_value(&result_val)?;
+        let f: mlua::Function = lua.load(&src).eval()?;
+        let returned: mlua::Value = f.call((ctx_lua, result_lua))?;
+        let new_result: Value = lua.from_value(returned)?;
+        serde_json::to_string(&new_result).map_err(json_failure)
     }
 }
 

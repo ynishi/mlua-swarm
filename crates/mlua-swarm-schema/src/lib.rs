@@ -129,6 +129,8 @@
 
 #![warn(missing_docs)]
 
+pub mod legacy_flow;
+
 use mlua_flow_ir::Node as FlowNode;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -267,7 +269,9 @@ pub struct Blueprint {
     /// Embeds the flow.ir Node verbatim (= keeps flow.ir side unpolluted).
     /// Opaque in the JSON Schema (the Node shape is owned by the `mlua-flow-ir`
     /// crate, a separate repo; see its docs for the Node / Expr grammar).
+    /// A legacy `assign` node is read as `let` (see [`legacy_flow`]).
     #[schemars(with = "Value")]
+    #[serde(deserialize_with = "legacy_flow::deserialize_flow")]
     pub flow: FlowNode,
     /// Swarm extension layer: agent → backend mapping.
     #[serde(default)]

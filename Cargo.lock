@@ -39,27 +39,38 @@ dependencies = [
 
 [[package]]
 name = "agent-block-core"
-version = "0.33.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbf7753bc0ae0327282662a8d9c74f85307f56d5876c1dcc7332a3f1e3260cee"
+checksum = "facb526d62ea1890da091a0ae32fcbcf071d344c85e63e897b1274c038784660"
 dependencies = [
  "agent-block-mcp",
  "agent-block-types",
  "agent-mesh-core",
  "agent-mesh-sdk",
  "async-trait",
+ "axum 0.8.9",
  "dotenvy",
+ "eventsdb-core",
+ "eventsdb-sqlite",
+ "htl",
  "landlock",
  "libc",
  "llm-extract",
  "mlua",
  "mlua-batteries",
- "mlua-isle 0.4.1",
+ "mlua-batteries-sqlite",
+ "mlua-isle 0.8.0",
+ "mlua-pkg",
  "reqwest 0.12.28",
  "rusqlite",
+ "rusqlite-isle",
+ "schema-bridge",
+ "schema-bridge-lshape",
  "seccompiler",
  "serde",
  "serde_json",
+ "serde_path_to_error",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -69,14 +80,14 @@ dependencies = [
 
 [[package]]
 name = "agent-block-mcp"
-version = "0.33.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e1483694ab76abbae74e223ec5f12c3050defe8e5fd85200476eb429fdd7add"
+checksum = "f8b56d62d2384dc6ac5da7cea8f53b1999a85fd495284ad21d5aa0b0552f8198"
 dependencies = [
  "agent-block-types",
  "async-trait",
  "mlua",
- "mlua-isle 0.4.1",
+ "mlua-isle 0.8.0",
  "rmcp 3.1.4",
  "rustls",
  "serde_json",
@@ -87,9 +98,9 @@ dependencies = [
 
 [[package]]
 name = "agent-block-types"
-version = "0.33.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2336f20e879e9d2ffa8667d94f3dcd39da919d97930bd14ec1daf227f77e0d3f"
+checksum = "ed16e381ac04b4e9bab2cb2e60a55fe94bae89d2c13c33598c358efe7a5a6a25"
 dependencies = [
  "reqwest 0.12.28",
  "serde_json",
@@ -133,18 +144,6 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "ahash"
-version = "0.8.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
-dependencies = [
- "cfg-if",
- "once_cell",
- "version_check",
- "zerocopy",
 ]
 
 [[package]]
@@ -217,9 +216,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.103"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arrayref"
@@ -260,6 +259,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -289,7 +310,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
- "axum-core",
+ "axum-core 0.4.5",
  "base64 0.22.1",
  "bytes",
  "futures-util",
@@ -299,7 +320,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "itoa",
- "matchit",
+ "matchit 0.7.3",
  "memchr",
  "mime",
  "percent-encoding",
@@ -317,6 +338,36 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "axum"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
+dependencies = [
+ "axum-core 0.5.6",
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "itoa",
+ "matchit 0.8.4",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "sync_wrapper",
+ "tokio",
+ "tower",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]
@@ -338,6 +389,24 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "sync_wrapper",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]
@@ -870,6 +939,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventsdb-core"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b1a1fb4e5f0b5e589619021080bc380c18a197bc2c6c2dace662a555655d728"
+dependencies = [
+ "async-trait",
+ "futures-core",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "eventsdb-sqlite"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af7be9fa0468d3297bc25e6eb18e71cff603f1da113101625679024d266b2894"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "eventsdb-core",
+ "futures-core",
+ "rusqlite",
+ "rusqlite-isle",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -910,9 +1008,9 @@ dependencies = [
 
 [[package]]
 name = "flow-ir-core"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "133248c274b873d6d9b2e11ff4049d804dbd8b6eb4c3a63daa05a2771b9be0c8"
+checksum = "cc0ce70351d5fb65bb2c4b93c43302bf84702713555403a824729c9dfbea52f0"
 dependencies = [
  "serde",
  "serde_json",
@@ -924,6 +1022,12 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "foreign-types"
@@ -1105,14 +1209,16 @@ dependencies = [
 
 [[package]]
 name = "git2"
-version = "0.19.0"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b903b73e45dc0c6c596f2d37eccece7c1c8bb6e4407b001096387c63d0d93724"
+checksum = "232e6a7bfe35766bf715e55a88b39a700596c0ccfd88cd3680b4cdb40d66ef70"
 dependencies = [
  "bitflags",
  "libc",
  "libgit2-sys",
  "log",
+ "openssl-probe 0.1.6",
+ "openssl-sys",
  "url",
 ]
 
@@ -1150,11 +1256,11 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.14.5"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
- "ahash",
+ "foldhash",
 ]
 
 [[package]]
@@ -1162,14 +1268,17 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash",
+]
 
 [[package]]
 name = "hashlink"
-version = "0.9.1"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
- "hashbrown 0.14.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -1191,6 +1300,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest",
+]
+
+[[package]]
+name = "htl"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "393891cf109197c73164f7bc6133860639349a19a7e03a2c71de2644f6b54057"
+dependencies = [
+ "htl-core",
+ "htl-macros",
+]
+
+[[package]]
+name = "htl-core"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "682c1439a7fb61eeb2f07e291f3da050f861e01aabd73b9478dc7f9dfe62b6e7"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "mlua",
+ "mlua-batteries",
+ "mlua-isle 0.8.0",
+ "mlua-pkg",
+ "semver",
+ "serde",
+ "serde_json",
+ "syn 2.0.118",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "walkdir",
+]
+
+[[package]]
+name = "htl-macros"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88eb66d68822c42c7b1d7d422a64a18e5d71734f7d60ffe8e84c16e385f0fb36"
+dependencies = [
+ "htl-core",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -1595,23 +1748,39 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libgit2-sys"
-version = "0.17.0+1.8.1"
+version = "0.16.2+1.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10472326a8a6477c3c20a64547b0059e4b0d086869eee31e6d7da728a8eb7224"
+checksum = "ee4126d8b4ee5c9d9ea891dd875cfdc1e9d0950437179104b183d7d8a74d24e8"
 dependencies = [
  "cc",
  "libc",
+ "libssh2-sys",
  "libz-sys",
+ "openssl-sys",
  "pkg-config",
 ]
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.28.0"
+version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c10584274047cb335c23d3e61bcef8e323adae7c5c8c760540f73610177fc3f"
+checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
 dependencies = [
  "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
+name = "libssh2-sys"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f5eb74291e8691cab524a01274a1b1e7742b1a94f29d8b101d8aadc8372c1cd"
+dependencies = [
+ "cc",
+ "libc",
+ "libz-sys",
+ "openssl-sys",
  "pkg-config",
  "vcpkg",
 ]
@@ -1682,18 +1851,18 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lua-src"
-version = "550.0.0"
+version = "551.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e836dc8ae16806c9bdcf42003a88da27d163433e3f9684c52f0301258004a4fb"
+checksum = "d400ffef0e3d4d29287092bdc5a276d0bf468b2c69709d5bab0d469312d9f947"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "luajit-src"
-version = "210.6.6+707c12b"
+version = "210.7.4+c6ffc14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a86cc925d4053d0526ae7f5bc765dbd0d7a5d1a63d43974f4966cb349ca63295"
+checksum = "1db548b001f0b7da416daf0ffae963912bae6cad1799fa9f4eaba09da6dba837"
 dependencies = [
  "cc",
  "which",
@@ -1713,6 +1882,12 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "memchr"
@@ -1755,9 +1930,9 @@ dependencies = [
 
 [[package]]
 name = "mlua"
-version = "0.11.6"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccd36acfa49ce6ee56d1307a061dd302c564eee757e6e4cd67eb4f7204846fab"
+checksum = "7a7ae6b65bf54b7fdd4cf5b6f44f60862350ebf3fe3779b3a9cc005e7fa14f81"
 dependencies = [
  "bstr",
  "either",
@@ -1768,20 +1943,18 @@ dependencies = [
  "num-traits",
  "parking_lot",
  "rustc-hash",
- "rustversion",
  "serde",
  "serde-value",
 ]
 
 [[package]]
 name = "mlua-batteries"
-version = "0.3.0"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdffa17da0e0ab86296164c1fea5607f807b24607c40aac797a0bee659fa0cde"
+checksum = "a3ff8949ba32bdbb67ec75984737be6526f56a54793a810861a5b213d81c4cce"
 dependencies = [
  "globset",
  "mlua",
- "rusqlite",
  "serde_json",
  "tokio",
  "tracing",
@@ -1789,10 +1962,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "mlua-flow-ir"
-version = "0.2.0"
+name = "mlua-batteries-sqlite"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2472e21aeca4b3fb42b957e03198707c8b6ec3291a3d2985f6f882a4f8b7d488"
+checksum = "16a0fb54ac50cdfabf847878ce62f9128764331be8a5744807b5bc8d1142afbf"
+dependencies = [
+ "mlua",
+ "mlua-batteries",
+ "rusqlite",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mlua-flow-ir"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1c203ff6959994fd563b61db484ccd124490fa29ab55226dc508637fe4d7c65"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -1804,9 +1991,9 @@ dependencies = [
 
 [[package]]
 name = "mlua-isle"
-version = "0.4.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e970e132fabd7030926662683974475d708250fabaa23152358ffa2ba0a5e03a"
+checksum = "aceee08080f0cbc1e0ec6e878e799f7fad84baa547273f6ac7262298b3b2b97d"
 dependencies = [
  "mlua",
  "thiserror 2.0.18",
@@ -1815,13 +2002,31 @@ dependencies = [
 
 [[package]]
 name = "mlua-isle"
-version = "0.5.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "918f18c18ab8821059d9a43af7b67e6c38e524cda4c764e049461de0fab30455"
+checksum = "90c9a0587786cb800063f87bc94cecc9ea552a7923fcd2ccf2fe025407eb33b8"
 dependencies = [
  "mlua",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "mlua-pkg"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f90f6e693d3f25c6a8f90ed79483e1715e5fffddbad07b6c113e786824bc45"
+dependencies = [
+ "anyhow",
+ "clap",
+ "git2",
+ "mlua",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -1841,7 +2046,7 @@ dependencies = [
  "minijinja",
  "mlua",
  "mlua-flow-ir",
- "mlua-isle 0.5.0",
+ "mlua-isle 0.10.0",
  "mlua-swarm-compile",
  "mlua-swarm-diag",
  "mlua-swarm-schema",
@@ -1870,7 +2075,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "async-trait",
- "axum",
+ "axum 0.7.9",
  "clap",
  "futures-util",
  "hex",
@@ -1950,7 +2155,7 @@ version = "0.28.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.7.9",
  "clap",
  "futures-util",
  "hex",
@@ -1978,9 +2183,9 @@ dependencies = [
 
 [[package]]
 name = "mlua-sys"
-version = "0.10.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f1c3a7fc7580227ece249fd90aa2fa3b39eb2b49d3aec5e103b3e85f2c3dfc8"
+checksum = "1631cda17bd6486410ab751d91f5fd4484f441589278cdad879eb3afc721a285"
 dependencies = [
  "cc",
  "cfg-if",
@@ -1999,7 +2204,7 @@ dependencies = [
  "libc",
  "log",
  "openssl",
- "openssl-probe",
+ "openssl-probe 0.2.1",
  "openssl-sys",
  "schannel",
  "security-framework",
@@ -2097,6 +2302,12 @@ dependencies = [
  "quote",
  "syn 2.0.118",
 ]
+
+[[package]]
+name = "openssl-probe"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
 name = "openssl-probe"
@@ -2585,24 +2796,36 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusqlite"
-version = "0.31.0"
+name = "rsqlite-vfs"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b838eba278d213a8beaf485bd313fd580ca4505a00d5871caeb1457c55322cae"
+checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
+dependencies = [
+ "hashbrown 0.16.1",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.40.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
 dependencies = [
  "bitflags",
  "fallible-iterator",
  "fallible-streaming-iterator",
  "hashlink",
  "libsqlite3-sys",
+ "serde_json",
  "smallvec",
+ "sqlite-wasm-rs",
 ]
 
 [[package]]
 name = "rusqlite-isle"
-version = "0.2.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be775d7d7d2e9c834e259e70e9852a0336c848eba311a1022cb5bed28e4d1503"
+checksum = "6f00fdfab1789f914f7c013c85cd433d59dcebd8a5ce646e07eb89aadbd9182d"
 dependencies = [
  "rusqlite",
  "thiserror 2.0.18",
@@ -2657,7 +2880,7 @@ version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
 dependencies = [
- "openssl-probe",
+ "openssl-probe 0.2.1",
  "rustls-pki-types",
  "schannel",
  "security-framework",
@@ -2738,6 +2961,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "schema-bridge"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11adc0f1445fbf542d13388cbf9fec7e90a9cde71af61910de475d1a4eaecb73"
+dependencies = [
+ "schema-bridge-core",
+ "schema-bridge-macro",
+ "serde",
+]
+
+[[package]]
+name = "schema-bridge-core"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "190c12851001ecbfc2541090961519946073e16ee019377c308252b6cc6a3aa4"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schema-bridge-lshape"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c61aef9984cc4ad6bcbb8ae399a1ee4e835e36a191a1d2a45778d4b3830e5ed"
+dependencies = [
+ "schema-bridge-core",
+]
+
+[[package]]
+name = "schema-bridge-macro"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54269d2ac695ed4f594d34bffc2b77fb71404559c5ffa9d68cd139ef9d93843b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -3041,6 +3305,18 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sqlite-wasm-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
+dependencies = [
+ "cc",
+ "js-sys",
+ "rsqlite-vfs",
+ "wasm-bindgen",
 ]
 
 [[package]]

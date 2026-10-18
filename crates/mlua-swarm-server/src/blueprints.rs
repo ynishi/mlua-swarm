@@ -304,6 +304,9 @@ async fn seed_blueprint(
             ));
         }
     }
+    // Legacy flow nodes are rewritten when the body is parsed below, so
+    // this is the last point that can see them as the author wrote them.
+    let diagnostics = registration_diagnostics(&raw_body);
     let body: Blueprint = if let Some(base) = state.ref_base.as_ref() {
         // Four-tier cascade for the kind resolution: (3) BP JSON top-level
         // `default_agent_kind` → (2) CLI value → (1) Schema impl Default =
@@ -368,7 +371,12 @@ async fn seed_blueprint(
         if traced.trace.version == v {
             return Ok((
                 StatusCode::OK,
-                Json(serde_json::json!({"id": id, "version": format!("{:?}", v), "seeded": false})),
+                Json(serde_json::json!({
+                    "id": id,
+                    "version": format!("{:?}", v),
+                    "seeded": false,
+                    "diagnostics": diagnostics,
+                })),
             ));
         }
     }
@@ -397,8 +405,29 @@ async fn seed_blueprint(
         })?;
     Ok((
         StatusCode::CREATED,
-        Json(serde_json::json!({"id": id, "version": format!("{:?}", v), "seeded": true})),
+        Json(serde_json::json!({
+            "id": id,
+            "version": format!("{:?}", v),
+            "seeded": true,
+            "diagnostics": diagnostics,
+        })),
     ))
+}
+
+/// Findings on the registered document as the author sent it — currently
+/// one `flow-node-renamed` per legacy `assign` flow node. Always an array
+/// (empty when nothing was found), so a caller can tell "checked, clean"
+/// from a server that predates the field.
+fn registration_diagnostics(raw_body: &serde_json::Value) -> Vec<mlua_swarm::diag::Diagnostic> {
+    raw_body
+        .get("flow")
+        .map(mlua_swarm_schema::legacy_flow::legacy_assign_paths)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| {
+            mlua_swarm::diag::flow_node_renamed(mlua_swarm::diag::DiagStage::Register, path)
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -1869,6 +1898,62 @@ You write.\n";
         .expect("seed ok");
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(resp.0["seeded"], json!(true));
+    }
+
+    /// A legacy `assign` flow node registers (read as `let`) and the
+    /// response carries one `flow-node-renamed` finding pointing at it.
+    #[tokio::test]
+    async fn legacy_assign_node_registers_with_a_flow_node_renamed_finding() {
+        let mut body = minimal_bp_body("legacy-assign-bp");
+        let step = body["flow"].clone();
+        body["flow"] = json!({
+            "kind": "seq",
+            "children": [
+                { "kind": "assign", "at": {"op": "path", "at": "$.input"},
+                  "value": {"op": "lit", "value": "x"} },
+                step
+            ]
+        });
+        let state = state_for_test(InMemoryBlueprintStore::new(), None, false);
+
+        let (status, resp) = seed_blueprint(
+            State(state.clone()),
+            Path("legacy-assign-bp".into()),
+            Json(body),
+        )
+        .await
+        .expect("legacy assign must register");
+        assert_eq!(status, StatusCode::CREATED);
+        let diags = resp.0["diagnostics"].as_array().expect("diagnostics array");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0]["kind"], "flow-node-renamed");
+        assert_eq!(diags[0]["stage"]["type"], "Register");
+        assert_eq!(diags[0]["span"]["json_path"], "$.flow.children[0]");
+
+        let head = state
+            .store
+            .read_head(&BlueprintId::new("legacy-assign-bp"))
+            .await
+            .expect("head");
+        let mlua_flow_ir::Node::Seq { children } = &head.value.flow else {
+            panic!("expected seq");
+        };
+        assert!(matches!(children[0], mlua_flow_ir::Node::Let { .. }));
+    }
+
+    /// A Blueprint in the current shape reports an empty, present
+    /// `diagnostics` array.
+    #[tokio::test]
+    async fn current_shape_registers_with_empty_diagnostics() {
+        let state = state_for_test(InMemoryBlueprintStore::new(), None, false);
+        let (_, resp) = seed_blueprint(
+            State(state),
+            Path("clean-bp".into()),
+            Json(minimal_bp_body("clean-bp")),
+        )
+        .await
+        .expect("seed ok");
+        assert_eq!(resp.0["diagnostics"], json!([]));
     }
 
     // (b) Default (strict_embed=false) + unresolvable ref → 400 with

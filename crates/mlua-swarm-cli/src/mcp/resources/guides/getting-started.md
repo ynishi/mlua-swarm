@@ -3,7 +3,7 @@
 `mse` is the command line interface for **mlua-swarm**, a long-running swarm
 engine host that compiles `flow.ir` Blueprints and dispatches their agent
 steps to workers. A Blueprint declares a `flow` (step / seq / branch / loop /
-fanout / try / assign nodes) plus the `agents` it references; the engine
+fanout / try / let nodes) plus the `agents` it references; the engine
 resolves each agent to a backend (in-process Lua, a Rust function, a child
 process, or an interactive Operator) and drives the flow while recording task
 state.

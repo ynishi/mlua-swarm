@@ -279,7 +279,7 @@ pub const RESOURCES: &[ResourceEntry] = &[
     ResourceEntry {
         uri: "mse://blueprints/samples/01-pure-ctx-eval",
         title: "Sample Blueprint — pure ctx eval",
-        description: "Zero-spawn pure ctx evaluation using Assign + And + Gt + Lt + Lit primitives.",
+        description: "Zero-spawn pure ctx evaluation using Let + And + Gt + Lt + Lit primitives.",
         mime_type: "application/json",
         body: ResourceBody::Static(SAMPLE_01_PURE_CTX_EVAL_BODY),
     },
@@ -1293,9 +1293,9 @@ mod tests {
                 }),
             ),
             (
-                "assign",
+                "let",
                 serde_json::json!({
-                    "kind":"assign","at":{"op":"path","at":"$.x"},"value":{"op":"lit","value":1}
+                    "kind":"let","at":"$.x","value":{"op":"lit","value":1}
                 }),
             ),
         ]

@@ -183,11 +183,8 @@ mod tests {
         )
         .expect("script must build");
         assert_eq!(out["id"], serde_json::json!("t"));
-        assert_eq!(out["flow"]["kind"], serde_json::json!("assign"));
-        assert_eq!(
-            out["flow"]["at"],
-            serde_json::json!({"op": "path", "at": "$.x"})
-        );
+        assert_eq!(out["flow"]["kind"], serde_json::json!("let"));
+        assert_eq!(out["flow"]["at"], serde_json::json!("$.x"));
     }
 
     #[test]

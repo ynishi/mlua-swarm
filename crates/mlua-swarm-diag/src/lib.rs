@@ -222,6 +222,9 @@ pub enum DiagStage {
     Runtime,
     /// `$file` / `$agent_md` ref resolution (the include cascade).
     RefResolve,
+    /// Blueprint registration (`POST /v1/blueprints/:id`) — the last stage
+    /// that sees the document as the author sent it.
+    Register,
 }
 
 /// One diagnostic finding — the unified shape every MSE feedback stage
@@ -620,6 +623,14 @@ pub const LINT_DECLS: &[LintDecl] = &[
         "spawner_hints.layers names a layer that no longer exists (operator_delegate).",
         "mse://guides/blueprint-authoring",
     ),
+    decl(
+        "flow-node-renamed",
+        DiagLevel::Warn,
+        LintCategory::Migration,
+        "A flow node uses the legacy `assign` kind; it is read as `let` (mlua-flow-ir 0.3.0 \
+         rename).",
+        "mse://guides/blueprint-authoring",
+    ),
     // ─── Meta-lints (findings about the lints config itself) ─────────
     decl(
         "unknown-lint-kind",
@@ -678,6 +689,40 @@ pub fn removed_spawner_hint_suggestion() -> Suggestion {
             .into(),
         applicability: Applicability::HasPlaceholders,
     }
+}
+
+/// One `flow-node-renamed` finding for the legacy `assign` node at
+/// `json_path` (a JSONPath into the Blueprint document, e.g.
+/// `$.flow.children[2]`), as reported by `stage`.
+///
+/// The node still runs: it is rewritten to `let` when the Blueprint is
+/// read, so the finding is a warning that the document is in the old
+/// shape, not a refusal. The text lives here so every stage that reports
+/// the kind tells the author the same thing.
+pub fn flow_node_renamed(stage: DiagStage, json_path: impl Into<String>) -> Diagnostic {
+    let json_path = json_path.into();
+    Diagnostic::new(
+        "flow-node-renamed",
+        stage,
+        DiagLevel::Warn,
+        format!(
+            "flow node at {json_path} uses the legacy kind `assign`; it is read as `let`. \
+             Rewrite it to the `let` shape."
+        ),
+    )
+    .with_span(DiagSpan {
+        element: DiagElement::BlueprintRoot,
+        json_path: Some(json_path),
+    })
+    .with_suggestion(Suggestion {
+        msg: "rename the node kind to `let` and write `at` as a bare path string".into(),
+        patch: "{ \"kind\": \"let\", \"at\": \"$.<path>\", \"value\": <expr> }".into(),
+        applicability: Applicability::HasPlaceholders,
+    })
+    .with_docs_ref(DocsRef {
+        uri: "mse://guides/blueprint-authoring",
+        anchor: Some("#legacy-assign-nodes"),
+    })
 }
 
 /// Author-declared level for one lint kind or group — the diag-side twin
@@ -973,6 +1018,25 @@ mod tests {
         .expect("element must serialize");
         assert_eq!(step["type"], "Step");
         assert_eq!(step["ref"], "scout");
+    }
+
+    #[test]
+    fn flow_node_renamed_is_a_declared_migration_warning_with_a_span() {
+        let d = flow_node_renamed(DiagStage::Register, "$.flow.children[2]");
+        let decl = lint_decl(d.kind).expect("flow-node-renamed must be declared");
+        assert_eq!(decl.category, LintCategory::Migration);
+        assert_eq!(decl.default_level, DiagLevel::Warn);
+        assert_eq!(d.level, DiagLevel::Warn);
+        assert_eq!(
+            d.span.as_ref().and_then(|s| s.json_path.as_deref()),
+            Some("$.flow.children[2]")
+        );
+        assert!(d.message.contains("$.flow.children[2]"));
+        let patch = &d.suggestion.as_ref().expect("suggestion").patch;
+        assert!(patch.contains("\"kind\": \"let\""));
+        let v = serde_json::to_value(&d).expect("diagnostic must serialize");
+        assert_eq!(v["stage"]["type"], "Register");
+        assert_eq!(v["docs_ref"]["anchor"], "#legacy-assign-nodes");
     }
 
     #[test]

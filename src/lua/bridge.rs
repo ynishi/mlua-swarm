@@ -20,6 +20,17 @@ use mlua::LuaSerdeExt;
 use mlua_flow_ir::Node;
 use serde_json::Value;
 
+/// Convert a Lua-side flow table to a [`Node`], reading a legacy `assign`
+/// node as `let` the same way a JSON Blueprint is read
+/// (`mlua_swarm_schema::legacy_flow`).
+fn lua_to_node(lua: &mlua::Lua, bp_val: mlua::Value) -> Result<Node, EngineError> {
+    let raw: Value = lua
+        .from_value(bp_val)
+        .map_err(|e| EngineError::Internal(format!("lua → Node parse: {e}")))?;
+    mlua_swarm_schema::legacy_flow::flow_node_from_value(raw)
+        .map_err(|e| EngineError::Internal(format!("lua → Node parse: {e}")))
+}
+
 /// Load a Lua source, evaluate it, and pull out a BluePrint `Node`
 /// (`mlua_flow_ir::Node`). The Lua source must ultimately
 /// **`return` a table** — one that follows the flow.ir schema.
@@ -47,9 +58,7 @@ pub fn parse_lua_blueprint(lua_src: &str) -> Result<Node, EngineError> {
         .load(lua_src)
         .eval()
         .map_err(|e| EngineError::Internal(format!("lua eval: {e}")))?;
-    let bp: Node = lua
-        .from_value(bp_val)
-        .map_err(|e| EngineError::Internal(format!("lua → Node parse: {e}")))?;
+    let bp = lua_to_node(&lua, bp_val)?;
     Ok(bp)
 }
 
@@ -71,9 +80,7 @@ pub fn parse_lua_blueprint_with_ctx(lua_src: &str) -> Result<(Node, Value), Engi
         .get("ctx")
         .map_err(|e| EngineError::Internal(format!("table missing `ctx`: {e}")))?;
 
-    let bp: Node = lua
-        .from_value(bp_val)
-        .map_err(|e| EngineError::Internal(format!("lua → Node parse: {e}")))?;
+    let bp = lua_to_node(&lua, bp_val)?;
     let ctx: Value = lua
         .from_value(ctx_val)
         .map_err(|e| EngineError::Internal(format!("lua → ctx parse: {e}")))?;

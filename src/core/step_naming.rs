@@ -421,7 +421,7 @@ fn collect_steps(node: &Node, out: &mut Vec<(String, Option<(String, bool)>)>) {
             collect_steps(body, out);
             collect_steps(catch, out);
         }
-        Node::Assign { .. } => {} // The Assign node carries no ref.
+        Node::Let { .. } => {} // The Let node carries no ref.
     }
 }
 
@@ -626,8 +626,8 @@ mod tests {
                     catch: Box::new(step("in-catch", "$.g")),
                     err_at: None,
                 },
-                Node::Assign {
-                    at: path("$.h"),
+                Node::Let {
+                    at: "$.h".parse().expect("valid path"),
                     value: Expr::Lit { value: json!(1) },
                 },
             ],
