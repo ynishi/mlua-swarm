@@ -122,6 +122,9 @@ pub struct EmbedTemplate {
     /// `{tools_csv}` placeholder value (overrides.tools > profile.tools,
     /// CSV-joined).
     pub tools_csv: String,
+    /// Per-attempt wall-clock limit (`SubprocessDef.timeout_ms`). `None`
+    /// = no limit beyond the run TTL and cancellation.
+    pub timeout: Option<std::time::Duration>,
 }
 
 /// Wire protocol used to receive `OutputEvent`s from the child's
@@ -515,6 +518,28 @@ fn subprocess_base_stats(
     }
 }
 
+/// The failed result of an attempt that hit `SubprocessDef.timeout_ms`.
+/// The child has already been killed (dropping it kills it); it has no
+/// exit code, so the stats say `timed_out` instead.
+fn timed_out_result(limit: std::time::Duration, model: Option<&str>) -> WorkerResult {
+    let timeout_ms = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX);
+    WorkerResult {
+        value: serde_json::json!({
+            "error": format!("subprocess timed out after {timeout_ms} ms and was killed"),
+            "timed_out": true,
+            "timeout_ms": timeout_ms,
+        }),
+        ok: false,
+        stats: Some(crate::store::trace::WorkerStats {
+            worker_kind: Some("subprocess".to_string()),
+            model: model.map(str::to_string),
+            usage: None,
+            num_turns: None,
+            adapter_data: Some(serde_json::json!({ "exit_code": null, "timed_out": true })),
+        }),
+    }
+}
+
 /// GH #83 stats declaration — apply `SubprocessOutput.stats` JSON
 /// Pointers to the parsed stdout, enriching `stats` in place. Pointer
 /// misses are silent (stats are observational; a CLI that omits usage
@@ -768,7 +793,10 @@ impl ProcessSpawner {
             .env("MSE_CTX_AGENT", &ctx.agent)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // A timeout or a cancel drops the wait future, and with it the
+            // child; without this the process would keep running.
+            .kill_on_drop(true);
         for (k, v) in &rendered_env {
             cmd.env(k, v);
         }
@@ -804,12 +832,13 @@ impl ProcessSpawner {
         let stream_mode = self.stream_mode.clone();
         let output_decl = embed.output.clone();
         let model_for_stats = embed.model.clone();
+        let timeout = embed.timeout;
 
         tokio::spawn(async move {
             let result: Result<WorkerResult, WorkerError> = if let Some(mode) = stream_mode {
                 // Streaming keeps the existing event protocol untouched
                 // (output normalization is a plain-mode declaration).
-                run_streaming_mode(
+                let streaming = run_streaming_mode(
                     mode,
                     child,
                     &engine_for_emit,
@@ -817,9 +846,40 @@ impl ProcessSpawner {
                     &task_id_for_emit,
                     attempt,
                     cancel_inner,
-                )
-                .await
+                );
+                match timeout {
+                    None => streaming.await,
+                    Some(limit) => match tokio::time::timeout(limit, streaming).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            // The stream never produced its Final; emit the
+                            // failure as one so the attempt settles.
+                            let wr = timed_out_result(limit, model_for_stats.as_deref());
+                            if let Some(stats) = wr.stats.clone() {
+                                engine_for_emit
+                                    .record_worker_stats(&task_id_for_emit, attempt, stats)
+                                    .await;
+                            }
+                            let ev = OutputEvent::Final {
+                                content: ContentRef::Inline {
+                                    value: wr.value.clone(),
+                                },
+                                ok: false,
+                            };
+                            let _ = engine_for_emit
+                                .submit_output(&token_for_emit, &task_id_for_emit, attempt, ev)
+                                .await;
+                            Ok(wr)
+                        }
+                    },
+                }
             } else {
+                let deadline = async {
+                    match timeout {
+                        Some(limit) => tokio::time::sleep(limit).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 let result = tokio::select! {
                     output = child.wait_with_output() => {
                         match output {
@@ -832,6 +892,10 @@ impl ProcessSpawner {
                         }
                     }
                     _ = cancel_inner.cancelled() => Err(WorkerError::Cancelled),
+                    _ = deadline => Ok(timed_out_result(
+                        timeout.unwrap_or_default(),
+                        model_for_stats.as_deref(),
+                    )),
                 };
                 if let Ok(wr) = &result {
                     if let Some(stats) = wr.stats.clone() {

@@ -197,6 +197,99 @@ async fn declared_json_unparsable_stdout_fails_the_step() {
     );
 }
 
+/// One-step Blueprint whose worker runs `script` under a template with
+/// the given `timeout_ms`.
+fn timeout_bp(id: &str, script: &str, timeout_ms: u64) -> Value {
+    json!({
+        "schema_version": "0.1.0",
+        "id": id,
+        "flow": {
+            "kind": "step",
+            "ref": "slow",
+            "in": {"op": "lit", "value": "ignored"},
+            "out": {"op": "path", "at": "$.result"}
+        },
+        "agents": [{
+            "name": "slow",
+            "kind": "subprocess",
+            "spec": {},
+            "runner": {"backend": "subprocess", "template": "slow"}
+        }],
+        "subprocesses": [{
+            "name": "slow",
+            "argv": ["sh", "-c", script],
+            "output": {"format": "json", "result_ptr": "/result"},
+            "timeout_ms": timeout_ms
+        }]
+    })
+}
+
+/// timeout: a child still running at `timeout_ms` fails the step with a
+/// `timed_out` value, well before it would have finished, and is killed —
+/// the marker it would write after its sleep never appears.
+#[tokio::test]
+async fn timeout_fails_the_step_and_kills_the_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("still-running");
+    let script = format!(
+        "sleep 1; touch '{}'; printf '{{\"result\": 1}}'",
+        marker.display()
+    );
+    let started = std::time::Instant::now();
+    let result = service()
+        .launch(launch_input(
+            timeout_bp("embed-timeout", &script, 200),
+            json!({}),
+        ))
+        .await;
+    let elapsed = started.elapsed();
+    let err = format!(
+        "{:?}",
+        result.expect_err("a timed-out step must fail the launch")
+    );
+    assert!(
+        err.contains("timed_out"),
+        "error must name the timeout: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "the step must fail at the limit, not when the child exits ({elapsed:?})"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !marker.exists(),
+        "the child must have been killed before it reached `touch`"
+    );
+}
+
+/// timeout: a child that finishes inside the limit is unaffected.
+#[tokio::test]
+async fn timeout_does_not_affect_a_child_that_finishes_in_time() {
+    let out = service()
+        .launch(launch_input(
+            timeout_bp("embed-in-time", "printf '{\"result\": \"done\"}'", 5_000),
+            json!({}),
+        ))
+        .await
+        .expect("a child inside the limit must pass");
+    assert_eq!(out.final_ctx["result"], json!("done"));
+}
+
+/// timeout: `timeout_ms: 0` is refused at compile time rather than
+/// failing every attempt instantly.
+#[tokio::test]
+async fn zero_timeout_is_refused_at_compile_time() {
+    let result = service()
+        .launch(launch_input(
+            timeout_bp("embed-zero-timeout", "printf '{\"result\": 1}'", 0),
+            json!({}),
+        ))
+        .await;
+    let err = format!("{:?}", result.expect_err("timeout_ms = 0 must be refused"));
+    assert!(err.contains("timeout_ms must be greater than 0"), "{err}");
+}
+
 /// cwd: a template `cwd: "{work_dir}"` runs the child inside the
 /// task-level work_dir (proved by reading a marker file with a relative
 /// path — no path-string comparison, so macOS `/private` symlinking
