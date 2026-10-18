@@ -1954,6 +1954,13 @@ impl SubprocessProcessSpawnerFactory {
             Some(other) => return Err(invalid(format!("unknown stream_mode: {other}"))),
             None => None,
         };
+        if def.timeout_ms == Some(0) {
+            return Err(invalid(format!(
+                "SubprocessDef '{}': timeout_ms must be greater than 0 \
+                 (omit the field for no per-attempt limit)",
+                def.name
+            )));
+        }
         if let Some(output) = &def.output {
             if stream_mode.is_some() {
                 return Err(invalid(format!(
@@ -2027,6 +2034,7 @@ impl SubprocessProcessSpawnerFactory {
                 system_prompt,
                 model,
                 tools_csv: tools.join(","),
+                timeout: def.timeout_ms.map(std::time::Duration::from_millis),
             }),
         };
         Ok(sp)
@@ -4904,6 +4912,7 @@ mod subprocess_embed_compile_tests {
             cwd: None,
             output: None,
             stream_mode: None,
+            timeout_ms: None,
         }
     }
 

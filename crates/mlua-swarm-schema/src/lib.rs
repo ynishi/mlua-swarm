@@ -1170,6 +1170,12 @@ pub struct SubprocessDef {
     /// spec-based Subprocess path). `None` = plain mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_mode: Option<String>,
+    /// Wall-clock limit for one attempt, in milliseconds. When the child
+    /// has not exited by then it is killed and the step fails with a
+    /// `timed_out` value. `None` = no per-attempt limit (only the run TTL
+    /// and cancellation apply). `0` is rejected at compile time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 /// GH #83 — declarative stdout → worker-result normalization for a
@@ -3232,6 +3238,7 @@ mod tests {
                 stats: None,
             }),
             stream_mode: None,
+            timeout_ms: None,
         }
     }
 
@@ -3253,6 +3260,7 @@ mod tests {
             cwd: None,
             output: None,
             stream_mode: None,
+            timeout_ms: None,
         };
         let json = serde_json::to_value(&def).expect("serializes");
         let obj = json.as_object().unwrap();

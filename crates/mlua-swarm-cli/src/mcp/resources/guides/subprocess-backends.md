@@ -48,7 +48,8 @@ Declared in the `Blueprint.subprocesses` registry (same shape as
     "result_ptr": "/result",           // RFC 6901 JSON Pointer into the parsed stdout
     "ok_from": "exit_code"             // "exit_code" (default) or a JSON Pointer to a boolean
   },
-  "stream_mode": null                  // "ndjson_lines" | "sse_events" | "length_prefixed" | absent
+  "stream_mode": null,                 // "ndjson_lines" | "sse_events" | "length_prefixed" | absent
+  "timeout_ms": 60000                  // optional; per-attempt wall-clock limit, child killed when it passes
 }
 ```
 
@@ -116,7 +117,9 @@ freely in one Blueprint.
 | `format: "json"` + unparsable stdout | failed step; value carries `{"raw", "stderr", "parse_error"}` |
 | `result_ptr` not found in the parsed stdout | failed step; value carries an actionable `error` |
 | `ok_from` pointer missing / not boolean `true` | failed step |
-| timeout / cancel | existing run-TTL / cancellation machinery, unchanged |
+| `timeout_ms` passed | the child is killed; failed step, value `{"error", "timed_out": true, "timeout_ms"}`; stats carry `exit_code: null, timed_out: true` |
+| `timeout_ms: 0` | refused at compile time (`InvalidSpec`) — omit the field for no limit |
+| run TTL / cancel | existing run-TTL / cancellation machinery; on the template path a cancelled child is killed too |
 | referenced placeholder with no source | spawn fails loud (`SpawnError`) before the child ever starts |
 
 ## Complete neutral-binary example
