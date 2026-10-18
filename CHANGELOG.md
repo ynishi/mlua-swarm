@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0](https://github.com/ynishi/mlua-swarm/compare/v0.29.0...v0.30.0) - 2026-10-18
+
+### Added
+
+- [**breaking**] move to agent-block 0.42 and mlua-flow-ir 0.4, read legacy `assign` nodes as `let`
+- *(cli)* let an `agent-block` agent name its block through `meta.ctx.block`
+
+### Other
+
+- Merge pull request #106 from ynishi/feat/agent-block-0.42
+
 ## [0.29.0](https://github.com/ynishi/mlua-swarm/compare/v0.28.1...v0.29.0) - 2026-09-05
 
 ### Added
