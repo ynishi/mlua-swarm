@@ -1,0 +1,100 @@
+{
+  "id": "sample-cli-staged-fanout",
+  "flow": {
+    "kind": "seq",
+    "children": [
+      {
+        "kind": "let",
+        "at": "$.finished",
+        "value": { "op": "lit", "value": false }
+      },
+      {
+        "kind": "loop",
+        "counter": { "op": "path", "at": "$.round" },
+        "cond": { "op": "not", "arg": { "op": "path", "at": "$.finished" } },
+        "max": 10,
+        "body": {
+          "kind": "seq",
+          "children": [
+            {
+              "kind": "step",
+              "ref": "next-batch",
+              "in": { "op": "path", "at": "$.round" },
+              "out": { "op": "path", "at": "$.batch" }
+            },
+            {
+              "kind": "branch",
+              "cond": {
+                "op": "eq",
+                "lhs": { "op": "len", "arg": { "op": "path", "at": "$.batch" } },
+                "rhs": { "op": "lit", "value": 0 }
+              },
+              "then": {
+                "kind": "let",
+                "at": "$.finished",
+                "value": { "op": "lit", "value": true }
+              },
+              "else": {
+                "kind": "fanout",
+                "items": { "op": "path", "at": "$.batch" },
+                "bind": { "op": "path", "at": "$.unit" },
+                "join": "all",
+                "out": { "op": "path", "at": "$.last_stage" },
+                "body": {
+                  "kind": "step",
+                  "ref": "build",
+                  "in": { "op": "path", "at": "$.unit" },
+                  "out": { "op": "path", "at": "$.built" }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "agents": [
+    {
+      "name": "next-batch",
+      "kind": "subprocess",
+      "spec": {},
+      "runner": { "backend": "subprocess", "template": "next-batch" }
+    },
+    {
+      "name": "build",
+      "kind": "subprocess",
+      "spec": {},
+      "runner": { "backend": "subprocess", "template": "build" },
+      "max_concurrency": 2
+    }
+  ],
+  "subprocesses": [
+    {
+      "name": "next-batch",
+      "argv": [
+        "sh", "-c",
+        "case \"$(cat)\" in 0) b='[\"schema\",\"types\"]';; 1) b='[\"store\",\"api\",\"cli\"]';; 2) b='[\"docs\"]';; *) b='[]';; esac; printf '{\"batch\": %s}' \"$b\""
+      ],
+      "stdin": "{prompt}",
+      "output": { "format": "json", "result_ptr": "/batch" },
+      "timeout_ms": 5000
+    },
+    {
+      "name": "build",
+      "argv": [
+        "sh", "-c",
+        "u=$(cat); sleep 0.2; printf '{\"built\": \"%s\"}' \"$u\""
+      ],
+      "stdin": "{prompt}",
+      "output": { "format": "json", "result_ptr": "/built" },
+      "timeout_ms": 30000
+    }
+  ],
+  "strategy": {
+    "strict_refs": true,
+    "strict_kind": true
+  },
+  "metadata": {
+    "description": "Stage-by-stage build driven by deterministic CLI steps, no LLM and no SubAgent. `next-batch` is a Subprocess step that answers, for the loop counter it receives, which units are ready to build next (here a fixed three-stage plan; a real tool would read its own state), and an empty list once everything is built. Each stage fans its units out to `build`, which `max_concurrency: 2` keeps at two children at a time across lanes and runs, and `timeout_ms` keeps from hanging the run. Dependencies are resolved by the CLI, not the flow: the flow only loops while there is a next batch. Neutral binaries only (sh)."
+  }
+}

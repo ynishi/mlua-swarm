@@ -227,6 +227,15 @@ only when the embedding host wired an externs registry
 (`TaskLaunchService::with_externs`), so a Blueprint using it is not
 portable to a plain `mse serve`.
 
+**Stages that depend on each other.** A fanout runs its lanes with no order
+between them, and the flow cannot index or filter an array, so it cannot
+work out which units are ready next by itself. Let a step answer that:
+a `loop` asks a "next batch" step for the units whose dependencies are
+done, fans that batch out, and stops when the answer is empty. The
+dependency order lives in the step (typically a deterministic CLI behind
+a Subprocess template), not in the flow. `mse://blueprints/samples/12-cli-staged-fanout`
+is a runnable version, with `max_concurrency` on the fanned-out agent.
+
 **Writing this shape in the Lua DSL.** `bp_dsl`'s `B.stage "id" { fanout =
 {...} }` emits exactly the node described here — items / bind / join / out
 defaults, the one-step homogeneous body or the heterogeneous branch cascade
