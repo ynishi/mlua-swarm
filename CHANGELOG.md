@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/ynishi/mlua-swarm/compare/v0.31.0...v0.32.0) - 2026-10-19
+
+### Added
+
+- *(engine)* cap how many steps of an agent run at once with `max_concurrency`
+
 ## [0.31.0](https://github.com/ynishi/mlua-swarm/compare/v0.30.0...v0.31.0) - 2026-10-18
 
 ### Added
