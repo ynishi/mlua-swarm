@@ -7448,6 +7448,7 @@ mod tests {
                 runner_ref: None,
                 verdict: None,
                 lints: None,
+                max_concurrency: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -9796,6 +9797,7 @@ mod tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -9817,6 +9819,7 @@ mod tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -9832,6 +9835,7 @@ mod tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -9951,6 +9955,7 @@ mod tests {
                     values: values.iter().map(|s| (*s).into()).collect(),
                 }),
                 lints: None,
+                max_concurrency: None,
             })
             .collect();
         bp
@@ -11227,6 +11232,7 @@ mod tests {
                     runner_ref: None,
                     verdict: None,
                     lints: None,
+                    max_concurrency: None,
                 },
                 AgentDef {
                     name: "auditor".into(),
@@ -11238,6 +11244,7 @@ mod tests {
                     runner_ref: None,
                     verdict: None,
                     lints: None,
+                    max_concurrency: None,
                 },
             ],
             operators: vec![],

@@ -922,6 +922,7 @@ mod after_run_audit_tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 

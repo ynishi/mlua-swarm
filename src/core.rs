@@ -1,6 +1,7 @@
 //! Core runtime primitives: Engine + Ctx + State + Config.
 
 pub mod agent_context;
+pub(crate) mod concurrency;
 pub mod config;
 pub mod ctx;
 pub mod engine;

@@ -185,6 +185,7 @@ fn two_step_blueprint() -> Blueprint {
                 runner_ref: None,
                 verdict: None,
                 lints: None,
+                max_concurrency: None,
             },
             AgentDef {
                 name: "agent-b".into(),
@@ -196,6 +197,7 @@ fn two_step_blueprint() -> Blueprint {
                 runner_ref: None,
                 verdict: None,
                 lints: None,
+                max_concurrency: None,
             },
         ],
         operators: vec![],

@@ -3151,6 +3151,7 @@ mod tests {
                 runner_ref: None,
                 verdict: None,
                 lints: None,
+                max_concurrency: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -3384,6 +3385,7 @@ mod tests {
                 runner_ref: None,
                 verdict: None,
                 lints: None,
+                max_concurrency: None,
             }],
             operators: vec![operator_def(seat)],
             ..identity_blueprint()
@@ -4104,6 +4106,7 @@ mod tests {
                 runner_ref: None,
                 verdict: None,
                 lints: None,
+                max_concurrency: None,
             }],
             operators: vec![],
             metas: vec![],

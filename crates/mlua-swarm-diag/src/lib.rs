@@ -445,6 +445,13 @@ pub const LINT_DECLS: &[LintDecl] = &[
         "mse://guides/blueprint-authoring",
     ),
     decl(
+        "invalid-max-concurrency",
+        DiagLevel::Error,
+        LintCategory::Correctness,
+        "An AgentDef declares max_concurrency = 0, so none of its steps could ever run.",
+        "mse://guides/blueprint-authoring",
+    ),
+    decl(
         "unresolved-operator-ref",
         DiagLevel::Error,
         LintCategory::Correctness,

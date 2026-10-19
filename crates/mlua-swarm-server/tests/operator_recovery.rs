@@ -845,6 +845,7 @@ fn identity_blueprint() -> Blueprint {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }],
         // A launch pin assigns the Run to one Blueprint-declared Operator
         // seat, so the Blueprint has to declare one for the pin below to

@@ -68,6 +68,9 @@ struct EngineInner {
     /// middleware implementations — it declares the capabilities it needs
     /// as hint keys".
     layer_registry: crate::middleware::LayerRegistry,
+    /// Per-(Blueprint, agent) `AgentDef.max_concurrency` semaphores,
+    /// shared by every run on this engine.
+    concurrency: crate::core::concurrency::ConcurrencyLimits,
     /// Optional Data-plane `OutputStore` backend (subtask-4 / ST2 rework —
     /// see `submit_output`'s doc). `None` (the default) preserves
     /// pre-subtask-4 behavior exactly: `submit_output` /
@@ -385,6 +388,7 @@ impl Engine {
                 spawn_hooks: tokio::sync::RwLock::new(HashMap::new()),
                 operators: tokio::sync::RwLock::new(HashMap::new()),
                 layer_registry,
+                concurrency: Default::default(),
                 data_store: std::sync::RwLock::new(None),
                 verdict_contracts: std::sync::RwLock::new(HashMap::new()),
             }),
@@ -410,6 +414,7 @@ impl Engine {
             spawn_hooks: tokio::sync::RwLock::new(HashMap::new()),
             operators: tokio::sync::RwLock::new(HashMap::new()),
             layer_registry: self.inner.layer_registry.clone(),
+            concurrency: Default::default(),
             data_store: std::sync::RwLock::new(None),
             verdict_contracts: std::sync::RwLock::new(HashMap::new()),
         });
@@ -437,6 +442,18 @@ impl Engine {
     /// `Engine::new_with_layers(cfg, parent.layer_registry().clone())`.
     pub fn layer_registry(&self) -> &crate::middleware::LayerRegistry {
         &self.inner.layer_registry
+    }
+
+    /// The `AgentDef.max_concurrency` semaphore for `agent` in Blueprint
+    /// `blueprint_id`, shared by every run on this engine (see
+    /// [`crate::core::concurrency`]).
+    pub(crate) fn concurrency_slot(
+        &self,
+        blueprint_id: &str,
+        agent: &str,
+        limit: u32,
+    ) -> Arc<tokio::sync::Semaphore> {
+        self.inner.concurrency.semaphore(blueprint_id, agent, limit)
     }
 
     /// Access the `TokenSigner` used to mint/verify `CapToken`s.
@@ -5236,6 +5253,7 @@ mod submit_time_projection_sink_tests {
                 runner_ref: None,
                 verdict: None,
                 lints: None,
+                max_concurrency: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -6983,6 +7001,7 @@ mod skip_tier_tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 
@@ -7048,6 +7067,7 @@ mod skip_tier_tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 
@@ -7099,6 +7119,7 @@ mod skip_tier_tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 

@@ -137,6 +137,11 @@ pub struct StepEntry {
     /// worker-kind independent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Milliseconds the step waited for a slot of its agent's
+    /// `max_concurrency` before it started. Not part of `duration_ms`.
+    /// `None` when the agent declares no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_ms: Option<u64>,
     /// Worker kind label (`"agent_block"` / `"subprocess"` / `"operator"`
     /// / …) as reported by the worker boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +181,7 @@ impl StepEntry {
             started_at_ms: None,
             completed_at_ms: None,
             duration_ms: None,
+            queued_ms: None,
             worker_kind: None,
             model: None,
             usage: None,
