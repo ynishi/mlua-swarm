@@ -62,6 +62,7 @@
 //! | `mse://blueprints/samples/10-fanout`         | Sample `.bp.lua` — GH #82 `F.fanout`: one agent fanned out over an item array (one dispatch per item) + aggregate. |
 //! | `mse://guides/subprocess-backends`           | GH #83 SubprocessDef CLI invocation templates (EmbedAgent): closed placeholder set, output normalization, Runner::Subprocess binding. |
 //! | `mse://blueprints/samples/11-subprocess-embed` | GH #83 sample — two headless workers on different SubprocessDef templates, neutral binaries only. |
+//! | `mse://blueprints/samples/12-cli-staged-fanout` | Stage-by-stage build: a `next-batch` CLI step drives a loop, each batch fans out to a `max_concurrency`-capped `build` agent. |
 //! | `mse://guides/skip-tier-and-skip-on`         | Skip tier semantics + `skip_on = { ... }` DSL surface + `bp_doctor` `skip_on_lint` family + error surface (GH #76). |
 //! | `mse://api/blueprint-schema`                 | Live Blueprint JSON Schema (generated per read).    |
 //! | `mse://api/http-endpoints`                   | Live HTTP wire-body JSON Schemas, keyed by endpoint (issue #19). |
@@ -147,6 +148,8 @@ const SAMPLE_09_SKIP_ON_EXAMPLE_BODY: &str =
 const SAMPLE_10_FANOUT_BODY: &str = include_str!("./resources/samples/10-fanout.bp.lua");
 const SAMPLE_11_SUBPROCESS_EMBED_BODY: &str =
     include_str!("./resources/samples/11-subprocess-embed.json");
+const SAMPLE_12_CLI_STAGED_FANOUT_BODY: &str =
+    include_str!("./resources/samples/12-cli-staged-fanout.json");
 
 /// Static resource catalogue. Order is the order `list_resources` reports.
 pub const RESOURCES: &[ResourceEntry] = &[
@@ -359,6 +362,13 @@ pub const RESOURCES: &[ResourceEntry] = &[
         description: "GH #83: two headless workers backed by different SubprocessDef templates in one Blueprint — one pipes {prompt} to stdin and reads {system_file} back via env, one is a bare echo; both extract their worker result via output.result_ptr. Neutral binaries only (sh) — runnable with no vendor CLI installed. Authoring guide: mse://guides/subprocess-backends.",
         mime_type: "application/json",
         body: ResourceBody::Static(SAMPLE_11_SUBPROCESS_EMBED_BODY),
+    },
+    ResourceEntry {
+        uri: "mse://blueprints/samples/12-cli-staged-fanout",
+        title: "Sample Blueprint — stage-by-stage build driven by CLI steps",
+        description: "A loop asks a Subprocess `next-batch` step which units are ready (the CLI owns the dependency order and answers [] when done) and fans each batch out to a `build` agent capped by `max_concurrency: 2`; both templates carry `timeout_ms`. No LLM, no SubAgent, neutral binaries only (sh). Guides: mse://guides/subprocess-backends, mse://guides/blueprint-authoring#agent-max-concurrency.",
+        mime_type: "application/json",
+        body: ResourceBody::Static(SAMPLE_12_CLI_STAGED_FANOUT_BODY),
     },
     ResourceEntry {
         uri: "mse://guides/skip-tier-and-skip-on",

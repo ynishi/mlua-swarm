@@ -132,3 +132,8 @@ same shape with a real agent CLI is purely a data change — swap the
 `argv` for the CLI's non-interactive form, point its model/tool flags at
 `{model}` / `{tools_csv}`, and declare where its output format puts the
 result.
+
+`mse://blueprints/samples/12-cli-staged-fanout` uses templates as
+deterministic tools rather than agent CLIs: a `next-batch` step decides
+which units are ready, and each batch fans out to a `build` template capped
+by `max_concurrency`, with `timeout_ms` on both.
