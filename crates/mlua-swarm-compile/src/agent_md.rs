@@ -266,6 +266,10 @@ pub fn parse(text: &str, source_label: &str, kind: AgentKind) -> Result<AgentDef
         // frontmatter authoring for it too.
         verdict: None,
         lints,
+        // A concurrency limit is a property of how a Blueprint runs the
+        // agent, not of the agent's persona; it is declared on the
+        // Blueprint's agent entry, not in `agent.md`.
+        max_concurrency: None,
     })
 }
 

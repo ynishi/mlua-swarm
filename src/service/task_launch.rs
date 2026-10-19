@@ -1124,6 +1124,17 @@ impl TaskLaunchService {
         // is a no-op, matching `EngineDispatcher::with_spawner`'s default.
         let dispatcher = dispatcher.with_step_metas(derive_step_metas(&input.blueprint));
         let dispatcher = dispatcher.with_binding_digests(binding_digests);
+        // `AgentDef.max_concurrency`: limited agents of this Blueprint,
+        // counted engine-wide under the Blueprint id.
+        let dispatcher = dispatcher.with_concurrency_limits(
+            input.blueprint.id.as_str(),
+            input
+                .blueprint
+                .agents
+                .iter()
+                .filter_map(|a| a.max_concurrency.map(|n| (a.name.clone(), n)))
+                .collect(),
+        );
         // GH #23: attach the `StepNaming` table `Compiler::compile` already
         // built once for this Blueprint (the sole construction site — see
         // `core::step_naming::StepNaming::from_blueprint`'s doc).
@@ -1245,6 +1256,7 @@ mod tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -2884,6 +2896,7 @@ mod tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -3115,6 +3128,7 @@ mod tests {
                 runner_ref: None,
                 verdict: None,
                 lints: None,
+                max_concurrency: None,
             }
         }
 

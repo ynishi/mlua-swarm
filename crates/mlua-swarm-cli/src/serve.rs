@@ -1049,6 +1049,7 @@ fn seed_blueprint(id: &str) -> Blueprint {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }],
         operators: vec![],
         metas: vec![],

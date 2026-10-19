@@ -785,6 +785,36 @@ priority): (1) per-`AgentDef.kind` literal, (2) the Blueprint's top-level
 `default_agent_kind`, (3) a CLI-level default (e.g. `mse serve
 --default-agent-kind`), (4) the schema `Default` impl (`operator`).
 
+### Limiting how many steps of an agent run at once {#agent-max-concurrency}
+
+A `fanout` starts every lane at once. When the lanes dispatch an agent
+that calls an LLM, spawns a SubAgent or runs a heavy child process, cap it
+on the agent:
+
+```jsonc
+{ "name": "coder", "kind": "agent_block", "spec": { ... }, "max_concurrency": 2 }
+```
+
+- **What is counted**: steps of this agent across every run of this
+  Blueprint on the server (keyed by Blueprint id + agent name). Six
+  fanout lanes and two runs of the same Blueprint started together share
+  the same 2 slots. Another Blueprint's agent of the same name has its own.
+- **Waiting**: a step over the limit waits for a slot before its worker
+  is spawned, in arrival order. The wait is recorded on the step entry as
+  `queued_ms`; it is not part of `duration_ms` and does not count toward a
+  Subprocess `timeout_ms`. It does count toward the run TTL. A cancelled
+  run leaves the queue without taking a slot.
+- **Resume**: a step that only replays a recorded result still takes a
+  slot for the instant it replays, so on resume it may wait behind steps
+  of the same agent that are running.
+- **Re-registering** the Blueprint with a different limit applies to steps
+  that start after it; steps already running keep their slot.
+- `max_concurrency: 0` is refused at compile time (`invalid-max-concurrency`).
+  Omit the field for no limit.
+
+This limit is about how many run together, not about request rate: an LLM
+provider's rate limit is still handled by the client's retry and backoff.
+
 ### `$agent_md` file-ref expansion
 
 Instead of writing an `AgentDef` object inline, you can reference an

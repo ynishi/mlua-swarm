@@ -63,6 +63,7 @@ fn two_step_blueprint() -> Blueprint {
                 runner_ref: None,
                 verdict: None,
                 lints: None,
+                max_concurrency: None,
             },
             AgentDef {
                 name: "agent-b".into(),
@@ -74,6 +75,7 @@ fn two_step_blueprint() -> Blueprint {
                 runner_ref: None,
                 verdict: None,
                 lints: None,
+                max_concurrency: None,
             },
         ],
         operators: vec![],
@@ -116,6 +118,7 @@ fn two_step_blueprint_with_unbound_operator() -> Blueprint {
         runner_ref: None,
         verdict: None,
         lints: None,
+        max_concurrency: None,
     };
     // `bp.operators` stays empty — that's the whole point.
     bp

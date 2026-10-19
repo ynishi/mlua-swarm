@@ -90,6 +90,7 @@ mod tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         };
         factory
             .build(&agent_def, None)

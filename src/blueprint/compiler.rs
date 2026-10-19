@@ -77,6 +77,16 @@ pub enum CompileError {
     /// Two `AgentDef`s in the same `Blueprint` share a name.
     #[error("duplicate AgentDef name: {0}")]
     DuplicateAgent(String),
+    /// An `AgentDef.max_concurrency` of `0`, which would let no step of
+    /// that agent ever start.
+    #[error(
+        "agent '{agent}' declares max_concurrency = 0, so none of its steps could ever run; \
+         use a positive limit, or omit the field for no limit"
+    )]
+    InvalidMaxConcurrency {
+        /// The agent whose limit is zero.
+        agent: String,
+    },
     /// A `kind = Operator` agent's `spec.operator_ref` does not match
     /// any `OperatorDef.name` declared in `Blueprint.operators`.
     #[error("agent '{agent}' operator_ref '{op_ref}' does not match any OperatorDef.name in Blueprint.operators (defined: {defined:?})")]
@@ -361,6 +371,22 @@ impl From<&CompileError> for mlua_swarm_diag::Diagnostic {
             CompileError::DuplicateAgent(name) => {
                 base("duplicate-agent-name").with_span(agent_span(name))
             }
+            CompileError::InvalidMaxConcurrency { agent } => base("invalid-max-concurrency")
+                .with_suggestion(Suggestion {
+                    msg: "use a positive limit, or drop the field for no limit".into(),
+                    patch: "\"max_concurrency\": 2".into(),
+                    applicability: Applicability::HasPlaceholders,
+                })
+                .with_docs_ref(DocsRef {
+                    uri: "mse://guides/blueprint-authoring",
+                    anchor: Some("#agent-max-concurrency"),
+                })
+                .with_span(DiagSpan {
+                    element: DiagElement::Agent {
+                        name: agent.clone(),
+                    },
+                    json_path: Some(format!("$.agents[?(@.name=='{agent}')].max_concurrency")),
+                }),
             CompileError::UnresolvedOperatorRef { agent, defined, .. } => {
                 base("unresolved-operator-ref")
                     .with_note(format!("declared OperatorDef names: {defined:?}"))
@@ -774,6 +800,11 @@ impl Compiler {
                 return Err(CompileError::DuplicateAgent(ad.name.clone()));
             }
             seen.insert(ad.name.clone(), ());
+            if ad.max_concurrency == Some(0) {
+                return Err(CompileError::InvalidMaxConcurrency {
+                    agent: ad.name.clone(),
+                });
+            }
 
             // GH #50: contract registration is orthogonal to spawner
             // resolution (an agent may declare `verdict` regardless of
@@ -2877,6 +2908,7 @@ mod operator_spawner_factory_worker_binding_tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -3008,6 +3040,7 @@ mod lua_inline_source_tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -3128,6 +3161,7 @@ mod meta_ref_validation_tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -3311,6 +3345,7 @@ mod audit_agent_validation_tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -3618,6 +3653,7 @@ mod operator_ref_resolution_tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -3785,6 +3821,7 @@ mod projection_placement_compile_tests {
                 runner_ref: None,
                 verdict: None,
                 lints: None,
+                max_concurrency: None,
             }],
             operators: vec![],
             metas: vec![],
@@ -3902,6 +3939,7 @@ mod verdict_contract_lint_tests {
             runner_ref: None,
             verdict,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -4876,6 +4914,33 @@ mod verdict_contract_lint_tests {
             other => panic!("expected Agent span, got {other:?}"),
         }
     }
+
+    #[test]
+    fn invalid_max_concurrency_diagnostic_is_a_declared_error_on_the_agent() {
+        let err = CompileError::InvalidMaxConcurrency {
+            agent: "coder".into(),
+        };
+        let d = mlua_swarm_diag::Diagnostic::from(&err);
+        assert_eq!(d.kind, "invalid-max-concurrency");
+        assert_eq!(d.level, mlua_swarm_diag::DiagLevel::Error);
+        let decl = mlua_swarm_diag::lint_decl(d.kind).expect("kind must be declared");
+        assert_eq!(decl.default_level, mlua_swarm_diag::DiagLevel::Error);
+        assert!(d
+            .suggestion
+            .as_ref()
+            .expect("suggestion")
+            .patch
+            .contains("max_concurrency"));
+        let span = d.span.expect("span must be set");
+        assert_eq!(
+            span.json_path.as_deref(),
+            Some("$.agents[?(@.name=='coder')].max_concurrency")
+        );
+        match span.element {
+            mlua_swarm_diag::DiagElement::Agent { name } => assert_eq!(name, "coder"),
+            other => panic!("expected Agent span, got {other:?}"),
+        }
+    }
 }
 
 // ─── GH #83: SubprocessDef template hint + placeholder validation ─────────
@@ -4900,6 +4965,7 @@ mod subprocess_embed_compile_tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 
@@ -5034,6 +5100,7 @@ mod subprocess_embed_compile_tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 

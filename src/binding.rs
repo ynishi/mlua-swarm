@@ -696,6 +696,7 @@ mod tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         });
         resolve_bound_agents(&bp).unwrap()
     }

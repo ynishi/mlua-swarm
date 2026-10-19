@@ -56,6 +56,7 @@
 //!         runner_ref: None,
 //!         verdict: None,
 //!         lints: None,
+//!         max_concurrency: None,
 //!     }],
 //!     operators: vec![],
 //!     metas: vec![],
@@ -842,6 +843,15 @@ pub struct AgentDef {
     /// overrides; every pre-existing Blueprint is unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lints: Option<BTreeMap<String, LintSetting>>,
+    /// At most this many steps dispatched to this agent run at once,
+    /// counted across every run of this Blueprint on the server (keyed by
+    /// Blueprint id + agent name). A step over the limit waits for a
+    /// free slot before its worker is spawned; the wait is recorded as
+    /// the step's `queued_ms` and is not part of its duration or of a
+    /// Subprocess `timeout_ms`. `None` (the default) = no limit. `0` is
+    /// refused at compile time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
 }
 
 /// Agent persona information. Orthogonal to the backend kind (Shell / InProc / Operator).
@@ -3005,6 +3015,7 @@ mod tests {
             runner_ref,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         }
     }
 

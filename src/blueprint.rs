@@ -117,6 +117,18 @@ pub struct EngineDispatcher {
     /// — the engine's submit-time sink then falls back to
     /// `EngineCfg.check_policy` (the server-wide default).
     check_policy: Option<CheckPolicy>,
+    /// `AgentDef.max_concurrency` limits of the running Blueprint
+    /// (`agent name -> limit`) and the Blueprint id they are counted under.
+    /// Empty (the default) = no agent is limited.
+    concurrency: ConcurrencyDecl,
+}
+
+/// The per-agent limits [`EngineDispatcher::with_concurrency_limits`]
+/// installs.
+#[derive(Default)]
+struct ConcurrencyDecl {
+    blueprint_id: String,
+    limits: HashMap<String, u32>,
 }
 
 impl EngineDispatcher {
@@ -140,7 +152,49 @@ impl EngineDispatcher {
             projection_placement: None,
             binding_digests: HashMap::new(),
             check_policy: None,
+            concurrency: ConcurrencyDecl::default(),
         }
+    }
+
+    /// Attach the Blueprint's `AgentDef.max_concurrency` limits
+    /// (`agent name -> limit`), counted under `blueprint_id` across every
+    /// run on the engine. [`Self::dispatch`] holds one slot of an agent's
+    /// limit for the whole dispatch of each of its steps. An agent absent
+    /// from `limits` is not limited.
+    pub fn with_concurrency_limits(
+        mut self,
+        blueprint_id: impl Into<String>,
+        limits: HashMap<String, u32>,
+    ) -> Self {
+        self.concurrency = ConcurrencyDecl {
+            blueprint_id: blueprint_id.into(),
+            limits,
+        };
+        self
+    }
+
+    /// Wait for a slot of `agent`'s `max_concurrency`, when it declares
+    /// one. Returns the permit to hold for the step's dispatch and how long
+    /// the wait took; `(None, None)` for an unlimited agent.
+    async fn acquire_concurrency_slot(
+        &self,
+        agent: &str,
+    ) -> Result<(Option<tokio::sync::OwnedSemaphorePermit>, Option<u64>), EvalError> {
+        let Some(&limit) = self.concurrency.limits.get(agent) else {
+            return Ok((None, None));
+        };
+        let semaphore = self
+            .engine
+            .concurrency_slot(&self.concurrency.blueprint_id, agent, limit);
+        let waited = std::time::Instant::now();
+        let permit = semaphore
+            .acquire_owned()
+            .await
+            .map_err(|e| EvalError::DispatcherError {
+                ref_: agent.to_string(),
+                msg: format!("max_concurrency slot unavailable: {e}"),
+            })?;
+        Ok((Some(permit), Some(waited.elapsed().as_millis() as u64)))
     }
 
     /// Attach a [`RunContext`] (builder style) so every dispatched step is
@@ -433,6 +487,14 @@ impl AsyncDispatcher for EngineDispatcher {
             }
         }
 
+        // `AgentDef.max_concurrency`: wait for a slot of this agent's limit
+        // before anything below starts, so the wait is neither part of the
+        // step's measured duration nor of a worker's own timeout. The
+        // permit is held until this function returns. A cancelled run
+        // drops this future while it waits, which takes it out of the
+        // queue without consuming a slot.
+        let (_concurrency_permit, queued_ms) = self.acquire_concurrency_slot(ref_).await?;
+
         // Trace rail: when the RunContext carries a TraceHandle, register
         // it with the engine for the duration of this step (the
         // pervasive-insertion port middlewares/workers read via
@@ -516,6 +578,7 @@ impl AsyncDispatcher for EngineDispatcher {
             entry.started_at_ms = Some(started_at_ms);
             entry.completed_at_ms = Some(completed_at_ms);
             entry.duration_ms = Some(duration_ms);
+            entry.queued_ms = queued_ms;
             // `attempt` from worker_stats when a boundary reported one;
             // fall back to the engine's own attempt counter so
             // non-stats-carrying workers (RustFn / Lua) still populate
@@ -798,6 +861,7 @@ mod tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 
@@ -872,6 +936,7 @@ mod tests {
             runner_ref: None,
             verdict: None,
             lints: None,
+            max_concurrency: None,
         };
         let spawner = factory.build(&def, None).expect("build");
 
