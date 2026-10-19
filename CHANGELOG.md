@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.1](https://github.com/ynishi/mlua-swarm/compare/v0.32.0...v0.32.1) - 2026-10-19
+
+### Added
+
+- *(cli)* bundle a stage-by-stage build sample driven by CLI steps
+
 ## [0.32.0](https://github.com/ynishi/mlua-swarm/compare/v0.31.0...v0.32.0) - 2026-10-19
 
 ### Added
